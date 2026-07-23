@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "job-queue"
+version = "0.1.0"
+description = "Multi-tenant job queue with lease, heartbeat, and visibility timeout"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary,pool]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+    "testcontainers[postgres]>=4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/job_queue"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/job_queue", "tests", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+pythonpath = ["src"]
