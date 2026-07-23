@@ -1920,6 +1920,130 @@ def test_fair_lease_prefers_under_served_tenants(queue: JobQueue):
     assert claimed_tenants.count("noisy") < 5
 
 
+def test_fair_lease_ack_drain_does_not_starve_late_tenant(queue: JobQueue):
+    """Real starvation case: noisy backlog enqueued first, workers lease+ack.
+
+    With rank-by-created_at (or lease-count fairness that collapses when jobs
+    are acked immediately), the entire noisy backlog would drain before quiet
+    ever runs. Round-robin per tenant must serve quiet early.
+    """
+    noisy_n = 50
+    for i in range(noisy_n):
+        queue.enqueue(tenant_id="noisy", payload={"i": i, "t": "noisy"})
+    quiet = queue.enqueue(tenant_id="quiet", payload={"t": "quiet"})
+
+    order: list[str] = []
+    quiet_position: int | None = None
+    for step in range(noisy_n + 1):
+        job = queue.lease(worker_id="drain-w")
+        assert job is not None, f"expected a job at step {step}"
+        order.append(job.tenant_id)
+        if job.id == quiet.id:
+            quiet_position = step
+        _ack(queue, job, "drain-w")
+
+    assert quiet_position is not None, "quiet job never leased"
+    # Must not wait until after the full noisy backlog (position 50).
+    # Round-robin: at worst quiet is 2nd (after noisy's first rn=1 job).
+    assert quiet_position <= 1, (
+        f"quiet starved until position {quiet_position}; order={order[:10]}..."
+    )
+    assert order.count("quiet") == 1
+    assert order.count("noisy") == noisy_n
+    assert queue.lease(worker_id="drain-w") is None
+
+
+def test_fair_lease_round_robin_three_tenants_with_backlog(queue: JobQueue):
+    """Each tenant with a backlog gets a turn before any gets a second job."""
+    for t in ("a", "b", "c"):
+        for i in range(10):
+            queue.enqueue(tenant_id=t, payload={"t": t, "i": i})
+
+    first_round: list[str] = []
+    for _ in range(3):
+        job = queue.lease(worker_id="rr-w")
+        assert job is not None
+        first_round.append(job.tenant_id)
+        _ack(queue, job, "rr-w")
+
+    assert set(first_round) == {"a", "b", "c"}
+
+    second_round: list[str] = []
+    for _ in range(3):
+        job = queue.lease(worker_id="rr-w")
+        assert job is not None
+        second_round.append(job.tenant_id)
+        _ack(queue, job, "rr-w")
+
+    assert set(second_round) == {"a", "b", "c"}
+
+
+def test_fair_lease_ack_drain_multi_worker_no_starvation(queue: JobQueue):
+    """Several workers race lease+ack against a noisy backlog + quiet jobs."""
+    for i in range(40):
+        queue.enqueue(tenant_id="noisy", payload={"i": i})
+    quiet_ids = set()
+    for i in range(5):
+        q = queue.enqueue(tenant_id="quiet", payload={"q": i})
+        quiet_ids.add(q.id)
+
+    completed_quiet: set = set()
+    lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def worker_loop(wid: str) -> None:
+        try:
+            while True:
+                job = queue.lease(worker_id=wid)
+                if job is None:
+                    # Might be racing; brief retry then exit if still empty.
+                    time.sleep(0.05)
+                    job = queue.lease(worker_id=wid)
+                    if job is None:
+                        return
+                if job.id in quiet_ids:
+                    with lock:
+                        completed_quiet.add(job.id)
+                _ack(queue, job, wid)
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker_loop, args=(f"mw-{i}",)) for i in range(6)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+        assert not t.is_alive()
+
+    assert errors == [], f"worker errors: {errors!r}"
+    assert completed_quiet == quiet_ids
+    assert queue.count(tenant_id="noisy", status=JobStatus.COMPLETED) == 40
+    assert queue.count(tenant_id="quiet", status=JobStatus.COMPLETED) == 5
+
+
+def test_fair_lease_starvation_with_priority_and_backlog(queue: JobQueue):
+    """High-priority noisy backlog still cannot block quiet default jobs forever."""
+    for i in range(30):
+        queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=10)
+    quiet = queue.enqueue(tenant_id="quiet", payload={"t": "q"}, priority=0)
+
+    seen_quiet = False
+    for step in range(31):
+        job = queue.lease(worker_id="pri-w")
+        assert job is not None
+        if job.id == quiet.id:
+            seen_quiet = True
+            _ack(queue, job, "pri-w")
+            break
+        _ack(queue, job, "pri-w")
+        assert step < 5, f"quiet still starved after {step + 1} leases"
+
+    assert seen_quiet
+
+
 def test_fair_lease_respects_tenant_concurrency_limit(queue: JobQueue):
     queue.set_concurrency_limit("capped", 1)
     queue.enqueue(tenant_id="capped", payload={"n": 1})

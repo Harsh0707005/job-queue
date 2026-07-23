@@ -35,9 +35,10 @@ Design notes
   until every parent is ``completed``. If a parent ends as failed/dead/cancelled,
   pending dependents are cascade-cancelled (they do not sit forever).
 * **Fair multi-tenant lease**: ``lease(worker_id=...)`` without ``tenant_id``
-  claims the next ready job across tenants, preferring tenants with fewer
-  current leases so a noisy tenant cannot starve others. Per-job rules
-  (delay, deps, concurrency caps, queue name) still apply.
+  claims ready jobs across tenants by **least-recently-served tenant**
+  (``tenant_fairness.last_lease_at``), so a large backlog enqueued first
+  cannot starve quieter tenants even under sequential lease+ack drain.
+  Per-job rules (delay, deps, concurrency caps, queue name) still apply.
 """
 
 from __future__ import annotations
@@ -624,8 +625,10 @@ class JobQueue:
         now: datetime,
     ) -> Job | None:
         token = uuid4()
-        # Prefer tenants with fewer current leases, then job priority / age.
-        # Concurrency caps and reclaim rules are applied in WHERE / re-check.
+        # Least-recently-served tenant first (never-served = -infinity).
+        # This stays fair under sequential lease+ack: after noisy is served
+        # once, quiet (never/older last_lease_at) is preferred even if noisy
+        # still has a large older backlog.
         candidate = conn.execute(
             f"""
             SELECT {_JOB_COLUMNS}
@@ -662,11 +665,13 @@ class JobQueue:
                  )
               )
             ORDER BY
-              (
-                SELECT COUNT(*)::int
-                FROM jobs j3
-                WHERE j3.tenant_id = jobs.tenant_id
-                  AND j3.status = %s
+              COALESCE(
+                (
+                    SELECT tf.last_lease_at
+                    FROM tenant_fairness tf
+                    WHERE tf.tenant_id = jobs.tenant_id
+                ),
+                TIMESTAMPTZ '-infinity'
               ) ASC,
               priority DESC,
               created_at ASC
@@ -680,7 +685,6 @@ class JobQueue:
                 JobStatus.LEASED.value,
                 JobStatus.LEASED.value,
                 now,
-                JobStatus.LEASED.value,
             ),
         ).fetchone()
 
@@ -698,7 +702,7 @@ class JobQueue:
             if limit is not None and leased_count >= limit:
                 raise _SkipLeaseCandidate("tenant at concurrency limit")
 
-        return self._claim_locked_job(
+        claimed = self._claim_locked_job(
             conn,
             candidate,
             worker_id=worker_id,
@@ -706,6 +710,17 @@ class JobQueue:
             visibility_timeout_seconds=visibility_timeout_seconds,
             now=now,
         )
+        # Record that this tenant was just served (drives next fair pick).
+        conn.execute(
+            """
+            INSERT INTO tenant_fairness (tenant_id, last_lease_at)
+            VALUES (%s, %s)
+            ON CONFLICT (tenant_id) DO UPDATE
+            SET last_lease_at = EXCLUDED.last_lease_at
+            """,
+            (claimed.tenant_id, now),
+        )
+        return claimed
 
     def _claim_locked_job(
         self,

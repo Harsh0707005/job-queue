@@ -98,6 +98,15 @@ CREATE TABLE IF NOT EXISTS tenant_settings (
     )
 );
 
+-- Fair multi-tenant lease: least-recently-served tenant wins the next claim.
+CREATE TABLE IF NOT EXISTS tenant_fairness (
+    tenant_id       TEXT PRIMARY KEY,
+    last_lease_at   TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_fairness_last_lease
+    ON tenant_fairness (last_lease_at ASC);
+
 -- Recurring schedules: tick to enqueue jobs every interval_seconds.
 CREATE TABLE IF NOT EXISTS schedules (
     id                          UUID PRIMARY KEY,

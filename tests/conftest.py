@@ -47,6 +47,7 @@ def queue(postgres_url: str):
     with q._pool.connection() as conn:
         conn.execute("TRUNCATE jobs")
         conn.execute("TRUNCATE tenant_settings")
+        conn.execute("TRUNCATE tenant_fairness")
         conn.execute("TRUNCATE schedules")
         conn.commit()
     yield q
