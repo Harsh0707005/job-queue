@@ -34,6 +34,10 @@ Design notes
 * **Dependencies**: ``depends_on`` parent job id(s). A child is not claimable
   until every parent is ``completed``. If a parent ends as failed/dead/cancelled,
   pending dependents are cascade-cancelled (they do not sit forever).
+* **Fair multi-tenant lease**: ``lease(worker_id=...)`` without ``tenant_id``
+  claims the next ready job across tenants, preferring tenants with fewer
+  current leases so a noisy tenant cannot starve others. Per-job rules
+  (delay, deps, concurrency caps, queue name) still apply.
 """
 
 from __future__ import annotations
@@ -146,6 +150,10 @@ class ReplayError(Exception):
 
 class DependencyError(Exception):
     """Raised when job dependency setup is invalid."""
+
+
+class _SkipLeaseCandidate(Exception):
+    """Internal: abandon a locked fair-lease candidate and try another."""
 
 
 class ScheduleError(Exception):
@@ -441,12 +449,17 @@ class JobQueue:
     def lease(
         self,
         *,
-        tenant_id: str,
         worker_id: str,
+        tenant_id: str | None = None,
         queue_name: str = "default",
         visibility_timeout_seconds: int | None = None,
     ) -> Job | None:
-        """Claim the next available job for *tenant_id* / *queue_name*.
+        """Claim the next available job.
+
+        Pass *tenant_id* to lease only that tenant's work (legacy / dedicated
+        workers). Omit *tenant_id* for **fair multi-tenant** leasing: the
+        queue picks a ready job across tenants, preferring tenants that
+        currently hold fewer leases so one noisy tenant cannot starve others.
 
         Available means:
           * status = pending AND available_at <= now() AND all ``depends_on``
@@ -454,21 +467,39 @@ class JobQueue:
           * status = leased AND lease_expires_at < now()  (orphaned lease)
             AND attempts < max_attempts
 
-        Delayed pending jobs (available_at in the future) are skipped until
-        their time arrives. Jobs waiting on unfinished parents are not
-        claimable. Expired leases that already used all attempts are
-        dead-lettered in bulk first (and their pending dependents cancelled).
-
-        If the tenant has a concurrency limit and already holds that many
-        leased jobs, only an *expired* lease may be reclaimed (count stays
-        the same). New pending jobs are not claimed until a slot frees.
+        Delayed pending jobs, unmet dependencies, and per-tenant concurrency
+        caps are always enforced. Expired leases that already used all
+        attempts are dead-lettered first (dependents cascade-cancelled).
 
         Uses ``FOR UPDATE SKIP LOCKED`` so concurrent workers never claim the
         same row. A fresh ``lease_token`` is minted for fencing.
         """
-        if not tenant_id or not worker_id:
-            raise ValueError("tenant_id and worker_id are required")
+        if not worker_id:
+            raise ValueError("worker_id is required")
+        if tenant_id is not None and not tenant_id:
+            raise ValueError("tenant_id must be non-empty when provided")
 
+        if tenant_id is None:
+            return self._lease_fair(
+                worker_id=worker_id,
+                queue_name=queue_name,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+            )
+        return self._lease_for_tenant(
+            tenant_id=tenant_id,
+            worker_id=worker_id,
+            queue_name=queue_name,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+        )
+
+    def _lease_for_tenant(
+        self,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        queue_name: str,
+        visibility_timeout_seconds: int | None,
+    ) -> Job | None:
         now = _utcnow()
         token = uuid4()
 
@@ -480,50 +511,13 @@ class JobQueue:
                 (tenant_id,),
             )
 
-            # Drop exhausted orphaned leases so they never block the queue head.
-            # Scope is tenant-wide (not just this queue_name) so concurrency
-            # accounting stays accurate across queues.
-            dead_rows = conn.execute(
-                """
-                UPDATE jobs
-                SET status = %s,
-                    leased_by = NULL,
-                    lease_token = NULL,
-                    lease_expires_at = NULL,
-                    last_error = COALESCE(
-                        last_error,
-                        'exceeded max_attempts after lease expiry'
-                    ),
-                    updated_at = %s
-                WHERE tenant_id = %s
-                  AND status = %s
-                  AND lease_expires_at < %s
-                  AND attempts >= max_attempts
-                RETURNING id
-                """,
-                (
-                    JobStatus.DEAD.value,
-                    now,
-                    tenant_id,
-                    JobStatus.LEASED.value,
-                    now,
-                ),
-            ).fetchall()
-            for dead in dead_rows:
-                self._cascade_cancel_dependents(
-                    conn,
-                    parent_id=dead["id"],
-                    tenant_id=tenant_id,
-                    reason=f"parent job {dead['id']} dead-lettered",
-                    now=now,
-                )
+            self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
 
             limit = self._read_concurrency_limit(conn, tenant_id)
             leased_count = self._count_leased(conn, tenant_id)
             at_limit = limit is not None and leased_count >= limit
 
             if at_limit:
-                # Only reclaim expired leases (does not raise concurrent count).
                 candidate = conn.execute(
                     f"""
                     SELECT {_JOB_COLUMNS}
@@ -579,40 +573,253 @@ class JobQueue:
 
             if candidate is None:
                 return None
+            return self._claim_locked_job(
+                conn,
+                candidate,
+                worker_id=worker_id,
+                token=token,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
 
-            new_attempts = candidate["attempts"] + 1
-            vt = visibility_timeout_seconds or candidate["visibility_timeout_seconds"]
-            lease_expires = now + timedelta(seconds=vt)
+    def _lease_fair(
+        self,
+        *,
+        worker_id: str,
+        queue_name: str,
+        visibility_timeout_seconds: int | None,
+        _max_attempts: int = 64,
+    ) -> Job | None:
+        """Lease fairly across tenants for *queue_name*."""
+        now = _utcnow()
 
-            row = conn.execute(
-                f"""
+        with transaction(self._pool) as conn:
+            self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
+
+            for _ in range(_max_attempts):
+                try:
+                    # Savepoint so a rejected candidate releases its row lock.
+                    with conn.transaction():
+                        claimed = self._try_claim_fair_candidate(
+                            conn,
+                            worker_id=worker_id,
+                            queue_name=queue_name,
+                            visibility_timeout_seconds=visibility_timeout_seconds,
+                            now=now,
+                        )
+                        if claimed is None:
+                            return None
+                        return claimed
+                except _SkipLeaseCandidate:
+                    continue
+            return None
+
+    def _try_claim_fair_candidate(
+        self,
+        conn: Any,
+        *,
+        worker_id: str,
+        queue_name: str,
+        visibility_timeout_seconds: int | None,
+        now: datetime,
+    ) -> Job | None:
+        token = uuid4()
+        # Prefer tenants with fewer current leases, then job priority / age.
+        # Concurrency caps and reclaim rules are applied in WHERE / re-check.
+        candidate = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE queue_name = %s
+              AND (
+                    (
+                        status = %s
+                        AND available_at <= %s
+                        AND {_DEPS_SATISFIED_SQL}
+                        AND (
+                            NOT EXISTS (
+                                SELECT 1
+                                FROM tenant_settings ts
+                                WHERE ts.tenant_id = jobs.tenant_id
+                                  AND ts.max_concurrent_leases IS NOT NULL
+                            )
+                            OR (
+                                SELECT COUNT(*)::int
+                                FROM jobs j2
+                                WHERE j2.tenant_id = jobs.tenant_id
+                                  AND j2.status = %s
+                            ) < (
+                                SELECT ts.max_concurrent_leases
+                                FROM tenant_settings ts
+                                WHERE ts.tenant_id = jobs.tenant_id
+                            )
+                        )
+                    )
+                 OR (
+                        status = %s
+                    AND lease_expires_at < %s
+                    AND attempts < max_attempts
+                 )
+              )
+            ORDER BY
+              (
+                SELECT COUNT(*)::int
+                FROM jobs j3
+                WHERE j3.tenant_id = jobs.tenant_id
+                  AND j3.status = %s
+              ) ASC,
+              priority DESC,
+              created_at ASC
+            FOR UPDATE OF jobs SKIP LOCKED
+            LIMIT 1
+            """,
+            (
+                queue_name,
+                JobStatus.PENDING.value,
+                now,
+                JobStatus.LEASED.value,
+                JobStatus.LEASED.value,
+                now,
+                JobStatus.LEASED.value,
+            ),
+        ).fetchone()
+
+        if candidate is None:
+            return None
+
+        # Re-check concurrency under tenant lock (closes races with other workers).
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (candidate["tenant_id"],),
+        )
+        if candidate["status"] == JobStatus.PENDING.value:
+            limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
+            leased_count = self._count_leased(conn, candidate["tenant_id"])
+            if limit is not None and leased_count >= limit:
+                raise _SkipLeaseCandidate("tenant at concurrency limit")
+
+        return self._claim_locked_job(
+            conn,
+            candidate,
+            worker_id=worker_id,
+            token=token,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+            now=now,
+        )
+
+    def _claim_locked_job(
+        self,
+        conn: Any,
+        candidate: dict[str, Any],
+        *,
+        worker_id: str,
+        token: UUID,
+        visibility_timeout_seconds: int | None,
+        now: datetime,
+    ) -> Job:
+        new_attempts = candidate["attempts"] + 1
+        vt = visibility_timeout_seconds or candidate["visibility_timeout_seconds"]
+        lease_expires = now + timedelta(seconds=vt)
+
+        row = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = %s,
+                lease_token = %s,
+                lease_expires_at = %s,
+                attempts = %s,
+                visibility_timeout_seconds = %s,
+                updated_at = %s,
+                last_error = NULL
+            WHERE id = %s
+              AND tenant_id = %s
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.LEASED.value,
+                worker_id,
+                token,
+                lease_expires,
+                new_attempts,
+                vt,
+                now,
+                candidate["id"],
+                candidate["tenant_id"],
+            ),
+        ).fetchone()
+        assert row is not None
+        return _row_to_job(row)
+
+    def _dead_letter_exhausted_leases(
+        self,
+        conn: Any,
+        *,
+        now: datetime,
+        tenant_id: str | None,
+    ) -> None:
+        """Mark expired leases that exhausted attempts as dead; cascade children."""
+        if tenant_id is not None:
+            dead_rows = conn.execute(
+                """
                 UPDATE jobs
                 SET status = %s,
-                    leased_by = %s,
-                    lease_token = %s,
-                    lease_expires_at = %s,
-                    attempts = %s,
-                    visibility_timeout_seconds = %s,
-                    updated_at = %s,
-                    last_error = NULL
-                WHERE id = %s
-                  AND tenant_id = %s
-                RETURNING {_JOB_COLUMNS}
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    last_error = COALESCE(
+                        last_error,
+                        'exceeded max_attempts after lease expiry'
+                    ),
+                    updated_at = %s
+                WHERE tenant_id = %s
+                  AND status = %s
+                  AND lease_expires_at < %s
+                  AND attempts >= max_attempts
+                RETURNING id, tenant_id
                 """,
                 (
-                    JobStatus.LEASED.value,
-                    worker_id,
-                    token,
-                    lease_expires,
-                    new_attempts,
-                    vt,
+                    JobStatus.DEAD.value,
                     now,
-                    candidate["id"],
                     tenant_id,
+                    JobStatus.LEASED.value,
+                    now,
                 ),
-            ).fetchone()
-            assert row is not None
-            return _row_to_job(row)
+            ).fetchall()
+        else:
+            dead_rows = conn.execute(
+                """
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    last_error = COALESCE(
+                        last_error,
+                        'exceeded max_attempts after lease expiry'
+                    ),
+                    updated_at = %s
+                WHERE status = %s
+                  AND lease_expires_at < %s
+                  AND attempts >= max_attempts
+                RETURNING id, tenant_id
+                """,
+                (
+                    JobStatus.DEAD.value,
+                    now,
+                    JobStatus.LEASED.value,
+                    now,
+                ),
+            ).fetchall()
+
+        for dead in dead_rows:
+            self._cascade_cancel_dependents(
+                conn,
+                parent_id=dead["id"],
+                tenant_id=dead["tenant_id"],
+                reason=f"parent job {dead['id']} dead-lettered",
+                now=now,
+            )
 
     # ------------------------------------------------------------------
     # Cancel

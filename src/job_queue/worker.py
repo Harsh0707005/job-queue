@@ -66,6 +66,8 @@ class Worker:
 
         queue = JobQueue.connect(dsn)
         worker = Worker(queue, tenant_id="acme", worker_id="w1")
+        # Or omit tenant_id for fair multi-tenant leasing:
+        # worker = Worker(queue, worker_id="shared-1")
 
         @worker.handler
         def process(job: Job, lease: LeaseContext) -> None:
@@ -79,7 +81,7 @@ class Worker:
         self,
         queue: JobQueue,
         *,
-        tenant_id: str,
+        tenant_id: str | None = None,
         worker_id: str | None = None,
         queue_name: str = "default",
         heartbeat_interval_seconds: float | None = None,
@@ -87,7 +89,7 @@ class Worker:
         visibility_timeout_seconds: int | None = None,
     ) -> None:
         self.queue = queue
-        self.tenant_id = tenant_id
+        self.tenant_id = tenant_id  # None → fair lease across tenants
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:12]}"
         self.queue_name = queue_name
         # Default heartbeat is filled in per-job from visibility timeout / 3.

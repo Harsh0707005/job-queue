@@ -1883,3 +1883,129 @@ def test_worker_handler_return_value_becomes_result(queue: JobQueue):
     final = queue.get(enq.id, tenant_id="t1")
     assert final is not None
     assert final.status == JobStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# Fair multi-tenant leasing
+# ---------------------------------------------------------------------------
+
+
+def test_fair_lease_without_tenant_id(queue: JobQueue):
+    queue.enqueue(tenant_id="alpha", payload={"t": "a"})
+    queue.enqueue(tenant_id="beta", payload={"t": "b"})
+
+    j1 = queue.lease(worker_id="shared-1")
+    j2 = queue.lease(worker_id="shared-1")
+    assert j1 is not None and j2 is not None
+    tenants = {j1.tenant_id, j2.tenant_id}
+    assert tenants == {"alpha", "beta"}
+    assert queue.lease(worker_id="shared-1") is None
+
+
+def test_fair_lease_prefers_under_served_tenants(queue: JobQueue):
+    """Noisy tenant with many jobs must not monopolize early leases."""
+    for i in range(20):
+        queue.enqueue(tenant_id="noisy", payload={"i": i})
+    queue.enqueue(tenant_id="quiet", payload={"only": True})
+
+    claimed_tenants: list[str] = []
+    for _ in range(5):
+        job = queue.lease(worker_id="fair-w")
+        assert job is not None
+        claimed_tenants.append(job.tenant_id)
+
+    # Quiet tenant should appear within the first few leases (fairness).
+    assert "quiet" in claimed_tenants
+    # Not all five from noisy before quiet got a turn.
+    assert claimed_tenants.count("noisy") < 5
+
+
+def test_fair_lease_respects_tenant_concurrency_limit(queue: JobQueue):
+    queue.set_concurrency_limit("capped", 1)
+    queue.enqueue(tenant_id="capped", payload={"n": 1})
+    queue.enqueue(tenant_id="capped", payload={"n": 2})
+    queue.enqueue(tenant_id="other", payload={"n": 3})
+
+    first = queue.lease(worker_id="w1")
+    assert first is not None
+    # Hold first without acking.
+    second = queue.lease(worker_id="w2")
+    assert second is not None
+
+    if first.tenant_id == "capped":
+        # Second must not be another capped pending job while first held.
+        assert second.tenant_id == "other"
+        third = queue.lease(worker_id="w3")
+        assert third is None
+    else:
+        # First was other; second can be capped.
+        assert first.tenant_id == "other"
+        assert second.tenant_id == "capped"
+        third = queue.lease(worker_id="w3")
+        assert third is None  # capped at limit, other done
+
+
+def test_fair_lease_respects_delay_and_dependencies(queue: JobQueue):
+    from datetime import datetime, timedelta, timezone
+
+    parent = queue.enqueue(tenant_id="t1", payload={"p": 1})
+    queue.enqueue(
+        tenant_id="t1",
+        payload={"child": True},
+        depends_on=parent.id,
+    )
+    queue.enqueue(
+        tenant_id="t2",
+        payload={"later": True},
+        available_at=datetime.now(timezone.utc) + timedelta(seconds=2),
+    )
+    ready = queue.enqueue(tenant_id="t3", payload={"ready": True})
+
+    first = queue.lease(worker_id="w1")
+    assert first is not None
+    # Child blocked; delayed not due — only parent or ready.
+    assert first.id in {parent.id, ready.id}
+    if first.id == parent.id:
+        _ack(queue, first, "w1")
+        second = queue.lease(worker_id="w1")
+        assert second is not None
+        assert second.id in {ready.id, parent.id} or second.payload.get("child")
+    else:
+        assert first.id == ready.id
+
+
+def test_fair_lease_queue_name_isolation(queue: JobQueue):
+    queue.enqueue(tenant_id="a", queue_name="email", payload={"q": "e"})
+    queue.enqueue(tenant_id="b", queue_name="sms", payload={"q": "s"})
+
+    job = queue.lease(worker_id="w1", queue_name="email")
+    assert job is not None
+    assert job.queue_name == "email"
+    assert job.tenant_id == "a"
+    assert queue.lease(worker_id="w1", queue_name="email") is None
+
+
+def test_tenant_scoped_lease_still_works(queue: JobQueue):
+    queue.enqueue(tenant_id="only-me", payload={"x": 1})
+    queue.enqueue(tenant_id="other", payload={"x": 2})
+
+    job = queue.lease(tenant_id="only-me", worker_id="w1")
+    assert job is not None
+    assert job.tenant_id == "only-me"
+    assert queue.lease(tenant_id="only-me", worker_id="w1") is None
+
+
+def test_fair_worker_processes_across_tenants(queue: JobQueue):
+    queue.enqueue(tenant_id="a", payload={"n": 1})
+    queue.enqueue(tenant_id="b", payload={"n": 2})
+
+    seen: list[str] = []
+    worker = Worker(queue, worker_id="fair-worker")  # no tenant_id
+
+    @worker.handler
+    def handle(job: Job) -> None:
+        seen.append(job.tenant_id)
+
+    n = worker.run(max_jobs=2, stop_when_idle=True)
+    assert n == 2
+    assert set(seen) == {"a", "b"}
