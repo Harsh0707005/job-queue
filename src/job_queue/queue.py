@@ -59,7 +59,7 @@ _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
     max_attempts, visibility_timeout_seconds, available_at, dedupe_key,
     schedule_id, depends_on, leased_by, lease_token, lease_expires_at,
-    created_at, updated_at, completed_at, last_error
+    created_at, updated_at, completed_at, result, last_error
 """
 
 # Pending job is claimable only when every depends_on parent is completed.
@@ -109,6 +109,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        result=row.get("result"),
         last_error=row["last_error"],
     )
 
@@ -756,9 +757,15 @@ class JobQueue:
         tenant_id: str,
         worker_id: str,
         lease_token: UUID,
+        result: Any = None,
     ) -> Job:
-        """Mark a leased job completed. Only the current lease holder may ack."""
+        """Mark a leased job completed. Only the current lease holder may ack.
+
+        Optional *result* is stored as JSON on the job and can be read later
+        via ``get`` / ``get_result``.
+        """
         now = _utcnow()
+        result_json = Jsonb(result) if result is not None else None
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_tenant(conn, job_id, tenant_id)
@@ -772,6 +779,7 @@ class JobQueue:
                     lease_token = NULL,
                     lease_expires_at = NULL,
                     completed_at = %s,
+                    result = %s,
                     updated_at = %s
                 WHERE id = %s
                   AND tenant_id = %s
@@ -782,6 +790,7 @@ class JobQueue:
                 (
                     JobStatus.COMPLETED.value,
                     now,
+                    result_json,
                     now,
                     job_id,
                     tenant_id,
@@ -899,6 +908,17 @@ class JobQueue:
                 (job_id, tenant_id),
             ).fetchone()
             return _row_to_job(row) if row else None
+
+    def get_result(self, job_id: UUID, *, tenant_id: str) -> Any | None:
+        """Return the stashed ack *result* for a job, or None if missing/unset.
+
+        Cross-tenant and unknown ids return None. Incomplete jobs typically
+        have ``result is None`` until a successful ``ack(..., result=...)``.
+        """
+        job = self.get(job_id, tenant_id=tenant_id)
+        if job is None:
+            return None
+        return job.result
 
     def count(
         self,

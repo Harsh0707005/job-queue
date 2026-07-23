@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at                TIMESTAMPTZ,
+    result                      JSONB,
     last_error                  TEXT,
 
     CONSTRAINT jobs_attempts_check CHECK (attempts >= 0),
@@ -40,6 +41,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS schedule_id UUID;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS depends_on UUID[];
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result JSONB;
 
 UPDATE jobs SET available_at = created_at WHERE available_at IS NULL;
 ALTER TABLE jobs ALTER COLUMN available_at SET DEFAULT NOW();

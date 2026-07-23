@@ -171,7 +171,7 @@ class Worker:
             if lease_lost.is_set():
                 raise LeaseError(f"job {job.id} lease lost before handler start")
 
-            self._call_handler(job, ctx)
+            handler_result = self._call_handler(job, ctx)
 
             # If the lease was reclaimed mid-flight, do not ack or nack.
             if lease_lost.is_set():
@@ -185,6 +185,7 @@ class Worker:
                 tenant_id=job.tenant_id,
                 worker_id=self.worker_id,
                 lease_token=job.lease_token,
+                result=handler_result,
             )
             logger.info("acked job %s", job.id)
         except LeaseError:
@@ -212,7 +213,8 @@ class Worker:
             stop_hb.set()
             hb_thread.join(timeout=interval + 1)
 
-    def _call_handler(self, job: Job, ctx: LeaseContext) -> None:
+    def _call_handler(self, job: Job, ctx: LeaseContext) -> Any:
+        """Run the handler; return value is stored as the job result on ack."""
         assert self._handler is not None
         # Support both handler(job) and handler(job, lease).
         try:
@@ -224,9 +226,8 @@ class Worker:
             nparams = 1
 
         if nparams >= 2:
-            self._handler(job, ctx)
-        else:
-            self._handler(job)
+            return self._handler(job, ctx)
+        return self._handler(job)
 
     def _heartbeat_loop(
         self,

@@ -51,6 +51,7 @@ class Job:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    result: dict[str, Any] | list[Any] | str | int | float | bool | None
     last_error: str | None
 
     @property
