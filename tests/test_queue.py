@@ -2504,3 +2504,139 @@ def test_fair_lease_skips_paused_prefers_others(queue: JobQueue):
         _ack(queue, job, "w")
         claimed += 1
     assert claimed == 5
+
+
+def test_paused_tenant_schedules_do_not_enqueue(queue: JobQueue):
+    """While paused, process_due must not pile schedule jobs."""
+    sched = queue.create_schedule(
+        tenant_id="paused-sched",
+        interval_seconds=1,
+        payload={"tick": True},
+        name="t1",
+    )
+    queue.pause_tenant("paused-sched")
+
+    # Many due ticks simulated by repeated process_due while paused.
+    for _ in range(5):
+        fires = queue.process_due_schedules(tenant_id="paused-sched")
+        assert fires == []
+        time.sleep(0.25)
+
+    assert queue.count(tenant_id="paused-sched") == 0
+    # Other tenants' schedules still fire.
+    queue.create_schedule(
+        tenant_id="ok-sched",
+        interval_seconds=60,
+        payload={"ok": True},
+        name="ok",
+    )
+    ok_fires = queue.process_due_schedules(tenant_id="ok-sched")
+    assert len(ok_fires) == 1
+
+
+def test_resume_tenant_schedule_fires_once_not_tick_backlog(queue: JobQueue):
+    """After a long pause, resume + process_due enqueues one job per schedule."""
+    queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=1,
+        payload={"n": 1},
+        name="s1",
+    )
+    # Fire once, complete, then pause and wait through several intervals.
+    fires = queue.process_due_schedules(tenant_id="t1")
+    assert len(fires) == 1
+    j = queue.lease(tenant_id="t1", worker_id="w1")
+    assert j is not None
+    _ack(queue, j, "w1")
+
+    queue.pause_tenant("t1")
+    time.sleep(2.5)  # would have been multiple ticks if not paused
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 0
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
+
+    queue.resume_tenant("t1")
+    fires2 = queue.process_due_schedules(tenant_id="t1")
+    assert len(fires2) == 1
+    # Second process immediately should not fire again (interval advanced).
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+
+
+def test_paused_tenant_expired_lease_not_reclaimed(queue: JobQueue):
+    """Expired leases for a paused tenant must not be reclaimed until resume."""
+    queue.enqueue(
+        tenant_id="t1",
+        payload={"x": 1},
+        max_attempts=5,
+        visibility_timeout_seconds=1,
+    )
+    leased = queue.lease(
+        tenant_id="t1",
+        worker_id="holder",
+        visibility_timeout_seconds=1,
+    )
+    assert leased is not None
+    queue.pause_tenant("t1")
+
+    time.sleep(1.2)
+
+    # Scoped and fair must not reclaim while paused.
+    assert queue.lease(tenant_id="t1", worker_id="other") is None
+    assert queue.lease(worker_id="fair-other") is None
+
+    # Original job still leased (expired) or not taken by others.
+    got = queue.get(leased.id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.LEASED
+    assert got.leased_by == "holder"
+
+    # After resume, reclaim is allowed.
+    queue.resume_tenant("t1")
+    reclaimed = queue.lease(
+        tenant_id="t1",
+        worker_id="rescuer",
+        visibility_timeout_seconds=30,
+    )
+    assert reclaimed is not None
+    assert reclaimed.id == leased.id
+    assert reclaimed.leased_by == "rescuer"
+    _ack(queue, reclaimed, "rescuer")
+
+
+def test_paused_tenant_fair_lease_no_reclaim_among_mixed_tenants(queue: JobQueue):
+    queue.enqueue(
+        tenant_id="paused",
+        payload={"p": 1},
+        visibility_timeout_seconds=1,
+        max_attempts=5,
+    )
+    queue.enqueue(tenant_id="active", payload={"a": 1})
+
+    held = queue.lease(
+        worker_id="w1",
+        visibility_timeout_seconds=1,
+    )
+    assert held is not None
+    # Ensure we hold the paused tenant's job specifically.
+    if held.tenant_id != "paused":
+        _ack(queue, held, "w1")
+        held = queue.lease(worker_id="w1", visibility_timeout_seconds=1)
+        assert held is not None
+        assert held.tenant_id == "paused"
+
+    queue.pause_tenant("paused")
+    time.sleep(1.2)
+
+    # Fair lease should only see active tenant work (or nothing if already done).
+    for _ in range(3):
+        job = queue.lease(worker_id="w2")
+        if job is None:
+            break
+        assert job.tenant_id != "paused"
+        _ack(queue, job, "w2")
+
+    still = queue.get(held.id, tenant_id="paused")
+    assert still is not None
+    assert still.status == JobStatus.LEASED
+    assert still.leased_by == "w1"

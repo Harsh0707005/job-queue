@@ -42,9 +42,11 @@ Design notes
 * **Retry backoff**: nack-requeue uses exponential ``available_at`` delay
   (base * 2^(attempt-1), capped by max). After ``max_attempts`` the job is
   dead-lettered instead of requeued forever.
-* **Tenant pause**: ``pause_tenant`` stops all new leases for that tenant
-  (fair and scoped). In-flight leased jobs may still heartbeat / ack / nack.
-  ``resume_tenant`` restores leasing. ``get_tenant_stats`` reports counts.
+* **Tenant pause**: ``pause_tenant`` stops new leases and schedule ticks for
+  that tenant, and blocks reclaim of expired leases until resume. In-flight
+  holders may still heartbeat / ack / nack. ``resume_tenant`` restores
+  leasing and aligns overdue schedules for a single clean next fire (no
+  missed-tick flood). ``get_tenant_stats`` reports counts.
 """
 
 from __future__ import annotations
@@ -313,10 +315,13 @@ class JobQueue:
             return row["max_concurrent_leases"]
 
     def pause_tenant(self, tenant_id: str) -> None:
-        """Stop new leases for *tenant_id* (pending work stays, in-flight continues).
+        """Pause a tenant: no new leases, no schedule fires, no reclaim.
 
-        Workers (scoped or fair) will not claim new jobs for this tenant.
-        Already leased jobs may still heartbeat / ack / nack. Enqueue still works.
+        * Workers (scoped or fair) will not lease pending jobs for this tenant.
+        * Expired leases for this tenant will not be reclaimed by anyone until
+          resume (holders may still heartbeat / ack / nack while the lease lives).
+        * Recurring schedules for this tenant are skipped (no tick backlog).
+        * Manual enqueue still works; jobs wait as pending until resume.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -336,7 +341,12 @@ class JobQueue:
             )
 
     def resume_tenant(self, tenant_id: str) -> None:
-        """Allow leasing again for a previously paused tenant."""
+        """Resume leasing and schedule ticks for a paused tenant.
+
+        Overdue schedules are aligned so the next ``process_due_schedules``
+        produces at most one job per schedule (no catch-up flood of missed
+        ticks from the pause window).
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         now = _utcnow()
@@ -353,6 +363,20 @@ class JobQueue:
                 """,
                 (tenant_id, now),
             )
+            # Clean schedule pickup: one next fire, not N missed intervals.
+            # Schedules that were due during pause keep a single due timestamp
+            # of *now* so the next tick enqueues once, then advances normally.
+            conn.execute(
+                """
+                UPDATE schedules
+                SET next_run_at = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                  AND enabled = TRUE
+                  AND next_run_at < %s
+                """,
+                (now, now, tenant_id, now),
+            )
             conn.execute(
                 """
                 DELETE FROM tenant_settings
@@ -362,7 +386,6 @@ class JobQueue:
                 """,
                 (tenant_id,),
             )
-
     def is_tenant_paused(self, tenant_id: str) -> bool:
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -1790,6 +1813,10 @@ class JobQueue:
         ``next_run_at = now + interval_seconds`` (fixed delay from fire time,
         no catch-up burst).
 
+        **Paused tenants are skipped entirely** — no jobs are enqueued for their
+        schedules while paused, so ticks do not pile up. After ``resume_tenant``,
+        overdue schedules fire once (clean pickup).
+
         **No overlapping runs:** if a previous job for the same schedule is
         still ``pending`` or ``leased``, this tick is skipped and
         ``next_run_at`` is left unchanged so the schedule remains due and can
@@ -1803,8 +1830,20 @@ class JobQueue:
         now = _utcnow()
         fires: list[ScheduleFire] = []
 
+        # Shared filter: never tick schedules for paused tenants.
+        paused_filter = """
+            AND NOT EXISTS (
+                SELECT 1
+                FROM tenant_settings ts
+                WHERE ts.tenant_id = schedules.tenant_id
+                  AND ts.paused = TRUE
+            )
+        """
+
         with transaction(self._pool) as conn:
             if tenant_id is not None:
+                if self._is_tenant_paused(conn, tenant_id):
+                    return []
                 due = conn.execute(
                     f"""
                     SELECT {_SCHEDULE_COLUMNS}
@@ -1812,6 +1851,7 @@ class JobQueue:
                     WHERE enabled = TRUE
                       AND next_run_at <= %s
                       AND tenant_id = %s
+                      {paused_filter}
                     ORDER BY next_run_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
@@ -1825,6 +1865,7 @@ class JobQueue:
                     FROM schedules
                     WHERE enabled = TRUE
                       AND next_run_at <= %s
+                      {paused_filter}
                     ORDER BY next_run_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
@@ -1833,6 +1874,10 @@ class JobQueue:
                 ).fetchall()
 
             for sched_row in due:
+                # Race: tenant paused after SELECT.
+                if self._is_tenant_paused(conn, sched_row["tenant_id"]):
+                    continue
+
                 # Skip if a prior run is still in flight (pending or leased).
                 active = conn.execute(
                     """
