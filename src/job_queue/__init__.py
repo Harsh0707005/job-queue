@@ -8,6 +8,7 @@ from job_queue.queue import (
     LeaseError,
     ReplayError,
     ScheduleError,
+    compute_retry_backoff_seconds,
 )
 from job_queue.scheduler import ScheduleRunner
 from job_queue.worker import LeaseContext, Worker
@@ -26,5 +27,6 @@ __all__ = [
     "ScheduleFire",
     "ScheduleRunner",
     "Worker",
+    "compute_retry_backoff_seconds",
 ]
 __version__ = "0.1.0"

@@ -41,6 +41,8 @@ class Job:
     attempts: int
     max_attempts: int
     visibility_timeout_seconds: int
+    retry_backoff_base_seconds: int
+    retry_backoff_max_seconds: int
     available_at: datetime
     dedupe_key: str | None
     schedule_id: UUID | None

@@ -39,6 +39,9 @@ Design notes
   (``tenant_fairness.last_lease_at``), so a large backlog enqueued first
   cannot starve quieter tenants even under sequential lease+ack drain.
   Per-job rules (delay, deps, concurrency caps, queue name) still apply.
+* **Retry backoff**: nack-requeue uses exponential ``available_at`` delay
+  (base * 2^(attempt-1), capped by max). After ``max_attempts`` the job is
+  dead-lettered instead of requeued forever.
 """
 
 from __future__ import annotations
@@ -62,9 +65,10 @@ _DEDUPE_LOCK_CLASS = 884_422_01
 
 _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
-    max_attempts, visibility_timeout_seconds, available_at, dedupe_key,
-    schedule_id, depends_on, leased_by, lease_token, lease_expires_at,
-    created_at, updated_at, completed_at, result, last_error
+    max_attempts, visibility_timeout_seconds, retry_backoff_base_seconds,
+    retry_backoff_max_seconds, available_at, dedupe_key, schedule_id,
+    depends_on, leased_by, lease_token, lease_expires_at, created_at,
+    updated_at, completed_at, result, last_error
 """
 
 # Pending job is claimable only when every depends_on parent is completed.
@@ -104,6 +108,16 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         attempts=row["attempts"],
         max_attempts=row["max_attempts"],
         visibility_timeout_seconds=row["visibility_timeout_seconds"],
+        retry_backoff_base_seconds=(
+            1
+            if row.get("retry_backoff_base_seconds") is None
+            else int(row["retry_backoff_base_seconds"])
+        ),
+        retry_backoff_max_seconds=(
+            300
+            if row.get("retry_backoff_max_seconds") is None
+            else int(row["retry_backoff_max_seconds"])
+        ),
         available_at=row["available_at"],
         dedupe_key=row["dedupe_key"],
         schedule_id=row["schedule_id"],
@@ -121,6 +135,26 @@ def _row_to_job(row: dict[str, Any]) -> Job:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def compute_retry_backoff_seconds(
+    attempts: int,
+    *,
+    base_seconds: int = 1,
+    max_seconds: int = 300,
+) -> int:
+    """Exponential delay after a failed attempt: base * 2^(attempts-1), capped.
+
+    ``attempts`` is the lease attempt count after the failure (typically >= 1).
+    """
+    if base_seconds < 0 or max_seconds < 0:
+        raise ValueError("backoff seconds must be >= 0")
+    if attempts < 1:
+        attempts = 1
+    # Cap exponent to avoid huge ints before min().
+    exp = min(attempts - 1, 30)
+    delay = base_seconds * (2**exp)
+    return int(min(max_seconds, delay))
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -281,6 +315,8 @@ class JobQueue:
         priority: int = 0,
         max_attempts: int = 3,
         visibility_timeout_seconds: int = 30,
+        retry_backoff_base_seconds: int = 1,
+        retry_backoff_max_seconds: int = 300,
         available_at: datetime | None = None,
         delay_seconds: float | int | None = None,
         dedupe_key: str | None = None,
@@ -307,6 +343,9 @@ class JobQueue:
             already failed/dead/cancelled at enqueue time, raises
             ``DependencyError``. If a parent later fails, pending children are
             cascade-cancelled.
+        retry_backoff_base_seconds / retry_backoff_max_seconds:
+            On nack requeue, delay is ``base * 2^(attempt-1)`` seconds, capped
+            by max. After ``max_attempts`` failures the job is dead-lettered.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -314,6 +353,10 @@ class JobQueue:
             raise ValueError("max_attempts must be >= 1")
         if visibility_timeout_seconds < 1:
             raise ValueError("visibility_timeout_seconds must be >= 1")
+        if retry_backoff_base_seconds < 0:
+            raise ValueError("retry_backoff_base_seconds must be >= 0")
+        if retry_backoff_max_seconds < 0:
+            raise ValueError("retry_backoff_max_seconds must be >= 0")
         if available_at is not None and delay_seconds is not None:
             raise ValueError("pass only one of available_at or delay_seconds")
         if delay_seconds is not None and delay_seconds < 0:
@@ -364,11 +407,13 @@ class JobQueue:
                     INSERT INTO jobs (
                         id, tenant_id, queue_name, payload, status, priority,
                         attempts, max_attempts, visibility_timeout_seconds,
+                        retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
                         created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
+                        %s, %s,
                         %s, %s, NULL, %s,
                         %s, %s
                     )
@@ -387,6 +432,8 @@ class JobQueue:
                         priority,
                         max_attempts,
                         visibility_timeout_seconds,
+                        retry_backoff_base_seconds,
+                        retry_backoff_max_seconds,
                         run_at,
                         dedupe_key,
                         dep_ids,
@@ -415,11 +462,13 @@ class JobQueue:
                 INSERT INTO jobs (
                     id, tenant_id, queue_name, payload, status, priority,
                     attempts, max_attempts, visibility_timeout_seconds,
+                    retry_backoff_base_seconds, retry_backoff_max_seconds,
                     available_at, dedupe_key, schedule_id, depends_on,
                     created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     0, %s, %s,
+                    %s, %s,
                     %s, NULL, NULL, %s,
                     %s, %s
                 )
@@ -434,6 +483,8 @@ class JobQueue:
                     priority,
                     max_attempts,
                     visibility_timeout_seconds,
+                    retry_backoff_base_seconds,
+                    retry_backoff_max_seconds,
                     run_at,
                     dep_ids,
                     now,
@@ -1037,8 +1088,11 @@ class JobQueue:
         """Release a lease after a processing failure.
 
         If *requeue* is True and attempts < max_attempts, the job returns to
-        ``pending`` so another worker can pick it up. Otherwise it is marked
-        ``failed`` (or ``dead`` when attempts are exhausted).
+        ``pending`` with ``available_at`` pushed forward by exponential
+        backoff (base * 2^(attempts-1), capped by the job's max backoff) so
+        it is not immediately leaseable again. When attempts are exhausted
+        (or requeue is False), the job is ``dead`` / ``failed`` and dependents
+        are cascade-cancelled.
         """
         now = _utcnow()
 
@@ -1051,10 +1105,20 @@ class JobQueue:
 
             if requeue and attempts < max_attempts:
                 new_status = JobStatus.PENDING.value
+                base = row.get("retry_backoff_base_seconds")
+                cap = row.get("retry_backoff_max_seconds")
+                backoff = compute_retry_backoff_seconds(
+                    attempts,
+                    base_seconds=1 if base is None else int(base),
+                    max_seconds=300 if cap is None else int(cap),
+                )
+                next_available = now + timedelta(seconds=backoff)
             elif attempts >= max_attempts:
                 new_status = JobStatus.DEAD.value
+                next_available = row["available_at"]
             else:
                 new_status = JobStatus.FAILED.value
+                next_available = row["available_at"]
 
             updated = conn.execute(
                 f"""
@@ -1063,6 +1127,7 @@ class JobQueue:
                     leased_by = NULL,
                     lease_token = NULL,
                     lease_expires_at = NULL,
+                    available_at = %s,
                     last_error = %s,
                     updated_at = %s
                 WHERE id = %s
@@ -1073,6 +1138,7 @@ class JobQueue:
                 """,
                 (
                     new_status,
+                    next_available,
                     error,
                     now,
                     job_id,
@@ -1693,11 +1759,13 @@ class JobQueue:
                             INSERT INTO jobs (
                                 id, tenant_id, queue_name, payload, status, priority,
                                 attempts, max_attempts, visibility_timeout_seconds,
+                                retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
                                 created_at, updated_at
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
                                 0, %s, %s,
+                                1, 300,
                                 %s, NULL, %s, %s,
                                 %s, %s
                             )
