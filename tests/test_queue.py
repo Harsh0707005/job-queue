@@ -3033,3 +3033,97 @@ def test_webhook_claim_before_post_not_pending_until_done(queue: JobQueue):
         assert len(capture.received) == 0
     finally:
         capture.stop()
+
+
+def test_paused_tenant_does_not_enqueue_webhooks(queue: JobQueue):
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed", "job.failed", "job.dead"],
+            backoff_base_seconds=0,
+        )
+        queue.pause_tenant("t1")
+
+        # Complete while paused → no delivery row.
+        queue.enqueue(tenant_id="t1", payload={"a": 1})
+        # Resume only to lease, then pause again before ack? In-flight can
+        # complete while paused — still must not enqueue webhooks.
+        queue.resume_tenant("t1")
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        queue.pause_tenant("t1")
+        _ack(queue, job, "w1", result={"ok": True})
+
+        assert queue.list_webhook_deliveries(tenant_id="t1") == []
+        assert queue.process_webhook_deliveries() == []
+        assert capture.received == []
+
+        # Dead while paused also creates no delivery.
+        queue.resume_tenant("t1")
+        queue.enqueue(
+            tenant_id="t1",
+            payload={"d": 1},
+            max_attempts=1,
+            retry_backoff_base_seconds=0,
+        )
+        j2 = queue.lease(tenant_id="t1", worker_id="w1")
+        assert j2 is not None
+        queue.pause_tenant("t1")
+        n2 = _nack(queue, j2, "w1", error="x", requeue=True)
+        assert n2.status == JobStatus.DEAD
+        assert queue.list_webhook_deliveries(tenant_id="t1") == []
+    finally:
+        capture.stop()
+
+
+def test_paused_tenant_does_not_claim_pending_webhook_deliveries(queue: JobQueue):
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            backoff_base_seconds=0,
+        )
+        # Create delivery while active.
+        queue.enqueue(tenant_id="t1", payload={})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending) == 1
+
+        queue.pause_tenant("t1")
+        # Must not claim/send while paused.
+        assert queue.process_webhook_deliveries() == []
+        assert capture.received == []
+        still = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(still) == 1
+
+        # Other tenant still delivers.
+        queue.register_webhook(
+            tenant_id="t2",
+            url=capture.url,
+            events=["job.completed"],
+            backoff_base_seconds=0,
+        )
+        queue.enqueue(tenant_id="t2", payload={})
+        j2 = queue.lease(tenant_id="t2", worker_id="w2")
+        assert j2 is not None
+        _ack(queue, j2, "w2")
+        r = queue.process_webhook_deliveries()
+        assert len(r) == 1
+        assert r[0].success
+        assert capture.received[-1]["body"]["tenant_id"] == "t2"
+
+        # Resume → pending t1 delivery goes out.
+        queue.resume_tenant("t1")
+        r2 = queue.process_webhook_deliveries()
+        assert len(r2) == 1
+        assert r2[0].success
+        assert r2[0].delivery.tenant_id == "t1"
+        assert any(x["body"]["tenant_id"] == "t1" for x in capture.received)
+    finally:
+        capture.stop()

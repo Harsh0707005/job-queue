@@ -49,7 +49,9 @@ Design notes
   missed-tick flood). ``get_tenant_stats`` reports counts.
 * **Webhooks**: terminal events (completed / failed / dead) insert durable
   ``webhook_deliveries`` first; ``process_webhook_deliveries`` POSTs with
-  exponential backoff and dead-letters failed deliveries.
+  exponential backoff and dead-letters failed deliveries. Paused tenants do
+  not enqueue new deliveries and their pending rows are not claimed until
+  resume.
 """
 
 from __future__ import annotations
@@ -334,6 +336,8 @@ class JobQueue:
           resume (holders may still heartbeat / ack / nack while the lease lives).
         * Recurring schedules for this tenant are skipped (no tick backlog).
         * Manual enqueue still works; jobs wait as pending until resume.
+        * No new webhook deliveries are enqueued; pending webhook rows are not
+          claimed/sent until resume.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -1848,6 +1852,10 @@ class JobQueue:
         so receivers can treat duplicates as one event; we never leave a
         successful POST looking like an unattempted pending row.
 
+        **Paused tenants:** no new deliveries are enqueued, and pending /
+        reclaimable deliveries for paused tenants are not claimed (except
+        finalizing an already-proven 2xx success without re-POSTing).
+
         Returns a list of ``WebhookDeliveryResult``.
         """
         from job_queue.webhooks import WebhookDeliveryResult, post_webhook
@@ -1871,12 +1879,21 @@ class JobQueue:
                 SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
                 FROM webhook_deliveries
                 WHERE (
-                        status = 'pending'
-                    AND next_attempt_at <= %s
-                ) OR (
-                        status = 'delivering'
-                    AND delivering_until IS NOT NULL
-                    AND delivering_until < %s
+                        (
+                            status = 'pending'
+                        AND next_attempt_at <= %s
+                        )
+                     OR (
+                            status = 'delivering'
+                        AND delivering_until IS NOT NULL
+                        AND delivering_until < %s
+                     )
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM tenant_settings ts
+                    WHERE ts.tenant_id = webhook_deliveries.tenant_id
+                      AND ts.paused = TRUE
                 )
                 ORDER BY next_attempt_at ASC
                 FOR UPDATE SKIP LOCKED
@@ -1886,6 +1903,41 @@ class JobQueue:
             ).fetchall()
 
             for drow in due:
+                # Race: tenant paused after SELECT.
+                if self._is_tenant_paused(conn, drow["tenant_id"]):
+                    # Still finalize proven 2xx without POSTing.
+                    code = drow.get("last_status_code")
+                    if (
+                        drow["status"] == "delivering"
+                        and code is not None
+                        and 200 <= int(code) < 300
+                    ):
+                        updated = conn.execute(
+                            f"""
+                            UPDATE webhook_deliveries
+                            SET status = 'succeeded',
+                                delivering_until = NULL,
+                                last_error = NULL,
+                                updated_at = %s,
+                                completed_at = COALESCE(completed_at, %s)
+                            WHERE id = %s
+                              AND status = 'delivering'
+                            RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                            """,
+                            (now, now, drow["id"]),
+                        ).fetchone()
+                        if updated is not None:
+                            rec = WebhookDeliveryResult(
+                                delivery=self._row_to_webhook_delivery(updated),
+                                success=True,
+                                status_code=int(code),
+                                error=None,
+                            )
+                            recovered.append(rec)
+                            if on_result is not None:
+                                on_result(rec)
+                    continue
+
                 is_reclaim = drow["status"] == "delivering"
                 if is_reclaim:
                     # If a prior POST already recorded a 2xx status code but the
@@ -2167,7 +2219,13 @@ class JobQueue:
         event: WebhookEvent,
         now: datetime,
     ) -> None:
-        """Insert pending delivery rows for all matching enabled endpoints."""
+        """Insert pending delivery rows for all matching enabled endpoints.
+
+        No-op when the tenant is paused (no new outbox rows until resume).
+        """
+        if self._is_tenant_paused(conn, job.tenant_id):
+            return
+
         endpoints = conn.execute(
             f"""
             SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
