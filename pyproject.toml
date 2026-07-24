@@ -12,6 +12,9 @@ dependencies = [
     "psycopg[binary,pool]>=3.1",
 ]
 
+[project.scripts]
+job-queue = "job_queue.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

@@ -1,0 +1,164 @@
+"""Read-only CLI for inspecting tenant stats and pause flags."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from typing import Sequence
+
+from job_queue import JobQueue, TenantStats
+
+
+def _resolve_dsn(explicit: str | None) -> str:
+    dsn = explicit or os.environ.get("JOB_QUEUE_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        raise SystemExit(
+            "database DSN required: pass --dsn or set JOB_QUEUE_DSN / DATABASE_URL"
+        )
+    # Accept SQLAlchemy-style driver URLs if present.
+    return (
+        dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+        .replace("postgresql+psycopg2://", "postgresql://", 1)
+    )
+
+
+def _format_stats(stats: TenantStats) -> str:
+    paused = "yes" if stats.paused else "no"
+    limit = (
+        str(stats.max_concurrent_leases)
+        if stats.max_concurrent_leases is not None
+        else "unlimited"
+    )
+    return (
+        f"tenant={stats.tenant_id}\n"
+        f"  paused={paused}\n"
+        f"  max_concurrent_leases={limit}\n"
+        f"  pending={stats.pending}\n"
+        f"  leased={stats.leased}\n"
+        f"  claimable={stats.claimable}\n"
+        f"  completed={stats.completed}\n"
+        f"  failed={stats.failed}\n"
+        f"  dead={stats.dead}\n"
+        f"  cancelled={stats.cancelled}\n"
+        f"  total={stats.total}"
+    )
+
+
+def _format_table(rows: Sequence[TenantStats]) -> str:
+    if not rows:
+        return "(no tenants)"
+
+    headers = (
+        "TENANT",
+        "PAUSED",
+        "LIMIT",
+        "PENDING",
+        "LEASED",
+        "CLAIMABLE",
+        "COMPLETED",
+        "FAILED",
+        "DEAD",
+        "CANCELLED",
+        "TOTAL",
+    )
+    table_rows: list[tuple[str, ...]] = [headers]
+    for s in rows:
+        limit = (
+            str(s.max_concurrent_leases)
+            if s.max_concurrent_leases is not None
+            else "-"
+        )
+        table_rows.append(
+            (
+                s.tenant_id,
+                "yes" if s.paused else "no",
+                limit,
+                str(s.pending),
+                str(s.leased),
+                str(s.claimable),
+                str(s.completed),
+                str(s.failed),
+                str(s.dead),
+                str(s.cancelled),
+                str(s.total),
+            )
+        )
+
+    widths = [
+        max(len(row[i]) for row in table_rows) for i in range(len(headers))
+    ]
+    lines: list[str] = []
+    for idx, row in enumerate(table_rows):
+        line = "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+        lines.append(line)
+        if idx == 0:
+            lines.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    return "\n".join(lines)
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    dsn = _resolve_dsn(args.dsn)
+    queue = JobQueue.connect(dsn, min_size=1, max_size=2)
+    try:
+        if args.tenant:
+            stats = queue.get_tenant_stats(args.tenant)
+            print(_format_stats(stats))
+        else:
+            all_stats = queue.list_tenant_stats()
+            if args.verbose:
+                if not all_stats:
+                    print("(no tenants)")
+                else:
+                    print(
+                        "\n\n".join(_format_stats(s) for s in all_stats)
+                    )
+            else:
+                print(_format_table(all_stats))
+    finally:
+        queue.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="job-queue",
+        description="Read-only inspection tools for the multi-tenant job queue.",
+    )
+    parser.add_argument(
+        "--dsn",
+        default=None,
+        help="Postgres DSN (default: JOB_QUEUE_DSN or DATABASE_URL)",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    stats = sub.add_parser(
+        "stats",
+        help="Print per-tenant job counts and pause flags (read-only).",
+    )
+    stats.add_argument(
+        "--tenant",
+        "-t",
+        default=None,
+        help="Show a single tenant (default: all tenants with jobs/settings)",
+    )
+    stats.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="When listing all tenants, print multi-line blocks instead of a table",
+    )
+    stats.set_defaults(func=cmd_stats)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
