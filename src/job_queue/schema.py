@@ -105,15 +105,21 @@ CREATE INDEX IF NOT EXISTS idx_jobs_schedule_id
 CREATE INDEX IF NOT EXISTS idx_jobs_depends_on
     ON jobs USING GIN (depends_on);
 
--- Per-tenant concurrency limits (NULL row / missing = unlimited).
+-- Per-tenant concurrency limits + pause flag (NULL row / missing = unlimited, not paused).
 CREATE TABLE IF NOT EXISTS tenant_settings (
     tenant_id              TEXT PRIMARY KEY,
     max_concurrent_leases  INTEGER,
+    paused                 BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT tenant_settings_max_concurrent_check CHECK (
         max_concurrent_leases IS NULL OR max_concurrent_leases >= 1
     )
 );
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS paused BOOLEAN;
+UPDATE tenant_settings SET paused = FALSE WHERE paused IS NULL;
+ALTER TABLE tenant_settings ALTER COLUMN paused SET DEFAULT FALSE;
+ALTER TABLE tenant_settings ALTER COLUMN paused SET NOT NULL;
 
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.
 CREATE TABLE IF NOT EXISTS tenant_fairness (

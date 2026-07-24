@@ -91,3 +91,21 @@ class ScheduleFire:
 
     schedule: Schedule
     job: Job
+
+
+@dataclass(frozen=True, slots=True)
+class TenantStats:
+    """Per-tenant queue metrics and control flags."""
+
+    tenant_id: str
+    paused: bool
+    max_concurrent_leases: int | None
+    pending: int
+    leased: int
+    completed: int
+    failed: int
+    dead: int
+    cancelled: int
+    total: int
+    # Ready to lease right now (pending, due, deps met); 0 when paused.
+    claimable: int

@@ -42,6 +42,9 @@ Design notes
 * **Retry backoff**: nack-requeue uses exponential ``available_at`` delay
   (base * 2^(attempt-1), capped by max). After ``max_attempts`` the job is
   dead-lettered instead of requeued forever.
+* **Tenant pause**: ``pause_tenant`` stops all new leases for that tenant
+  (fair and scoped). In-flight leased jobs may still heartbeat / ack / nack.
+  ``resume_tenant`` restores leasing. ``get_tenant_stats`` reports counts.
 """
 
 from __future__ import annotations
@@ -57,7 +60,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from job_queue.db import init_schema, transaction
-from job_queue.models import Job, JobStatus, Schedule, ScheduleFire
+from job_queue.models import Job, JobStatus, Schedule, ScheduleFire, TenantStats
 
 # Namespace for pg_advisory_xact_lock(classid, hash) so dedupe locks never
 # collide with tenant concurrency locks (which use single-arg hashtext).
@@ -248,7 +251,7 @@ class JobQueue:
         self._pool.close()
 
     # ------------------------------------------------------------------
-    # Tenant concurrency limits
+    # Tenant concurrency limits + pause / metrics
     # ------------------------------------------------------------------
 
     def set_concurrency_limit(
@@ -258,7 +261,7 @@ class JobQueue:
     ) -> None:
         """Set how many jobs may be leased at once for *tenant_id*.
 
-        Pass ``None`` (or remove the limit) to allow unlimited concurrent leases.
+        Pass ``None`` to clear the limit (unlimited). Does not clear *paused*.
         ``max_concurrent`` must be >= 1 when set.
         """
         if not tenant_id:
@@ -268,22 +271,29 @@ class JobQueue:
 
         now = _utcnow()
         with transaction(self._pool) as conn:
-            if max_concurrent is None:
-                conn.execute(
-                    "DELETE FROM tenant_settings WHERE tenant_id = %s",
-                    (tenant_id,),
-                )
-                return
             conn.execute(
                 """
-                INSERT INTO tenant_settings (tenant_id, max_concurrent_leases, updated_at)
-                VALUES (%s, %s, %s)
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, paused, updated_at
+                )
+                VALUES (%s, %s, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET max_concurrent_leases = EXCLUDED.max_concurrent_leases,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (tenant_id, max_concurrent, now),
             )
+            # Drop empty settings rows (no limit, not paused).
+            if max_concurrent is None:
+                conn.execute(
+                    """
+                    DELETE FROM tenant_settings
+                    WHERE tenant_id = %s
+                      AND max_concurrent_leases IS NULL
+                      AND paused = FALSE
+                    """,
+                    (tenant_id,),
+                )
 
     def get_concurrency_limit(self, tenant_id: str) -> int | None:
         """Return the tenant's max concurrent leases, or None if unlimited."""
@@ -301,6 +311,87 @@ class JobQueue:
             if row is None:
                 return None
             return row["max_concurrent_leases"]
+
+    def pause_tenant(self, tenant_id: str) -> None:
+        """Stop new leases for *tenant_id* (pending work stays, in-flight continues).
+
+        Workers (scoped or fair) will not claim new jobs for this tenant.
+        Already leased jobs may still heartbeat / ack / nack. Enqueue still works.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, paused, updated_at
+                )
+                VALUES (%s, NULL, TRUE, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET paused = TRUE,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, now),
+            )
+
+    def resume_tenant(self, tenant_id: str) -> None:
+        """Allow leasing again for a previously paused tenant."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, paused, updated_at
+                )
+                VALUES (%s, NULL, FALSE, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET paused = FALSE,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, now),
+            )
+            conn.execute(
+                """
+                DELETE FROM tenant_settings
+                WHERE tenant_id = %s
+                  AND max_concurrent_leases IS NULL
+                  AND paused = FALSE
+                """,
+                (tenant_id,),
+            )
+
+    def is_tenant_paused(self, tenant_id: str) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            return self._is_tenant_paused(conn, tenant_id)
+
+    def get_tenant_stats(self, tenant_id: str) -> TenantStats:
+        """Return job counts and control flags for one tenant."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        with self._pool.connection() as conn:
+            return self._load_tenant_stats(conn, tenant_id, now=now)
+
+    def list_tenant_stats(self) -> list[TenantStats]:
+        """Stats for every tenant that has jobs and/or settings."""
+        now = _utcnow()
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT tenant_id FROM jobs
+                UNION
+                SELECT tenant_id FROM tenant_settings
+                ORDER BY tenant_id
+                """
+            ).fetchall()
+            return [
+                self._load_tenant_stats(conn, r["tenant_id"], now=now) for r in rows
+            ]
 
     # ------------------------------------------------------------------
     # Enqueue
@@ -520,7 +611,8 @@ class JobQueue:
             AND attempts < max_attempts
 
         Delayed pending jobs, unmet dependencies, and per-tenant concurrency
-        caps are always enforced. Expired leases that already used all
+        caps are always enforced. Paused tenants yield no new leases (in-flight
+        work may still complete). Expired leases that already used all
         attempts are dead-lettered first (dependents cascade-cancelled).
 
         Uses ``FOR UPDATE SKIP LOCKED`` so concurrent workers never claim the
@@ -564,6 +656,11 @@ class JobQueue:
             )
 
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
+
+            # Paused: no new claims (pending or reclaim). In-flight holders
+            # still use heartbeat/ack/nack outside this path.
+            if self._is_tenant_paused(conn, tenant_id):
+                return None
 
             limit = self._read_concurrency_limit(conn, tenant_id)
             leased_count = self._count_leased(conn, tenant_id)
@@ -685,6 +782,12 @@ class JobQueue:
             SELECT {_JOB_COLUMNS}
             FROM jobs
             WHERE queue_name = %s
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM tenant_settings ts
+                    WHERE ts.tenant_id = jobs.tenant_id
+                      AND ts.paused = TRUE
+              )
               AND (
                     (
                         status = %s
@@ -742,11 +845,13 @@ class JobQueue:
         if candidate is None:
             return None
 
-        # Re-check concurrency under tenant lock (closes races with other workers).
+        # Re-check pause + concurrency under tenant lock (closes races).
         conn.execute(
             "SELECT pg_advisory_xact_lock(hashtext(%s))",
             (candidate["tenant_id"],),
         )
+        if self._is_tenant_paused(conn, candidate["tenant_id"]):
+            raise _SkipLeaseCandidate("tenant paused")
         if candidate["status"] == JobStatus.PENDING.value:
             limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
             leased_count = self._count_leased(conn, candidate["tenant_id"])
@@ -1881,6 +1986,20 @@ class JobQueue:
         return row["max_concurrent_leases"]
 
     @staticmethod
+    def _is_tenant_paused(conn: Any, tenant_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT paused
+            FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["paused"])
+
+    @staticmethod
     def _count_leased(conn: Any, tenant_id: str) -> int:
         row = conn.execute(
             """
@@ -1893,6 +2012,74 @@ class JobQueue:
         assert row is not None
         return int(row["n"])
 
+    def _load_tenant_stats(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        now: datetime,
+    ) -> TenantStats:
+        counts = {
+            JobStatus.PENDING.value: 0,
+            JobStatus.LEASED.value: 0,
+            JobStatus.COMPLETED.value: 0,
+            JobStatus.FAILED.value: 0,
+            JobStatus.DEAD.value: 0,
+            JobStatus.CANCELLED.value: 0,
+        }
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*)::int AS n
+            FROM jobs
+            WHERE tenant_id = %s
+            GROUP BY status
+            """,
+            (tenant_id,),
+        ).fetchall()
+        for r in rows:
+            counts[r["status"]] = int(r["n"])
+
+        settings = conn.execute(
+            """
+            SELECT max_concurrent_leases, paused
+            FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        paused = bool(settings["paused"]) if settings else False
+        max_conc = settings["max_concurrent_leases"] if settings else None
+
+        if paused:
+            claimable = 0
+        else:
+            claimable_row = conn.execute(
+                f"""
+                SELECT COUNT(*)::int AS n
+                FROM jobs
+                WHERE tenant_id = %s
+                  AND status = %s
+                  AND available_at <= %s
+                  AND {_DEPS_SATISFIED_SQL}
+                """,
+                (tenant_id, JobStatus.PENDING.value, now),
+            ).fetchone()
+            claimable = int(claimable_row["n"]) if claimable_row else 0
+
+        total = sum(counts.values())
+        return TenantStats(
+            tenant_id=tenant_id,
+            paused=paused,
+            max_concurrent_leases=max_conc,
+            pending=counts[JobStatus.PENDING.value],
+            leased=counts[JobStatus.LEASED.value],
+            completed=counts[JobStatus.COMPLETED.value],
+            failed=counts[JobStatus.FAILED.value],
+            dead=counts[JobStatus.DEAD.value],
+            cancelled=counts[JobStatus.CANCELLED.value],
+            total=total,
+            claimable=claimable,
+        )
     @staticmethod
     def _lock_dedupe_key(
         conn: Any,

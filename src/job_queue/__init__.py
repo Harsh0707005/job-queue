@@ -1,6 +1,6 @@
 """Multi-tenant job queue with lease, heartbeat, and visibility timeout."""
 
-from job_queue.models import Job, JobStatus, Schedule, ScheduleFire
+from job_queue.models import Job, JobStatus, Schedule, ScheduleFire, TenantStats
 from job_queue.queue import (
     CancelError,
     DependencyError,
@@ -26,6 +26,7 @@ __all__ = [
     "ScheduleError",
     "ScheduleFire",
     "ScheduleRunner",
+    "TenantStats",
     "Worker",
     "compute_retry_backoff_seconds",
 ]
