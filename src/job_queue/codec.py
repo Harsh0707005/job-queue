@@ -6,7 +6,15 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from job_queue.models import Job, JobStatus, Schedule, TenantStats, WebhookEndpoint
+from job_queue.models import (
+    ClaimedWebhook,
+    Job,
+    JobStatus,
+    Schedule,
+    TenantStats,
+    WebhookDelivery,
+    WebhookEndpoint,
+)
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -134,4 +142,36 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "cancelled": stats.cancelled,
         "total": stats.total,
         "claimable": stats.claimable,
+    }
+
+
+def webhook_delivery_to_dict(d: WebhookDelivery) -> dict[str, Any]:
+    return {
+        "id": str(d.id),
+        "endpoint_id": str(d.endpoint_id),
+        "tenant_id": d.tenant_id,
+        "job_id": str(d.job_id),
+        "event": d.event,
+        "payload": d.payload,
+        "status": d.status,
+        "attempts": d.attempts,
+        "max_attempts": d.max_attempts,
+        "backoff_base_seconds": d.backoff_base_seconds,
+        "backoff_max_seconds": d.backoff_max_seconds,
+        "next_attempt_at": _dt(d.next_attempt_at),
+        "delivering_until": _dt(d.delivering_until),
+        "last_error": d.last_error,
+        "last_status_code": d.last_status_code,
+        "created_at": _dt(d.created_at),
+        "updated_at": _dt(d.updated_at),
+        "completed_at": _dt(d.completed_at),
+    }
+
+
+def claimed_webhook_to_dict(c: ClaimedWebhook) -> dict[str, Any]:
+    return {
+        "delivery": webhook_delivery_to_dict(c.delivery),
+        "url": c.url,
+        "secret": c.secret,
+        "endpoint_enabled": c.endpoint_enabled,
     }

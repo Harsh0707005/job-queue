@@ -1,12 +1,23 @@
-# Distributed job-queue fleet:
-#   postgres | coordinator (HTTP) | 4 fair workers | schedule node | webhook node
-#   + webhook sink + soak driver
+# Distributed fleet with dual coordinators + remote webhook agents.
 #
-# Run soak:
-#   docker compose up --build --abort-on-container-exit soak
+# Soak with chaos (kills, pause/resume):
+#   docker compose up --build --abort-on-container-exit --exit-code-from soak soak
 #
 # Tear down:
 #   docker compose down -v
+
+x-worker: &worker
+  build: .
+  environment: &worker_env
+    COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+    POLL_INTERVAL: "0.3"
+    VISIBILITY_TIMEOUT: "30"
+    LOG_LEVEL: INFO
+  depends_on: &coord_deps
+    coordinator-1:
+      condition: service_healthy
+    coordinator-2:
+      condition: service_healthy
 
 services:
   postgres:
@@ -23,17 +34,43 @@ services:
     ports:
       - "5433:5432"
 
-  coordinator:
+  coordinator-1:
     build: .
     command: ["job-queue-coordinator", "--host", "0.0.0.0", "--port", "8080"]
     environment:
       JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      COORDINATOR_NODE: coordinator-1
       LOG_LEVEL: INFO
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  coordinator-2:
+    build: .
+    command: ["job-queue-coordinator", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      COORDINATOR_NODE: coordinator-2
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
     healthcheck:
       test:
         [
@@ -67,96 +104,137 @@ services:
       retries: 20
 
   worker-1:
-    build: .
-    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    <<: *worker
+    command: ["job-queue-worker-agent"]
     environment:
+      <<: *worker_env
       WORKER_ID: worker-1
-      COORDINATOR_URL: http://coordinator:8080
-      POLL_INTERVAL: "0.3"
-      VISIBILITY_TIMEOUT: "30"
-      LOG_LEVEL: INFO
-    depends_on:
-      coordinator:
-        condition: service_healthy
 
   worker-2:
-    build: .
-    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    <<: *worker
+    command: ["job-queue-worker-agent"]
     environment:
+      <<: *worker_env
       WORKER_ID: worker-2
-      COORDINATOR_URL: http://coordinator:8080
-      POLL_INTERVAL: "0.3"
-      VISIBILITY_TIMEOUT: "30"
-      LOG_LEVEL: INFO
-    depends_on:
-      coordinator:
-        condition: service_healthy
 
   worker-3:
-    build: .
-    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    <<: *worker
+    command: ["job-queue-worker-agent"]
     environment:
+      <<: *worker_env
       WORKER_ID: worker-3
-      COORDINATOR_URL: http://coordinator:8080
-      POLL_INTERVAL: "0.3"
-      VISIBILITY_TIMEOUT: "30"
-      LOG_LEVEL: INFO
-    depends_on:
-      coordinator:
-        condition: service_healthy
 
   worker-4:
-    build: .
-    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    <<: *worker
+    command: ["job-queue-worker-agent"]
     environment:
+      <<: *worker_env
       WORKER_ID: worker-4
-      COORDINATOR_URL: http://coordinator:8080
-      POLL_INTERVAL: "0.3"
-      VISIBILITY_TIMEOUT: "30"
-      LOG_LEVEL: INFO
-    depends_on:
-      coordinator:
-        condition: service_healthy
 
   scheduler:
     build: .
-    command: ["job-queue-scheduler-node", "--coordinator", "http://coordinator:8080"]
+    command: ["job-queue-scheduler-node"]
     environment:
-      COORDINATOR_URL: http://coordinator:8080
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       POLL_INTERVAL: "0.5"
       LOG_LEVEL: INFO
     depends_on:
-      coordinator:
-        condition: service_healthy
+      <<: *coord_deps
 
-  webhook:
+  webhook-1:
     build: .
-    command: ["job-queue-webhook-node", "--coordinator", "http://coordinator:8080"]
+    command: ["job-queue-webhook-node"]
     environment:
-      COORDINATOR_URL: http://coordinator:8080
-      POLL_INTERVAL: "0.5"
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.4"
       LOG_LEVEL: INFO
     depends_on:
-      coordinator:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
         condition: service_healthy
       webhook-sink:
         condition: service_healthy
 
+  webhook-2:
+    build: .
+    command: ["job-queue-webhook-node"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.4"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+
+  # Chaos: kill a coordinator + a webhook node repeatedly; pause/resume tenants.
+  chaos:
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      COMPOSE_PROJECT_NAME: job-queue
+      CHAOS_INTERVAL_SECONDS: "45"
+      CHAOS_ROUNDS: "6"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "chaos: waiting for stack to settle"
+        sleep 40
+        i=0
+        while [ "$$i" -lt "$$CHAOS_ROUNDS" ]; do
+          i=$$((i+1))
+          echo "chaos round $$i: kill coordinator-1"
+          docker kill job-queue-coordinator-1-1 2>/dev/null || docker kill $$(docker ps -q -f name=coordinator-1) || true
+          sleep 8
+          echo "chaos round $$i: restart coordinator-1"
+          docker start job-queue-coordinator-1-1 2>/dev/null || docker start $$(docker ps -aq -f name=coordinator-1 | head -1) || true
+          sleep 5
+          echo "chaos round $$i: kill webhook-1"
+          docker kill job-queue-webhook-1-1 2>/dev/null || docker kill $$(docker ps -q -f name=webhook-1) || true
+          sleep 8
+          echo "chaos round $$i: restart webhook-1"
+          docker start job-queue-webhook-1-1 2>/dev/null || docker start $$(docker ps -aq -f name=webhook-1 | head -1) || true
+          sleep "$$CHAOS_INTERVAL_SECONDS"
+        done
+        echo "chaos finished"
+        # keep alive until soak exits / compose aborts
+        sleep 3600
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      webhook-1:
+        condition: service_started
+      webhook-2:
+        condition: service_started
+
   soak:
     build: .
-    command: ["python", "scripts/distributed_soak.py"]
+    command: ["python", "scripts/chaos_soak.py"]
     environment:
-      COORDINATOR_URL: http://coordinator:8080
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       SINK_URL: http://webhook-sink:8090
       WEBHOOK_URL: http://webhook-sink:8090/hook
       TENANTS: "8"
-      INTERVAL_SECONDS: "25"
-      TARGET_COMPLETED: "35"
+      INTERVAL_SECONDS: "20"
+      TARGET_COMPLETED: "25"
       MAX_WALL_SECONDS: "2400"
       POLL_SECONDS: "3"
+      PAUSE_TENANTS: "tenant-01,tenant-03"
+      PAUSE_AFTER_SECONDS: "90"
+      RESUME_AFTER_SECONDS: "180"
       LOG_LEVEL: INFO
     depends_on:
-      coordinator:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
         condition: service_healthy
       webhook-sink:
         condition: service_healthy
@@ -170,5 +248,9 @@ services:
         condition: service_started
       scheduler:
         condition: service_started
-      webhook:
+      webhook-1:
+        condition: service_started
+      webhook-2:
+        condition: service_started
+      chaos:
         condition: service_started

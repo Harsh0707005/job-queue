@@ -1,8 +1,8 @@
 """HTTP coordinator: multi-node fleet control plane over Postgres JobQueue.
 
 Remote worker agents, schedule nodes, and webhook nodes call this service.
-The coordinator is the only process that needs the database DSN for the
-distributed fleet (workers never open Postgres connections).
+The coordinator is a thin Postgres façade. Worker agents lease over HTTP;
+webhook agents claim over HTTP and POST themselves (coordinator never POSTs).
 """
 
 from __future__ import annotations
@@ -18,9 +18,11 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
+    claimed_webhook_to_dict,
     job_to_dict,
     schedule_to_dict,
     tenant_stats_to_dict,
+    webhook_delivery_to_dict,
     webhook_endpoint_to_dict,
 )
 from job_queue.models import JobStatus
@@ -52,7 +54,7 @@ class Coordinator:
     ) -> tuple[int, dict[str, Any]]:
         body = body or {}
         if method == "GET" and path == "/health":
-            return 200, {"ok": True, "role": "coordinator"}
+            return 200, {"ok": True, "role": "coordinator", "node": os.environ.get("COORDINATOR_NODE", "default")}
 
         if method == "POST" and path == "/v1/lease":
             return self._lease(body)
@@ -65,8 +67,12 @@ class Coordinator:
 
         if method == "POST" and path == "/v1/schedules/process-due":
             return self._process_due(body)
-        if method == "POST" and path == "/v1/webhooks/process":
-            return self._process_webhooks(body)
+        if method == "POST" and path == "/v1/webhooks/claim":
+            return self._claim_webhooks(body)
+        if method == "POST" and path.startswith("/v1/webhooks/") and path.endswith("/finalize"):
+            return self._finalize_webhook(path, body)
+        # Legacy in-process process path intentionally removed from coordinator
+        # so agents always claim+POST+finalize themselves.
 
         if method == "POST" and path == "/v1/schedules":
             return self._create_schedule(body)
@@ -74,6 +80,10 @@ class Coordinator:
             return self._register_webhook(body)
         if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/pause"):
             return self._pause_schedule(path, body)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/pause"):
+            return self._pause_tenant(path)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/resume"):
+            return self._resume_tenant(path)
 
         if method == "GET" and path == "/v1/admin/backlog":
             return self._backlog()
@@ -83,6 +93,8 @@ class Coordinator:
             return self._list_stats(query)
         if method == "GET" and path == "/v1/admin/webhook-stats":
             return self._webhook_stats()
+        if method == "GET" and path == "/v1/admin/fairness-check":
+            return self._fairness_check()
 
         return 404, {"error": f"unknown route {method} {path}"}
 
@@ -186,28 +198,79 @@ class Coordinator:
             ],
         }
 
-    def _process_webhooks(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def _claim_webhooks(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Claim deliveries for remote agents — coordinator does NOT POST."""
         limit = int(body.get("limit") or 50)
         timeout = float(body.get("http_timeout_seconds") or 10.0)
-        results = self.queue.process_webhook_deliveries(
+        claim_seconds = body.get("claim_seconds")
+        claimed, auto = self.queue.claim_webhook_deliveries(
             limit=limit,
             http_timeout_seconds=timeout,
+            claim_seconds=float(claim_seconds) if claim_seconds is not None else None,
         )
-        out = []
-        for r in results:
-            out.append(
+        auto_out = []
+        for r in auto:
+            auto_out.append(
                 {
                     "delivery_id": str(r.delivery.id),
                     "tenant_id": r.delivery.tenant_id,
                     "job_id": str(r.delivery.job_id),
-                    "event": r.delivery.event,
                     "status": r.delivery.status,
                     "success": r.success,
                     "status_code": r.status_code,
                     "error": r.error,
                 }
             )
-        return 200, {"count": len(out), "results": out}
+        return 200, {
+            "count": len(claimed),
+            "claimed": [claimed_webhook_to_dict(c) for c in claimed],
+            "auto_finalized": auto_out,
+        }
+
+    def _finalize_webhook(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / webhooks / {id} / finalize
+        if len(parts) != 4:
+            return 400, {"error": "invalid finalize path"}
+        did = parts[2]
+        if not _UUID_RE.match(did):
+            return 400, {"error": "invalid delivery id"}
+        result = self.queue.finalize_webhook_delivery(
+            UUID(did),
+            status_code=body.get("status_code"),
+            error=body.get("error"),
+            endpoint_missing=bool(body.get("endpoint_missing", False)),
+        )
+        if result is None:
+            return 409, {
+                "error": "delivery not in delivering state",
+                "code": "lease_error",
+            }
+        return 200, {
+            "delivery": webhook_delivery_to_dict(result.delivery),
+            "success": result.success,
+            "status_code": result.status_code,
+            "error": result.error,
+        }
+
+    def _pause_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / pause
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        self.queue.pause_tenant(tenant_id)
+        return 200, {"tenant_id": tenant_id, "paused": True}
+
+    def _resume_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        self.queue.resume_tenant(tenant_id)
+        return 200, {"tenant_id": tenant_id, "paused": False}
 
     # ------------------------------------------------------------------
     # Setup / admin
@@ -355,6 +418,54 @@ class Coordinator:
         return 200, {
             "by_status": {r["status"]: int(r["n"]) for r in rows},
             "duplicate_succeeded_job_events": [dict(r) for r in dups],
+        }
+
+    def _fairness_check(self) -> tuple[int, dict[str, Any]]:
+        """Schedule overlap + paused claimable + completed-by-tenant for soak."""
+        with self.queue._pool.connection() as conn:
+            active = conn.execute(
+                """
+                SELECT schedule_id::text AS schedule_id, COUNT(*)::int AS n
+                FROM jobs
+                WHERE schedule_id IS NOT NULL
+                  AND status IN ('pending', 'leased')
+                GROUP BY schedule_id
+                """
+            ).fetchall()
+            # New pending work should not appear for paused tenants (schedules
+            # skip pause; reclaim also skips). In-flight leased jobs may finish.
+            paused_claimable = conn.execute(
+                """
+                SELECT j.tenant_id, COUNT(*)::int AS n
+                FROM jobs j
+                JOIN tenant_settings ts ON ts.tenant_id = j.tenant_id
+                WHERE ts.paused = TRUE
+                  AND j.status = 'pending'
+                GROUP BY j.tenant_id
+                """
+            ).fetchall()
+            by_tenant = conn.execute(
+                """
+                SELECT tenant_id, COUNT(*)::int AS completed
+                FROM jobs
+                WHERE status = 'completed'
+                GROUP BY tenant_id
+                ORDER BY tenant_id
+                """
+            ).fetchall()
+        return 200, {
+            "active_jobs_by_schedule": {
+                r["schedule_id"]: int(r["n"]) for r in active
+            },
+            "paused_tenant_claimable": {
+                r["tenant_id"]: int(r["n"]) for r in paused_claimable
+            },
+            "completed_by_tenant": {
+                r["tenant_id"]: int(r["completed"]) for r in by_tenant
+            },
+            "max_active_per_schedule": max(
+                (int(r["n"]) for r in active), default=0
+            ),
         }
 
 

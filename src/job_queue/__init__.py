@@ -1,6 +1,7 @@
 """Multi-tenant job queue with lease, heartbeat, and visibility timeout."""
 
 from job_queue.models import (
+    ClaimedWebhook,
     Job,
     JobStatus,
     Schedule,
@@ -27,23 +28,22 @@ from job_queue.coordinator import Coordinator
 from job_queue.remote import CoordinatorClient, RemoteWorkerAgent, ScheduleNode, WebhookNode
 
 __all__ = [
+    "CancelError",
+    "ClaimedWebhook",
     "Coordinator",
     "CoordinatorClient",
-    "RemoteWorkerAgent",
-    "ScheduleNode",
-    "WebhookNode",
-
-    "CancelError",
     "DependencyError",
     "Job",
     "JobStatus",
     "JobQueue",
     "LeaseContext",
     "LeaseError",
+    "RemoteWorkerAgent",
     "ReplayError",
     "Schedule",
     "ScheduleError",
     "ScheduleFire",
+    "ScheduleNode",
     "ScheduleRunner",
     "TenantStats",
     "WebhookDelivery",
@@ -51,6 +51,7 @@ __all__ = [
     "WebhookDispatcher",
     "WebhookEndpoint",
     "WebhookEvent",
+    "WebhookNode",
     "Worker",
     "compute_retry_backoff_seconds",
 ]

@@ -22,11 +22,35 @@ logger = logging.getLogger(__name__)
 
 
 class CoordinatorClient:
-    """HTTP client for the fleet coordinator."""
+    """HTTP client for one or more fleet coordinators (failover / RR)."""
 
-    def __init__(self, base_url: str, *, timeout: float = 30.0) -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str | list[str],
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        if isinstance(base_url, str):
+            urls = [u.strip() for u in base_url.split(",") if u.strip()]
+        else:
+            urls = list(base_url)
+        if not urls:
+            raise ValueError("at least one coordinator URL is required")
+        self.base_urls = [u.rstrip("/") for u in urls]
         self.timeout = timeout
+        self._rr = 0
+        self._lock = threading.Lock()
+
+    @property
+    def base_url(self) -> str:
+        return self.base_urls[0]
+
+    def _next_order(self) -> list[str]:
+        with self._lock:
+            n = len(self.base_urls)
+            start = self._rr % n
+            self._rr += 1
+        return self.base_urls[start:] + self.base_urls[:start]
 
     def _request(
         self,
@@ -36,35 +60,46 @@ class CoordinatorClient:
         *,
         allow_204: bool = False,
     ) -> dict[str, Any] | None:
-        url = f"{self.base_url}{path}"
         data = None
         headers = {"Accept": "application/json"}
         if body is not None:
             data = json.dumps(body, default=str).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                code = int(resp.getcode())
-                raw = resp.read()
-                if code == 204 or (allow_204 and not raw):
-                    return None
-                if not raw:
-                    return {}
-                return json.loads(raw.decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raw = exc.read() if exc.fp else b""
+
+        last_err: Exception | None = None
+        for base in self._next_order():
+            url = f"{base}{path}"
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                payload = json.loads(raw.decode("utf-8") or "{}")
-            except json.JSONDecodeError:
-                payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
-            if exc.code == 409 and payload.get("code") == "lease_error":
-                raise LeaseError(payload.get("error") or "lease error") from exc
-            raise RuntimeError(
-                f"coordinator {method} {path} -> {exc.code}: {payload}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"coordinator unreachable: {exc}") from exc
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    code = int(resp.getcode())
+                    raw = resp.read()
+                    if code == 204 or (allow_204 and not raw):
+                        return None
+                    if not raw:
+                        return {}
+                    return json.loads(raw.decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                raw = exc.read() if exc.fp else b""
+                try:
+                    payload = json.loads(raw.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
+                if exc.code == 409 and payload.get("code") == "lease_error":
+                    raise LeaseError(payload.get("error") or "lease error") from exc
+                # 5xx → try next coordinator; 4xx is definitive.
+                if 500 <= int(exc.code) < 600:
+                    last_err = RuntimeError(
+                        f"coordinator {method} {path} -> {exc.code}: {payload}"
+                    )
+                    continue
+                raise RuntimeError(
+                    f"coordinator {method} {path} -> {exc.code}: {payload}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                last_err = RuntimeError(f"coordinator {base} unreachable: {exc}")
+                continue
+        raise RuntimeError(f"all coordinators failed for {method} {path}: {last_err}")
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health") or {}
@@ -98,29 +133,40 @@ class CoordinatorClient:
             body["tenant_id"] = tenant_id
         if visibility_timeout_seconds is not None:
             body["visibility_timeout_seconds"] = visibility_timeout_seconds
-        # 204 => empty
-        url = f"{self.base_url}/v1/lease"
-        data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                if int(resp.getcode()) == 204:
-                    return None
-                raw = resp.read()
-                if not raw:
-                    return None
-                payload = json.loads(raw.decode("utf-8"))
-                return job_from_dict(payload["job"])
-        except urllib.error.HTTPError as exc:
-            raw = exc.read() if exc.fp else b""
-            raise RuntimeError(
-                f"lease failed {exc.code}: {raw.decode('utf-8', errors='replace')}"
-            ) from exc
+        last_err: Exception | None = None
+        for base in self._next_order():
+            url = f"{base}/v1/lease"
+            data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    if int(resp.getcode()) == 204:
+                        return None
+                    raw = resp.read()
+                    if not raw:
+                        return None
+                    payload = json.loads(raw.decode("utf-8"))
+                    return job_from_dict(payload["job"])
+            except urllib.error.HTTPError as exc:
+                if 500 <= int(exc.code) < 600:
+                    last_err = exc
+                    continue
+                raw = exc.read() if exc.fp else b""
+                raise RuntimeError(
+                    f"lease failed {exc.code}: {raw.decode('utf-8', errors='replace')}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                last_err = exc
+                continue
+        raise RuntimeError(f"lease failed on all coordinators: {last_err}")
 
     def heartbeat(
         self,
@@ -194,16 +240,51 @@ class CoordinatorClient:
         assert payload is not None
         return int(payload.get("count") or 0)
 
-    def process_webhooks(
-        self, *, limit: int = 50, http_timeout_seconds: float = 10.0
-    ) -> int:
+    def claim_webhooks(
+        self,
+        *,
+        limit: int = 50,
+        http_timeout_seconds: float = 10.0,
+        claim_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "limit": limit,
+            "http_timeout_seconds": http_timeout_seconds,
+        }
+        if claim_seconds is not None:
+            body["claim_seconds"] = claim_seconds
+        payload = self._request("POST", "/v1/webhooks/claim", body)
+        assert payload is not None
+        return payload
+
+    def finalize_webhook(
+        self,
+        delivery_id: str | UUID,
+        *,
+        status_code: int | None = None,
+        error: str | None = None,
+        endpoint_missing: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"endpoint_missing": endpoint_missing}
+        if status_code is not None:
+            body["status_code"] = status_code
+        if error is not None:
+            body["error"] = error
         payload = self._request(
-            "POST",
-            "/v1/webhooks/process",
-            {"limit": limit, "http_timeout_seconds": http_timeout_seconds},
+            "POST", f"/v1/webhooks/{delivery_id}/finalize", body
         )
         assert payload is not None
-        return int(payload.get("count") or 0)
+        return payload
+
+    def pause_tenant(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/pause", {})
+        assert payload is not None
+        return payload
+
+    def resume_tenant(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/resume", {})
+        assert payload is not None
+        return payload
 
     def create_schedule(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/schedules", kwargs)
@@ -401,7 +482,10 @@ class ScheduleNode:
 
 
 class WebhookNode:
-    """Polls coordinator webhook process endpoint."""
+    """Webhook agent: claim via coordinator, POST itself, then finalize.
+
+    Coordinators never perform outbound HTTP — only durable claim/finalize.
+    """
 
     def __init__(
         self,
@@ -421,19 +505,58 @@ class WebhookNode:
     def stop(self) -> None:
         self._stop.set()
 
+    def run_once(self) -> int:
+        from job_queue.webhooks import post_webhook
+
+        payload = self.client.claim_webhooks(
+            limit=self.batch_limit,
+            http_timeout_seconds=self.http_timeout_seconds,
+        )
+        n = 0
+        for item in payload.get("claimed") or []:
+            delivery = item["delivery"]
+            did = delivery["id"]
+            if not item.get("endpoint_enabled") or not item.get("url"):
+                self.client.finalize_webhook(did, endpoint_missing=True)
+                n += 1
+                continue
+            code, detail = post_webhook(
+                item["url"],
+                delivery.get("payload") or {},
+                secret=item.get("secret"),
+                timeout_seconds=self.http_timeout_seconds,
+                idempotency_key=str(did),
+            )
+            self.client.finalize_webhook(
+                did,
+                status_code=code,
+                error=None if 200 <= code < 300 else detail,
+            )
+            n += 1
+            if 200 <= code < 300:
+                self.delivered += 1
+        auto = payload.get("auto_finalized") or []
+        n += len(auto)
+        for r in auto:
+            if r.get("success"):
+                self.delivered += 1
+        return n
+
     def run(self) -> int:
-        logger.info("webhook node starting")
+        logger.info(
+            "webhook agent starting (claim+POST+finalize; coordinator does not POST)"
+        )
         while not self._stop.is_set():
             try:
-                n = self.client.process_webhooks(
-                    limit=self.batch_limit,
-                    http_timeout_seconds=self.http_timeout_seconds,
-                )
+                n = self.run_once()
                 if n:
-                    self.delivered += n
-                    logger.info("processed %d webhook(s) (total=%d)", n, self.delivered)
+                    logger.info(
+                        "handled %d webhook claim(s) (delivered_ok=%d)",
+                        n,
+                        self.delivered,
+                    )
             except Exception:
-                logger.exception("webhook process failed")
+                logger.exception("webhook agent cycle failed")
             self._stop.wait(self.poll_interval_seconds)
         return self.delivered
 
@@ -448,6 +571,10 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 
 def _coord_url() -> str:
+    # COORDINATOR_URLS takes precedence (comma-separated for multi-coordinator).
+    multi = _env("COORDINATOR_URLS")
+    if multi:
+        return multi
     return (
         _env("COORDINATOR_URL")
         or _env("JOB_QUEUE_COORDINATOR_URL")

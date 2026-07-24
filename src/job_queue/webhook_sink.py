@@ -51,7 +51,9 @@ class WebhookSinkState:
             return {
                 "total_posts": self.total_posts,
                 "unique_deliveries": len(self.by_delivery),
-                "duplicate_posts": self.duplicate_posts,
+                # HTTP retries after claim reclaim (same delivery_id) are expected
+                # under chaos; they are not logical double-deliveries.
+                "retry_posts": self.duplicate_posts,
                 "deliveries_with_multiple_posts": len(multi),
                 "multi_post_sample": dict(list(multi.items())[:20]),
                 "by_tenant": dict(self.by_tenant),

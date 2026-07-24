@@ -1829,50 +1829,38 @@ class JobQueue:
             ).fetchone()
             return self._row_to_webhook_delivery(row) if row else None
 
-    def process_webhook_deliveries(
+    def claim_webhook_deliveries(
         self,
         *,
         limit: int = 50,
-        http_timeout_seconds: float = 10.0,
         claim_seconds: float | None = None,
-        on_result: Any = None,
-    ) -> list[Any]:
-        """Deliver due webhook outbox rows (POST with backoff / dead-letter).
+        http_timeout_seconds: float = 10.0,
+    ) -> tuple[list[Any], list[Any]]:
+        """Claim due webhook deliveries without performing HTTP POSTs.
 
-        **Crash safety (no double-send after successful POST):**
-        1. Claim rows into ``delivering`` and **commit** (attempts++, lease).
-        2. HTTP POST outside that claim transaction.
-        3. Mark succeeded / retry / dead.
+        Returns ``(claimed, auto_finalized)`` where *claimed* is a list of
+        :class:`~job_queue.models.ClaimedWebhook` ready for the agent to POST,
+        and *auto_finalized* are :class:`~job_queue.webhooks.WebhookDeliveryResult`
+        for cases that need no HTTP (e.g. reclaim with proven 2xx last_status_code).
 
-        If the process dies after a successful POST but before step 3, the row
-        remains ``delivering`` (not ``pending``), so it is **not** auto-resent
-        as a fresh pending delivery. Stuck ``delivering`` rows past
-        ``delivering_until`` are recovered carefully: we only re-POST with the
-        same ``Idempotency-Key`` (= delivery id) after the claim lease expires,
-        so receivers can treat duplicates as one event; we never leave a
-        successful POST looking like an unattempted pending row.
-
-        **Paused tenants:** no new deliveries are enqueued, and pending /
-        reclaimable deliveries for paused tenants are not claimed (except
-        finalizing an already-proven 2xx success without re-POSTing).
-
-        Returns a list of ``WebhookDeliveryResult``.
+        Claim commits ``status=delivering`` before return so a crash mid-POST
+        cannot leave the row as pending.
         """
-        from job_queue.webhooks import WebhookDeliveryResult, post_webhook
+        from job_queue.models import ClaimedWebhook
+        from job_queue.webhooks import WebhookDeliveryResult
 
         if limit < 1:
             raise ValueError("limit must be >= 1")
 
-        # Claim lease long enough to cover HTTP timeout + slack.
         lease_s = claim_seconds if claim_seconds is not None else max(
             30.0, float(http_timeout_seconds) * 3.0
         )
         now = _utcnow()
         claim_until = now + timedelta(seconds=lease_s)
 
-        # --- Phase 1: durable claim (commit before any HTTP) ---
-        claimed: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-        recovered: list[Any] = []
+        claimed: list[ClaimedWebhook] = []
+        auto_finalized: list[Any] = []
+
         with transaction(self._pool) as conn:
             due = conn.execute(
                 f"""
@@ -1903,9 +1891,7 @@ class JobQueue:
             ).fetchall()
 
             for drow in due:
-                # Race: tenant paused after SELECT.
                 if self._is_tenant_paused(conn, drow["tenant_id"]):
-                    # Still finalize proven 2xx without POSTing.
                     code = drow.get("last_status_code")
                     if (
                         drow["status"] == "delivering"
@@ -1927,22 +1913,18 @@ class JobQueue:
                             (now, now, drow["id"]),
                         ).fetchone()
                         if updated is not None:
-                            rec = WebhookDeliveryResult(
-                                delivery=self._row_to_webhook_delivery(updated),
-                                success=True,
-                                status_code=int(code),
-                                error=None,
+                            auto_finalized.append(
+                                WebhookDeliveryResult(
+                                    delivery=self._row_to_webhook_delivery(updated),
+                                    success=True,
+                                    status_code=int(code),
+                                    error=None,
+                                )
                             )
-                            recovered.append(rec)
-                            if on_result is not None:
-                                on_result(rec)
                     continue
 
                 is_reclaim = drow["status"] == "delivering"
                 if is_reclaim:
-                    # If a prior POST already recorded a 2xx status code but the
-                    # process crashed before status=succeeded, finalize without
-                    # sending again (prevents double delivery).
                     code = drow.get("last_status_code")
                     if code is not None and 200 <= int(code) < 300:
                         updated = conn.execute(
@@ -1960,18 +1942,15 @@ class JobQueue:
                             (now, now, drow["id"]),
                         ).fetchone()
                         if updated is not None:
-                            rec = WebhookDeliveryResult(
-                                delivery=self._row_to_webhook_delivery(updated),
-                                success=True,
-                                status_code=int(code),
-                                error=None,
+                            auto_finalized.append(
+                                WebhookDeliveryResult(
+                                    delivery=self._row_to_webhook_delivery(updated),
+                                    success=True,
+                                    status_code=int(code),
+                                    error=None,
+                                )
                             )
-                            recovered.append(rec)
-                            if on_result is not None:
-                                on_result(rec)
                         continue
-                    # Stuck after crash mid-flight: keep attempts, re-POST later
-                    # with the same Idempotency-Key (delivery id).
                     updated = conn.execute(
                         f"""
                         UPDATE webhook_deliveries
@@ -1991,7 +1970,6 @@ class JobQueue:
                 else:
                     new_attempts = int(drow["attempts"]) + 1
                     if new_attempts > int(drow["max_attempts"]):
-                        # Should not normally happen for pending, but be safe.
                         updated = conn.execute(
                             f"""
                             UPDATE webhook_deliveries
@@ -2005,8 +1983,8 @@ class JobQueue:
                             """,
                             (now, now, drow["id"]),
                         ).fetchone()
-                        if updated is not None and on_result is not None:
-                            on_result(
+                        if updated is not None:
+                            auto_finalized.append(
                                 WebhookDeliveryResult(
                                     delivery=self._row_to_webhook_delivery(updated),
                                     success=False,
@@ -2040,171 +2018,253 @@ class JobQueue:
                     """,
                     (updated["endpoint_id"],),
                 ).fetchone()
-                claimed.append((updated, endpoint))
+                delivery = self._row_to_webhook_delivery(updated)
+                if endpoint is None:
+                    claimed.append(
+                        ClaimedWebhook(
+                            delivery=delivery,
+                            url=None,
+                            secret=None,
+                            endpoint_enabled=False,
+                        )
+                    )
+                else:
+                    claimed.append(
+                        ClaimedWebhook(
+                            delivery=delivery,
+                            url=endpoint["url"],
+                            secret=endpoint["secret"],
+                            endpoint_enabled=bool(endpoint["enabled"]),
+                        )
+                    )
 
-        # --- Phase 2: HTTP then finalize (separate short transactions) ---
-        results: list[Any] = list(recovered)
-        for drow, endpoint in claimed:
-            delivery = self._row_to_webhook_delivery(drow)
-            now = _utcnow()
+        return claimed, auto_finalized
 
-            if endpoint is None or not endpoint["enabled"]:
-                with transaction(self._pool) as conn:
-                    updated = conn.execute(
-                        f"""
-                        UPDATE webhook_deliveries
-                        SET status = 'dead',
-                            delivering_until = NULL,
-                            last_error = %s,
-                            updated_at = %s,
-                            completed_at = %s
-                        WHERE id = %s
-                          AND status = 'delivering'
-                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                        """,
-                        (
-                            "endpoint missing or disabled",
-                            now,
-                            now,
-                            delivery.id,
-                        ),
-                    ).fetchone()
+    def finalize_webhook_delivery(
+        self,
+        delivery_id: UUID,
+        *,
+        status_code: int | None = None,
+        error: str | None = None,
+        endpoint_missing: bool = False,
+    ) -> Any | None:
+        """Finalize a claimed (delivering) webhook after the agent POSTed (or not).
+
+        On success, persists ``last_status_code`` first so a crash before the
+        status flip still prevents double-POST on reclaim.
+        Returns ``None`` if the delivery is no longer ``delivering`` (lost race).
+        """
+        from job_queue.webhooks import WebhookDeliveryResult
+
+        now = _utcnow()
+
+        if endpoint_missing:
+            with transaction(self._pool) as conn:
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'dead',
+                        delivering_until = NULL,
+                        last_error = %s,
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                    """,
+                    (
+                        "endpoint missing or disabled",
+                        now,
+                        now,
+                        delivery_id,
+                    ),
+                ).fetchone()
+            if updated is None:
+                return None
+            return WebhookDeliveryResult(
+                delivery=self._row_to_webhook_delivery(updated),
+                success=False,
+                status_code=None,
+                error="endpoint missing or disabled",
+            )
+
+        success = status_code is not None and 200 <= int(status_code) < 300
+        detail = (error or "")[:2000] if error else None
+
+        # Load attempts / max under lock for retry vs dead decision.
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (delivery_id,),
+            ).fetchone()
+            if row is None or row["status"] != "delivering":
+                return None
+
+            delivery = self._row_to_webhook_delivery(row)
+            attempts = delivery.attempts
+
+            if success:
+                # Evidence of 2xx before status flip (crash-safe).
+                conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET last_status_code = %s,
+                        last_error = NULL,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    """,
+                    (int(status_code), now, delivery_id),
+                )
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'succeeded',
+                        delivering_until = NULL,
+                        last_status_code = %s,
+                        last_error = NULL,
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                    """,
+                    (int(status_code), now, now, delivery_id),
+                ).fetchone()
                 if updated is None:
-                    # Already finalized elsewhere.
-                    continue
-                result = WebhookDeliveryResult(
+                    return None
+                return WebhookDeliveryResult(
+                    delivery=self._row_to_webhook_delivery(updated),
+                    success=True,
+                    status_code=int(status_code),
+                    error=None,
+                )
+
+            if attempts >= delivery.max_attempts:
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'dead',
+                        delivering_until = NULL,
+                        last_status_code = %s,
+                        last_error = %s,
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                    """,
+                    (
+                        status_code,
+                        detail or "delivery failed",
+                        now,
+                        now,
+                        delivery_id,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    return None
+                return WebhookDeliveryResult(
                     delivery=self._row_to_webhook_delivery(updated),
                     success=False,
-                    status_code=None,
-                    error="endpoint missing or disabled",
+                    status_code=status_code,
+                    error=detail or "delivery failed",
                 )
+
+            delay = compute_retry_backoff_seconds(
+                attempts,
+                base_seconds=delivery.backoff_base_seconds,
+                max_seconds=delivery.backoff_max_seconds,
+            )
+            next_at = now + timedelta(seconds=delay)
+            updated = conn.execute(
+                f"""
+                UPDATE webhook_deliveries
+                SET status = 'pending',
+                    delivering_until = NULL,
+                    last_status_code = %s,
+                    last_error = %s,
+                    next_attempt_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND status = 'delivering'
+                RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                """,
+                (
+                    status_code,
+                    detail or "delivery failed",
+                    next_at,
+                    now,
+                    delivery_id,
+                ),
+            ).fetchone()
+            if updated is None:
+                return None
+            return WebhookDeliveryResult(
+                delivery=self._row_to_webhook_delivery(updated),
+                success=False,
+                status_code=status_code,
+                error=detail or "delivery failed",
+            )
+
+    def process_webhook_deliveries(
+        self,
+        *,
+        limit: int = 50,
+        http_timeout_seconds: float = 10.0,
+        claim_seconds: float | None = None,
+        on_result: Any = None,
+    ) -> list[Any]:
+        """Local orchestrator: claim → POST → finalize (tests / in-process).
+
+        Distributed webhook *agents* should call :meth:`claim_webhook_deliveries`
+        and :meth:`finalize_webhook_delivery` themselves and never rely on the
+        coordinator to POST.
+        """
+        from job_queue.webhooks import post_webhook
+
+        claimed, auto = self.claim_webhook_deliveries(
+            limit=limit,
+            claim_seconds=claim_seconds,
+            http_timeout_seconds=http_timeout_seconds,
+        )
+        results: list[Any] = list(auto)
+        if on_result is not None:
+            for rec in auto:
+                on_result(rec)
+
+        for item in claimed:
+            delivery = item.delivery
+            if not item.endpoint_enabled or not item.url:
+                result = self.finalize_webhook_delivery(
+                    delivery.id, endpoint_missing=True
+                )
+                if result is None:
+                    continue
                 results.append(result)
                 if on_result is not None:
                     on_result(result)
                 continue
 
-            # Stable key for the whole delivery lifetime (not per attempt).
-            idem_key = str(delivery.id)
             status_code, detail = post_webhook(
-                endpoint["url"],
+                item.url,
                 delivery.payload,
-                secret=endpoint["secret"],
+                secret=item.secret,
                 timeout_seconds=http_timeout_seconds,
-                idempotency_key=idem_key,
+                idempotency_key=str(delivery.id),
             )
-            success = 200 <= status_code < 300
-            attempts = delivery.attempts
-            now = _utcnow()
-
-            # Persist HTTP outcome *before* final status flip so a crash after
-            # a successful POST still leaves evidence (2xx last_status_code)
-            # and reclaim finalizes without re-sending.
-            if success:
-                with transaction(self._pool) as conn:
-                    conn.execute(
-                        """
-                        UPDATE webhook_deliveries
-                        SET last_status_code = %s,
-                            last_error = NULL,
-                            updated_at = %s
-                        WHERE id = %s
-                          AND status = 'delivering'
-                        """,
-                        (status_code, now, delivery.id),
-                    )
-
-            with transaction(self._pool) as conn:
-                if success:
-                    updated = conn.execute(
-                        f"""
-                        UPDATE webhook_deliveries
-                        SET status = 'succeeded',
-                            delivering_until = NULL,
-                            last_status_code = %s,
-                            last_error = NULL,
-                            updated_at = %s,
-                            completed_at = %s
-                        WHERE id = %s
-                          AND status = 'delivering'
-                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                        """,
-                        (status_code, now, now, delivery.id),
-                    ).fetchone()
-                    if updated is None:
-                        continue
-                    result = WebhookDeliveryResult(
-                        delivery=self._row_to_webhook_delivery(updated),
-                        success=True,
-                        status_code=status_code,
-                        error=None,
-                    )
-                elif attempts >= delivery.max_attempts:
-                    updated = conn.execute(
-                        f"""
-                        UPDATE webhook_deliveries
-                        SET status = 'dead',
-                            delivering_until = NULL,
-                            last_status_code = %s,
-                            last_error = %s,
-                            updated_at = %s,
-                            completed_at = %s
-                        WHERE id = %s
-                          AND status = 'delivering'
-                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                        """,
-                        (
-                            status_code or None,
-                            detail[:2000],
-                            now,
-                            now,
-                            delivery.id,
-                        ),
-                    ).fetchone()
-                    if updated is None:
-                        continue
-                    result = WebhookDeliveryResult(
-                        delivery=self._row_to_webhook_delivery(updated),
-                        success=False,
-                        status_code=status_code or None,
-                        error=detail,
-                    )
-                else:
-                    delay = compute_retry_backoff_seconds(
-                        attempts,
-                        base_seconds=delivery.backoff_base_seconds,
-                        max_seconds=delivery.backoff_max_seconds,
-                    )
-                    next_at = now + timedelta(seconds=delay)
-                    updated = conn.execute(
-                        f"""
-                        UPDATE webhook_deliveries
-                        SET status = 'pending',
-                            delivering_until = NULL,
-                            last_status_code = %s,
-                            last_error = %s,
-                            next_attempt_at = %s,
-                            updated_at = %s
-                        WHERE id = %s
-                          AND status = 'delivering'
-                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                        """,
-                        (
-                            status_code or None,
-                            detail[:2000],
-                            next_at,
-                            now,
-                            delivery.id,
-                        ),
-                    ).fetchone()
-                    if updated is None:
-                        continue
-                    result = WebhookDeliveryResult(
-                        delivery=self._row_to_webhook_delivery(updated),
-                        success=False,
-                        status_code=status_code or None,
-                        error=detail,
-                    )
-
+            result = self.finalize_webhook_delivery(
+                delivery.id,
+                status_code=status_code,
+                error=None if 200 <= status_code < 300 else detail,
+            )
+            if result is None:
+                continue
             results.append(result)
             if on_result is not None:
                 on_result(result)

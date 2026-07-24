@@ -162,3 +162,17 @@ class WebhookDelivery:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedWebhook:
+    """A delivery claimed for remote HTTP POST by a webhook agent.
+
+    The claim is committed in Postgres (status=delivering) before this is
+    returned. The agent POSTs, then calls finalize. Coordinators never POST.
+    """
+
+    delivery: WebhookDelivery
+    url: str | None
+    secret: str | None
+    endpoint_enabled: bool

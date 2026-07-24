@@ -107,15 +107,79 @@ def test_schedule_and_webhook_via_coordinator(queue, coordinator_url, monkeypatc
     agent.stop()
     th.join(timeout=5)
 
-    # Deliver webhook via coordinator.
-    for _ in range(20):
-        client.process_webhooks()
+    # Agent claims via coordinator, POSTs itself, then finalizes.
+    from job_queue.remote import WebhookNode
+
+    wh = WebhookNode(client, poll_interval_seconds=0.1, batch_limit=10)
+    for _ in range(30):
+        wh.run_once()
         if received:
             break
-        time.sleep(0.2)
+        time.sleep(0.1)
     sink.shutdown()
 
     assert agent.processed >= 1
     assert len(received) == 1
     assert received[0]["tenant_id"] == "t1"
     assert received[0]["event"] == "job.completed"
+
+
+def test_claim_finalize_no_coordinator_post(queue, coordinator_url):
+    """Coordinator claim returns endpoint; agent POSTs; finalize persists."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json
+
+    posts: list[str] = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            n = int(self.headers.get("Content-Length") or "0")
+            body = json.loads(self.rfile.read(n).decode("utf-8"))
+            posts.append(body.get("delivery_id") or body.get("job_id"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            return
+
+    sink = HTTPServer(("127.0.0.1", 0), H)
+    port = sink.server_address[1]
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+
+    client = CoordinatorClient(coordinator_url)
+    client.register_webhook(
+        tenant_id="t1",
+        url=f"http://127.0.0.1:{port}/hook",
+        events=["job.completed"],
+    )
+    queue.enqueue(tenant_id="t1", payload={"z": 1})
+    job = queue.lease(tenant_id="t1", worker_id="w")
+    assert job is not None
+    queue.ack(
+        job.id,
+        tenant_id="t1",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+
+    claimed = client.claim_webhooks(limit=10)
+    assert claimed["count"] == 1
+    item = claimed["claimed"][0]
+    assert item["url"].endswith("/hook")
+    assert item["delivery"]["status"] == "delivering"
+
+    from job_queue.webhooks import post_webhook
+
+    code, _ = post_webhook(
+        item["url"],
+        item["delivery"]["payload"],
+        secret=item.get("secret"),
+        idempotency_key=item["delivery"]["id"],
+    )
+    assert code == 200
+    fin = client.finalize_webhook(item["delivery"]["id"], status_code=code)
+    assert fin["success"] is True
+    assert fin["delivery"]["status"] == "succeeded"
+    assert len(posts) == 1
+    sink.shutdown()
