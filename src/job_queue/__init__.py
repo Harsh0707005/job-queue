@@ -1,6 +1,15 @@
 """Multi-tenant job queue with lease, heartbeat, and visibility timeout."""
 
-from job_queue.models import Job, JobStatus, Schedule, ScheduleFire, TenantStats
+from job_queue.models import (
+    Job,
+    JobStatus,
+    Schedule,
+    ScheduleFire,
+    TenantStats,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEvent,
+)
 from job_queue.queue import (
     CancelError,
     DependencyError,
@@ -11,6 +20,7 @@ from job_queue.queue import (
     compute_retry_backoff_seconds,
 )
 from job_queue.scheduler import ScheduleRunner
+from job_queue.webhooks import WebhookDeliveryResult, WebhookDispatcher
 from job_queue.worker import LeaseContext, Worker
 
 __all__ = [
@@ -27,6 +37,11 @@ __all__ = [
     "ScheduleFire",
     "ScheduleRunner",
     "TenantStats",
+    "WebhookDelivery",
+    "WebhookDeliveryResult",
+    "WebhookDispatcher",
+    "WebhookEndpoint",
+    "WebhookEvent",
     "Worker",
     "compute_retry_backoff_seconds",
 ]

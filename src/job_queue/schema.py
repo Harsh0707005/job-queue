@@ -163,4 +163,63 @@ CREATE INDEX IF NOT EXISTS idx_schedules_tenant
 CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_tenant_name
     ON schedules (tenant_id, name)
     WHERE name IS NOT NULL;
+
+-- HTTP webhooks: endpoints + durable delivery outbox.
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+    id                          UUID PRIMARY KEY,
+    tenant_id                   TEXT NOT NULL,
+    url                         TEXT NOT NULL,
+    secret                      TEXT,
+    events                      TEXT[] NOT NULL,
+    enabled                     BOOLEAN NOT NULL DEFAULT TRUE,
+    max_attempts                INTEGER NOT NULL DEFAULT 5,
+    backoff_base_seconds        INTEGER NOT NULL DEFAULT 1,
+    backoff_max_seconds         INTEGER NOT NULL DEFAULT 300,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT webhook_endpoints_max_attempts_check CHECK (max_attempts >= 1),
+    CONSTRAINT webhook_endpoints_backoff_base_check CHECK (backoff_base_seconds >= 0),
+    CONSTRAINT webhook_endpoints_backoff_max_check CHECK (backoff_max_seconds >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_tenant
+    ON webhook_endpoints (tenant_id)
+    WHERE enabled = TRUE;
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id                          UUID PRIMARY KEY,
+    endpoint_id                 UUID NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    tenant_id                   TEXT NOT NULL,
+    job_id                      UUID NOT NULL,
+    event                       TEXT NOT NULL,
+    payload                     JSONB NOT NULL,
+    status                      TEXT NOT NULL,
+    attempts                    INTEGER NOT NULL DEFAULT 0,
+    max_attempts                INTEGER NOT NULL,
+    backoff_base_seconds        INTEGER NOT NULL DEFAULT 1,
+    backoff_max_seconds         INTEGER NOT NULL DEFAULT 300,
+    next_attempt_at             TIMESTAMPTZ NOT NULL,
+    last_error                  TEXT,
+    last_status_code            INTEGER,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at                TIMESTAMPTZ,
+
+    CONSTRAINT webhook_deliveries_status_check CHECK (
+        status IN ('pending', 'succeeded', 'dead')
+    ),
+    CONSTRAINT webhook_deliveries_attempts_check CHECK (attempts >= 0),
+    CONSTRAINT webhook_deliveries_max_attempts_check CHECK (max_attempts >= 1)
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
+    ON webhook_deliveries (next_attempt_at ASC)
+    WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_status
+    ON webhook_deliveries (tenant_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_job
+    ON webhook_deliveries (job_id);
 """

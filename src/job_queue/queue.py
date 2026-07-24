@@ -47,6 +47,9 @@ Design notes
   holders may still heartbeat / ack / nack. ``resume_tenant`` restores
   leasing and aligns overdue schedules for a single clean next fire (no
   missed-tick flood). ``get_tenant_stats`` reports counts.
+* **Webhooks**: terminal events (completed / failed / dead) insert durable
+  ``webhook_deliveries`` first; ``process_webhook_deliveries`` POSTs with
+  exponential backoff and dead-letters failed deliveries.
 """
 
 from __future__ import annotations
@@ -62,7 +65,16 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from job_queue.db import init_schema, transaction
-from job_queue.models import Job, JobStatus, Schedule, ScheduleFire, TenantStats
+from job_queue.models import (
+    Job,
+    JobStatus,
+    Schedule,
+    ScheduleFire,
+    TenantStats,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEvent,
+)
 
 # Namespace for pg_advisory_xact_lock(classid, hash) so dedupe locks never
 # collide with tenant concurrency locks (which use single-arg hashtext).
@@ -1014,6 +1026,17 @@ class JobQueue:
                 reason=f"parent job {dead['id']} dead-lettered",
                 now=now,
             )
+            full = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (dead["id"],),
+            ).fetchone()
+            if full is not None:
+                self._enqueue_job_webhooks(
+                    conn,
+                    job=_row_to_job(full),
+                    event=WebhookEvent.JOB_DEAD,
+                    now=now,
+                )
 
     # ------------------------------------------------------------------
     # Cancel
@@ -1201,7 +1224,11 @@ class JobQueue:
             ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during ack")
-            return _row_to_job(updated)
+            job = _row_to_job(updated)
+            self._enqueue_job_webhooks(
+                conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
+            )
+            return job
 
     def nack(
         self,
@@ -1289,7 +1316,16 @@ class JobQueue:
                     ),
                     now=now,
                 )
-            return _row_to_job(updated)
+            job = _row_to_job(updated)
+            if new_status == JobStatus.DEAD.value:
+                self._enqueue_job_webhooks(
+                    conn, job=job, event=WebhookEvent.JOB_DEAD, now=now
+                )
+            elif new_status == JobStatus.FAILED.value:
+                self._enqueue_job_webhooks(
+                    conn, job=job, event=WebhookEvent.JOB_FAILED, now=now
+                )
+            return job
 
     def ensure_lease(
         self,
@@ -1607,6 +1643,471 @@ class JobQueue:
                 continue
         return replayed
 
+
+    # ------------------------------------------------------------------
+    # Webhooks (durable outbox)
+    # ------------------------------------------------------------------
+
+    _WEBHOOK_ENDPOINT_COLUMNS = """
+        id, tenant_id, url, secret, events, enabled, max_attempts,
+        backoff_base_seconds, backoff_max_seconds, created_at, updated_at
+    """
+
+    _WEBHOOK_DELIVERY_COLUMNS = """
+        id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,
+        max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,
+        last_error, last_status_code, created_at, updated_at, completed_at
+    """
+
+    def register_webhook(
+        self,
+        *,
+        tenant_id: str,
+        url: str,
+        events: Sequence[str] | None = None,
+        secret: str | None = None,
+        max_attempts: int = 5,
+        backoff_base_seconds: int = 1,
+        backoff_max_seconds: int = 300,
+        enabled: bool = True,
+        endpoint_id: UUID | None = None,
+    ) -> WebhookEndpoint:
+        """Register an HTTP webhook endpoint for terminal job events."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if not url or not url.startswith(("http://", "https://")):
+            raise ValueError("url must be an http(s) URL")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if backoff_base_seconds < 0 or backoff_max_seconds < 0:
+            raise ValueError("backoff seconds must be >= 0")
+
+        event_list = list(events) if events is not None else [
+            WebhookEvent.JOB_COMPLETED.value,
+            WebhookEvent.JOB_FAILED.value,
+            WebhookEvent.JOB_DEAD.value,
+        ]
+        allowed = {e.value for e in WebhookEvent}
+        for ev in event_list:
+            if ev not in allowed:
+                raise ValueError(f"unsupported webhook event {ev!r}")
+        if not event_list:
+            raise ValueError("events must be non-empty")
+
+        now = _utcnow()
+        eid = endpoint_id or uuid4()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                INSERT INTO webhook_endpoints (
+                    id, tenant_id, url, secret, events, enabled, max_attempts,
+                    backoff_base_seconds, backoff_max_seconds, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+                RETURNING {self._WEBHOOK_ENDPOINT_COLUMNS}
+                """,
+                (
+                    eid,
+                    tenant_id,
+                    url,
+                    secret,
+                    event_list,
+                    enabled,
+                    max_attempts,
+                    backoff_base_seconds,
+                    backoff_max_seconds,
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_webhook_endpoint(row)
+
+    def list_webhooks(self, *, tenant_id: str) -> list[WebhookEndpoint]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
+                FROM webhook_endpoints
+                WHERE tenant_id = %s
+                ORDER BY created_at ASC
+                """,
+                (tenant_id,),
+            ).fetchall()
+            return [self._row_to_webhook_endpoint(r) for r in rows]
+
+    def delete_webhook(self, endpoint_id: UUID, *, tenant_id: str) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                """
+                DELETE FROM webhook_endpoints
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id
+                """,
+                (endpoint_id, tenant_id),
+            ).fetchone()
+            return row is not None
+
+    def set_webhook_enabled(
+        self, endpoint_id: UUID, *, tenant_id: str, enabled: bool
+    ) -> WebhookEndpoint:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                UPDATE webhook_endpoints
+                SET enabled = %s, updated_at = %s
+                WHERE id = %s AND tenant_id = %s
+                RETURNING {self._WEBHOOK_ENDPOINT_COLUMNS}
+                """,
+                (enabled, now, endpoint_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"webhook {endpoint_id} not found for tenant {tenant_id!r}"
+                )
+            return self._row_to_webhook_endpoint(row)
+
+    def list_webhook_deliveries(
+        self,
+        *,
+        tenant_id: str,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[WebhookDelivery]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        clauses = ["tenant_id = %s"]
+        params: list[Any] = [tenant_id]
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status)
+        params.extend([limit, offset])
+        where = " AND ".join(clauses)
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params,
+            ).fetchall()
+            return [self._row_to_webhook_delivery(r) for r in rows]
+
+    def get_webhook_delivery(
+        self, delivery_id: UUID, *, tenant_id: str
+    ) -> WebhookDelivery | None:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (delivery_id, tenant_id),
+            ).fetchone()
+            return self._row_to_webhook_delivery(row) if row else None
+
+    def process_webhook_deliveries(
+        self,
+        *,
+        limit: int = 50,
+        http_timeout_seconds: float = 10.0,
+        on_result: Any = None,
+    ) -> list[Any]:
+        """Deliver due webhook outbox rows (POST with backoff / dead-letter).
+
+        Returns a list of delivery result objects from
+        ``job_queue.webhooks.WebhookDeliveryResult``.
+        """
+        from job_queue.webhooks import WebhookDeliveryResult, post_webhook
+
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        now = _utcnow()
+        results: list[Any] = []
+
+        with transaction(self._pool) as conn:
+            due = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE status = 'pending'
+                  AND next_attempt_at <= %s
+                ORDER BY next_attempt_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+                """,
+                (now, limit),
+            ).fetchall()
+
+            for drow in due:
+                delivery = self._row_to_webhook_delivery(drow)
+                endpoint = conn.execute(
+                    f"""
+                    SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
+                    FROM webhook_endpoints
+                    WHERE id = %s
+                    """,
+                    (delivery.endpoint_id,),
+                ).fetchone()
+                if endpoint is None or not endpoint["enabled"]:
+                    # Endpoint removed/disabled: dead-letter the delivery.
+                    updated = conn.execute(
+                        f"""
+                        UPDATE webhook_deliveries
+                        SET status = 'dead',
+                            last_error = %s,
+                            updated_at = %s,
+                            completed_at = %s
+                        WHERE id = %s
+                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                        """,
+                        (
+                            "endpoint missing or disabled",
+                            now,
+                            now,
+                            delivery.id,
+                        ),
+                    ).fetchone()
+                    assert updated is not None
+                    result = WebhookDeliveryResult(
+                        delivery=self._row_to_webhook_delivery(updated),
+                        success=False,
+                        status_code=None,
+                        error="endpoint missing or disabled",
+                    )
+                    results.append(result)
+                    if on_result is not None:
+                        on_result(result)
+                    continue
+
+                status_code, detail = post_webhook(
+                    endpoint["url"],
+                    delivery.payload,
+                    secret=endpoint["secret"],
+                    timeout_seconds=http_timeout_seconds,
+                )
+                attempts = delivery.attempts + 1
+                success = 200 <= status_code < 300
+
+                if success:
+                    updated = conn.execute(
+                        f"""
+                        UPDATE webhook_deliveries
+                        SET status = 'succeeded',
+                            attempts = %s,
+                            last_status_code = %s,
+                            last_error = NULL,
+                            updated_at = %s,
+                            completed_at = %s
+                        WHERE id = %s
+                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                        """,
+                        (attempts, status_code, now, now, delivery.id),
+                    ).fetchone()
+                    assert updated is not None
+                    result = WebhookDeliveryResult(
+                        delivery=self._row_to_webhook_delivery(updated),
+                        success=True,
+                        status_code=status_code,
+                        error=None,
+                    )
+                elif attempts >= delivery.max_attempts:
+                    updated = conn.execute(
+                        f"""
+                        UPDATE webhook_deliveries
+                        SET status = 'dead',
+                            attempts = %s,
+                            last_status_code = %s,
+                            last_error = %s,
+                            updated_at = %s,
+                            completed_at = %s
+                        WHERE id = %s
+                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                        """,
+                        (
+                            attempts,
+                            status_code or None,
+                            detail[:2000],
+                            now,
+                            now,
+                            delivery.id,
+                        ),
+                    ).fetchone()
+                    assert updated is not None
+                    result = WebhookDeliveryResult(
+                        delivery=self._row_to_webhook_delivery(updated),
+                        success=False,
+                        status_code=status_code or None,
+                        error=detail,
+                    )
+                else:
+                    delay = compute_retry_backoff_seconds(
+                        attempts,
+                        base_seconds=delivery.backoff_base_seconds,
+                        max_seconds=delivery.backoff_max_seconds,
+                    )
+                    next_at = now + timedelta(seconds=delay)
+                    updated = conn.execute(
+                        f"""
+                        UPDATE webhook_deliveries
+                        SET status = 'pending',
+                            attempts = %s,
+                            last_status_code = %s,
+                            last_error = %s,
+                            next_attempt_at = %s,
+                            updated_at = %s
+                        WHERE id = %s
+                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                        """,
+                        (
+                            attempts,
+                            status_code or None,
+                            detail[:2000],
+                            next_at,
+                            now,
+                            delivery.id,
+                        ),
+                    ).fetchone()
+                    assert updated is not None
+                    result = WebhookDeliveryResult(
+                        delivery=self._row_to_webhook_delivery(updated),
+                        success=False,
+                        status_code=status_code or None,
+                        error=detail,
+                    )
+
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
+
+        return results
+
+    def _enqueue_job_webhooks(
+        self,
+        conn: Any,
+        *,
+        job: Job,
+        event: WebhookEvent,
+        now: datetime,
+    ) -> None:
+        """Insert pending delivery rows for all matching enabled endpoints."""
+        endpoints = conn.execute(
+            f"""
+            SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
+            FROM webhook_endpoints
+            WHERE tenant_id = %s
+              AND enabled = TRUE
+              AND %s = ANY(events)
+            """,
+            (job.tenant_id, event.value),
+        ).fetchall()
+        if not endpoints:
+            return
+
+        payload = {
+            "event": event.value,
+            "job_id": str(job.id),
+            "tenant_id": job.tenant_id,
+            "queue_name": job.queue_name,
+            "status": job.status.value,
+            "payload": job.payload,
+            "result": job.result,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "last_error": job.last_error,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "timestamp": now.isoformat(),
+        }
+
+        for ep in endpoints:
+            conn.execute(
+                f"""
+                INSERT INTO webhook_deliveries (
+                    id, endpoint_id, tenant_id, job_id, event, payload,
+                    status, attempts, max_attempts, backoff_base_seconds,
+                    backoff_max_seconds, next_attempt_at, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    'pending', 0, %s, %s,
+                    %s, %s, %s, %s
+                )
+                """,
+                (
+                    uuid4(),
+                    ep["id"],
+                    job.tenant_id,
+                    job.id,
+                    event.value,
+                    Jsonb(payload),
+                    ep["max_attempts"],
+                    ep["backoff_base_seconds"],
+                    ep["backoff_max_seconds"],
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+    @staticmethod
+    def _row_to_webhook_endpoint(row: dict[str, Any]) -> WebhookEndpoint:
+        events = row["events"] or []
+        return WebhookEndpoint(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            url=row["url"],
+            secret=row["secret"],
+            events=tuple(events),
+            enabled=bool(row["enabled"]),
+            max_attempts=int(row["max_attempts"]),
+            backoff_base_seconds=int(row["backoff_base_seconds"]),
+            backoff_max_seconds=int(row["backoff_max_seconds"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_webhook_delivery(row: dict[str, Any]) -> WebhookDelivery:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return WebhookDelivery(
+            id=row["id"],
+            endpoint_id=row["endpoint_id"],
+            tenant_id=row["tenant_id"],
+            job_id=row["job_id"],
+            event=row["event"],
+            payload=payload,
+            status=row["status"],
+            attempts=int(row["attempts"]),
+            max_attempts=int(row["max_attempts"]),
+            backoff_base_seconds=int(row["backoff_base_seconds"]),
+            backoff_max_seconds=int(row["backoff_max_seconds"]),
+            next_attempt_at=row["next_attempt_at"],
+            last_error=row["last_error"],
+            last_status_code=row["last_status_code"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+        )
 
     # ------------------------------------------------------------------
     # Recurring schedules

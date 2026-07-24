@@ -2640,3 +2640,266 @@ def test_paused_tenant_fair_lease_no_reclaim_among_mixed_tenants(queue: JobQueue
     assert still is not None
     assert still.status == JobStatus.LEASED
     assert still.leased_by == "w1"
+
+
+# ---------------------------------------------------------------------------
+# HTTP webhooks (durable outbox)
+# ---------------------------------------------------------------------------
+
+
+class _WebhookCapture:
+    """Minimal HTTP server that records POSTs for tests."""
+
+    def __init__(self, *, fail_times: int = 0, status: int = 200):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        self.received: list[dict] = []
+        self.fail_times = fail_times
+        self._fails_left = fail_times
+        self.status = status
+        self._lock = threading.Lock()
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                import json
+
+                with parent._lock:
+                    should_fail = parent._fails_left > 0
+                    if should_fail:
+                        parent._fails_left -= 1
+                    parent.received.append(
+                        {
+                            "path": self.path,
+                            "body": json.loads(body.decode("utf-8")),
+                            "signature": self.headers.get("X-Job-Queue-Signature"),
+                        }
+                    )
+                if should_fail:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"fail")
+                else:
+                    self.send_response(parent.status)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+
+            def log_message(self, format, *args):  # noqa: A003
+                return
+
+        self._httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._httpd.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}/hook"
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._thread.join(timeout=5)
+
+
+def test_webhook_on_complete_persisted_then_delivered(queue: JobQueue):
+    from job_queue import WebhookEvent
+
+    capture = _WebhookCapture()
+    try:
+        ep = queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="s3cret",
+        )
+        assert ep.enabled is True
+
+        queue.enqueue(tenant_id="t1", payload={"hello": "world"})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1", result={"score": 1})
+
+        # Durable outbox row exists before delivery.
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending) == 1
+        assert pending[0].event == "job.completed"
+        assert pending[0].payload["result"] == {"score": 1}
+        assert pending[0].job_id == job.id
+
+        results = queue.process_webhook_deliveries(limit=10)
+        assert len(results) == 1
+        assert results[0].success is True
+        assert results[0].delivery.status == "succeeded"
+
+        assert len(capture.received) == 1
+        assert capture.received[0]["body"]["event"] == "job.completed"
+        assert capture.received[0]["signature"] is not None
+
+        assert queue.list_webhook_deliveries(tenant_id="t1", status="pending") == []
+        assert len(queue.list_webhook_deliveries(tenant_id="t1", status="succeeded")) == 1
+    finally:
+        capture.stop()
+
+
+def test_webhook_retry_backoff_then_succeed(queue: JobQueue):
+    capture = _WebhookCapture(fail_times=2)
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            max_attempts=5,
+            backoff_base_seconds=1,
+            backoff_max_seconds=5,
+        )
+        queue.enqueue(tenant_id="t1", payload={})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+
+        # Attempt 1 fails → still pending with backoff.
+        r1 = queue.process_webhook_deliveries()
+        assert len(r1) == 1
+        assert r1[0].success is False
+        assert r1[0].delivery.status == "pending"
+        assert r1[0].delivery.attempts == 1
+        assert r1[0].delivery.next_attempt_at > r1[0].delivery.updated_at
+
+        # Not due yet.
+        assert queue.process_webhook_deliveries() == []
+
+        time.sleep(1.15)
+        r2 = queue.process_webhook_deliveries()
+        assert len(r2) == 1
+        assert r2[0].success is False
+        assert r2[0].delivery.attempts == 2
+
+        time.sleep(2.15)  # exponential: 2s after attempt 2
+        r3 = queue.process_webhook_deliveries()
+        assert len(r3) == 1
+        assert r3[0].success is True
+        assert r3[0].delivery.status == "succeeded"
+        assert len(capture.received) == 3
+    finally:
+        capture.stop()
+
+
+def test_webhook_dead_letters_after_max_attempts(queue: JobQueue):
+    capture = _WebhookCapture(fail_times=100)
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            max_attempts=2,
+            backoff_base_seconds=0,
+            backoff_max_seconds=0,
+        )
+        queue.enqueue(tenant_id="t1", payload={})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+
+        r1 = queue.process_webhook_deliveries()
+        assert r1[0].delivery.status == "pending"
+        r2 = queue.process_webhook_deliveries()
+        assert r2[0].delivery.status == "dead"
+        assert r2[0].delivery.attempts == 2
+        assert queue.list_webhook_deliveries(tenant_id="t1", status="dead")
+    finally:
+        capture.stop()
+
+
+def test_webhook_on_failed_and_dead_events(queue: JobQueue):
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.failed", "job.dead"],
+            backoff_base_seconds=0,
+        )
+        # failed via requeue=False
+        queue.enqueue(
+            tenant_id="t1",
+            payload={"f": 1},
+            max_attempts=3,
+            retry_backoff_base_seconds=0,
+        )
+        j1 = queue.lease(tenant_id="t1", worker_id="w1")
+        assert j1 is not None
+        n1 = _nack(queue, j1, "w1", error="nope", requeue=False)
+        assert n1.status == JobStatus.FAILED
+
+        # dead via max attempts
+        queue.enqueue(
+            tenant_id="t1",
+            payload={"d": 1},
+            max_attempts=1,
+            retry_backoff_base_seconds=0,
+        )
+        j2 = queue.lease(tenant_id="t1", worker_id="w1")
+        assert j2 is not None
+        n2 = _nack(queue, j2, "w1", error="gone", requeue=True)
+        assert n2.status == JobStatus.DEAD
+
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        events = {d.event for d in pending}
+        assert events == {"job.failed", "job.dead"}
+
+        results = queue.process_webhook_deliveries(limit=10)
+        assert len(results) == 2
+        assert all(r.success for r in results)
+        received_events = {r["body"]["event"] for r in capture.received}
+        assert received_events == {"job.failed", "job.dead"}
+    finally:
+        capture.stop()
+
+
+def test_webhook_only_matching_tenant_and_events(queue: JobQueue):
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="a",
+            url=capture.url,
+            events=["job.completed"],
+        )
+        queue.register_webhook(
+            tenant_id="b",
+            url=capture.url,
+            events=["job.dead"],
+        )
+        queue.enqueue(tenant_id="a", payload={})
+        ja = queue.lease(tenant_id="a", worker_id="w")
+        assert ja is not None
+        _ack(queue, ja, "w")
+
+        # Only tenant a completion delivery.
+        pending = queue.list_webhook_deliveries(tenant_id="a", status="pending")
+        assert len(pending) == 1
+        assert queue.list_webhook_deliveries(tenant_id="b", status="pending") == []
+
+        queue.process_webhook_deliveries()
+        assert len(capture.received) == 1
+        assert capture.received[0]["body"]["tenant_id"] == "a"
+    finally:
+        capture.stop()
+
+
+def test_webhook_dispatcher_run_once(queue: JobQueue):
+    from job_queue import WebhookDispatcher
+
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(tenant_id="t1", url=capture.url, events=["job.completed"])
+        queue.enqueue(tenant_id="t1", payload={})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+
+        disp = WebhookDispatcher(queue, batch_limit=10)
+        results = disp.run_once()
+        assert len(results) == 1
+        assert results[0].success
+    finally:
+        capture.stop()

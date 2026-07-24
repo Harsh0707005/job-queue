@@ -109,3 +109,50 @@ class TenantStats:
     total: int
     # Ready to lease right now (pending, due, deps met); 0 when paused.
     claimable: int
+
+
+
+class WebhookEvent(str, Enum):
+    JOB_COMPLETED = "job.completed"
+    JOB_FAILED = "job.failed"
+    JOB_DEAD = "job.dead"
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookEndpoint:
+    """Registered HTTP webhook destination for a tenant."""
+
+    id: UUID
+    tenant_id: str
+    url: str
+    secret: str | None
+    events: tuple[str, ...]
+    enabled: bool
+    max_attempts: int
+    backoff_base_seconds: int
+    backoff_max_seconds: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookDelivery:
+    """Durable outbox row for one webhook POST attempt lifecycle."""
+
+    id: UUID
+    endpoint_id: UUID
+    tenant_id: str
+    job_id: UUID
+    event: str
+    payload: dict[str, Any]
+    status: str
+    attempts: int
+    max_attempts: int
+    backoff_base_seconds: int
+    backoff_max_seconds: int
+    next_attempt_at: datetime
+    last_error: str | None
+    last_status_code: int | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
