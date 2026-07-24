@@ -1,0 +1,174 @@
+# Distributed job-queue fleet:
+#   postgres | coordinator (HTTP) | 4 fair workers | schedule node | webhook node
+#   + webhook sink + soak driver
+#
+# Run soak:
+#   docker compose up --build --abort-on-container-exit soak
+#
+# Tear down:
+#   docker compose down -v
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queue
+      POSTGRES_PASSWORD: queue
+      POSTGRES_DB: queue
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue -d queue"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "5433:5432"
+
+  coordinator:
+    build: .
+    command: ["job-queue-coordinator", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  webhook-sink:
+    build: .
+    command: ["job-queue-webhook-sink", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      LOG_LEVEL: INFO
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  worker-1:
+    build: .
+    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    environment:
+      WORKER_ID: worker-1
+      COORDINATOR_URL: http://coordinator:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  worker-2:
+    build: .
+    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    environment:
+      WORKER_ID: worker-2
+      COORDINATOR_URL: http://coordinator:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  worker-3:
+    build: .
+    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    environment:
+      WORKER_ID: worker-3
+      COORDINATOR_URL: http://coordinator:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  worker-4:
+    build: .
+    command: ["job-queue-worker-agent", "--coordinator", "http://coordinator:8080"]
+    environment:
+      WORKER_ID: worker-4
+      COORDINATOR_URL: http://coordinator:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  scheduler:
+    build: .
+    command: ["job-queue-scheduler-node", "--coordinator", "http://coordinator:8080"]
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      POLL_INTERVAL: "0.5"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  webhook:
+    build: .
+    command: ["job-queue-webhook-node", "--coordinator", "http://coordinator:8080"]
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      POLL_INTERVAL: "0.5"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+
+  soak:
+    build: .
+    command: ["python", "scripts/distributed_soak.py"]
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      SINK_URL: http://webhook-sink:8090
+      WEBHOOK_URL: http://webhook-sink:8090/hook
+      TENANTS: "8"
+      INTERVAL_SECONDS: "25"
+      TARGET_COMPLETED: "35"
+      MAX_WALL_SECONDS: "2400"
+      POLL_SECONDS: "3"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      scheduler:
+        condition: service_started
+      webhook:
+        condition: service_started

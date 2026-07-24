@@ -23,7 +23,16 @@ from job_queue.scheduler import ScheduleRunner
 from job_queue.webhooks import WebhookDeliveryResult, WebhookDispatcher
 from job_queue.worker import LeaseContext, Worker
 
+from job_queue.coordinator import Coordinator
+from job_queue.remote import CoordinatorClient, RemoteWorkerAgent, ScheduleNode, WebhookNode
+
 __all__ = [
+    "Coordinator",
+    "CoordinatorClient",
+    "RemoteWorkerAgent",
+    "ScheduleNode",
+    "WebhookNode",
+
     "CancelError",
     "DependencyError",
     "Job",

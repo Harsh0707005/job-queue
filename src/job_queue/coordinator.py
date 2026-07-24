@@ -1,0 +1,480 @@
+"""HTTP coordinator: multi-node fleet control plane over Postgres JobQueue.
+
+Remote worker agents, schedule nodes, and webhook nodes call this service.
+The coordinator is the only process that needs the database DSN for the
+distributed fleet (workers never open Postgres connections).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+from uuid import UUID
+
+from job_queue.codec import (
+    job_to_dict,
+    schedule_to_dict,
+    tenant_stats_to_dict,
+    webhook_endpoint_to_dict,
+)
+from job_queue.models import JobStatus
+from job_queue.queue import JobQueue, LeaseError, ScheduleError
+
+logger = logging.getLogger(__name__)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+class Coordinator:
+    """Thin HTTP façade over :class:`JobQueue`."""
+
+    def __init__(self, queue: JobQueue) -> None:
+        self.queue = queue
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def handle(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+        query: dict[str, list[str]],
+    ) -> tuple[int, dict[str, Any]]:
+        body = body or {}
+        if method == "GET" and path == "/health":
+            return 200, {"ok": True, "role": "coordinator"}
+
+        if method == "POST" and path == "/v1/lease":
+            return self._lease(body)
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/heartbeat"):
+            return self._job_action(path, body, "heartbeat")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/ack"):
+            return self._job_action(path, body, "ack")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/nack"):
+            return self._job_action(path, body, "nack")
+
+        if method == "POST" and path == "/v1/schedules/process-due":
+            return self._process_due(body)
+        if method == "POST" and path == "/v1/webhooks/process":
+            return self._process_webhooks(body)
+
+        if method == "POST" and path == "/v1/schedules":
+            return self._create_schedule(body)
+        if method == "POST" and path == "/v1/webhooks":
+            return self._register_webhook(body)
+        if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/pause"):
+            return self._pause_schedule(path, body)
+
+        if method == "GET" and path == "/v1/admin/backlog":
+            return self._backlog()
+        if method == "GET" and path == "/v1/admin/completed-by-schedule":
+            return self._completed_by_schedule()
+        if method == "GET" and path == "/v1/admin/stats":
+            return self._list_stats(query)
+        if method == "GET" and path == "/v1/admin/webhook-stats":
+            return self._webhook_stats()
+
+        return 404, {"error": f"unknown route {method} {path}"}
+
+    # ------------------------------------------------------------------
+    # Worker protocol
+    # ------------------------------------------------------------------
+
+    def _lease(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        worker_id = body.get("worker_id")
+        if not worker_id:
+            return 400, {"error": "worker_id is required"}
+        tenant_id = body.get("tenant_id")  # None => fair
+        queue_name = body.get("queue_name") or "default"
+        vt = body.get("visibility_timeout_seconds")
+        job = self.queue.lease(
+            worker_id=str(worker_id),
+            tenant_id=str(tenant_id) if tenant_id else None,
+            queue_name=str(queue_name),
+            visibility_timeout_seconds=int(vt) if vt is not None else None,
+        )
+        if job is None:
+            return 204, {}
+        return 200, {"job": job_to_dict(job)}
+
+    def _job_action(
+        self, path: str, body: dict[str, Any], action: str
+    ) -> tuple[int, dict[str, Any]]:
+        # /v1/jobs/{uuid}/{action}
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != "v1" or parts[1] != "jobs":
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        job_id = UUID(job_id_s)
+
+        tenant_id = body.get("tenant_id")
+        worker_id = body.get("worker_id")
+        lease_token = body.get("lease_token")
+        if not tenant_id or not worker_id or not lease_token:
+            return 400, {"error": "tenant_id, worker_id, lease_token required"}
+        try:
+            token = UUID(str(lease_token))
+        except ValueError:
+            return 400, {"error": "invalid lease_token"}
+
+        try:
+            if action == "heartbeat":
+                job = self.queue.heartbeat(
+                    job_id,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    extend_by_seconds=body.get("extend_by_seconds"),
+                )
+            elif action == "ack":
+                job = self.queue.ack(
+                    job_id,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    result=body.get("result"),
+                )
+            elif action == "nack":
+                job = self.queue.nack(
+                    job_id,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    error=body.get("error"),
+                    requeue=bool(body.get("requeue", True)),
+                )
+            else:
+                return 400, {"error": f"unknown action {action}"}
+        except LeaseError as exc:
+            return 409, {"error": str(exc), "code": "lease_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
+        return 200, {"job": job_to_dict(job)}
+
+    # ------------------------------------------------------------------
+    # Scheduler / webhook nodes
+    # ------------------------------------------------------------------
+
+    def _process_due(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        limit = int(body.get("limit") or 100)
+        tenant_id = body.get("tenant_id")
+        fires = self.queue.process_due_schedules(
+            tenant_id=str(tenant_id) if tenant_id else None,
+            limit=limit,
+        )
+        return 200, {
+            "count": len(fires),
+            "fires": [
+                {
+                    "schedule": schedule_to_dict(f.schedule),
+                    "job": job_to_dict(f.job),
+                }
+                for f in fires
+            ],
+        }
+
+    def _process_webhooks(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        limit = int(body.get("limit") or 50)
+        timeout = float(body.get("http_timeout_seconds") or 10.0)
+        results = self.queue.process_webhook_deliveries(
+            limit=limit,
+            http_timeout_seconds=timeout,
+        )
+        out = []
+        for r in results:
+            out.append(
+                {
+                    "delivery_id": str(r.delivery.id),
+                    "tenant_id": r.delivery.tenant_id,
+                    "job_id": str(r.delivery.job_id),
+                    "event": r.delivery.event,
+                    "status": r.delivery.status,
+                    "success": r.success,
+                    "status_code": r.status_code,
+                    "error": r.error,
+                }
+            )
+        return 200, {"count": len(out), "results": out}
+
+    # ------------------------------------------------------------------
+    # Setup / admin
+    # ------------------------------------------------------------------
+
+    def _create_schedule(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        try:
+            sched = self.queue.create_schedule(
+                tenant_id=str(body["tenant_id"]),
+                interval_seconds=int(body["interval_seconds"]),
+                payload=dict(body.get("payload") or {}),
+                queue_name=str(body.get("queue_name") or "default"),
+                name=body.get("name"),
+                priority=int(body.get("priority") or 0),
+                max_attempts=int(body.get("max_attempts") or 3),
+                visibility_timeout_seconds=int(
+                    body.get("visibility_timeout_seconds") or 30
+                ),
+                enabled=bool(body.get("enabled", True)),
+            )
+        except (KeyError, ValueError, ScheduleError) as exc:
+            return 400, {"error": str(exc)}
+        return 201, {"schedule": schedule_to_dict(sched)}
+
+    def _register_webhook(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        try:
+            ep = self.queue.register_webhook(
+                tenant_id=str(body["tenant_id"]),
+                url=str(body["url"]),
+                events=body.get("events"),
+                secret=body.get("secret"),
+                max_attempts=int(body.get("max_attempts") or 5),
+                backoff_base_seconds=int(body.get("backoff_base_seconds") or 1),
+                backoff_max_seconds=int(body.get("backoff_max_seconds") or 300),
+                enabled=bool(body.get("enabled", True)),
+            )
+        except (KeyError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 201, {"endpoint": webhook_endpoint_to_dict(ep)}
+
+    def _pause_schedule(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / schedules / {id} / pause
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            sched = self.queue.pause_schedule(UUID(sid), tenant_id=str(tenant_id))
+        except ScheduleError as exc:
+            return 404, {"error": str(exc)}
+        return 200, {"schedule": schedule_to_dict(sched)}
+
+    def _backlog(self) -> tuple[int, dict[str, Any]]:
+        with self.queue._pool.connection() as conn:
+            job_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+                  COUNT(*) FILTER (WHERE status = 'leased')::int AS leased,
+                  COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+                  COUNT(*) FILTER (WHERE status = 'dead')::int AS dead,
+                  COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+                  COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled
+                FROM jobs
+                """
+            ).fetchone()
+            wh_row = conn.execute(
+                """
+                SELECT
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+                  COUNT(*) FILTER (WHERE status = 'delivering')::int AS delivering,
+                  COUNT(*) FILTER (WHERE status = 'dead')::int AS dead,
+                  COUNT(*) FILTER (WHERE status = 'succeeded')::int AS succeeded
+                FROM webhook_deliveries
+                """
+            ).fetchone()
+        assert job_row is not None and wh_row is not None
+        return 200, {
+            "jobs": dict(job_row),
+            "webhooks": dict(wh_row),
+        }
+
+    def _completed_by_schedule(self) -> tuple[int, dict[str, Any]]:
+        with self.queue._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT schedule_id::text AS schedule_id, COUNT(*)::int AS completed
+                FROM jobs
+                WHERE schedule_id IS NOT NULL
+                  AND status = %s
+                GROUP BY schedule_id
+                ORDER BY schedule_id
+                """,
+                (JobStatus.COMPLETED.value,),
+            ).fetchall()
+            scheds = conn.execute(
+                """
+                SELECT id::text AS id, tenant_id, name, enabled, interval_seconds
+                FROM schedules
+                ORDER BY tenant_id
+                """
+            ).fetchall()
+        by = {r["schedule_id"]: int(r["completed"]) for r in rows}
+        return 200, {
+            "completed_by_schedule": by,
+            "schedules": [dict(s) for s in scheds],
+        }
+
+    def _list_stats(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant = (query.get("tenant") or [None])[0]
+        if tenant:
+            stats = self.queue.get_tenant_stats(tenant)
+            return 200, {"stats": [tenant_stats_to_dict(stats)]}
+        all_stats = self.queue.list_tenant_stats()
+        return 200, {"stats": [tenant_stats_to_dict(s) for s in all_stats]}
+
+    def _webhook_stats(self) -> tuple[int, dict[str, Any]]:
+        with self.queue._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*)::int AS n
+                FROM webhook_deliveries
+                GROUP BY status
+                """
+            ).fetchall()
+            # Detect multiple succeeded deliveries for same job+event (should be 1).
+            dups = conn.execute(
+                """
+                SELECT job_id::text AS job_id, event, COUNT(*)::int AS n
+                FROM webhook_deliveries
+                WHERE status = 'succeeded'
+                GROUP BY job_id, event
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+        return 200, {
+            "by_status": {r["status"]: int(r["n"]) for r in rows},
+            "duplicate_succeeded_job_events": [dict(r) for r in dups],
+        }
+
+
+def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+            logger.debug("http: " + format, *args)
+
+        def _read_json(self) -> dict[str, Any] | None:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length <= 0:
+                return None
+            raw = self.rfile.read(length)
+            if not raw:
+                return None
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid json: {exc}") from exc
+            if data is None:
+                return {}
+            if not isinstance(data, dict):
+                raise ValueError("json body must be an object")
+            return data
+
+        def _send(self, status: int, payload: dict[str, Any]) -> None:
+            if status == 204:
+                self.send_response(204)
+                self.end_headers()
+                return
+            body = json.dumps(payload, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _dispatch(self, method: str) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            # keep trailing structure for /v1/jobs/.../ack
+            if self.path.split("?", 1)[0].endswith("/") and path != "/":
+                path = self.path.split("?", 1)[0].rstrip("/")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json() if method in ("POST", "PUT", "PATCH") else None
+                status, payload = coordinator.handle(method, path, body, query)
+                self._send(status, payload)
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("coordinator error: %s", exc)
+                self._send(
+                    500,
+                    {
+                        "error": str(exc),
+                        "trace": traceback.format_exc().splitlines()[-5:],
+                    },
+                )
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._dispatch("GET")
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._dispatch("POST")
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._dispatch("PUT")
+
+    return Handler
+
+
+def serve_coordinator(
+    dsn: str,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    min_size: int = 2,
+    max_size: int = 20,
+) -> None:
+    """Bind ThreadingHTTPServer and serve forever."""
+    queue = JobQueue.connect(dsn, min_size=min_size, max_size=max_size)
+    coordinator = Coordinator(queue)
+    handler = _make_handler(coordinator)
+    server = ThreadingHTTPServer((host, port), handler)
+    logger.info("coordinator listening on http://%s:%s", host, port)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        queue.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    p = argparse.ArgumentParser(prog="job-queue-coordinator")
+    p.add_argument(
+        "--dsn",
+        default=os.environ.get("JOB_QUEUE_DSN") or os.environ.get("DATABASE_URL"),
+        help="Postgres DSN",
+    )
+    p.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    p.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    args = p.parse_args(argv)
+    if not args.dsn:
+        print("JOB_QUEUE_DSN / --dsn required", file=__import__("sys").stderr)
+        return 2
+    dsn = (
+        args.dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+        .replace("postgresql+psycopg2://", "postgresql://", 1)
+    )
+    serve_coordinator(dsn, host=args.host, port=args.port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
