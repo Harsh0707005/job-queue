@@ -200,22 +200,32 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     backoff_base_seconds        INTEGER NOT NULL DEFAULT 1,
     backoff_max_seconds         INTEGER NOT NULL DEFAULT 300,
     next_attempt_at             TIMESTAMPTZ NOT NULL,
+    delivering_until            TIMESTAMPTZ,
     last_error                  TEXT,
     last_status_code            INTEGER,
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at                TIMESTAMPTZ,
 
-    CONSTRAINT webhook_deliveries_status_check CHECK (
-        status IN ('pending', 'succeeded', 'dead')
-    ),
     CONSTRAINT webhook_deliveries_attempts_check CHECK (attempts >= 0),
     CONSTRAINT webhook_deliveries_max_attempts_check CHECK (max_attempts >= 1)
 );
 
+-- Status check replaceable for upgrades (adds 'delivering').
+ALTER TABLE webhook_deliveries DROP CONSTRAINT IF EXISTS webhook_deliveries_status_check;
+ALTER TABLE webhook_deliveries ADD CONSTRAINT webhook_deliveries_status_check CHECK (
+    status IN ('pending', 'delivering', 'succeeded', 'dead')
+);
+
+ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS delivering_until TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
     ON webhook_deliveries (next_attempt_at ASC)
     WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_stuck
+    ON webhook_deliveries (delivering_until ASC)
+    WHERE status = 'delivering';
 
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_status
     ON webhook_deliveries (tenant_id, status);

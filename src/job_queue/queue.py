@@ -1656,7 +1656,8 @@ class JobQueue:
     _WEBHOOK_DELIVERY_COLUMNS = """
         id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,
         max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,
-        last_error, last_status_code, created_at, updated_at, completed_at
+        delivering_until, last_error, last_status_code, created_at, updated_at,
+        completed_at
     """
 
     def register_webhook(
@@ -1829,55 +1830,184 @@ class JobQueue:
         *,
         limit: int = 50,
         http_timeout_seconds: float = 10.0,
+        claim_seconds: float | None = None,
         on_result: Any = None,
     ) -> list[Any]:
         """Deliver due webhook outbox rows (POST with backoff / dead-letter).
 
-        Returns a list of delivery result objects from
-        ``job_queue.webhooks.WebhookDeliveryResult``.
+        **Crash safety (no double-send after successful POST):**
+        1. Claim rows into ``delivering`` and **commit** (attempts++, lease).
+        2. HTTP POST outside that claim transaction.
+        3. Mark succeeded / retry / dead.
+
+        If the process dies after a successful POST but before step 3, the row
+        remains ``delivering`` (not ``pending``), so it is **not** auto-resent
+        as a fresh pending delivery. Stuck ``delivering`` rows past
+        ``delivering_until`` are recovered carefully: we only re-POST with the
+        same ``Idempotency-Key`` (= delivery id) after the claim lease expires,
+        so receivers can treat duplicates as one event; we never leave a
+        successful POST looking like an unattempted pending row.
+
+        Returns a list of ``WebhookDeliveryResult``.
         """
         from job_queue.webhooks import WebhookDeliveryResult, post_webhook
 
         if limit < 1:
             raise ValueError("limit must be >= 1")
 
+        # Claim lease long enough to cover HTTP timeout + slack.
+        lease_s = claim_seconds if claim_seconds is not None else max(
+            30.0, float(http_timeout_seconds) * 3.0
+        )
         now = _utcnow()
-        results: list[Any] = []
+        claim_until = now + timedelta(seconds=lease_s)
 
+        # --- Phase 1: durable claim (commit before any HTTP) ---
+        claimed: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+        recovered: list[Any] = []
         with transaction(self._pool) as conn:
             due = conn.execute(
                 f"""
                 SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
                 FROM webhook_deliveries
-                WHERE status = 'pending'
-                  AND next_attempt_at <= %s
+                WHERE (
+                        status = 'pending'
+                    AND next_attempt_at <= %s
+                ) OR (
+                        status = 'delivering'
+                    AND delivering_until IS NOT NULL
+                    AND delivering_until < %s
+                )
                 ORDER BY next_attempt_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
                 """,
-                (now, limit),
+                (now, now, limit),
             ).fetchall()
 
             for drow in due:
-                delivery = self._row_to_webhook_delivery(drow)
+                is_reclaim = drow["status"] == "delivering"
+                if is_reclaim:
+                    # If a prior POST already recorded a 2xx status code but the
+                    # process crashed before status=succeeded, finalize without
+                    # sending again (prevents double delivery).
+                    code = drow.get("last_status_code")
+                    if code is not None and 200 <= int(code) < 300:
+                        updated = conn.execute(
+                            f"""
+                            UPDATE webhook_deliveries
+                            SET status = 'succeeded',
+                                delivering_until = NULL,
+                                last_error = NULL,
+                                updated_at = %s,
+                                completed_at = COALESCE(completed_at, %s)
+                            WHERE id = %s
+                              AND status = 'delivering'
+                            RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                            """,
+                            (now, now, drow["id"]),
+                        ).fetchone()
+                        if updated is not None:
+                            rec = WebhookDeliveryResult(
+                                delivery=self._row_to_webhook_delivery(updated),
+                                success=True,
+                                status_code=int(code),
+                                error=None,
+                            )
+                            recovered.append(rec)
+                            if on_result is not None:
+                                on_result(rec)
+                        continue
+                    # Stuck after crash mid-flight: keep attempts, re-POST later
+                    # with the same Idempotency-Key (delivery id).
+                    updated = conn.execute(
+                        f"""
+                        UPDATE webhook_deliveries
+                        SET status = 'delivering',
+                            delivering_until = %s,
+                            updated_at = %s,
+                            last_error = COALESCE(
+                                last_error,
+                                'reclaimed stuck delivering claim'
+                            )
+                        WHERE id = %s
+                          AND status = 'delivering'
+                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                        """,
+                        (claim_until, now, drow["id"]),
+                    ).fetchone()
+                else:
+                    new_attempts = int(drow["attempts"]) + 1
+                    if new_attempts > int(drow["max_attempts"]):
+                        # Should not normally happen for pending, but be safe.
+                        updated = conn.execute(
+                            f"""
+                            UPDATE webhook_deliveries
+                            SET status = 'dead',
+                                last_error = COALESCE(last_error, 'max attempts exceeded'),
+                                updated_at = %s,
+                                completed_at = %s,
+                                delivering_until = NULL
+                            WHERE id = %s
+                            RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                            """,
+                            (now, now, drow["id"]),
+                        ).fetchone()
+                        if updated is not None and on_result is not None:
+                            on_result(
+                                WebhookDeliveryResult(
+                                    delivery=self._row_to_webhook_delivery(updated),
+                                    success=False,
+                                    status_code=None,
+                                    error="max attempts exceeded",
+                                )
+                            )
+                        continue
+                    updated = conn.execute(
+                        f"""
+                        UPDATE webhook_deliveries
+                        SET status = 'delivering',
+                            attempts = %s,
+                            delivering_until = %s,
+                            updated_at = %s
+                        WHERE id = %s
+                          AND status = 'pending'
+                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                        """,
+                        (new_attempts, claim_until, now, drow["id"]),
+                    ).fetchone()
+
+                if updated is None:
+                    continue
+
                 endpoint = conn.execute(
                     f"""
                     SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
                     FROM webhook_endpoints
                     WHERE id = %s
                     """,
-                    (delivery.endpoint_id,),
+                    (updated["endpoint_id"],),
                 ).fetchone()
-                if endpoint is None or not endpoint["enabled"]:
-                    # Endpoint removed/disabled: dead-letter the delivery.
+                claimed.append((updated, endpoint))
+
+        # --- Phase 2: HTTP then finalize (separate short transactions) ---
+        results: list[Any] = list(recovered)
+        for drow, endpoint in claimed:
+            delivery = self._row_to_webhook_delivery(drow)
+            now = _utcnow()
+
+            if endpoint is None or not endpoint["enabled"]:
+                with transaction(self._pool) as conn:
                     updated = conn.execute(
                         f"""
                         UPDATE webhook_deliveries
                         SET status = 'dead',
+                            delivering_until = NULL,
                             last_error = %s,
                             updated_at = %s,
                             completed_at = %s
                         WHERE id = %s
+                          AND status = 'delivering'
                         RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
                         """,
                         (
@@ -1887,43 +2017,69 @@ class JobQueue:
                             delivery.id,
                         ),
                     ).fetchone()
-                    assert updated is not None
-                    result = WebhookDeliveryResult(
-                        delivery=self._row_to_webhook_delivery(updated),
-                        success=False,
-                        status_code=None,
-                        error="endpoint missing or disabled",
-                    )
-                    results.append(result)
-                    if on_result is not None:
-                        on_result(result)
+                if updated is None:
+                    # Already finalized elsewhere.
                     continue
-
-                status_code, detail = post_webhook(
-                    endpoint["url"],
-                    delivery.payload,
-                    secret=endpoint["secret"],
-                    timeout_seconds=http_timeout_seconds,
+                result = WebhookDeliveryResult(
+                    delivery=self._row_to_webhook_delivery(updated),
+                    success=False,
+                    status_code=None,
+                    error="endpoint missing or disabled",
                 )
-                attempts = delivery.attempts + 1
-                success = 200 <= status_code < 300
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
+                continue
 
+            # Stable key for the whole delivery lifetime (not per attempt).
+            idem_key = str(delivery.id)
+            status_code, detail = post_webhook(
+                endpoint["url"],
+                delivery.payload,
+                secret=endpoint["secret"],
+                timeout_seconds=http_timeout_seconds,
+                idempotency_key=idem_key,
+            )
+            success = 200 <= status_code < 300
+            attempts = delivery.attempts
+            now = _utcnow()
+
+            # Persist HTTP outcome *before* final status flip so a crash after
+            # a successful POST still leaves evidence (2xx last_status_code)
+            # and reclaim finalizes without re-sending.
+            if success:
+                with transaction(self._pool) as conn:
+                    conn.execute(
+                        """
+                        UPDATE webhook_deliveries
+                        SET last_status_code = %s,
+                            last_error = NULL,
+                            updated_at = %s
+                        WHERE id = %s
+                          AND status = 'delivering'
+                        """,
+                        (status_code, now, delivery.id),
+                    )
+
+            with transaction(self._pool) as conn:
                 if success:
                     updated = conn.execute(
                         f"""
                         UPDATE webhook_deliveries
                         SET status = 'succeeded',
-                            attempts = %s,
+                            delivering_until = NULL,
                             last_status_code = %s,
                             last_error = NULL,
                             updated_at = %s,
                             completed_at = %s
                         WHERE id = %s
+                          AND status = 'delivering'
                         RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
                         """,
-                        (attempts, status_code, now, now, delivery.id),
+                        (status_code, now, now, delivery.id),
                     ).fetchone()
-                    assert updated is not None
+                    if updated is None:
+                        continue
                     result = WebhookDeliveryResult(
                         delivery=self._row_to_webhook_delivery(updated),
                         success=True,
@@ -1935,16 +2091,16 @@ class JobQueue:
                         f"""
                         UPDATE webhook_deliveries
                         SET status = 'dead',
-                            attempts = %s,
+                            delivering_until = NULL,
                             last_status_code = %s,
                             last_error = %s,
                             updated_at = %s,
                             completed_at = %s
                         WHERE id = %s
+                          AND status = 'delivering'
                         RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
                         """,
                         (
-                            attempts,
                             status_code or None,
                             detail[:2000],
                             now,
@@ -1952,7 +2108,8 @@ class JobQueue:
                             delivery.id,
                         ),
                     ).fetchone()
-                    assert updated is not None
+                    if updated is None:
+                        continue
                     result = WebhookDeliveryResult(
                         delivery=self._row_to_webhook_delivery(updated),
                         success=False,
@@ -1970,16 +2127,16 @@ class JobQueue:
                         f"""
                         UPDATE webhook_deliveries
                         SET status = 'pending',
-                            attempts = %s,
+                            delivering_until = NULL,
                             last_status_code = %s,
                             last_error = %s,
                             next_attempt_at = %s,
                             updated_at = %s
                         WHERE id = %s
+                          AND status = 'delivering'
                         RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
                         """,
                         (
-                            attempts,
                             status_code or None,
                             detail[:2000],
                             next_at,
@@ -1987,7 +2144,8 @@ class JobQueue:
                             delivery.id,
                         ),
                     ).fetchone()
-                    assert updated is not None
+                    if updated is None:
+                        continue
                     result = WebhookDeliveryResult(
                         delivery=self._row_to_webhook_delivery(updated),
                         success=False,
@@ -1995,9 +2153,9 @@ class JobQueue:
                         error=detail,
                     )
 
-                results.append(result)
-                if on_result is not None:
-                    on_result(result)
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
 
         return results
 
@@ -2023,22 +2181,25 @@ class JobQueue:
         if not endpoints:
             return
 
-        payload = {
-            "event": event.value,
-            "job_id": str(job.id),
-            "tenant_id": job.tenant_id,
-            "queue_name": job.queue_name,
-            "status": job.status.value,
-            "payload": job.payload,
-            "result": job.result,
-            "attempts": job.attempts,
-            "max_attempts": job.max_attempts,
-            "last_error": job.last_error,
-            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-            "timestamp": now.isoformat(),
-        }
-
         for ep in endpoints:
+            delivery_id = uuid4()
+            payload = {
+                "event": event.value,
+                "delivery_id": str(delivery_id),
+                "job_id": str(job.id),
+                "tenant_id": job.tenant_id,
+                "queue_name": job.queue_name,
+                "status": job.status.value,
+                "payload": job.payload,
+                "result": job.result,
+                "attempts": job.attempts,
+                "max_attempts": job.max_attempts,
+                "last_error": job.last_error,
+                "completed_at": (
+                    job.completed_at.isoformat() if job.completed_at else None
+                ),
+                "timestamp": now.isoformat(),
+            }
             conn.execute(
                 f"""
                 INSERT INTO webhook_deliveries (
@@ -2052,7 +2213,7 @@ class JobQueue:
                 )
                 """,
                 (
-                    uuid4(),
+                    delivery_id,
                     ep["id"],
                     job.tenant_id,
                     job.id,
@@ -2102,13 +2263,13 @@ class JobQueue:
             backoff_base_seconds=int(row["backoff_base_seconds"]),
             backoff_max_seconds=int(row["backoff_max_seconds"]),
             next_attempt_at=row["next_attempt_at"],
+            delivering_until=row.get("delivering_until"),
             last_error=row["last_error"],
             last_status_code=row["last_status_code"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
         )
-
     # ------------------------------------------------------------------
     # Recurring schedules
     # ------------------------------------------------------------------

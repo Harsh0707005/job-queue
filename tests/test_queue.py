@@ -2903,3 +2903,133 @@ def test_webhook_dispatcher_run_once(queue: JobQueue):
         assert results[0].success
     finally:
         capture.stop()
+
+
+def test_webhook_no_double_send_after_success_before_db_finalize(queue: JobQueue):
+    """Simulate crash after HTTP 200 but before status=succeeded.
+
+    Claim+POST leave last_status_code=2xx while status stays delivering.
+    Next process must NOT POST again; it finalizes as succeeded.
+    """
+    from datetime import datetime, timedelta, timezone
+    from job_queue.webhooks import post_webhook
+
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            backoff_base_seconds=0,
+        )
+        queue.enqueue(tenant_id="t1", payload={"x": 1})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending) == 1
+        delivery = pending[0]
+
+        # --- Simulate phase1 claim + successful POST + crash before succeeded ---
+        now = datetime.now(timezone.utc)
+        with queue._pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status = 'delivering',
+                    attempts = 1,
+                    delivering_until = %s,
+                    last_status_code = 200,
+                    updated_at = %s
+                WHERE id = %s
+                """,
+                (now + timedelta(seconds=60), now, delivery.id),
+            )
+            conn.commit()
+
+        # Record that the real first POST already happened (simulate).
+        code, _ = post_webhook(
+            capture.url,
+            delivery.payload,
+            idempotency_key=str(delivery.id),
+        )
+        assert 200 <= code < 300
+        assert len(capture.received) == 1
+
+        # Still within claim lease: process must not re-select as pending.
+        r_mid = queue.process_webhook_deliveries(claim_seconds=60)
+        # May recover as succeeded if lease not expired... with 60s claim_seconds
+        # and delivering_until in future, reclaim query needs delivering_until < now.
+        # So nothing due.
+        assert all(
+            x.delivery.id != delivery.id or x.delivery.status == "succeeded"
+            for x in r_mid
+        )
+        # Force stuck lease expiry (crash recovery window).
+        with queue._pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET delivering_until = %s
+                WHERE id = %s AND status = 'delivering'
+                """,
+                (datetime.now(timezone.utc) - timedelta(seconds=1), delivery.id),
+            )
+            conn.commit()
+
+        before = len(capture.received)
+        results = queue.process_webhook_deliveries(claim_seconds=30)
+        # Recovered via last_status_code=200 → succeeded, no new POST.
+        assert len(capture.received) == before
+        got = queue.get_webhook_delivery(delivery.id, tenant_id="t1")
+        assert got is not None
+        assert got.status == "succeeded"
+        assert any(r.success and r.delivery.id == delivery.id for r in results)
+    finally:
+        capture.stop()
+
+
+def test_webhook_claim_before_post_not_pending_until_done(queue: JobQueue):
+    """After claim, row is delivering so concurrent process won't double-claim."""
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            backoff_base_seconds=0,
+        )
+        queue.enqueue(tenant_id="t1", payload={})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+
+        # Manually claim like phase1
+        now = __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        )
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending) == 1
+        did = pending[0].id
+        with queue._pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status = 'delivering',
+                    attempts = 1,
+                    delivering_until = %s
+                WHERE id = %s
+                """,
+                (now + __import__("datetime").timedelta(seconds=120), did),
+            )
+            conn.commit()
+
+        # Concurrent process sees no pending due rows.
+        assert queue.list_webhook_deliveries(tenant_id="t1", status="pending") == []
+        assert queue.list_webhook_deliveries(tenant_id="t1", status="delivering")
+        r = queue.process_webhook_deliveries()
+        assert r == []  # still leased, not expired
+        assert len(capture.received) == 0
+    finally:
+        capture.stop()

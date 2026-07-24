@@ -41,8 +41,13 @@ def post_webhook(
     *,
     secret: str | None = None,
     timeout_seconds: float = 10.0,
+    idempotency_key: str | None = None,
 ) -> tuple[int, str]:
-    """POST JSON payload. Returns (status_code, response_snippet_or_error)."""
+    """POST JSON payload. Returns (status_code, response_snippet_or_error).
+
+    *idempotency_key* is sent as ``Idempotency-Key`` and
+    ``X-Job-Queue-Delivery-Id`` so receivers can treat retries as one event.
+    """
     body = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -50,6 +55,9 @@ def post_webhook(
     }
     if secret:
         headers["X-Job-Queue-Signature"] = sign_payload(secret, body)
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+        headers["X-Job-Queue-Delivery-Id"] = idempotency_key
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:

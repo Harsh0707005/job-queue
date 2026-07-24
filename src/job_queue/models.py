@@ -137,7 +137,12 @@ class WebhookEndpoint:
 
 @dataclass(frozen=True, slots=True)
 class WebhookDelivery:
-    """Durable outbox row for one webhook POST attempt lifecycle."""
+    """Durable outbox row for one webhook POST attempt lifecycle.
+
+    Status lifecycle: pending → delivering → succeeded | pending (retry) | dead.
+    Claim (delivering) is committed *before* HTTP so a crash after a successful
+    POST cannot leave the row as pending and cause an automatic resend.
+    """
 
     id: UUID
     endpoint_id: UUID
@@ -151,6 +156,7 @@ class WebhookDelivery:
     backoff_base_seconds: int
     backoff_max_seconds: int
     next_attempt_at: datetime
+    delivering_until: datetime | None
     last_error: str | None
     last_status_code: int | None
     created_at: datetime
