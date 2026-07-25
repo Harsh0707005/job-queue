@@ -3533,3 +3533,70 @@ def test_worker_stopped_by_max_runtime(queue: JobQueue):
         queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
         or queue.count(tenant_id="t1", status=JobStatus.DEAD) == 1
     )
+
+
+def test_parent_dead_cancels_running_child_and_pending_grandchild(queue: JobQueue):
+    """When a mid-chain job dies, leased children are fenced and descendants cancelled."""
+    from job_queue import LeaseError
+
+    root = queue.enqueue(tenant_id="t1", payload={"n": "root"})
+    mid = queue.enqueue(tenant_id="t1", payload={"n": "mid"}, depends_on=root.id)
+    leaf = queue.enqueue(tenant_id="t1", payload={"n": "leaf"}, depends_on=mid.id)
+
+    # Complete root so mid can run.
+    r = queue.lease(tenant_id="t1", worker_id="w1")
+    assert r is not None and r.id == root.id
+    _ack(queue, r, "w1")
+
+    # Lease mid (running child of root; parent of leaf).
+    m = queue.lease(tenant_id="t1", worker_id="w-mid")
+    assert m is not None and m.id == mid.id
+    assert m.lease_token is not None
+
+    # Kill mid → cascade must stop mid's fence and cancel pending leaf.
+    dead = _nack(queue, m, "w-mid", error="mid boom", requeue=False)
+    assert dead.status in (JobStatus.FAILED, JobStatus.DEAD)
+
+    mid_after = queue.get(mid.id, tenant_id="t1")
+    # mid itself is failed/dead from nack, not cancelled
+    assert mid_after is not None
+    assert mid_after.status in (JobStatus.FAILED, JobStatus.DEAD)
+
+    leaf_after = queue.get(leaf.id, tenant_id="t1")
+    assert leaf_after is not None
+    assert leaf_after.status == JobStatus.CANCELLED
+
+
+def test_cancel_running_parent_kills_running_dependent_chain(queue: JobQueue):
+    """Cancel leased mid-job: its leased child cannot finish (fence cleared)."""
+    from job_queue import LeaseError
+
+    # Build chain where we can have two leased jobs that depend transitively.
+    # a completed → b leased, c depends on b still pending.
+    # Then cancel b while leased → c cancelled.
+    a = queue.enqueue(tenant_id="t1", payload={"n": "a"})
+    b = queue.enqueue(tenant_id="t1", payload={"n": "b"}, depends_on=a.id)
+    c = queue.enqueue(tenant_id="t1", payload={"n": "c"}, depends_on=b.id)
+
+    la = queue.lease(tenant_id="t1", worker_id="wa")
+    assert la is not None and la.id == a.id
+    _ack(queue, la, "wa")
+
+    lb = queue.lease(tenant_id="t1", worker_id="wb")
+    assert lb is not None and lb.id == b.id
+    token_b = lb.lease_token
+    assert token_b is not None
+
+    cancelled = queue.cancel(b.id, tenant_id="t1")
+    assert cancelled.status == JobStatus.CANCELLED
+
+    # Running holder cannot finish.
+    with pytest.raises(LeaseError):
+        queue.ack(b.id, tenant_id="t1", worker_id="wb", lease_token=token_b)
+    with pytest.raises(LeaseError):
+        queue.heartbeat(b.id, tenant_id="t1", worker_id="wb", lease_token=token_b)
+
+    lc = queue.get(c.id, tenant_id="t1")
+    assert lc is not None
+    assert lc.status == JobStatus.CANCELLED
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1  # only a

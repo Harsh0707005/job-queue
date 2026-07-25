@@ -1,0 +1,61 @@
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  worker-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      BATCH_SIZE: "3"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+  worker-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      BATCH_SIZE: "3"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+  worker-3:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      BATCH_SIZE: "3"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+  worker-4:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      BATCH_SIZE: "3"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+
+  cascade-soak:
+    build: .
+    command: ["python", "scripts/cascade_cancel_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "6"
+      JOBS_PER_TENANT: "20"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

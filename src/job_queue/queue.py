@@ -39,7 +39,9 @@ Design notes
   ``pending`` or ``leased`` (no overlapping runs).
 * **Dependencies**: ``depends_on`` parent job id(s). A child is not claimable
   until every parent is ``completed``. If a parent ends as failed/dead/cancelled,
-  pending dependents are cascade-cancelled (they do not sit forever).
+  dependents are cascade-cancelled **recursively** — both *pending* and
+  *leased* (running) children are stopped: fencing tokens cleared so the
+  holding worker cannot ack/heartbeat and finish them.
 * **Priority lanes + fair multi-tenant lease**: ``lease`` / ``lease_batch``
   without ``tenant_id`` claim ready jobs across tenants in **priority lanes**:
   higher ``priority`` always before lower. Within the same priority, tenants
@@ -3226,7 +3228,11 @@ class JobQueue:
         reason: str,
         now: datetime,
     ) -> None:
-        """Cancel pending jobs that depend on *parent_id* (recursively)."""
+        """Cancel pending *and leased* jobs that depend on *parent_id* (recursive).
+
+        Running (leased) children have their fencing token cleared so the worker
+        holding them cannot heartbeat/ack and complete after the parent died.
+        """
         frontier: list[UUID] = [parent_id]
         visited: set[UUID] = set()
         while frontier:
@@ -3239,13 +3245,22 @@ class JobQueue:
                 SELECT {_JOB_COLUMNS}
                 FROM jobs
                 WHERE tenant_id = %s
-                  AND status = %s
+                  AND status IN (%s, %s)
                   AND depends_on @> ARRAY[%s]::uuid[]
                 FOR UPDATE
                 """,
-                (tenant_id, JobStatus.PENDING.value, current),
+                (
+                    tenant_id,
+                    JobStatus.PENDING.value,
+                    JobStatus.LEASED.value,
+                    current,
+                ),
             ).fetchall()
             for child in children:
+                was_running = child["status"] == JobStatus.LEASED.value
+                err = reason
+                if was_running:
+                    err = f"{reason} (stopped while running)"
                 conn.execute(
                     """
                     UPDATE jobs
@@ -3253,19 +3268,21 @@ class JobQueue:
                         leased_by = NULL,
                         lease_token = NULL,
                         lease_expires_at = NULL,
+                        lease_started_at = NULL,
                         last_error = %s,
                         updated_at = %s
                     WHERE id = %s
                       AND tenant_id = %s
-                      AND status = %s
+                      AND status IN (%s, %s)
                     """,
                     (
                         JobStatus.CANCELLED.value,
-                        reason,
+                        err,
                         now,
                         child["id"],
                         tenant_id,
                         JobStatus.PENDING.value,
+                        JobStatus.LEASED.value,
                     ),
                 )
                 frontier.append(child["id"])

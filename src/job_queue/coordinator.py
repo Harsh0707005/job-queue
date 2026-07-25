@@ -112,6 +112,15 @@ class Coordinator:
 
     def _enqueue(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
+            deps = body.get("depends_on")
+            dep_ids = None
+            if deps is not None:
+                from uuid import UUID as _UUID
+
+                if isinstance(deps, (str,)):
+                    dep_ids = _UUID(str(deps))
+                else:
+                    dep_ids = [_UUID(str(x)) for x in deps]
             job = self.queue.enqueue(
                 tenant_id=str(body["tenant_id"]),
                 payload=dict(body.get("payload") or {}),
@@ -122,6 +131,7 @@ class Coordinator:
                     body.get("visibility_timeout_seconds") or 30
                 ),
                 max_runtime_seconds=int(body.get("max_runtime_seconds") or 3600),
+                depends_on=dep_ids,
             )
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
