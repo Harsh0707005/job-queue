@@ -76,6 +76,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claimable
     ON jobs (tenant_id, queue_name, available_at, priority DESC, created_at ASC)
     WHERE status = 'pending';
 
+-- Fair multi-tenant scan: priority lanes across tenants for a queue.
+CREATE INDEX IF NOT EXISTS idx_jobs_fair_priority
+    ON jobs (queue_name, priority DESC, available_at ASC, created_at ASC)
+    WHERE status = 'pending';
+
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry
     ON jobs (lease_expires_at)
     WHERE status = 'leased';

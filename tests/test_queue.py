@@ -2035,24 +2035,71 @@ def test_fair_lease_ack_drain_multi_worker_no_starvation(queue: JobQueue):
     assert queue.count(tenant_id="quiet", status=JobStatus.COMPLETED) == 5
 
 
-def test_fair_lease_starvation_with_priority_and_backlog(queue: JobQueue):
-    """High-priority noisy backlog still cannot block quiet default jobs forever."""
-    for i in range(30):
-        queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=10)
-    quiet = queue.enqueue(tenant_id="quiet", payload={"t": "q"}, priority=0)
+def test_fair_lease_priority_lane_before_low(queue: JobQueue):
+    """High-priority work of any tenant runs before low-priority noise."""
+    for i in range(20):
+        queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=0)
+    high = queue.enqueue(tenant_id="quiet", payload={"t": "q"}, priority=10)
 
-    seen_quiet = False
-    for step in range(31):
+    first = queue.lease(worker_id="pri-w")
+    assert first is not None
+    assert first.id == high.id
+    _ack(queue, first, "pri-w")
+
+
+def test_fair_lease_high_priority_lane_fair_across_tenants(queue: JobQueue):
+    """Within the high lane, tenants rotate — one tenant cannot monopolize."""
+    for i in range(15):
+        queue.enqueue(tenant_id="a", payload={"i": i}, priority=10)
+    for i in range(15):
+        queue.enqueue(tenant_id="b", payload={"i": i}, priority=10)
+    # Low noise that must wait until the high lane drains.
+    for i in range(10):
+        queue.enqueue(tenant_id="c", payload={"i": i}, priority=0)
+
+    first_30: list[str] = []
+    for _ in range(30):
+        job = queue.lease(worker_id="lane-w")
+        assert job is not None
+        first_30.append(job.tenant_id)
+        assert job.priority == 10, "low lane must not interleave before high drains"
+        _ack(queue, job, "lane-w")
+
+    assert first_30.count("a") == 15
+    assert first_30.count("b") == 15
+    # Round-robin within lane: no long monopoly streak of a single tenant.
+    max_streak = 1
+    streak = 1
+    for i in range(1, len(first_30)):
+        if first_30[i] == first_30[i - 1]:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 1
+    assert max_streak <= 2, f"tenant monopolized high lane: streak={max_streak}"
+
+    low = queue.lease(worker_id="lane-w")
+    assert low is not None
+    assert low.priority == 0
+    assert low.tenant_id == "c"
+
+
+def test_fair_lease_high_of_quiet_beats_low_of_noisy(queue: JobQueue):
+    """Noisy tenant flooding low priority cannot block quiet high priority."""
+    for i in range(40):
+        queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=1)
+    quiet_high = queue.enqueue(tenant_id="quiet", payload={"t": "q"}, priority=100)
+
+    order: list[tuple[str, int]] = []
+    for _ in range(5):
         job = queue.lease(worker_id="pri-w")
         assert job is not None
-        if job.id == quiet.id:
-            seen_quiet = True
-            _ack(queue, job, "pri-w")
-            break
+        order.append((job.tenant_id, job.priority))
         _ack(queue, job, "pri-w")
-        assert step < 5, f"quiet still starved after {step + 1} leases"
 
-    assert seen_quiet
+    assert order[0] == ("quiet", 100)
+    # Remaining early leases are noisy low only after high is done.
+    assert all(t == "noisy" and p == 1 for t, p in order[1:])
 
 
 def test_fair_lease_respects_tenant_concurrency_limit(queue: JobQueue):

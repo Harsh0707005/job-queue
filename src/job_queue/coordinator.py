@@ -56,6 +56,8 @@ class Coordinator:
         if method == "GET" and path == "/health":
             return 200, {"ok": True, "role": "coordinator", "node": os.environ.get("COORDINATOR_NODE", "default")}
 
+        if method == "POST" and path == "/v1/jobs":
+            return self._enqueue(body)
         if method == "POST" and path == "/v1/lease":
             return self._lease(body)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/heartbeat"):
@@ -95,12 +97,32 @@ class Coordinator:
             return self._webhook_stats()
         if method == "GET" and path == "/v1/admin/fairness-check":
             return self._fairness_check()
+        if method == "GET" and path == "/v1/admin/completion-order":
+            return self._completion_order(query)
+        if method == "GET" and path == "/v1/admin/priority-stats":
+            return self._priority_stats(query)
 
         return 404, {"error": f"unknown route {method} {path}"}
 
     # ------------------------------------------------------------------
     # Worker protocol
     # ------------------------------------------------------------------
+
+    def _enqueue(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        try:
+            job = self.queue.enqueue(
+                tenant_id=str(body["tenant_id"]),
+                payload=dict(body.get("payload") or {}),
+                queue_name=str(body.get("queue_name") or "default"),
+                priority=int(body.get("priority") or 0),
+                max_attempts=int(body.get("max_attempts") or 3),
+                visibility_timeout_seconds=int(
+                    body.get("visibility_timeout_seconds") or 30
+                ),
+            )
+        except (KeyError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 201, {"job": job_to_dict(job)}
 
     def _lease(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         worker_id = body.get("worker_id")
@@ -466,6 +488,95 @@ class Coordinator:
             "max_active_per_schedule": max(
                 (int(r["n"]) for r in active), default=0
             ),
+        }
+
+    def _completion_order(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        """Completed jobs in completion time order (for priority-lane soaks)."""
+        limit = int((query.get("limit") or ["500"])[0])
+        limit = max(1, min(limit, 5000))
+        with self.queue._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id::text AS id, tenant_id, priority, completed_at
+                FROM jobs
+                WHERE status = 'completed'
+                  AND completed_at IS NOT NULL
+                ORDER BY completed_at ASC, created_at ASC
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return 200, {
+            "completed": [
+                {
+                    "id": r["id"],
+                    "tenant_id": r["tenant_id"],
+                    "priority": int(r["priority"]),
+                    "completed_at": r["completed_at"].isoformat()
+                    if r["completed_at"]
+                    else None,
+                }
+                for r in rows
+            ]
+        }
+
+    def _priority_stats(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        """Aggregate high/low lane progress (defaults: high>=50, low<50)."""
+        high_min = int((query.get("high_min") or ["50"])[0])
+        with self.queue._pool.connection() as conn:
+            high_c = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n FROM jobs
+                WHERE status = 'completed' AND priority >= %s
+                """,
+                (high_min,),
+            ).fetchone()
+            low_c = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n FROM jobs
+                WHERE status = 'completed' AND priority < %s
+                """,
+                (high_min,),
+            ).fetchone()
+            high_p = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n FROM jobs
+                WHERE status = 'pending' AND priority >= %s
+                """,
+                (high_min,),
+            ).fetchone()
+            high_l = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n FROM jobs
+                WHERE status = 'leased' AND priority >= %s
+                """,
+                (high_min,),
+            ).fetchone()
+            by_tenant = conn.execute(
+                """
+                SELECT tenant_id, COUNT(*)::int AS n
+                FROM jobs
+                WHERE status = 'completed' AND priority >= %s
+                GROUP BY tenant_id
+                ORDER BY tenant_id
+                """,
+                (high_min,),
+            ).fetchall()
+        assert high_c is not None and low_c is not None
+        assert high_p is not None and high_l is not None
+        return 200, {
+            "high_min": high_min,
+            "high_completed": int(high_c["n"]),
+            "low_completed": int(low_c["n"]),
+            "high_pending": int(high_p["n"]),
+            "high_leased": int(high_l["n"]),
+            "high_completed_by_tenant": {
+                r["tenant_id"]: int(r["n"]) for r in by_tenant
+            },
         }
 
 

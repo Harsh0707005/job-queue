@@ -34,10 +34,13 @@ Design notes
 * **Dependencies**: ``depends_on`` parent job id(s). A child is not claimable
   until every parent is ``completed``. If a parent ends as failed/dead/cancelled,
   pending dependents are cascade-cancelled (they do not sit forever).
-* **Fair multi-tenant lease**: ``lease(worker_id=...)`` without ``tenant_id``
-  claims ready jobs across tenants by **least-recently-served tenant**
-  (``tenant_fairness.last_lease_at``), so a large backlog enqueued first
-  cannot starve quieter tenants even under sequential lease+ack drain.
+* **Priority lanes + fair multi-tenant lease**: ``lease(worker_id=...)``
+  without ``tenant_id`` claims ready jobs across tenants in **priority lanes**:
+  higher ``priority`` always before lower. Within the same priority, tenants
+  rotate by **least-recently-served** (``tenant_fairness.last_lease_at``) so a
+  noisy high-priority backlog cannot monopolize the lane — and a noisy
+  *low*-priority backlog cannot jump ahead of others' high-priority work.
+  Scoped ``lease(tenant_id=...)`` is priority-ordered within that tenant only.
   Per-job rules (delay, deps, concurrency caps, queue name) still apply.
 * **Retry backoff**: nack-requeue uses exponential ``available_at`` delay
   (base * 2^(attempt-1), capped by max). After ``max_attempts`` the job is
@@ -812,10 +815,11 @@ class JobQueue:
         now: datetime,
     ) -> Job | None:
         token = uuid4()
-        # Least-recently-served tenant first (never-served = -infinity).
-        # This stays fair under sequential lease+ack: after noisy is served
-        # once, quiet (never/older last_lease_at) is preferred even if noisy
-        # still has a large older backlog.
+        # Priority lanes first (higher priority always before lower), then
+        # least-recently-served tenant within that lane (never-served =
+        # -infinity). A noisy tenant's high-priority flood still rotates with
+        # other tenants at the same priority; it cannot leapfrog higher-priority
+        # work of quieter tenants, and low-priority noise cannot starve high.
         candidate = conn.execute(
             f"""
             SELECT {_JOB_COLUMNS}
@@ -858,6 +862,7 @@ class JobQueue:
                  )
               )
             ORDER BY
+              priority DESC,
               COALESCE(
                 (
                     SELECT tf.last_lease_at
@@ -866,7 +871,6 @@ class JobQueue:
                 ),
                 TIMESTAMPTZ '-infinity'
               ) ASC,
-              priority DESC,
               created_at ASC
             FOR UPDATE OF jobs SKIP LOCKED
             LIMIT 1
