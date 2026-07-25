@@ -41,6 +41,7 @@ class Job:
     attempts: int
     max_attempts: int
     visibility_timeout_seconds: int
+    max_runtime_seconds: int
     retry_backoff_base_seconds: int
     retry_backoff_max_seconds: int
     available_at: datetime
@@ -50,6 +51,7 @@ class Job:
     leased_by: str | None
     lease_token: UUID | None
     lease_expires_at: datetime | None
+    lease_started_at: datetime | None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None

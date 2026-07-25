@@ -11,6 +11,10 @@ Design notes
   ``lease_expires_at``. If the worker dies (no heartbeat), the lease expires
   and another worker may reclaim it. Live workers must heartbeat (the
   ``Worker`` helper does this) and abort when the lease is lost.
+* **Max runtime**: ``max_runtime_seconds`` is a hard wall-clock limit from
+  ``lease_started_at``. Heartbeats cannot extend the lease past that deadline;
+  once exceeded the lease is force-released (requeue or dead-letter) so a
+  stuck worker cannot hold a job forever by heartbeating.
 * **Delayed jobs**: pending jobs with ``available_at`` in the future cannot
   be claimed until that time.
 * **Deduplication**: ``dedupe_key`` ensures at most one active (pending or
@@ -91,10 +95,11 @@ _DEDUPE_LOCK_CLASS = 884_422_01
 
 _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
-    max_attempts, visibility_timeout_seconds, retry_backoff_base_seconds,
-    retry_backoff_max_seconds, available_at, dedupe_key, schedule_id,
-    depends_on, leased_by, lease_token, lease_expires_at, created_at,
-    updated_at, completed_at, result, last_error
+    max_attempts, visibility_timeout_seconds, max_runtime_seconds,
+    retry_backoff_base_seconds, retry_backoff_max_seconds, available_at,
+    dedupe_key, schedule_id, depends_on, leased_by, lease_token,
+    lease_expires_at, lease_started_at, created_at, updated_at, completed_at,
+    result, last_error
 """
 
 # Pending job is claimable only when every depends_on parent is completed.
@@ -134,6 +139,11 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         attempts=row["attempts"],
         max_attempts=row["max_attempts"],
         visibility_timeout_seconds=row["visibility_timeout_seconds"],
+        max_runtime_seconds=(
+            3600
+            if row.get("max_runtime_seconds") is None
+            else int(row["max_runtime_seconds"])
+        ),
         retry_backoff_base_seconds=(
             1
             if row.get("retry_backoff_base_seconds") is None
@@ -151,6 +161,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         leased_by=row["leased_by"],
         lease_token=row["lease_token"],
         lease_expires_at=row["lease_expires_at"],
+        lease_started_at=row.get("lease_started_at"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
@@ -452,6 +463,7 @@ class JobQueue:
         priority: int = 0,
         max_attempts: int = 3,
         visibility_timeout_seconds: int = 30,
+        max_runtime_seconds: int = 3600,
         retry_backoff_base_seconds: int = 1,
         retry_backoff_max_seconds: int = 300,
         available_at: datetime | None = None,
@@ -480,6 +492,10 @@ class JobQueue:
             already failed/dead/cancelled at enqueue time, raises
             ``DependencyError``. If a parent later fails, pending children are
             cascade-cancelled.
+        max_runtime_seconds:
+            Hard wall-clock limit for one lease attempt (from
+            ``lease_started_at``). Heartbeats cannot extend past this; on
+            exceed the job is force-released (requeued or dead-lettered).
         retry_backoff_base_seconds / retry_backoff_max_seconds:
             On nack requeue, delay is ``base * 2^(attempt-1)`` seconds, capped
             by max. After ``max_attempts`` failures the job is dead-lettered.
@@ -490,6 +506,8 @@ class JobQueue:
             raise ValueError("max_attempts must be >= 1")
         if visibility_timeout_seconds < 1:
             raise ValueError("visibility_timeout_seconds must be >= 1")
+        if max_runtime_seconds < 1:
+            raise ValueError("max_runtime_seconds must be >= 1")
         if retry_backoff_base_seconds < 0:
             raise ValueError("retry_backoff_base_seconds must be >= 0")
         if retry_backoff_max_seconds < 0:
@@ -544,12 +562,14 @@ class JobQueue:
                     INSERT INTO jobs (
                         id, tenant_id, queue_name, payload, status, priority,
                         attempts, max_attempts, visibility_timeout_seconds,
+                        max_runtime_seconds,
                         retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
                         created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
+                        %s,
                         %s, %s,
                         %s, %s, NULL, %s,
                         %s, %s
@@ -569,6 +589,7 @@ class JobQueue:
                         priority,
                         max_attempts,
                         visibility_timeout_seconds,
+                        max_runtime_seconds,
                         retry_backoff_base_seconds,
                         retry_backoff_max_seconds,
                         run_at,
@@ -599,12 +620,14 @@ class JobQueue:
                 INSERT INTO jobs (
                     id, tenant_id, queue_name, payload, status, priority,
                     attempts, max_attempts, visibility_timeout_seconds,
+                    max_runtime_seconds,
                     retry_backoff_base_seconds, retry_backoff_max_seconds,
                     available_at, dedupe_key, schedule_id, depends_on,
                     created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     0, %s, %s,
+                    %s,
                     %s, %s,
                     %s, NULL, NULL, %s,
                     %s, %s
@@ -620,6 +643,7 @@ class JobQueue:
                     priority,
                     max_attempts,
                     visibility_timeout_seconds,
+                    max_runtime_seconds,
                     retry_backoff_base_seconds,
                     retry_backoff_max_seconds,
                     run_at,
@@ -990,7 +1014,11 @@ class JobQueue:
     ) -> Job:
         new_attempts = candidate["attempts"] + 1
         vt = visibility_timeout_seconds or candidate["visibility_timeout_seconds"]
+        max_rt = int(candidate.get("max_runtime_seconds") or 3600)
         lease_expires = now + timedelta(seconds=vt)
+        hard = now + timedelta(seconds=max_rt)
+        if lease_expires > hard:
+            lease_expires = hard
 
         row = conn.execute(
             f"""
@@ -999,6 +1027,7 @@ class JobQueue:
                 leased_by = %s,
                 lease_token = %s,
                 lease_expires_at = %s,
+                lease_started_at = %s,
                 attempts = %s,
                 visibility_timeout_seconds = %s,
                 updated_at = %s,
@@ -1012,6 +1041,7 @@ class JobQueue:
                 worker_id,
                 token,
                 lease_expires,
+                now,
                 new_attempts,
                 vt,
                 now,
@@ -1021,6 +1051,105 @@ class JobQueue:
         ).fetchone()
         assert row is not None
         return _row_to_job(row)
+
+    def _hard_deadline(self, row: dict[str, Any]) -> datetime | None:
+        started = row.get("lease_started_at")
+        if started is None:
+            return None
+        max_rt = row.get("max_runtime_seconds")
+        if max_rt is None:
+            max_rt = 3600
+        return _as_utc(started) + timedelta(seconds=int(max_rt))
+
+    def _release_max_runtime_exceeded(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> None:
+        """Force-release a stuck lease that exceeded max_runtime_seconds."""
+        attempts = int(row["attempts"])
+        max_attempts = int(row["max_attempts"])
+        error = "max runtime exceeded"
+        if attempts >= max_attempts:
+            conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    lease_started_at = NULL,
+                    last_error = %s,
+                    completed_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND tenant_id = %s
+                  AND status = %s
+                """,
+                (
+                    JobStatus.DEAD.value,
+                    error,
+                    now,
+                    now,
+                    row["id"],
+                    row["tenant_id"],
+                    JobStatus.LEASED.value,
+                ),
+            )
+            self._cascade_cancel_dependents(
+                conn,
+                parent_id=row["id"],
+                tenant_id=row["tenant_id"],
+                reason=f"parent job {row['id']} dead (max runtime)",
+                now=now,
+            )
+            dead_row = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (row["id"],),
+            ).fetchone()
+            if dead_row is not None:
+                self._enqueue_job_webhooks(
+                    conn,
+                    job=_row_to_job(dead_row),
+                    event=WebhookEvent.JOB_DEAD,
+                    now=now,
+                )
+        else:
+            base = row.get("retry_backoff_base_seconds")
+            cap = row.get("retry_backoff_max_seconds")
+            backoff = compute_retry_backoff_seconds(
+                attempts,
+                base_seconds=1 if base is None else int(base),
+                max_seconds=300 if cap is None else int(cap),
+            )
+            next_available = now + timedelta(seconds=backoff)
+            conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    lease_started_at = NULL,
+                    last_error = %s,
+                    available_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND tenant_id = %s
+                  AND status = %s
+                """,
+                (
+                    JobStatus.PENDING.value,
+                    error,
+                    next_available,
+                    now,
+                    row["id"],
+                    row["tenant_id"],
+                    JobStatus.LEASED.value,
+                ),
+            )
 
     def _dead_letter_exhausted_leases(
         self,
@@ -1157,6 +1286,7 @@ class JobQueue:
                     leased_by = NULL,
                     lease_token = NULL,
                     lease_expires_at = NULL,
+                    lease_started_at = NULL,
                     last_error = CASE
                         WHEN %s THEN 'cancelled while running'
                         ELSE last_error
@@ -1214,40 +1344,60 @@ class JobQueue:
         """Extend the lease held by *worker_id* under *lease_token*.
 
         Requires matching tenant, worker, and fencing token. Raises
-        ``LeaseError`` if the lease was reclaimed, expired, or completed.
+        ``LeaseError`` if the lease was reclaimed, expired, completed, or the
+        hard ``max_runtime_seconds`` deadline has been exceeded (the job is
+        force-released so a stuck worker cannot heartbeat forever).
         """
         now = _utcnow()
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_tenant(conn, job_id, tenant_id)
-            self._assert_active_lease(row, worker_id, lease_token, now)
+            self._assert_lease_holder(row, worker_id, lease_token)
+            hard = self._hard_deadline(row)
+            if hard is not None and now >= hard:
+                # Commit force-release, then signal the worker (do not raise
+                # inside the transaction or the release would roll back).
+                self._release_max_runtime_exceeded(conn, row, now=now)
+                runtime_exceeded = True
+            else:
+                runtime_exceeded = False
+                self._assert_lease_not_expired(row, now)
 
-            extend = extend_by_seconds or row["visibility_timeout_seconds"]
-            new_expiry = now + timedelta(seconds=extend)
+                extend = extend_by_seconds or row["visibility_timeout_seconds"]
+                new_expiry = now + timedelta(seconds=extend)
+                if hard is not None and new_expiry > hard:
+                    new_expiry = hard
 
-            updated = conn.execute(
-                f"""
-                UPDATE jobs
-                SET lease_expires_at = %s,
-                    updated_at = %s
-                WHERE id = %s
-                  AND tenant_id = %s
-                  AND lease_token = %s
-                  AND status = %s
-                RETURNING {_JOB_COLUMNS}
-                """,
-                (
-                    new_expiry,
-                    now,
-                    job_id,
-                    tenant_id,
-                    lease_token,
-                    JobStatus.LEASED.value,
-                ),
-            ).fetchone()
-            if updated is None:
-                raise LeaseError(f"job {job_id} lease lost during heartbeat")
-            return _row_to_job(updated)
+                updated = conn.execute(
+                    f"""
+                    UPDATE jobs
+                    SET lease_expires_at = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND tenant_id = %s
+                      AND lease_token = %s
+                      AND status = %s
+                    RETURNING {_JOB_COLUMNS}
+                    """,
+                    (
+                        new_expiry,
+                        now,
+                        job_id,
+                        tenant_id,
+                        lease_token,
+                        JobStatus.LEASED.value,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    raise LeaseError(f"job {job_id} lease lost during heartbeat")
+                return _row_to_job(updated)
+
+        if runtime_exceeded:
+            raise LeaseError(
+                f"job {job_id} max runtime exceeded "
+                f"(limit={row.get('max_runtime_seconds')}s)"
+            )
+        raise LeaseError(f"job {job_id} lease lost during heartbeat")
 
     # ------------------------------------------------------------------
     # Ack / Nack
@@ -1272,42 +1422,56 @@ class JobQueue:
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_tenant(conn, job_id, tenant_id)
-            self._assert_active_lease(row, worker_id, lease_token, now)
+            self._assert_lease_holder(row, worker_id, lease_token)
+            hard = self._hard_deadline(row)
+            if hard is not None and now >= hard:
+                self._release_max_runtime_exceeded(conn, row, now=now)
+                runtime_exceeded = True
+            else:
+                runtime_exceeded = False
+                self._assert_lease_not_expired(row, now)
 
-            updated = conn.execute(
-                f"""
-                UPDATE jobs
-                SET status = %s,
-                    leased_by = NULL,
-                    lease_token = NULL,
-                    lease_expires_at = NULL,
-                    completed_at = %s,
-                    result = %s,
-                    updated_at = %s
-                WHERE id = %s
-                  AND tenant_id = %s
-                  AND lease_token = %s
-                  AND status = %s
-                RETURNING {_JOB_COLUMNS}
-                """,
-                (
-                    JobStatus.COMPLETED.value,
-                    now,
-                    result_json,
-                    now,
-                    job_id,
-                    tenant_id,
-                    lease_token,
-                    JobStatus.LEASED.value,
-                ),
-            ).fetchone()
-            if updated is None:
-                raise LeaseError(f"job {job_id} lease lost during ack")
-            job = _row_to_job(updated)
-            self._enqueue_job_webhooks(
-                conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
+                updated = conn.execute(
+                    f"""
+                    UPDATE jobs
+                    SET status = %s,
+                        leased_by = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        lease_started_at = NULL,
+                        completed_at = %s,
+                        result = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND tenant_id = %s
+                      AND lease_token = %s
+                      AND status = %s
+                    RETURNING {_JOB_COLUMNS}
+                    """,
+                    (
+                        JobStatus.COMPLETED.value,
+                        now,
+                        result_json,
+                        now,
+                        job_id,
+                        tenant_id,
+                        lease_token,
+                        JobStatus.LEASED.value,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    raise LeaseError(f"job {job_id} lease lost during ack")
+                job = _row_to_job(updated)
+                self._enqueue_job_webhooks(
+                    conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
+                )
+                return job
+
+        if runtime_exceeded:
+            raise LeaseError(
+                f"job {job_id} max runtime exceeded; refusing ack"
             )
-            return job
+        raise LeaseError(f"job {job_id} lease lost during ack")
 
     def nack(
         self,
@@ -1361,6 +1525,7 @@ class JobQueue:
                     leased_by = NULL,
                     lease_token = NULL,
                     lease_expires_at = NULL,
+                    lease_started_at = NULL,
                     available_at = %s,
                     last_error = %s,
                     updated_at = %s
@@ -2764,12 +2929,14 @@ class JobQueue:
                             INSERT INTO jobs (
                                 id, tenant_id, queue_name, payload, status, priority,
                                 attempts, max_attempts, visibility_timeout_seconds,
+                                max_runtime_seconds,
                                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
                                 created_at, updated_at
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
                                 0, %s, %s,
+                                3600,
                                 1, 300,
                                 %s, NULL, %s, %s,
                                 %s, %s
@@ -3131,11 +3298,10 @@ class JobQueue:
         ).fetchone()
 
     @staticmethod
-    def _assert_active_lease(
+    def _assert_lease_holder(
         row: dict[str, Any],
         worker_id: str,
         lease_token: UUID,
-        now: datetime,
     ) -> None:
         if row["status"] != JobStatus.LEASED.value:
             raise LeaseError(
@@ -3151,6 +3317,20 @@ class JobQueue:
                 f"job {row['id']} lease_token mismatch "
                 f"(fence invalidated; lease was reclaimed)"
             )
+
+    @staticmethod
+    def _assert_lease_not_expired(row: dict[str, Any], now: datetime) -> None:
         expires = row["lease_expires_at"]
         if expires is not None and expires < now:
             raise LeaseError(f"job {row['id']} lease has expired")
+
+    @classmethod
+    def _assert_active_lease(
+        cls,
+        row: dict[str, Any],
+        worker_id: str,
+        lease_token: UUID,
+        now: datetime,
+    ) -> None:
+        cls._assert_lease_holder(row, worker_id, lease_token)
+        cls._assert_lease_not_expired(row, now)

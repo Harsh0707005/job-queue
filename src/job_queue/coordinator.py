@@ -121,6 +121,7 @@ class Coordinator:
                 visibility_timeout_seconds=int(
                     body.get("visibility_timeout_seconds") or 30
                 ),
+                max_runtime_seconds=int(body.get("max_runtime_seconds") or 3600),
             )
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}

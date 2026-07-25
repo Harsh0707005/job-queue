@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts                    INTEGER NOT NULL DEFAULT 0,
     max_attempts                INTEGER NOT NULL DEFAULT 3,
     visibility_timeout_seconds  INTEGER NOT NULL DEFAULT 30,
+    max_runtime_seconds         INTEGER NOT NULL DEFAULT 3600,
     retry_backoff_base_seconds  INTEGER NOT NULL DEFAULT 1,
     retry_backoff_max_seconds   INTEGER NOT NULL DEFAULT 300,
     available_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     leased_by                   TEXT,
     lease_token                 UUID,
     lease_expires_at            TIMESTAMPTZ,
+    lease_started_at            TIMESTAMPTZ,
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at                TIMESTAMPTZ,
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     CONSTRAINT jobs_attempts_check CHECK (attempts >= 0),
     CONSTRAINT jobs_max_attempts_check CHECK (max_attempts >= 1),
     CONSTRAINT jobs_visibility_check CHECK (visibility_timeout_seconds >= 1),
+    CONSTRAINT jobs_max_runtime_check CHECK (max_runtime_seconds >= 1),
     CONSTRAINT jobs_backoff_base_check CHECK (retry_backoff_base_seconds >= 0),
     CONSTRAINT jobs_backoff_max_check CHECK (retry_backoff_max_seconds >= 0)
 );
@@ -48,6 +51,8 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS depends_on UUID[];
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result JSONB;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_backoff_base_seconds INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_backoff_max_seconds INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS max_runtime_seconds INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_started_at TIMESTAMPTZ;
 
 UPDATE jobs
 SET retry_backoff_base_seconds = 1
@@ -55,10 +60,15 @@ WHERE retry_backoff_base_seconds IS NULL;
 UPDATE jobs
 SET retry_backoff_max_seconds = 300
 WHERE retry_backoff_max_seconds IS NULL;
+UPDATE jobs
+SET max_runtime_seconds = 3600
+WHERE max_runtime_seconds IS NULL;
 ALTER TABLE jobs ALTER COLUMN retry_backoff_base_seconds SET DEFAULT 1;
 ALTER TABLE jobs ALTER COLUMN retry_backoff_max_seconds SET DEFAULT 300;
+ALTER TABLE jobs ALTER COLUMN max_runtime_seconds SET DEFAULT 3600;
 ALTER TABLE jobs ALTER COLUMN retry_backoff_base_seconds SET NOT NULL;
 ALTER TABLE jobs ALTER COLUMN retry_backoff_max_seconds SET NOT NULL;
+ALTER TABLE jobs ALTER COLUMN max_runtime_seconds SET NOT NULL;
 
 UPDATE jobs SET available_at = created_at WHERE available_at IS NULL;
 ALTER TABLE jobs ALTER COLUMN available_at SET DEFAULT NOW();

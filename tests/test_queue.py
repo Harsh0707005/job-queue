@@ -3386,3 +3386,150 @@ def test_cancel_running_cascades_to_pending_children(queue: JobQueue):
     queue.cancel(parent.id, tenant_id="t1")
     assert queue.get(parent.id, tenant_id="t1").status == JobStatus.CANCELLED
     assert queue.get(child.id, tenant_id="t1").status == JobStatus.CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# Max runtime hard stop (stuck heartbeat cannot hold forever)
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_cannot_extend_past_max_runtime(queue: JobQueue):
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        visibility_timeout_seconds=30,
+        max_runtime_seconds=2,
+        max_attempts=3,
+    )
+    leased = queue.lease(
+        tenant_id="t1",
+        worker_id="w1",
+        visibility_timeout_seconds=30,
+    )
+    assert leased is not None
+    assert leased.lease_started_at is not None
+    assert leased.max_runtime_seconds == 2
+    # First heartbeat while within window succeeds but caps expiry.
+    hb = queue.heartbeat(
+        leased.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        extend_by_seconds=30,
+    )
+    hard = leased.lease_started_at.timestamp() + 2
+    assert hb.lease_expires_at is not None
+    assert hb.lease_expires_at.timestamp() <= hard + 0.05
+
+    time.sleep(2.1)
+    with pytest.raises(LeaseError, match="max runtime"):
+        queue.heartbeat(
+            leased.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+        )
+
+    got = queue.get(leased.id, tenant_id="t1")
+    assert got is not None
+    # Force-released for retry (attempts=1 < max 3).
+    assert got.status == JobStatus.PENDING
+    assert got.last_error == "max runtime exceeded"
+    assert got.lease_token is None
+
+
+def test_max_runtime_dead_letters_after_max_attempts(queue: JobQueue):
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        visibility_timeout_seconds=30,
+        max_runtime_seconds=1,
+        max_attempts=1,
+        retry_backoff_base_seconds=0,
+    )
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    time.sleep(1.1)
+    with pytest.raises(LeaseError, match="max runtime"):
+        queue.heartbeat(
+            leased.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+        )
+    got = queue.get(job.id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.DEAD
+    assert got.last_error == "max runtime exceeded"
+
+
+def test_ack_rejected_after_max_runtime(queue: JobQueue):
+    queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        max_runtime_seconds=1,
+        visibility_timeout_seconds=30,
+        max_attempts=5,
+    )
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    time.sleep(1.1)
+    with pytest.raises(LeaseError, match="max runtime"):
+        queue.ack(
+            leased.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+            result={"late": True},
+        )
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
+
+
+def test_worker_stopped_by_max_runtime(queue: JobQueue):
+    """Worker heartbeating a long job hits max_runtime and cannot complete."""
+    queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        max_runtime_seconds=1,
+        visibility_timeout_seconds=30,
+        max_attempts=3,
+    )
+
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="stuck",
+        heartbeat_interval_seconds=0.2,
+        visibility_timeout_seconds=30,
+    )
+    outcomes: list[str] = []
+
+    @worker.handler
+    def handle(job: Job, lease: LeaseContext) -> dict:
+        outcomes.append("start")
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if lease.lease_lost.is_set():
+                outcomes.append("lost")
+                raise LeaseError("stopped")
+            try:
+                lease.ensure_held()
+            except LeaseError:
+                outcomes.append("ensure")
+                raise
+            time.sleep(0.1)
+        outcomes.append("done")
+        return {"ok": True}
+
+    with pytest.raises(LeaseError):
+        worker.run_once()
+
+    assert "done" not in outcomes
+    assert "lost" in outcomes or "ensure" in outcomes
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
+    # Force-released back to pending (or dead if attempts exhausted).
+    assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 0
+    assert (
+        queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+        or queue.count(tenant_id="t1", status=JobStatus.DEAD) == 1
+    )
