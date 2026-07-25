@@ -1,0 +1,141 @@
+# Optimized load stack: Go lease path + Postgres tuning.
+# Replaces Python coordinators in-place so worker depends_on stay valid.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.load-go.yml down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.load-go.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.load-go.yml \
+#     up --abort-on-container-exit --exit-code-from load-soak load-soak
+
+x-go-worker: &go_worker_env
+  COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+  POLL_INTERVAL: "0.02"
+  VISIBILITY_TIMEOUT: "30"
+  BATCH_SIZE: "64"
+  LOG_LEVEL: WARNING
+
+x-go-coord: &go_coord
+  build:
+    context: ./go
+    dockerfile: Dockerfile
+  entrypoint: ["/usr/local/bin/go-lease"]
+  command: []
+  environment: &go_coord_env
+    JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+    LISTEN_ADDR: ":8080"
+    PG_POOL_MAX: "48"
+    PG_POOL_MIN: "8"
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+    interval: 3s
+    timeout: 5s
+    retries: 40
+    start_period: 5s
+
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - checkpoint_completion_target=0.9
+    shm_size: 1g
+
+  schema-init:
+    build: .
+    command: ["python", "scripts/init_schema.py"]
+    environment:
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  coordinator-1:
+    <<: *go_coord
+    environment:
+      <<: *go_coord_env
+      COORDINATOR_NODE: go-lease-1
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  coordinator-2:
+    <<: *go_coord
+    environment:
+      <<: *go_coord_env
+      COORDINATOR_NODE: go-lease-2
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  worker-1:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w1
+  worker-2:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w2
+  worker-3:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w3
+  worker-4:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w4
+  worker-5:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w5
+  worker-6:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w6
+  worker-7:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w7
+  worker-8:
+    environment:
+      <<: *go_worker_env
+      WORKER_ID: load-w8
+
+  load-soak:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      LEASE_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "20"
+      JOBS_PER_TENANT: "250"
+      ENQUEUE_WORKERS: "24"
+      MAX_WALL_SECONDS: "300"
+      POLL_SECONDS: "0.5"
+      LOAD_LABEL: optimized-go
+      RESULTS_PATH: /results/optimized-go.json
+      LOG_LEVEL: INFO

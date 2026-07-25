@@ -1,0 +1,33 @@
+{
+  "scenario": {
+    "tenants": 20,
+    "jobs_per_tenant": 250,
+    "total_jobs": 5000,
+    "workers": 8,
+    "batch_size_baseline": 32,
+    "batch_size_optimized": 64
+  },
+  "baseline_python": {
+    "ok": false,
+    "error": "timeout",
+    "enqueue_seconds": 4.19,
+    "enqueue_jobs_per_sec": 1192.9,
+    "drain_seconds": 600.63,
+    "completed_before_timeout": 3200,
+    "pending_at_timeout": 1800,
+    "approx_drain_jobs_per_sec": 5.33
+  },
+  "optimized_go_postgres": {
+    "ok": true,
+    "enqueue_seconds": 12.1935,
+    "enqueue_jobs_per_sec": 410.06,
+    "drain_seconds": 19.8946,
+    "drain_jobs_per_sec": 251.32,
+    "time_to_first_complete_seconds": 0.5221,
+    "completed": 5000
+  },
+  "speedup": {
+    "drain_throughput_x": 47.2,
+    "notes": "Baseline timed out at 600s with 3200/5000 done (~5.3 jobs/s). Optimized drained all 5000 in ~20s (~251 jobs/s)."
+  }
+}

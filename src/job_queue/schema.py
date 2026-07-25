@@ -91,6 +91,19 @@ CREATE INDEX IF NOT EXISTS idx_jobs_fair_priority
     ON jobs (queue_name, priority DESC, available_at ASC, created_at ASC)
     WHERE status = 'pending';
 
+-- Fast ready-set scan for set-based fair lease (Go lease path / large backlogs).
+CREATE INDEX IF NOT EXISTS idx_jobs_fair_ready_v2
+    ON jobs (queue_name, priority DESC, created_at ASC)
+    WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_fair_reclaim_v2
+    ON jobs (queue_name, priority DESC, created_at ASC)
+    WHERE status = 'leased';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_queue_pending
+    ON jobs (tenant_id, queue_name, priority DESC, created_at ASC)
+    WHERE status = 'pending';
+
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry
     ON jobs (lease_expires_at)
     WHERE status = 'leased';

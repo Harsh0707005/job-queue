@@ -1,0 +1,297 @@
+{
+  "label": "optimized-go",
+  "ok": true,
+  "tenants": 20,
+  "jobs_per_tenant": 250,
+  "total_jobs": 5000,
+  "enqueue_seconds": 12.1935,
+  "enqueue_jobs_per_sec": 410.06,
+  "drain_seconds": 19.8946,
+  "drain_jobs_per_sec": 251.32,
+  "time_to_first_complete_seconds": 0.5221,
+  "coords": [
+    "http://coordinator-1:8080",
+    "http://coordinator-2:8080"
+  ],
+  "lease_urls": [
+    "http://coordinator-1:8080",
+    "http://coordinator-2:8080"
+  ],
+  "samples": [
+    {
+      "t": 0.0,
+      "completed": 0,
+      "pending": 4744,
+      "leased": 256,
+      "inst_jobs_per_sec": 0.0
+    },
+    {
+      "t": 0.522,
+      "completed": 106,
+      "pending": 4488,
+      "leased": 406,
+      "inst_jobs_per_sec": 212.0
+    },
+    {
+      "t": 1.03,
+      "completed": 266,
+      "pending": 4488,
+      "leased": 246,
+      "inst_jobs_per_sec": 320.0
+    },
+    {
+      "t": 1.537,
+      "completed": 429,
+      "pending": 4488,
+      "leased": 83,
+      "inst_jobs_per_sec": 326.0
+    },
+    {
+      "t": 2.051,
+      "completed": 553,
+      "pending": 3976,
+      "leased": 471,
+      "inst_jobs_per_sec": 248.0
+    },
+    {
+      "t": 2.58,
+      "completed": 707,
+      "pending": 3976,
+      "leased": 317,
+      "inst_jobs_per_sec": 308.0
+    },
+    {
+      "t": 3.093,
+      "completed": 874,
+      "pending": 3976,
+      "leased": 150,
+      "inst_jobs_per_sec": 334.0
+    },
+    {
+      "t": 3.601,
+      "completed": 1025,
+      "pending": 3720,
+      "leased": 255,
+      "inst_jobs_per_sec": 302.0
+    },
+    {
+      "t": 4.107,
+      "completed": 1157,
+      "pending": 3464,
+      "leased": 379,
+      "inst_jobs_per_sec": 264.0
+    },
+    {
+      "t": 4.624,
+      "completed": 1296,
+      "pending": 3464,
+      "leased": 240,
+      "inst_jobs_per_sec": 278.0
+    },
+    {
+      "t": 5.137,
+      "completed": 1442,
+      "pending": 3464,
+      "leased": 94,
+      "inst_jobs_per_sec": 292.0
+    },
+    {
+      "t": 5.643,
+      "completed": 1582,
+      "pending": 2952,
+      "leased": 466,
+      "inst_jobs_per_sec": 280.0
+    },
+    {
+      "t": 6.163,
+      "completed": 1735,
+      "pending": 2952,
+      "leased": 313,
+      "inst_jobs_per_sec": 306.0
+    },
+    {
+      "t": 6.67,
+      "completed": 1895,
+      "pending": 2952,
+      "leased": 153,
+      "inst_jobs_per_sec": 320.0
+    },
+    {
+      "t": 7.179,
+      "completed": 2050,
+      "pending": 2696,
+      "leased": 254,
+      "inst_jobs_per_sec": 310.0
+    },
+    {
+      "t": 7.69,
+      "completed": 2199,
+      "pending": 2440,
+      "leased": 361,
+      "inst_jobs_per_sec": 298.0
+    },
+    {
+      "t": 8.211,
+      "completed": 2327,
+      "pending": 2440,
+      "leased": 233,
+      "inst_jobs_per_sec": 256.0
+    },
+    {
+      "t": 8.729,
+      "completed": 2488,
+      "pending": 2440,
+      "leased": 72,
+      "inst_jobs_per_sec": 322.0
+    },
+    {
+      "t": 9.249,
+      "completed": 2592,
+      "pending": 1928,
+      "leased": 480,
+      "inst_jobs_per_sec": 208.0
+    },
+    {
+      "t": 10.026,
+      "completed": 2750,
+      "pending": 1928,
+      "leased": 322,
+      "inst_jobs_per_sec": 316.0
+    },
+    {
+      "t": 10.534,
+      "completed": 2918,
+      "pending": 1928,
+      "leased": 154,
+      "inst_jobs_per_sec": 336.0
+    },
+    {
+      "t": 11.043,
+      "completed": 3064,
+      "pending": 1800,
+      "leased": 136,
+      "inst_jobs_per_sec": 292.0
+    },
+    {
+      "t": 11.59,
+      "completed": 3216,
+      "pending": 1416,
+      "leased": 368,
+      "inst_jobs_per_sec": 304.0
+    },
+    {
+      "t": 12.098,
+      "completed": 3378,
+      "pending": 1416,
+      "leased": 206,
+      "inst_jobs_per_sec": 324.0
+    },
+    {
+      "t": 12.604,
+      "completed": 3545,
+      "pending": 1352,
+      "leased": 103,
+      "inst_jobs_per_sec": 334.0
+    },
+    {
+      "t": 13.108,
+      "completed": 3695,
+      "pending": 904,
+      "leased": 401,
+      "inst_jobs_per_sec": 300.0
+    },
+    {
+      "t": 13.622,
+      "completed": 3855,
+      "pending": 904,
+      "leased": 241,
+      "inst_jobs_per_sec": 320.0
+    },
+    {
+      "t": 14.129,
+      "completed": 4012,
+      "pending": 904,
+      "leased": 84,
+      "inst_jobs_per_sec": 314.0
+    },
+    {
+      "t": 14.64,
+      "completed": 4149,
+      "pending": 392,
+      "leased": 459,
+      "inst_jobs_per_sec": 274.0
+    },
+    {
+      "t": 15.153,
+      "completed": 4294,
+      "pending": 392,
+      "leased": 314,
+      "inst_jobs_per_sec": 290.0
+    },
+    {
+      "t": 15.675,
+      "completed": 4455,
+      "pending": 392,
+      "leased": 153,
+      "inst_jobs_per_sec": 322.0
+    },
+    {
+      "t": 16.183,
+      "completed": 4617,
+      "pending": 200,
+      "leased": 183,
+      "inst_jobs_per_sec": 324.0
+    },
+    {
+      "t": 16.689,
+      "completed": 4744,
+      "pending": 0,
+      "leased": 256,
+      "inst_jobs_per_sec": 254.0
+    },
+    {
+      "t": 17.2,
+      "completed": 4836,
+      "pending": 0,
+      "leased": 164,
+      "inst_jobs_per_sec": 184.0
+    },
+    {
+      "t": 17.76,
+      "completed": 4910,
+      "pending": 0,
+      "leased": 90,
+      "inst_jobs_per_sec": 148.0
+    },
+    {
+      "t": 18.296,
+      "completed": 4996,
+      "pending": 0,
+      "leased": 4,
+      "inst_jobs_per_sec": 172.0
+    },
+    {
+      "t": 18.882,
+      "completed": 5000,
+      "pending": 0,
+      "leased": 0,
+      "inst_jobs_per_sec": 8.0
+    }
+  ],
+  "final_backlog": {
+    "jobs": {
+      "cancelled": 0,
+      "completed": 5000,
+      "dead": 0,
+      "failed": 0,
+      "leased": 0,
+      "pending": 0
+    },
+    "webhooks": {
+      "dead": 0,
+      "delivering": 0,
+      "pending": 0,
+      "succeeded": 0
+    }
+  }
+}
