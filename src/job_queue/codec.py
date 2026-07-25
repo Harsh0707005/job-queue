@@ -159,6 +159,7 @@ def tenant_offboard_result_to_dict(result: TenantOffboardResult) -> dict[str, An
         "webhooks_deleted": result.webhooks_deleted,
         "jobs_purged": result.jobs_purged,
         "leased_remaining": result.leased_remaining,
+        "webhooks_delivering_remaining": result.webhooks_delivering_remaining,
         "offboarding": result.offboarding,
         "empty": result.empty,
     }

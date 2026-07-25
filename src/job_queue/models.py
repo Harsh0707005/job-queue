@@ -123,6 +123,8 @@ class TenantOffboardResult:
     webhooks_deleted: int
     jobs_purged: int
     leased_remaining: int
+    # Claimed (status=delivering) webhook rows left for agents to finalize.
+    webhooks_delivering_remaining: int
     offboarding: bool
     empty: bool
 

@@ -61,9 +61,11 @@ Design notes
   leasing and aligns overdue schedules for a single clean next fire (no
   missed-tick flood). ``get_tenant_stats`` reports counts.
 * **Tenant offboard**: ``offboard_tenant`` fully retires a tenant — cancels
-  pending work, deletes schedules and webhooks, purges non-running jobs, and
-  blocks new enqueue. Already-leased jobs may still finish; when the last
-  one ends the tenant is auto-purged empty (settings/fairness cleared).
+  pending work, deletes schedules and non-claimed webhooks, purges non-running
+  jobs, and blocks new enqueue. Already-leased jobs and already-claimed
+  (``delivering``) webhooks may still finish / finalize; when the last
+  in-flight work ends the tenant is auto-purged empty (settings/fairness
+  cleared).
 * **Webhooks**: terminal events (completed / failed / dead) insert durable
   ``webhook_deliveries`` first; ``process_webhook_deliveries`` POSTs with
   exponential backoff and dead-letters failed deliveries. Paused tenants do
@@ -452,15 +454,18 @@ class JobQueue:
         1. Marks tenant paused + offboarding (no new leases / schedule ticks /
            webhook claims; enqueue is rejected).
         2. Cancels all *pending* jobs (cascade kills pending dependents).
-        3. Deletes all schedules and webhook endpoints for the tenant
-           (webhook deliveries cascade-delete with endpoints).
-        4. Purges all non-``leased`` job rows (history / cancelled / dead).
-        5. Leaves *leased* jobs running; holders may still heartbeat / ack /
-           nack. When the last leased job ends, remaining rows and settings
-           are auto-purged so the tenant is empty.
+        3. Deletes all schedules.
+        4. Deletes *non-claimed* webhook deliveries and any endpoints that no
+           longer have a ``delivering`` claim. Already-claimed (``delivering``)
+           deliveries — and the endpoints they reference — are kept so agents
+           can still POST and ``finalize_webhook_delivery``.
+        5. Purges all non-``leased`` job rows (history / cancelled / dead).
+        6. Leaves *leased* jobs running and *delivering* webhooks in flight;
+           when the last of both ends, remaining rows and settings are
+           auto-purged so the tenant is empty.
 
         Returns a :class:`~job_queue.models.TenantOffboardResult` with counts
-        and how many leased jobs still need to finish.
+        and how much in-flight work still needs to finish.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -535,22 +540,42 @@ class JobQueue:
                 """,
                 (tenant_id,),
             ).fetchall()
-            # Endpoints CASCADE delete deliveries.
-            wh_del = conn.execute(
-                """
-                DELETE FROM webhook_endpoints
-                WHERE tenant_id = %s
-                RETURNING id
-                """,
-                (tenant_id,),
-            ).fetchall()
-            # Any orphan deliveries without endpoint (should be none).
+
+            # Keep claimed (delivering) webhook rows so agents can finalize.
+            # Endpoints are kept only while they still have a delivering claim
+            # (FK ON DELETE CASCADE would otherwise wipe those claims).
             conn.execute(
                 """
                 DELETE FROM webhook_deliveries
                 WHERE tenant_id = %s
+                  AND status <> 'delivering'
                 """,
                 (tenant_id,),
+            )
+            wh_del = conn.execute(
+                """
+                DELETE FROM webhook_endpoints e
+                WHERE e.tenant_id = %s
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM webhook_deliveries d
+                        WHERE d.endpoint_id = e.id
+                          AND d.status = 'delivering'
+                  )
+                RETURNING e.id
+                """,
+                (tenant_id,),
+            ).fetchall()
+            # Disable any remaining endpoints (still referenced by claims).
+            conn.execute(
+                """
+                UPDATE webhook_endpoints
+                SET enabled = FALSE,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                  AND enabled = TRUE
+                """,
+                (now, tenant_id),
             )
 
             purged = conn.execute(
@@ -563,19 +588,11 @@ class JobQueue:
                 (tenant_id, JobStatus.LEASED.value),
             ).fetchall()
 
-            leased_remaining = conn.execute(
-                """
-                SELECT COUNT(*)::int AS n
-                FROM jobs
-                WHERE tenant_id = %s
-                  AND status = %s
-                """,
-                (tenant_id, JobStatus.LEASED.value),
-            ).fetchone()
-            leased_n = int(leased_remaining["n"]) if leased_remaining else 0
+            leased_n = self._count_leased(conn, tenant_id)
+            delivering_n = self._count_webhook_delivering(conn, tenant_id)
 
             empty = False
-            if leased_n == 0:
+            if leased_n == 0 and delivering_n == 0:
                 self._finalize_offboard_locked(conn, tenant_id=tenant_id, now=now)
                 empty = True
 
@@ -586,6 +603,7 @@ class JobQueue:
                 webhooks_deleted=len(wh_del),
                 jobs_purged=len(purged),
                 leased_remaining=leased_n,
+                webhooks_delivering_remaining=delivering_n,
                 offboarding=not empty,
                 empty=empty,
             )
@@ -2316,6 +2334,10 @@ class JobQueue:
         auto_finalized: list[Any] = []
 
         with transaction(self._pool) as conn:
+            # Abandoned claims on offboarding tenants must not stick forever
+            # (pause blocks normal reclaim of pending work).
+            self._reap_offboarding_expired_webhooks(conn, now=now, tenant_id=None)
+
             due = conn.execute(
                 f"""
                 SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
@@ -2374,6 +2396,9 @@ class JobQueue:
                                     status_code=int(code),
                                     error=None,
                                 )
+                            )
+                            self._maybe_finalize_offboard(
+                                conn, tenant_id=drow["tenant_id"], now=now
                             )
                     continue
 
@@ -2507,6 +2532,10 @@ class JobQueue:
         On success, persists ``last_status_code`` first so a crash before the
         status flip still prevents double-POST on reclaim.
         Returns ``None`` if the delivery is no longer ``delivering`` (lost race).
+
+        While a tenant is offboarding, failed deliveries are forced terminal
+        (``dead``) instead of requeued to ``pending``, then the tenant is
+        auto-purged once no leased jobs / delivering webhooks remain.
         """
         from job_queue.webhooks import WebhookDeliveryResult
 
@@ -2533,14 +2562,17 @@ class JobQueue:
                         delivery_id,
                     ),
                 ).fetchone()
-            if updated is None:
-                return None
-            return WebhookDeliveryResult(
-                delivery=self._row_to_webhook_delivery(updated),
-                success=False,
-                status_code=None,
-                error="endpoint missing or disabled",
-            )
+                if updated is None:
+                    return None
+                self._maybe_finalize_offboard(
+                    conn, tenant_id=updated["tenant_id"], now=now
+                )
+                return WebhookDeliveryResult(
+                    delivery=self._row_to_webhook_delivery(updated),
+                    success=False,
+                    status_code=None,
+                    error="endpoint missing or disabled",
+                )
 
         success = status_code is not None and 200 <= int(status_code) < 300
         detail = (error or "")[:2000] if error else None
@@ -2561,6 +2593,8 @@ class JobQueue:
 
             delivery = self._row_to_webhook_delivery(row)
             attempts = delivery.attempts
+            tenant_id = delivery.tenant_id
+            offboarding = self._is_tenant_offboarding(conn, tenant_id)
 
             if success:
                 # Evidence of 2xx before status flip (crash-safe).
@@ -2592,6 +2626,7 @@ class JobQueue:
                 ).fetchone()
                 if updated is None:
                     return None
+                self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
                 return WebhookDeliveryResult(
                     delivery=self._row_to_webhook_delivery(updated),
                     success=True,
@@ -2599,7 +2634,12 @@ class JobQueue:
                     error=None,
                 )
 
-            if attempts >= delivery.max_attempts:
+            # Offboarding: never requeue pending webhook work after a claim.
+            force_dead = offboarding or attempts >= delivery.max_attempts
+            if force_dead:
+                err = detail or "delivery failed"
+                if offboarding and attempts < delivery.max_attempts:
+                    err = (detail or "delivery failed") + " (tenant offboard)"
                 updated = conn.execute(
                     f"""
                     UPDATE webhook_deliveries
@@ -2615,7 +2655,7 @@ class JobQueue:
                     """,
                     (
                         status_code,
-                        detail or "delivery failed",
+                        err,
                         now,
                         now,
                         delivery_id,
@@ -2623,11 +2663,12 @@ class JobQueue:
                 ).fetchone()
                 if updated is None:
                     return None
+                self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
                 return WebhookDeliveryResult(
                     delivery=self._row_to_webhook_delivery(updated),
                     success=False,
                     status_code=status_code,
-                    error=detail or "delivery failed",
+                    error=err,
                 )
 
             delay = compute_retry_backoff_seconds(
@@ -3333,6 +3374,19 @@ class JobQueue:
             return False
         return True
 
+    @staticmethod
+    def _count_webhook_delivering(conn: Any, tenant_id: str) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM webhook_deliveries
+            WHERE tenant_id = %s
+              AND status = 'delivering'
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
     def _finalize_offboard_locked(
         self,
         conn: Any,
@@ -3340,15 +3394,15 @@ class JobQueue:
         tenant_id: str,
         now: datetime,
     ) -> None:
-        """Purge all remaining tenant state after the last leased job ends.
+        """Purge all remaining tenant state after in-flight work ends.
 
-        Caller must hold the connection transaction and ensure no leased rows
-        remain (or accept they will be deleted too if still present — we only
-        delete non-leased defensively after an explicit leased check).
+        Caller must hold the connection transaction. Refuses to wipe while
+        leased jobs or claimed (``delivering``) webhooks remain.
         """
         # Safety: never wipe in-flight work.
-        leased = self._count_leased(conn, tenant_id)
-        if leased > 0:
+        if self._count_leased(conn, tenant_id) > 0:
+            return
+        if self._count_webhook_delivering(conn, tenant_id) > 0:
             return
 
         conn.execute(
@@ -3359,12 +3413,13 @@ class JobQueue:
             "DELETE FROM schedules WHERE tenant_id = %s",
             (tenant_id,),
         )
+        # Deliveries first so endpoint CASCADE is a no-op for leftovers.
         conn.execute(
-            "DELETE FROM webhook_endpoints WHERE tenant_id = %s",
+            "DELETE FROM webhook_deliveries WHERE tenant_id = %s",
             (tenant_id,),
         )
         conn.execute(
-            "DELETE FROM webhook_deliveries WHERE tenant_id = %s",
+            "DELETE FROM webhook_endpoints WHERE tenant_id = %s",
             (tenant_id,),
         )
         conn.execute(
@@ -3385,12 +3440,104 @@ class JobQueue:
         tenant_id: str,
         now: datetime,
     ) -> None:
-        """If tenant is offboarding and has no leased jobs left, purge it empty."""
+        """If tenant is offboarding and has no in-flight work left, purge empty."""
         if not self._is_tenant_offboarding(conn, tenant_id):
             return
         if self._count_leased(conn, tenant_id) > 0:
             return
+        if self._count_webhook_delivering(conn, tenant_id) > 0:
+            return
         self._finalize_offboard_locked(conn, tenant_id=tenant_id, now=now)
+
+    def _reap_offboarding_expired_webhooks(
+        self,
+        conn: Any,
+        *,
+        now: datetime,
+        tenant_id: str | None = None,
+    ) -> None:
+        """Dead-letter expired ``delivering`` webhooks for offboarding tenants.
+
+        Offboarding tenants are paused, so stuck claims are never reclaimed for
+        a re-POST. Without this, abandoned agents leave the tenant non-empty.
+        """
+        if tenant_id is not None:
+            if not self._is_tenant_offboarding(conn, tenant_id):
+                return
+            expired = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE tenant_id = %s
+                  AND status = 'delivering'
+                  AND delivering_until IS NOT NULL
+                  AND delivering_until < %s
+                FOR UPDATE
+                """,
+                (tenant_id, now),
+            ).fetchall()
+        else:
+            expired = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries d
+                WHERE d.status = 'delivering'
+                  AND d.delivering_until IS NOT NULL
+                  AND d.delivering_until < %s
+                  AND EXISTS (
+                        SELECT 1
+                        FROM tenant_settings ts
+                        WHERE ts.tenant_id = d.tenant_id
+                          AND ts.offboarding = TRUE
+                  )
+                FOR UPDATE OF d
+                """,
+                (now,),
+            ).fetchall()
+
+        tenants: set[str] = set()
+        for row in expired:
+            tid = row["tenant_id"]
+            # Proven 2xx already posted → succeed; else dead (no re-POST).
+            code = row.get("last_status_code")
+            if code is not None and 200 <= int(code) < 300:
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'succeeded',
+                        delivering_until = NULL,
+                        last_error = NULL,
+                        updated_at = %s,
+                        completed_at = COALESCE(completed_at, %s)
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING id
+                    """,
+                    (now, now, row["id"]),
+                ).fetchone()
+            else:
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'dead',
+                        delivering_until = NULL,
+                        last_error = COALESCE(
+                            last_error,
+                            'claim expired during tenant offboard'
+                        ),
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING id
+                    """,
+                    (now, now, row["id"]),
+                ).fetchone()
+            if updated is not None:
+                tenants.add(tid)
+
+        for tid in tenants:
+            self._maybe_finalize_offboard(conn, tenant_id=tid, now=now)
 
     def _reap_offboarding_expired_leases(
         self,

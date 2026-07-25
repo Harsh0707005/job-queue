@@ -132,6 +132,8 @@ def cmd_offboard(args: argparse.Namespace) -> int:
             f"  webhooks_deleted={result.webhooks_deleted}\n"
             f"  jobs_purged={result.jobs_purged}\n"
             f"  leased_remaining={result.leased_remaining}\n"
+            f"  webhooks_delivering_remaining="
+            f"{result.webhooks_delivering_remaining}\n"
             f"  offboarding={result.offboarding}\n"
             f"  empty={result.empty}"
         )

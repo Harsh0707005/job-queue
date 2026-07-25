@@ -368,6 +368,7 @@ class Coordinator:
             "empty": result.empty,
             "offboarding": result.offboarding,
             "leased_remaining": result.leased_remaining,
+            "webhooks_delivering_remaining": result.webhooks_delivering_remaining,
         }
 
     # ------------------------------------------------------------------
