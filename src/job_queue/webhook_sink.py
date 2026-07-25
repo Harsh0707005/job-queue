@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -63,6 +64,9 @@ class WebhookSinkState:
 
 def serve_sink(*, host: str = "0.0.0.0", port: int = 8090) -> None:
     state = WebhookSinkState()
+    # Optional artificial delay so fleet soaks can offboard while deliveries
+    # are still status=delivering (agent has claimed and is mid-POST).
+    slow_ms = int(os.environ.get("SLOW_MS", "0") or "0")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
@@ -78,6 +82,8 @@ def serve_sink(*, host: str = "0.0.0.0", port: int = 8090) -> None:
             if not isinstance(payload, dict):
                 payload = {}
             state.record(payload, self.headers)
+            if slow_ms > 0:
+                time.sleep(slow_ms / 1000.0)
             body = b"ok"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")

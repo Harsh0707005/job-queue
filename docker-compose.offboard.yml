@@ -1,0 +1,209 @@
+# Offboard end-to-end fleet soak (cold build recommended).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.offboard.yml down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.offboard.yml build --no-cache
+#   docker compose -f docker-compose.yml -f docker-compose.offboard.yml \
+#     up --abort-on-container-exit --exit-code-from offboard-soak offboard-soak
+#   docker compose -f docker-compose.yml -f docker-compose.offboard.yml down -v
+
+x-batch-worker: &batch_worker_env
+  COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+  POLL_INTERVAL: "0.25"
+  VISIBILITY_TIMEOUT: "45"
+  BATCH_SIZE: "6"
+  LOG_LEVEL: INFO
+
+services:
+  # Disable base soak + chaos; this overlay supplies its own.
+  chaos:
+    profiles: ["base-chaos-disabled"]
+  soak:
+    profiles: ["base-soak-disabled"]
+
+  # Slow POSTs so claim→finalize leaves status=delivering long enough to offboard.
+  webhook-sink:
+    environment:
+      LOG_LEVEL: INFO
+      SLOW_MS: "4000"
+
+  worker-1:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: worker-1
+  worker-2:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: worker-2
+  worker-3:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: worker-3
+  worker-4:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: worker-4
+
+  worker-5:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: worker-5
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  worker-6:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: worker-6
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  scheduler:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.4"
+      LOG_LEVEL: INFO
+
+  scheduler-2:
+    build: .
+    command: ["job-queue-scheduler-node"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.4"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  webhook-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      LOG_LEVEL: INFO
+
+  webhook-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      LOG_LEVEL: INFO
+
+  # Kill workers + coordinator-1 while soak runs; leave coordinator-2 up for failover.
+  offboard-chaos:
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      CHAOS_INTERVAL_SECONDS: "25"
+      CHAOS_ROUNDS: "12"
+      CHAOS_INITIAL_SLEEP: "20"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "offboard-chaos: settle $${CHAOS_INITIAL_SLEEP}s"
+        sleep "$${CHAOS_INITIAL_SLEEP}"
+        i=0
+        while [ "$$i" -lt "$$CHAOS_ROUNDS" ]; do
+          i=$$((i+1))
+          echo "chaos round $$i: kill coordinator-1"
+          docker ps -q -f name=coordinator-1 | xargs -r docker kill || true
+          sleep 6
+          echo "chaos round $$i: start coordinator-1"
+          docker ps -aq -f name=coordinator-1 | head -1 | xargs -r docker start || true
+          sleep 4
+
+          w=$$(( (i % 6) + 1 ))
+          echo "chaos round $$i: kill worker-$$w"
+          docker ps -q -f name=worker-$$w | xargs -r docker kill || true
+          sleep 5
+          echo "chaos round $$i: start worker-$$w"
+          docker ps -aq -f name=worker-$$w | head -1 | xargs -r docker start || true
+
+          if [ $$((i % 3)) -eq 0 ]; then
+            echo "chaos round $$i: kill webhook-1"
+            docker ps -q -f name=webhook-1 | xargs -r docker kill || true
+            sleep 5
+            docker ps -aq -f name=webhook-1 | head -1 | xargs -r docker start || true
+          fi
+          sleep "$$CHAOS_INTERVAL_SECONDS"
+        done
+        echo "offboard-chaos finished; idle"
+        sleep 3600
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-6:
+        condition: service_started
+
+  offboard-soak:
+    # docker CLI + python: can pause webhook agents to pin delivering claims.
+    image: docker:27-cli
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache python3 >/dev/null
+        exec python3 /scripts/offboard_soak.py
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/scripts:ro
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      SINK_URL: http://webhook-sink:8090
+      WEBHOOK_URL: http://webhook-sink:8090/hook
+      TENANTS: "8"
+      INTERVAL_SECONDS: "8"
+      JOB_SLEEP_MS: "2500"
+      SEED_SLOW_JOBS: "4"
+      OFFBOARD_COUNT: "2"
+      OFFBOARD_AFTER_SECONDS: "55"
+      KEEP_RUNNING_AFTER_SECONDS: "45"
+      OFFBOARD_DRAIN_TIMEOUT: "200"
+      FINAL_DRAIN_TIMEOUT: "300"
+      MAX_WALL_SECONDS: "900"
+      POLL_SECONDS: "2"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      scheduler:
+        condition: service_started
+      scheduler-2:
+        condition: service_started
+      webhook-1:
+        condition: service_started
+      webhook-2:
+        condition: service_started
+      offboard-chaos:
+        condition: service_started

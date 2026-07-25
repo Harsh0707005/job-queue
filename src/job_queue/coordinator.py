@@ -106,6 +106,8 @@ class Coordinator:
             return self._completion_order(query)
         if method == "GET" and path == "/v1/admin/priority-stats":
             return self._priority_stats(query)
+        if method == "GET" and path == "/v1/admin/tenant-residue":
+            return self._tenant_residue(query)
 
         return 404, {"error": f"unknown route {method} {path}"}
 
@@ -494,6 +496,120 @@ class Coordinator:
             return 200, {"stats": [tenant_stats_to_dict(stats)]}
         all_stats = self.queue.list_tenant_stats()
         return 200, {"stats": [tenant_stats_to_dict(s) for s in all_stats]}
+
+    def _tenant_residue(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        """Per-tenant residual state for offboard/empty soak verification.
+
+        Pass ``?tenant=id`` for one tenant, or omit for every tenant that still
+        has any jobs / schedules / webhooks / settings / fairness row.
+        """
+        single = (query.get("tenant") or [None])[0]
+
+        def residue_for(conn: Any, tenant_id: str) -> dict[str, Any]:
+            jobs = conn.execute(
+                """
+                SELECT
+                  COUNT(*)::int AS total,
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+                  COUNT(*) FILTER (WHERE status = 'leased')::int AS leased,
+                  COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+                  COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+                  COUNT(*) FILTER (WHERE status = 'dead')::int AS dead,
+                  COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
+                FROM jobs
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            schedules = conn.execute(
+                "SELECT COUNT(*)::int AS n FROM schedules WHERE tenant_id = %s",
+                (tenant_id,),
+            ).fetchone()
+            endpoints = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n
+                FROM webhook_endpoints
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            deliveries = conn.execute(
+                """
+                SELECT
+                  COUNT(*)::int AS total,
+                  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+                  COUNT(*) FILTER (WHERE status = 'delivering')::int AS delivering,
+                  COUNT(*) FILTER (WHERE status = 'succeeded')::int AS succeeded,
+                  COUNT(*) FILTER (WHERE status = 'dead')::int AS dead
+                FROM webhook_deliveries
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            settings = conn.execute(
+                """
+                SELECT paused, offboarding
+                FROM tenant_settings
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            fairness = conn.execute(
+                """
+                SELECT 1 FROM tenant_fairness WHERE tenant_id = %s LIMIT 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            j_total = int(jobs["total"]) if jobs else 0
+            s_n = int(schedules["n"]) if schedules else 0
+            e_n = int(endpoints["n"]) if endpoints else 0
+            d_total = int(deliveries["total"]) if deliveries else 0
+            has_settings = settings is not None
+            has_fairness = fairness is not None
+            empty = (
+                j_total == 0
+                and s_n == 0
+                and e_n == 0
+                and d_total == 0
+                and not has_settings
+                and not has_fairness
+            )
+            return {
+                "tenant_id": tenant_id,
+                "empty": empty,
+                "offboarding": bool(settings["offboarding"]) if settings else False,
+                "paused": bool(settings["paused"]) if settings else False,
+                "jobs": dict(jobs) if jobs else {},
+                "schedules": s_n,
+                "webhook_endpoints": e_n,
+                "webhook_deliveries": dict(deliveries) if deliveries else {},
+                "has_settings": has_settings,
+                "has_fairness": has_fairness,
+            }
+
+        with self.queue._pool.connection() as conn:
+            if single:
+                return 200, {"tenants": [residue_for(conn, str(single))]}
+            rows = conn.execute(
+                """
+                SELECT tenant_id FROM jobs
+                UNION
+                SELECT tenant_id FROM schedules
+                UNION
+                SELECT tenant_id FROM webhook_endpoints
+                UNION
+                SELECT tenant_id FROM webhook_deliveries
+                UNION
+                SELECT tenant_id FROM tenant_settings
+                UNION
+                SELECT tenant_id FROM tenant_fairness
+                ORDER BY tenant_id
+                """
+            ).fetchall()
+            tenants = [residue_for(conn, r["tenant_id"]) for r in rows]
+            return 200, {"tenants": tenants}
 
     def _webhook_stats(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:
