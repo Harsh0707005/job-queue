@@ -87,6 +87,12 @@ class CoordinatorClient:
                     payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
                 if exc.code == 409 and payload.get("code") == "lease_error":
                     raise LeaseError(payload.get("error") or "lease error") from exc
+                if exc.code == 409 and payload.get("code") == "cancel_error":
+                    from job_queue.queue import CancelError
+
+                    raise CancelError(
+                        payload.get("error") or "cancel error"
+                    ) from exc
                 # 5xx → try next coordinator; 4xx is definitive.
                 if 500 <= int(exc.code) < 600:
                     last_err = RuntimeError(
@@ -298,6 +304,15 @@ class CoordinatorClient:
         assert payload is not None
         return payload
 
+    def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/cancel",
+            {"tenant_id": tenant_id},
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
     def pause_tenant(self, tenant_id: str) -> dict[str, Any]:
         payload = self._request("POST", f"/v1/tenants/{tenant_id}/pause", {})
         assert payload is not None
@@ -442,8 +457,23 @@ class RemoteWorkerAgent:
         )
         hb.start()
         try:
-            # Fast deterministic work for fleet soak.
-            time.sleep(0.02)
+            # Optional payload sleep for cancel/long-job soaks; cooperative cancel.
+            sleep_ms = 0
+            if isinstance(job.payload, dict):
+                try:
+                    sleep_ms = int(job.payload.get("sleep_ms") or 0)
+                except (TypeError, ValueError):
+                    sleep_ms = 0
+            if sleep_ms > 0:
+                deadline = time.time() + (sleep_ms / 1000.0)
+                while time.time() < deadline:
+                    if lease_lost.is_set():
+                        raise LeaseError(
+                            f"job {job.id} cancelled/lease lost during work"
+                        )
+                    time.sleep(min(0.1, max(0.01, deadline - time.time())))
+            else:
+                time.sleep(0.02)
             result = {
                 "ok": True,
                 "worker_id": self.worker_id,

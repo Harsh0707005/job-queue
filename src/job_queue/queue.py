@@ -19,7 +19,9 @@ Design notes
 * **Tenant concurrency limit**: at most N jobs may be ``leased`` for a tenant
   at once (``set_concurrency_limit``). Enforced under a per-tenant advisory
   lock so concurrent workers cannot exceed the cap.
-* **Cancel**: pending jobs can be cancelled by id; leased jobs are left alone.
+* **Cancel**: ``cancel`` stops *pending* or *leased* (running) jobs. Cancelling
+  a leased job clears the fencing ``lease_token`` so the holding worker's
+  heartbeat / ack / nack fail with ``LeaseError`` and cannot complete it.
 * **Dead letter**: exhausted jobs land in ``dead``; inspect via
   ``list_dead_letters`` and re-queue with ``replay_dead_letter`` /
   ``replay_dead_letters``.
@@ -1106,11 +1108,18 @@ class JobQueue:
     # ------------------------------------------------------------------
 
     def cancel(self, job_id: UUID, *, tenant_id: str) -> Job:
-        """Cancel a *pending* job by id for *tenant_id*.
+        """Cancel a *pending* or *leased* (running) job by id for *tenant_id*.
 
-        Only ``pending`` jobs are cancelled. If the job is leased (or in any
-        other non-pending state), raises ``CancelError`` and leaves it
-        unchanged. Cross-tenant ids raise ``CancelError`` as not found.
+        **Pending:** marked ``cancelled`` and will never be leased.
+
+        **Leased (running):** marked ``cancelled`` and the fencing
+        ``lease_token`` / lease holder fields are cleared. The worker that held
+        the job will fail heartbeat / ack / nack with ``LeaseError`` and cannot
+        complete it. Cooperative handlers should watch ``lease_lost`` /
+        ``ensure_held()`` and exit early.
+
+        Terminal states (completed / failed / dead / already cancelled) raise
+        ``CancelError``. Cross-tenant ids raise ``CancelError`` as not found.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -1133,13 +1142,14 @@ class JobQueue:
                 )
 
             job = _row_to_job(row)
-            if job.status != JobStatus.PENDING:
+            if job.status not in (JobStatus.PENDING, JobStatus.LEASED):
                 raise CancelError(
                     f"job {job_id} cannot be cancelled "
-                    f"(status={job.status.value}; only pending jobs cancel)",
+                    f"(status={job.status.value}; only pending or leased jobs cancel)",
                     job=job,
                 )
 
+            was_running = job.status == JobStatus.LEASED
             updated = conn.execute(
                 f"""
                 UPDATE jobs
@@ -1147,22 +1157,28 @@ class JobQueue:
                     leased_by = NULL,
                     lease_token = NULL,
                     lease_expires_at = NULL,
+                    last_error = CASE
+                        WHEN %s THEN 'cancelled while running'
+                        ELSE last_error
+                    END,
                     updated_at = %s
                 WHERE id = %s
                   AND tenant_id = %s
-                  AND status = %s
+                  AND status IN (%s, %s)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 (
                     JobStatus.CANCELLED.value,
+                    was_running,
                     now,
                     job_id,
                     tenant_id,
                     JobStatus.PENDING.value,
+                    JobStatus.LEASED.value,
                 ),
             ).fetchone()
             if updated is None:
-                # Race: became leased between SELECT and UPDATE.
+                # Race: terminalized between SELECT and UPDATE.
                 current = conn.execute(
                     f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s AND tenant_id = %s",
                     (job_id, tenant_id),

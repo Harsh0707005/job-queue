@@ -26,7 +26,7 @@ from job_queue.codec import (
     webhook_endpoint_to_dict,
 )
 from job_queue.models import JobStatus
-from job_queue.queue import JobQueue, LeaseError, ScheduleError
+from job_queue.queue import CancelError, JobQueue, LeaseError, ScheduleError
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,8 @@ class Coordinator:
             return self._job_action(path, body, "ack")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/nack"):
             return self._job_action(path, body, "nack")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/cancel"):
+            return self._cancel_job(path, body)
 
         if method == "POST" and path == "/v1/schedules/process-due":
             return self._process_due(body)
@@ -154,6 +156,31 @@ class Coordinator:
         if len(jobs) == 1:
             payload["job"] = payload["jobs"][0]
         return 200, payload
+
+    def _cancel_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / jobs / {id} / cancel
+        if len(parts) != 4:
+            return 400, {"error": "invalid cancel path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            job = self.queue.cancel(UUID(job_id_s), tenant_id=str(tenant_id))
+        except CancelError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "cancel_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
 
     def _job_action(
         self, path: str, body: dict[str, Any], action: str

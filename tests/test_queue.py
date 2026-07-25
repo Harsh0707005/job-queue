@@ -921,21 +921,50 @@ def test_cancel_pending_job(queue: JobQueue):
     assert got.status == JobStatus.CANCELLED
 
 
-def test_cancel_leased_job_rejected(queue: JobQueue):
-    from job_queue import CancelError
+def test_cancel_leased_job_stops_worker_finish(queue: JobQueue):
+    """Cancelling a running job invalidates the fence; old worker cannot ack."""
+    from job_queue import CancelError, LeaseError
 
     job = queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None
+    assert leased.lease_token is not None
 
-    with pytest.raises(CancelError, match="only pending") as exc_info:
-        queue.cancel(leased.id, tenant_id="t1")
-    assert exc_info.value.job is not None
-    assert exc_info.value.job.status == JobStatus.LEASED
+    cancelled = queue.cancel(leased.id, tenant_id="t1")
+    assert cancelled.status == JobStatus.CANCELLED
+    assert cancelled.lease_token is None
+    assert cancelled.leased_by is None
+    assert cancelled.last_error == "cancelled while running"
 
-    # Still leased and completable.
-    _ack(queue, leased, "w1")
-    assert queue.get(leased.id, tenant_id="t1").status == JobStatus.COMPLETED
+    # Old worker cannot heartbeat / ack / nack.
+    with pytest.raises(LeaseError):
+        queue.heartbeat(
+            leased.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+        )
+    with pytest.raises(LeaseError):
+        queue.ack(
+            leased.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+        )
+    with pytest.raises(LeaseError):
+        queue.nack(
+            leased.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+            error="nope",
+        )
+
+    final = queue.get(leased.id, tenant_id="t1")
+    assert final is not None
+    assert final.status == JobStatus.CANCELLED
+    # Must not become completed.
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
 
 
 def test_cancel_completed_job_rejected(queue: JobQueue):
@@ -3267,3 +3296,93 @@ def test_lease_batch_invalid_limit(queue: JobQueue):
         queue.lease_batch(worker_id="w", limit=0)
     with pytest.raises(ValueError):
         queue.lease_batch(worker_id="w", limit=1000)
+
+
+def test_cancel_running_worker_aborts_mid_process(queue: JobQueue):
+    """Worker holding a lease must not complete after cancel."""
+    from job_queue import LeaseError
+
+    queue.enqueue(tenant_id="t1", payload={"slow": True})
+
+    started = threading.Event()
+    cancelled_seen = threading.Event()
+    outcomes: list[str] = []
+
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="runner",
+        heartbeat_interval_seconds=0.2,
+        visibility_timeout_seconds=30,
+    )
+
+    @worker.handler
+    def handle(job: Job, lease: LeaseContext) -> dict:
+        outcomes.append("start")
+        started.set()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if lease.lease_lost.is_set():
+                outcomes.append("lease_lost")
+                cancelled_seen.set()
+                raise LeaseError("aborted after cancel")
+            try:
+                lease.ensure_held()
+            except LeaseError:
+                outcomes.append("ensure_failed")
+                cancelled_seen.set()
+                raise
+            time.sleep(0.05)
+        outcomes.append("finished_ok")
+        return {"ok": True}
+
+    def run_worker() -> None:
+        try:
+            worker.run_once()
+            outcomes.append("run_returned")
+        except LeaseError:
+            outcomes.append("run_lease_error")
+
+    t = threading.Thread(target=run_worker)
+    t.start()
+    assert started.wait(timeout=5)
+
+    # Cancel the running job.
+    leased = None
+    for _ in range(20):
+        with queue._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE tenant_id = %s AND status = 'leased' LIMIT 1",
+                ("t1",),
+            ).fetchone()
+        if row:
+            leased = row["id"]
+            break
+        time.sleep(0.05)
+    assert leased is not None
+    cancelled = queue.cancel(leased, tenant_id="t1")
+    assert cancelled.status == JobStatus.CANCELLED
+
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert "finished_ok" not in outcomes
+    assert "run_returned" not in outcomes
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
+    assert queue.count(tenant_id="t1", status=JobStatus.CANCELLED) == 1
+    assert cancelled_seen.is_set() or "run_lease_error" in outcomes
+
+
+def test_cancel_running_cascades_to_pending_children(queue: JobQueue):
+    parent = queue.enqueue(tenant_id="t1", payload={"p": 1})
+    child = queue.enqueue(
+        tenant_id="t1",
+        payload={"c": 1},
+        depends_on=parent.id,
+    )
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    assert leased.id == parent.id
+
+    queue.cancel(parent.id, tenant_id="t1")
+    assert queue.get(parent.id, tenant_id="t1").status == JobStatus.CANCELLED
+    assert queue.get(child.id, tenant_id="t1").status == JobStatus.CANCELLED
