@@ -3600,3 +3600,207 @@ def test_cancel_running_parent_kills_running_dependent_chain(queue: JobQueue):
     assert lc is not None
     assert lc.status == JobStatus.CANCELLED
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1  # only a
+
+
+# ---------------------------------------------------------------------------
+# Tenant offboard
+# ---------------------------------------------------------------------------
+
+
+def test_offboard_cancels_pending_deletes_schedules_webhooks(queue: JobQueue):
+    from job_queue import TenantOffboardResult
+
+    queue.enqueue(tenant_id="gone", payload={"n": 1})
+    queue.enqueue(tenant_id="gone", payload={"n": 2})
+    queue.create_schedule(
+        tenant_id="gone",
+        interval_seconds=60,
+        payload={"tick": True},
+        name="tick",
+    )
+    ep = queue.register_webhook(
+        tenant_id="gone",
+        url="http://example.test/hook",
+    )
+    assert ep.tenant_id == "gone"
+
+    # Other tenant must be untouched.
+    queue.enqueue(tenant_id="keep", payload={"ok": True})
+    queue.create_schedule(
+        tenant_id="keep",
+        interval_seconds=60,
+        payload={"k": 1},
+        name="keep-tick",
+    )
+
+    result = queue.offboard_tenant("gone")
+    assert isinstance(result, TenantOffboardResult)
+    assert result.tenant_id == "gone"
+    assert result.pending_cancelled == 2
+    assert result.schedules_deleted == 1
+    assert result.webhooks_deleted == 1
+    assert result.leased_remaining == 0
+    assert result.empty is True
+    assert result.offboarding is False
+    assert queue.tenant_is_empty("gone") is True
+    assert queue.is_tenant_offboarding("gone") is False
+
+    # Keep tenant still works.
+    assert queue.count(tenant_id="keep", status=JobStatus.PENDING) == 1
+    assert len(queue.list_schedules(tenant_id="keep")) == 1
+    job = queue.lease(tenant_id="keep", worker_id="w1")
+    assert job is not None
+    _ack(queue, job, "w1")
+
+
+def test_offboard_allows_in_flight_ack_then_empties(queue: JobQueue):
+    queue.enqueue(tenant_id="gone", payload={"run": 1})
+    queue.enqueue(tenant_id="gone", payload={"wait": 1})  # pending, will cancel
+    leased = queue.lease(tenant_id="gone", worker_id="w1")
+    assert leased is not None
+    assert leased.payload == {"run": 1}
+
+    queue.create_schedule(
+        tenant_id="gone", interval_seconds=30, payload={"s": 1}
+    )
+    queue.register_webhook(tenant_id="gone", url="http://example.test/h")
+
+    result = queue.offboard_tenant("gone")
+    assert result.pending_cancelled >= 1
+    assert result.schedules_deleted == 1
+    assert result.webhooks_deleted == 1
+    assert result.leased_remaining == 1
+    assert result.empty is False
+    assert result.offboarding is True
+    assert queue.is_tenant_offboarding("gone") is True
+    assert queue.is_tenant_paused("gone") is True
+    assert queue.tenant_is_empty("gone") is False
+
+    # Enqueue / schedule / webhook / resume blocked while offboarding.
+    with pytest.raises(ValueError, match="offboarding"):
+        queue.enqueue(tenant_id="gone", payload={"nope": 1})
+    with pytest.raises(ValueError, match="offboarding"):
+        queue.create_schedule(
+            tenant_id="gone", interval_seconds=10, payload={}
+        )
+    with pytest.raises(ValueError, match="offboarding"):
+        queue.register_webhook(tenant_id="gone", url="http://example.test/x")
+    with pytest.raises(ValueError, match="offboarding"):
+        queue.resume_tenant("gone")
+
+    # No new leases.
+    assert queue.lease(tenant_id="gone", worker_id="w2") is None
+    assert queue.lease(worker_id="fair") is None  # fair also skips
+
+    # In-flight may heartbeat + ack.
+    _hb(queue, leased, "w1", extend_by_seconds=30)
+    done = _ack(queue, leased, "w1", result={"ok": True})
+    assert done.status == JobStatus.COMPLETED
+
+    # After last lease finishes, tenant is fully empty.
+    assert queue.tenant_is_empty("gone") is True
+    assert queue.is_tenant_offboarding("gone") is False
+    assert queue.get(leased.id, tenant_id="gone") is None
+
+
+def test_offboard_in_flight_nack_then_empties(queue: JobQueue):
+    j = queue.enqueue(
+        tenant_id="gone",
+        payload={"x": 1},
+        max_attempts=3,
+        retry_backoff_base_seconds=0,
+    )
+    leased = queue.lease(tenant_id="gone", worker_id="w1")
+    assert leased is not None and leased.id == j.id
+
+    result = queue.offboard_tenant("gone")
+    assert result.leased_remaining == 1
+    assert result.empty is False
+
+    # Nack (even with requeue) must not leave residual work.
+    nacked = _nack(queue, leased, "w1", error="boom", requeue=True)
+    # Either requeued-then-purged or terminalized; tenant empty either way.
+    assert queue.tenant_is_empty("gone") is True
+    assert queue.get(nacked.id, tenant_id="gone") is None
+
+
+def test_offboard_multiple_in_flight_empties_after_last(queue: JobQueue):
+    queue.set_concurrency_limit("gone", 5)
+    for i in range(3):
+        queue.enqueue(tenant_id="gone", payload={"i": i})
+    jobs = []
+    for i in range(3):
+        j = queue.lease(tenant_id="gone", worker_id=f"w{i}")
+        assert j is not None
+        jobs.append(j)
+
+    result = queue.offboard_tenant("gone")
+    assert result.leased_remaining == 3
+    assert result.empty is False
+
+    _ack(queue, jobs[0], "w0")
+    assert queue.tenant_is_empty("gone") is False
+    assert queue.count(tenant_id="gone", status=JobStatus.LEASED) == 2
+
+    _ack(queue, jobs[1], "w1")
+    assert queue.count(tenant_id="gone", status=JobStatus.LEASED) == 1
+
+    _ack(queue, jobs[2], "w2")
+    assert queue.tenant_is_empty("gone") is True
+
+
+def test_offboard_reaps_expired_abandoned_lease(queue: JobQueue):
+    """Expired leases on offboarding tenants must be cancelled (not stuck)."""
+    queue.enqueue(
+        tenant_id="gone",
+        payload={"x": 1},
+        visibility_timeout_seconds=1,
+        max_attempts=5,
+    )
+    leased = queue.lease(
+        tenant_id="gone",
+        worker_id="zombie",
+        visibility_timeout_seconds=1,
+    )
+    assert leased is not None
+
+    result = queue.offboard_tenant("gone")
+    assert result.leased_remaining == 1
+
+    # Wait for lease expiry; worker is gone and cannot ack.
+    time.sleep(1.2)
+
+    # Any lease attempt reaps expired offboarding leases.
+    assert queue.lease(worker_id="other") is None
+    assert queue.tenant_is_empty("gone") is True
+
+
+def test_offboard_idempotent_when_already_empty(queue: JobQueue):
+    result = queue.offboard_tenant("never-existed")
+    assert result.empty is True
+    assert result.pending_cancelled == 0
+    assert result.leased_remaining == 0
+    assert queue.tenant_is_empty("never-existed") is True
+
+    # Second call still fine.
+    result2 = queue.offboard_tenant("never-existed")
+    assert result2.empty is True
+
+
+def test_offboard_cancel_running_job_can_empty(queue: JobQueue):
+    queue.enqueue(tenant_id="gone", payload={"x": 1})
+    leased = queue.lease(tenant_id="gone", worker_id="w1")
+    assert leased is not None
+    token = leased.lease_token
+
+    queue.offboard_tenant("gone")
+    cancelled = queue.cancel(leased.id, tenant_id="gone")
+    assert cancelled.status == JobStatus.CANCELLED
+    with pytest.raises(LeaseError):
+        queue.ack(
+            leased.id,
+            tenant_id="gone",
+            worker_id="w1",
+            lease_token=token,  # type: ignore[arg-type]
+        )
+    assert queue.tenant_is_empty("gone") is True

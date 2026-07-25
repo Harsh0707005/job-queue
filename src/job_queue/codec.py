@@ -11,6 +11,7 @@ from job_queue.models import (
     Job,
     JobStatus,
     Schedule,
+    TenantOffboardResult,
     TenantStats,
     WebhookDelivery,
     WebhookEndpoint,
@@ -146,6 +147,20 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "cancelled": stats.cancelled,
         "total": stats.total,
         "claimable": stats.claimable,
+    }
+
+
+def tenant_offboard_result_to_dict(result: TenantOffboardResult) -> dict[str, Any]:
+    """Serialize :class:`~job_queue.models.TenantOffboardResult`."""
+    return {
+        "tenant_id": result.tenant_id,
+        "pending_cancelled": result.pending_cancelled,
+        "schedules_deleted": result.schedules_deleted,
+        "webhooks_deleted": result.webhooks_deleted,
+        "jobs_purged": result.jobs_purged,
+        "leased_remaining": result.leased_remaining,
+        "offboarding": result.offboarding,
+        "empty": result.empty,
     }
 
 

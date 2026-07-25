@@ -31,3 +31,29 @@ def test_cli_parser_stats_subcommand():
     assert args.tenant == "acme"
     assert args.verbose is True
     assert args.func is cmd_stats
+
+
+def test_cli_parser_offboard_subcommand():
+    from job_queue.cli import cmd_offboard
+
+    parser = build_parser()
+    args = parser.parse_args(["offboard", "-t", "acme"])
+    assert args.command == "offboard"
+    assert args.tenant == "acme"
+    assert args.func is cmd_offboard
+
+
+def test_cli_offboard_prints_result(queue, capsys, postgres_url):
+    queue.enqueue(tenant_id="cli-off", payload={"n": 1})
+    queue.create_schedule(
+        tenant_id="cli-off",
+        interval_seconds=60,
+        payload={"t": 1},
+    )
+    rc = main(["--dsn", postgres_url, "offboard", "--tenant", "cli-off"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "tenant=cli-off" in out
+    assert "pending_cancelled=" in out
+    assert "empty=True" in out
+    assert queue.tenant_is_empty("cli-off") is True

@@ -21,6 +21,7 @@ from job_queue.codec import (
     claimed_webhook_to_dict,
     job_to_dict,
     schedule_to_dict,
+    tenant_offboard_result_to_dict,
     tenant_stats_to_dict,
     webhook_delivery_to_dict,
     webhook_endpoint_to_dict,
@@ -88,6 +89,8 @@ class Coordinator:
             return self._pause_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/resume"):
             return self._resume_tenant(path)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/offboard"):
+            return self._offboard_tenant(path)
 
         if method == "GET" and path == "/v1/admin/backlog":
             return self._backlog()
@@ -343,8 +346,29 @@ class Coordinator:
         if len(parts) != 4:
             return 400, {"error": "invalid tenant path"}
         tenant_id = parts[2]
-        self.queue.resume_tenant(tenant_id)
+        try:
+            self.queue.resume_tenant(tenant_id)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
         return 200, {"tenant_id": tenant_id, "paused": False}
+
+    def _offboard_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / offboard
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        try:
+            result = self.queue.offboard_tenant(tenant_id)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "result": tenant_offboard_result_to_dict(result),
+            "tenant_id": tenant_id,
+            "empty": result.empty,
+            "offboarding": result.offboarding,
+            "leased_remaining": result.leased_remaining,
+        }
 
     # ------------------------------------------------------------------
     # Setup / admin

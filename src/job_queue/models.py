@@ -113,6 +113,20 @@ class TenantStats:
     claimable: int
 
 
+@dataclass(frozen=True, slots=True)
+class TenantOffboardResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.offboard_tenant`."""
+
+    tenant_id: str
+    pending_cancelled: int
+    schedules_deleted: int
+    webhooks_deleted: int
+    jobs_purged: int
+    leased_remaining: int
+    offboarding: bool
+    empty: bool
+
+
 
 class WebhookEvent(str, Enum):
     JOB_COMPLETED = "job.completed"

@@ -183,3 +183,50 @@ def test_claim_finalize_no_coordinator_post(queue, coordinator_url):
     assert fin["delivery"]["status"] == "succeeded"
     assert len(posts) == 1
     sink.shutdown()
+
+
+def test_offboard_via_coordinator_http(queue, coordinator_url):
+    """POST /v1/tenants/{id}/offboard clears pending work; in-flight may finish."""
+    client = CoordinatorClient(coordinator_url)
+
+    queue.enqueue(tenant_id="http-gone", payload={"pending": 1})
+    queue.enqueue(tenant_id="http-gone", payload={"run": 1}, priority=10)
+    leased = queue.lease(tenant_id="http-gone", worker_id="local-w")
+    assert leased is not None
+    assert leased.payload == {"run": 1}
+
+    queue.create_schedule(
+        tenant_id="http-gone",
+        interval_seconds=60,
+        payload={"s": 1},
+        name="http-sched",
+    )
+    queue.register_webhook(
+        tenant_id="http-gone",
+        url="http://example.test/hook",
+    )
+
+    result = client.offboard_tenant("http-gone")
+    assert result["empty"] is False
+    assert result["leased_remaining"] == 1
+    assert result["offboarding"] is True
+    body = result["result"]
+    assert body["pending_cancelled"] >= 1
+    assert body["schedules_deleted"] == 1
+    assert body["webhooks_deleted"] == 1
+
+    # Resume blocked.
+    with pytest.raises(Exception):
+        client.resume_tenant("http-gone")
+
+    # Finish in-flight via coordinator HTTP ack.
+    ack = client.ack(
+        leased.id,
+        tenant_id="http-gone",
+        worker_id="local-w",
+        lease_token=leased.lease_token,
+        result={"done": True},
+    )
+    assert ack.status.value == "completed" or str(ack.status) == "completed"
+
+    assert queue.tenant_is_empty("http-gone") is True

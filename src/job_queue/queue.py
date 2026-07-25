@@ -60,6 +60,10 @@ Design notes
   holders may still heartbeat / ack / nack. ``resume_tenant`` restores
   leasing and aligns overdue schedules for a single clean next fire (no
   missed-tick flood). ``get_tenant_stats`` reports counts.
+* **Tenant offboard**: ``offboard_tenant`` fully retires a tenant — cancels
+  pending work, deletes schedules and webhooks, purges non-running jobs, and
+  blocks new enqueue. Already-leased jobs may still finish; when the last
+  one ends the tenant is auto-purged empty (settings/fairness cleared).
 * **Webhooks**: terminal events (completed / failed / dead) insert durable
   ``webhook_deliveries`` first; ``process_webhook_deliveries`` POSTs with
   exponential backoff and dead-letters failed deliveries. Paused tenants do
@@ -85,6 +89,7 @@ from job_queue.models import (
     JobStatus,
     Schedule,
     ScheduleFire,
+    TenantOffboardResult,
     TenantStats,
     WebhookDelivery,
     WebhookEndpoint,
@@ -310,16 +315,16 @@ class JobQueue:
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, updated_at
+                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
                 )
-                VALUES (%s, %s, FALSE, %s)
+                VALUES (%s, %s, FALSE, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET max_concurrent_leases = EXCLUDED.max_concurrent_leases,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (tenant_id, max_concurrent, now),
             )
-            # Drop empty settings rows (no limit, not paused).
+            # Drop empty settings rows (no limit, not paused, not offboarding).
             if max_concurrent is None:
                 conn.execute(
                     """
@@ -327,6 +332,7 @@ class JobQueue:
                     WHERE tenant_id = %s
                       AND max_concurrent_leases IS NULL
                       AND paused = FALSE
+                      AND offboarding = FALSE
                     """,
                     (tenant_id,),
                 )
@@ -366,9 +372,9 @@ class JobQueue:
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, updated_at
+                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
                 )
-                VALUES (%s, NULL, TRUE, %s)
+                VALUES (%s, NULL, TRUE, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET paused = TRUE,
                     updated_at = EXCLUDED.updated_at
@@ -381,18 +387,23 @@ class JobQueue:
 
         Overdue schedules are aligned so the next ``process_due_schedules``
         produces at most one job per schedule (no catch-up flood of missed
-        ticks from the pause window).
+        ticks from the pause window). Cannot resume a tenant that is
+        offboarding.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ValueError(
+                    f"tenant {tenant_id!r} is offboarding and cannot be resumed"
+                )
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, updated_at
+                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
                 )
-                VALUES (%s, NULL, FALSE, %s)
+                VALUES (%s, NULL, FALSE, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET paused = FALSE,
                     updated_at = EXCLUDED.updated_at
@@ -419,6 +430,7 @@ class JobQueue:
                 WHERE tenant_id = %s
                   AND max_concurrent_leases IS NULL
                   AND paused = FALSE
+                  AND offboarding = FALSE
                 """,
                 (tenant_id,),
             )
@@ -427,6 +439,163 @@ class JobQueue:
             raise ValueError("tenant_id is required")
         with self._pool.connection() as conn:
             return self._is_tenant_paused(conn, tenant_id)
+
+    def is_tenant_offboarding(self, tenant_id: str) -> bool:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            return self._is_tenant_offboarding(conn, tenant_id)
+
+    def offboard_tenant(self, tenant_id: str) -> TenantOffboardResult:
+        """Fully offboard a tenant without interrupting in-flight work.
+
+        1. Marks tenant paused + offboarding (no new leases / schedule ticks /
+           webhook claims; enqueue is rejected).
+        2. Cancels all *pending* jobs (cascade kills pending dependents).
+        3. Deletes all schedules and webhook endpoints for the tenant
+           (webhook deliveries cascade-delete with endpoints).
+        4. Purges all non-``leased`` job rows (history / cancelled / dead).
+        5. Leaves *leased* jobs running; holders may still heartbeat / ack /
+           nack. When the last leased job ends, remaining rows and settings
+           are auto-purged so the tenant is empty.
+
+        Returns a :class:`~job_queue.models.TenantOffboardResult` with counts
+        and how many leased jobs still need to finish.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
+                )
+                VALUES (%s, NULL, TRUE, TRUE, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET paused = TRUE,
+                    offboarding = TRUE,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, now),
+            )
+
+            # Cancel pending only — leave leased running.
+            pending_rows = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE tenant_id = %s
+                  AND status = %s
+                FOR UPDATE
+                """,
+                (tenant_id, JobStatus.PENDING.value),
+            ).fetchall()
+            pending_cancelled = 0
+            for prow in pending_rows:
+                updated = conn.execute(
+                    f"""
+                    UPDATE jobs
+                    SET status = %s,
+                        leased_by = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        lease_started_at = NULL,
+                        last_error = COALESCE(last_error, 'tenant offboarded'),
+                        updated_at = %s
+                    WHERE id = %s
+                      AND tenant_id = %s
+                      AND status = %s
+                    RETURNING id
+                    """,
+                    (
+                        JobStatus.CANCELLED.value,
+                        now,
+                        prow["id"],
+                        tenant_id,
+                        JobStatus.PENDING.value,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    continue
+                pending_cancelled += 1
+                self._cascade_cancel_dependents(
+                    conn,
+                    parent_id=prow["id"],
+                    tenant_id=tenant_id,
+                    reason=f"parent job {prow['id']} cancelled (tenant offboard)",
+                    now=now,
+                )
+
+            sched_del = conn.execute(
+                """
+                DELETE FROM schedules
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (tenant_id,),
+            ).fetchall()
+            # Endpoints CASCADE delete deliveries.
+            wh_del = conn.execute(
+                """
+                DELETE FROM webhook_endpoints
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (tenant_id,),
+            ).fetchall()
+            # Any orphan deliveries without endpoint (should be none).
+            conn.execute(
+                """
+                DELETE FROM webhook_deliveries
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            )
+
+            purged = conn.execute(
+                """
+                DELETE FROM jobs
+                WHERE tenant_id = %s
+                  AND status <> %s
+                RETURNING id
+                """,
+                (tenant_id, JobStatus.LEASED.value),
+            ).fetchall()
+
+            leased_remaining = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n
+                FROM jobs
+                WHERE tenant_id = %s
+                  AND status = %s
+                """,
+                (tenant_id, JobStatus.LEASED.value),
+            ).fetchone()
+            leased_n = int(leased_remaining["n"]) if leased_remaining else 0
+
+            empty = False
+            if leased_n == 0:
+                self._finalize_offboard_locked(conn, tenant_id=tenant_id, now=now)
+                empty = True
+
+            return TenantOffboardResult(
+                tenant_id=tenant_id,
+                pending_cancelled=pending_cancelled,
+                schedules_deleted=len(sched_del),
+                webhooks_deleted=len(wh_del),
+                jobs_purged=len(purged),
+                leased_remaining=leased_n,
+                offboarding=not empty,
+                empty=empty,
+            )
+
+    def tenant_is_empty(self, tenant_id: str) -> bool:
+        """True when tenant has no jobs, schedules, webhooks, or settings."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            return self._tenant_is_empty(conn, tenant_id)
 
     def get_tenant_stats(self, tenant_id: str) -> TenantStats:
         """Return job counts and control flags for one tenant."""
@@ -536,6 +705,10 @@ class JobQueue:
             raise DependencyError("a job cannot depend on itself")
 
         with transaction(self._pool) as conn:
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ValueError(
+                    f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
+                )
             if dep_ids:
                 self._validate_dependencies(conn, tenant_id=tenant_id, depends_on=dep_ids)
 
@@ -758,6 +931,10 @@ class JobQueue:
             )
 
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
+            # Offboarding: cancel abandoned expired leases so the tenant can empty.
+            self._reap_offboarding_expired_leases(
+                conn, now=now, tenant_id=tenant_id
+            )
 
             # Paused: no new claims (pending or reclaim). In-flight holders
             # still use heartbeat/ack/nack outside this path.
@@ -866,6 +1043,7 @@ class JobQueue:
 
         with transaction(self._pool) as conn:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
+            self._reap_offboarding_expired_leases(conn, now=now, tenant_id=None)
 
             while len(claimed) < limit and skips < max_skips:
                 try:
@@ -1074,7 +1252,17 @@ class JobQueue:
         attempts = int(row["attempts"])
         max_attempts = int(row["max_attempts"])
         error = "max runtime exceeded"
-        if attempts >= max_attempts:
+        tenant_id = row["tenant_id"]
+        # Offboarding tenants must not regain pending work after a force-release.
+        force_terminal = self._is_tenant_offboarding(conn, tenant_id)
+        if attempts >= max_attempts or force_terminal:
+            terminal = (
+                JobStatus.CANCELLED.value
+                if force_terminal and attempts < max_attempts
+                else JobStatus.DEAD.value
+            )
+            if force_terminal and attempts < max_attempts:
+                error = "max runtime exceeded during tenant offboard"
             conn.execute(
                 f"""
                 UPDATE jobs
@@ -1084,40 +1272,43 @@ class JobQueue:
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     last_error = %s,
-                    completed_at = %s,
+                    completed_at = CASE WHEN %s = %s THEN %s ELSE completed_at END,
                     updated_at = %s
                 WHERE id = %s
                   AND tenant_id = %s
                   AND status = %s
                 """,
                 (
-                    JobStatus.DEAD.value,
+                    terminal,
                     error,
+                    terminal,
+                    JobStatus.DEAD.value,
                     now,
                     now,
                     row["id"],
-                    row["tenant_id"],
+                    tenant_id,
                     JobStatus.LEASED.value,
                 ),
             )
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=row["id"],
-                tenant_id=row["tenant_id"],
-                reason=f"parent job {row['id']} dead (max runtime)",
+                tenant_id=tenant_id,
+                reason=f"parent job {row['id']} ended as {terminal} (max runtime)",
                 now=now,
             )
             dead_row = conn.execute(
                 f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
                 (row["id"],),
             ).fetchone()
-            if dead_row is not None:
+            if dead_row is not None and terminal == JobStatus.DEAD.value:
                 self._enqueue_job_webhooks(
                     conn,
                     job=_row_to_job(dead_row),
                     event=WebhookEvent.JOB_DEAD,
                     now=now,
                 )
+            self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
         else:
             base = row.get("retry_backoff_base_seconds")
             cap = row.get("retry_backoff_max_seconds")
@@ -1148,7 +1339,7 @@ class JobQueue:
                     next_available,
                     now,
                     row["id"],
-                    row["tenant_id"],
+                    tenant_id,
                     JobStatus.LEASED.value,
                 ),
             )
@@ -1214,11 +1405,14 @@ class JobQueue:
                 ),
             ).fetchall()
 
+        tenants: set[str] = set()
         for dead in dead_rows:
+            tid = dead["tenant_id"]
+            tenants.add(tid)
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=dead["id"],
-                tenant_id=dead["tenant_id"],
+                tenant_id=tid,
                 reason=f"parent job {dead['id']} dead-lettered",
                 now=now,
             )
@@ -1233,6 +1427,8 @@ class JobQueue:
                     event=WebhookEvent.JOB_DEAD,
                     now=now,
                 )
+        for tid in tenants:
+            self._maybe_finalize_offboard(conn, tenant_id=tid, now=now)
 
     # ------------------------------------------------------------------
     # Cancel
@@ -1328,6 +1524,7 @@ class JobQueue:
                 reason=f"parent job {job_id} cancelled",
                 now=now,
             )
+            self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
             return _row_to_job(updated)
 
     # ------------------------------------------------------------------
@@ -1467,6 +1664,9 @@ class JobQueue:
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
                 )
+                self._maybe_finalize_offboard(
+                    conn, tenant_id=tenant_id, now=now
+                )
                 return job
 
         if runtime_exceeded:
@@ -1571,6 +1771,9 @@ class JobQueue:
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_FAILED, now=now
                 )
+            # Offboarding: requeued pending is purged when no leases remain;
+            # terminal nacks also trigger purge when this was the last holder.
+            self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
             return job
 
     def ensure_lease(
@@ -1733,6 +1936,10 @@ class JobQueue:
             run_at = now
 
         with transaction(self._pool) as conn:
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ReplayError(
+                    f"tenant {tenant_id!r} is offboarding; replay is rejected"
+                )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}
@@ -1944,6 +2151,11 @@ class JobQueue:
         now = _utcnow()
         eid = endpoint_id or uuid4()
         with transaction(self._pool) as conn:
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ValueError(
+                    f"tenant {tenant_id!r} is offboarding; "
+                    "webhook registration is rejected"
+                )
             row = conn.execute(
                 f"""
                 INSERT INTO webhook_endpoints (
@@ -2679,6 +2891,11 @@ class JobQueue:
         sid = schedule_id or uuid4()
 
         with transaction(self._pool) as conn:
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ValueError(
+                    f"tenant {tenant_id!r} is offboarding; "
+                    "schedule registration is rejected"
+                )
             try:
                 row = conn.execute(
                     f"""
@@ -3067,6 +3284,205 @@ class JobQueue:
         if row is None:
             return False
         return bool(row["paused"])
+
+    @staticmethod
+    def _is_tenant_offboarding(conn: Any, tenant_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT offboarding
+            FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["offboarding"])
+
+    def _tenant_is_empty(self, conn: Any, tenant_id: str) -> bool:
+        """True when tenant has no jobs, schedules, webhooks, or settings."""
+        jobs = conn.execute(
+            "SELECT 1 FROM jobs WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if jobs is not None:
+            return False
+        sched = conn.execute(
+            "SELECT 1 FROM schedules WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if sched is not None:
+            return False
+        wh = conn.execute(
+            "SELECT 1 FROM webhook_endpoints WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if wh is not None:
+            return False
+        deliveries = conn.execute(
+            "SELECT 1 FROM webhook_deliveries WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if deliveries is not None:
+            return False
+        settings = conn.execute(
+            "SELECT 1 FROM tenant_settings WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if settings is not None:
+            return False
+        return True
+
+    def _finalize_offboard_locked(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        now: datetime,
+    ) -> None:
+        """Purge all remaining tenant state after the last leased job ends.
+
+        Caller must hold the connection transaction and ensure no leased rows
+        remain (or accept they will be deleted too if still present — we only
+        delete non-leased defensively after an explicit leased check).
+        """
+        # Safety: never wipe in-flight work.
+        leased = self._count_leased(conn, tenant_id)
+        if leased > 0:
+            return
+
+        conn.execute(
+            "DELETE FROM jobs WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM schedules WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM webhook_endpoints WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM webhook_deliveries WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM tenant_settings WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM tenant_fairness WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        # *now* reserved for future audit rows; keep signature stable.
+        _ = now
+
+    def _maybe_finalize_offboard(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        now: datetime,
+    ) -> None:
+        """If tenant is offboarding and has no leased jobs left, purge it empty."""
+        if not self._is_tenant_offboarding(conn, tenant_id):
+            return
+        if self._count_leased(conn, tenant_id) > 0:
+            return
+        self._finalize_offboard_locked(conn, tenant_id=tenant_id, now=now)
+
+    def _reap_offboarding_expired_leases(
+        self,
+        conn: Any,
+        *,
+        now: datetime,
+        tenant_id: str | None = None,
+    ) -> None:
+        """Cancel expired leases for offboarding tenants.
+
+        Offboarding marks tenants paused, so expired leases are never reclaimed.
+        Without this sweep, abandoned holders would leave the tenant non-empty
+        forever. Cancelling expired leases lets ``_maybe_finalize_offboard``
+        purge the tenant once nothing is running.
+        """
+        if tenant_id is not None:
+            if not self._is_tenant_offboarding(conn, tenant_id):
+                return
+            expired = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE tenant_id = %s
+                  AND status = %s
+                  AND lease_expires_at < %s
+                FOR UPDATE
+                """,
+                (tenant_id, JobStatus.LEASED.value, now),
+            ).fetchall()
+        else:
+            expired = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE status = %s
+                  AND lease_expires_at < %s
+                  AND EXISTS (
+                        SELECT 1
+                        FROM tenant_settings ts
+                        WHERE ts.tenant_id = jobs.tenant_id
+                          AND ts.offboarding = TRUE
+                  )
+                FOR UPDATE OF jobs
+                """,
+                (JobStatus.LEASED.value, now),
+            ).fetchall()
+
+        tenants: set[str] = set()
+        for row in expired:
+            tid = row["tenant_id"]
+            updated = conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    lease_started_at = NULL,
+                    last_error = COALESCE(
+                        last_error,
+                        'lease expired during tenant offboard'
+                    ),
+                    updated_at = %s
+                WHERE id = %s
+                  AND tenant_id = %s
+                  AND status = %s
+                RETURNING id
+                """,
+                (
+                    JobStatus.CANCELLED.value,
+                    now,
+                    row["id"],
+                    tid,
+                    JobStatus.LEASED.value,
+                ),
+            ).fetchone()
+            if updated is None:
+                continue
+            tenants.add(tid)
+            self._cascade_cancel_dependents(
+                conn,
+                parent_id=row["id"],
+                tenant_id=tid,
+                reason=(
+                    f"parent job {row['id']} cancelled "
+                    f"(lease expired during offboard)"
+                ),
+                now=now,
+            )
+
+        for tid in tenants:
+            self._maybe_finalize_offboard(conn, tenant_id=tid, now=now)
 
     @staticmethod
     def _count_leased(conn: Any, tenant_id: str) -> int:

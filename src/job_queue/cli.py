@@ -120,10 +120,30 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_offboard(args: argparse.Namespace) -> int:
+    dsn = _resolve_dsn(args.dsn)
+    queue = JobQueue.connect(dsn, min_size=1, max_size=2)
+    try:
+        result = queue.offboard_tenant(args.tenant)
+        print(
+            f"tenant={result.tenant_id}\n"
+            f"  pending_cancelled={result.pending_cancelled}\n"
+            f"  schedules_deleted={result.schedules_deleted}\n"
+            f"  webhooks_deleted={result.webhooks_deleted}\n"
+            f"  jobs_purged={result.jobs_purged}\n"
+            f"  leased_remaining={result.leased_remaining}\n"
+            f"  offboarding={result.offboarding}\n"
+            f"  empty={result.empty}"
+        )
+    finally:
+        queue.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="job-queue",
-        description="Read-only inspection tools for the multi-tenant job queue.",
+        description="Inspection and admin tools for the multi-tenant job queue.",
     )
     parser.add_argument(
         "--dsn",
@@ -150,6 +170,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="When listing all tenants, print multi-line blocks instead of a table",
     )
     stats.set_defaults(func=cmd_stats)
+
+    offboard = sub.add_parser(
+        "offboard",
+        help=(
+            "Fully offboard a tenant: cancel pending work, delete schedules "
+            "and webhooks, purge history; in-flight leases may finish then "
+            "the tenant is auto-emptied."
+        ),
+    )
+    offboard.add_argument(
+        "--tenant",
+        "-t",
+        required=True,
+        help="Tenant id to offboard",
+    )
+    offboard.set_defaults(func=cmd_offboard)
 
     return parser
 

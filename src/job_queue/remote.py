@@ -323,6 +323,11 @@ class CoordinatorClient:
         assert payload is not None
         return payload
 
+    def offboard_tenant(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/offboard", {})
+        assert payload is not None
+        return payload
+
     def create_schedule(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/schedules", kwargs)
         assert payload is not None
