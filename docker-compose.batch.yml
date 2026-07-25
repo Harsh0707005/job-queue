@@ -1,0 +1,73 @@
+# Batch-lease distributed soak (dual coordinators, workers with BATCH_SIZE>1).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.batch.yml \
+#     up --build --abort-on-container-exit --exit-code-from batch-soak batch-soak
+#   docker compose -f docker-compose.yml -f docker-compose.batch.yml down -v
+
+services:
+  chaos:
+    profiles: ["chaos-only"]
+  soak:
+    profiles: ["chaos-only"]
+
+  worker-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      BATCH_SIZE: "8"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+
+  worker-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      BATCH_SIZE: "8"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+
+  worker-3:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      BATCH_SIZE: "5"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+
+  worker-4:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      BATCH_SIZE: "5"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+
+  batch-soak:
+    build: .
+    command: ["python", "scripts/batch_lease_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "6"
+      HIGH_PER_TENANT: "20"
+      LOW_PER_TENANT: "10"
+      HIGH_PRIORITY: "100"
+      LOW_PRIORITY: "1"
+      MAX_WALL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

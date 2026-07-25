@@ -131,15 +131,29 @@ class Coordinator:
         tenant_id = body.get("tenant_id")  # None => fair
         queue_name = body.get("queue_name") or "default"
         vt = body.get("visibility_timeout_seconds")
-        job = self.queue.lease(
-            worker_id=str(worker_id),
-            tenant_id=str(tenant_id) if tenant_id else None,
-            queue_name=str(queue_name),
-            visibility_timeout_seconds=int(vt) if vt is not None else None,
-        )
-        if job is None:
+        limit = int(body.get("limit") or 1)
+        if limit < 1:
+            return 400, {"error": "limit must be >= 1"}
+        try:
+            jobs = self.queue.lease_batch(
+                worker_id=str(worker_id),
+                limit=limit,
+                tenant_id=str(tenant_id) if tenant_id else None,
+                queue_name=str(queue_name),
+                visibility_timeout_seconds=int(vt) if vt is not None else None,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        if not jobs:
             return 204, {}
-        return 200, {"job": job_to_dict(job)}
+        payload: dict[str, Any] = {
+            "jobs": [job_to_dict(j) for j in jobs],
+            "count": len(jobs),
+        }
+        # Backward-compatible single-job field when limit==1 / one result.
+        if len(jobs) == 1:
+            payload["job"] = payload["jobs"][0]
+        return 200, payload
 
     def _job_action(
         self, path: str, body: dict[str, Any], action: str

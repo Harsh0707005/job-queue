@@ -87,6 +87,7 @@ class Worker:
         heartbeat_interval_seconds: float | None = None,
         poll_interval_seconds: float = 0.5,
         visibility_timeout_seconds: int | None = None,
+        batch_size: int = 1,
     ) -> None:
         self.queue = queue
         self.tenant_id = tenant_id  # None → fair lease across tenants
@@ -96,6 +97,9 @@ class Worker:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.visibility_timeout_seconds = visibility_timeout_seconds
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.batch_size = batch_size
         self._handler: Handler | None = None
         self._stop = threading.Event()
 
@@ -112,32 +116,52 @@ class Worker:
 
     def run_once(self) -> Job | None:
         """Lease and process at most one job. Returns the job, or None."""
+        jobs = self.run_batch_once(limit=1)
+        return jobs[0] if jobs else None
+
+    def run_batch_once(self, *, limit: int | None = None) -> list[Job]:
+        """Lease up to *limit* (default ``batch_size``) jobs and process them.
+
+        Jobs in the batch are processed sequentially with independent heartbeats.
+        Returns the list of jobs that were leased (may be shorter than *limit*).
+        """
         if self._handler is None:
             raise RuntimeError("no handler registered; use @worker.handler")
 
-        job = self.queue.lease(
+        take = self.batch_size if limit is None else limit
+        if take < 1:
+            raise ValueError("limit must be >= 1")
+
+        jobs = self.queue.lease_batch(
             tenant_id=self.tenant_id,
             worker_id=self.worker_id,
             queue_name=self.queue_name,
             visibility_timeout_seconds=self.visibility_timeout_seconds,
+            limit=take,
         )
-        if job is None:
-            return None
-
-        self._process(job)
-        return job
+        for job in jobs:
+            if self._stop.is_set():
+                break
+            self._process(job)
+        return jobs
 
     def run(self, *, max_jobs: int | None = None, stop_when_idle: bool = False) -> int:
         """Run the worker loop. Returns the number of jobs processed."""
         processed = 0
         while not self._stop.is_set():
-            job = self.run_once()
-            if job is None:
+            remaining = None
+            if max_jobs is not None:
+                remaining = max_jobs - processed
+                if remaining <= 0:
+                    break
+            take = self.batch_size if remaining is None else min(self.batch_size, remaining)
+            jobs = self.run_batch_once(limit=take)
+            if not jobs:
                 if stop_when_idle:
                     break
                 self._stop.wait(self.poll_interval_seconds)
                 continue
-            processed += 1
+            processed += len(jobs)
             if max_jobs is not None and processed >= max_jobs:
                 break
         return processed

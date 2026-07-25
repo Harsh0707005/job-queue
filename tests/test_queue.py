@@ -3174,3 +3174,96 @@ def test_paused_tenant_does_not_claim_pending_webhook_deliveries(queue: JobQueue
         assert any(x["body"]["tenant_id"] == "t1" for x in capture.received)
     finally:
         capture.stop()
+
+
+# ---------------------------------------------------------------------------
+# Batch lease
+# ---------------------------------------------------------------------------
+
+
+def test_lease_batch_tenant_scoped_priority_order(queue: JobQueue):
+    low = queue.enqueue(tenant_id="t1", payload={"p": "low"}, priority=1)
+    mid = queue.enqueue(tenant_id="t1", payload={"p": "mid"}, priority=5)
+    high = queue.enqueue(tenant_id="t1", payload={"p": "high"}, priority=10)
+
+    batch = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=3)
+    assert len(batch) == 3
+    assert [j.id for j in batch] == [high.id, mid.id, low.id]
+    # Distinct fencing tokens.
+    assert len({j.lease_token for j in batch}) == 3
+
+
+def test_lease_batch_respects_limit_and_empty(queue: JobQueue):
+    for i in range(5):
+        queue.enqueue(tenant_id="t1", payload={"i": i})
+    batch = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=2)
+    assert len(batch) == 2
+    batch2 = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=10)
+    assert len(batch2) == 3
+    assert queue.lease_batch(tenant_id="t1", worker_id="w1", limit=5) == []
+
+
+def test_lease_batch_fair_rotates_tenants_in_batch(queue: JobQueue):
+    """A fair batch should not hand all slots to one tenant when peers are ready."""
+    for t in ("a", "b", "c"):
+        for i in range(10):
+            queue.enqueue(tenant_id=t, payload={"t": t, "i": i})
+
+    batch = queue.lease_batch(worker_id="fair-batch", limit=6)
+    assert len(batch) == 6
+    tenants = [j.tenant_id for j in batch]
+    assert set(tenants) == {"a", "b", "c"}
+    # No tenant should take more than half of a 6-job fair batch.
+    for t in ("a", "b", "c"):
+        assert tenants.count(t) <= 3
+
+
+def test_lease_batch_fair_priority_before_low(queue: JobQueue):
+    for i in range(10):
+        queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=0)
+    for i in range(3):
+        queue.enqueue(tenant_id="vip", payload={"i": i}, priority=100)
+
+    batch = queue.lease_batch(worker_id="pri-batch", limit=5)
+    assert len(batch) == 5
+    # First three must be high priority.
+    assert all(j.priority == 100 for j in batch[:3])
+    assert all(j.tenant_id == "vip" for j in batch[:3])
+    assert all(j.priority == 0 for j in batch[3:])
+
+
+def test_lease_batch_concurrency_cap(queue: JobQueue):
+    queue.set_concurrency_limit("capped", 2)
+    for i in range(5):
+        queue.enqueue(tenant_id="capped", payload={"i": i})
+
+    batch = queue.lease_batch(tenant_id="capped", worker_id="w1", limit=5)
+    assert len(batch) == 2
+    more = queue.lease_batch(tenant_id="capped", worker_id="w2", limit=5)
+    assert more == []
+
+
+def test_worker_batch_processes_all(queue: JobQueue):
+    from job_queue import Worker
+
+    for i in range(7):
+        queue.enqueue(tenant_id="t1", payload={"i": i})
+
+    worker = Worker(queue, tenant_id="t1", worker_id="bw", batch_size=3)
+
+    @worker.handler
+    def handle(job):
+        return {"ok": True}
+
+    n = worker.run(max_jobs=7, stop_when_idle=True)
+    assert n == 7
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 7
+
+
+def test_lease_batch_invalid_limit(queue: JobQueue):
+    import pytest
+
+    with pytest.raises(ValueError):
+        queue.lease_batch(worker_id="w", limit=0)
+    with pytest.raises(ValueError):
+        queue.lease_batch(worker_id="w", limit=1000)

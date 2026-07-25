@@ -34,13 +34,15 @@ Design notes
 * **Dependencies**: ``depends_on`` parent job id(s). A child is not claimable
   until every parent is ``completed``. If a parent ends as failed/dead/cancelled,
   pending dependents are cascade-cancelled (they do not sit forever).
-* **Priority lanes + fair multi-tenant lease**: ``lease(worker_id=...)``
-  without ``tenant_id`` claims ready jobs across tenants in **priority lanes**:
+* **Priority lanes + fair multi-tenant lease**: ``lease`` / ``lease_batch``
+  without ``tenant_id`` claim ready jobs across tenants in **priority lanes**:
   higher ``priority`` always before lower. Within the same priority, tenants
   rotate by **least-recently-served** (``tenant_fairness.last_lease_at``) so a
   noisy high-priority backlog cannot monopolize the lane — and a noisy
   *low*-priority backlog cannot jump ahead of others' high-priority work.
-  Scoped ``lease(tenant_id=...)`` is priority-ordered within that tenant only.
+  ``lease_batch(limit=N)`` pulls up to N jobs in one go (each claim still
+  updates fairness so a single batch rotates tenants). Scoped
+  ``lease(tenant_id=...)`` is priority-ordered within that tenant only.
   Per-job rules (delay, deps, concurrency caps, queue name) still apply.
 * **Retry backoff**: nack-requeue uses exponential ``available_at`` delay
   (base * 2^(attempt-1), capped by max). After ``max_attempts`` the job is
@@ -639,12 +641,34 @@ class JobQueue:
         queue_name: str = "default",
         visibility_timeout_seconds: int | None = None,
     ) -> Job | None:
-        """Claim the next available job.
+        """Claim the next available job (batch size 1).
 
-        Pass *tenant_id* to lease only that tenant's work (legacy / dedicated
-        workers). Omit *tenant_id* for **fair multi-tenant** leasing: the
-        queue picks a ready job across tenants, preferring tenants that
-        currently hold fewer leases so one noisy tenant cannot starve others.
+        See :meth:`lease_batch` for multi-job pulls and full semantics.
+        """
+        jobs = self.lease_batch(
+            worker_id=worker_id,
+            limit=1,
+            tenant_id=tenant_id,
+            queue_name=queue_name,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+        )
+        return jobs[0] if jobs else None
+
+    def lease_batch(
+        self,
+        *,
+        worker_id: str,
+        limit: int = 1,
+        tenant_id: str | None = None,
+        queue_name: str = "default",
+        visibility_timeout_seconds: int | None = None,
+    ) -> list[Job]:
+        """Claim up to *limit* available jobs in one pull.
+
+        Pass *tenant_id* to lease only that tenant's work. Omit *tenant_id* for
+        **fair multi-tenant** leasing with **priority lanes**: higher priority
+        first; within a lane tenants rotate by least-recently-served so one
+        noisy tenant cannot monopolize the batch.
 
         Available means:
           * status = pending AND available_at <= now() AND all ``depends_on``
@@ -658,36 +682,44 @@ class JobQueue:
         attempts are dead-lettered first (dependents cascade-cancelled).
 
         Uses ``FOR UPDATE SKIP LOCKED`` so concurrent workers never claim the
-        same row. A fresh ``lease_token`` is minted for fencing.
+        same row. Each job gets a fresh ``lease_token`` for fencing. Returns
+        fewer than *limit* jobs when the queue is short (possibly empty list).
         """
         if not worker_id:
             raise ValueError("worker_id is required")
         if tenant_id is not None and not tenant_id:
             raise ValueError("tenant_id must be non-empty when provided")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if limit > 500:
+            raise ValueError("limit must be <= 500")
 
         if tenant_id is None:
-            return self._lease_fair(
+            return self._lease_fair_batch(
                 worker_id=worker_id,
                 queue_name=queue_name,
                 visibility_timeout_seconds=visibility_timeout_seconds,
+                limit=limit,
             )
-        return self._lease_for_tenant(
+        return self._lease_for_tenant_batch(
             tenant_id=tenant_id,
             worker_id=worker_id,
             queue_name=queue_name,
             visibility_timeout_seconds=visibility_timeout_seconds,
+            limit=limit,
         )
 
-    def _lease_for_tenant(
+    def _lease_for_tenant_batch(
         self,
         *,
         tenant_id: str,
         worker_id: str,
         queue_name: str,
         visibility_timeout_seconds: int | None,
-    ) -> Job | None:
+        limit: int,
+    ) -> list[Job]:
         now = _utcnow()
-        token = uuid4()
+        claimed: list[Job] = []
 
         with transaction(self._pool) as conn:
             # Serialize lease decisions for this tenant so concurrency caps
@@ -702,14 +734,15 @@ class JobQueue:
             # Paused: no new claims (pending or reclaim). In-flight holders
             # still use heartbeat/ack/nack outside this path.
             if self._is_tenant_paused(conn, tenant_id):
-                return None
+                return []
 
-            limit = self._read_concurrency_limit(conn, tenant_id)
+            conc_limit = self._read_concurrency_limit(conn, tenant_id)
             leased_count = self._count_leased(conn, tenant_id)
-            at_limit = limit is not None and leased_count >= limit
 
-            if at_limit:
-                candidate = conn.execute(
+            if conc_limit is not None and leased_count >= conc_limit:
+                # Only reclaim expired leases (does not increase concurrent
+                # holders beyond the cap in steady state).
+                candidates = conn.execute(
                     f"""
                     SELECT {_JOB_COLUMNS}
                     FROM jobs
@@ -720,17 +753,24 @@ class JobQueue:
                       AND attempts < max_attempts
                     ORDER BY priority DESC, created_at ASC
                     FOR UPDATE SKIP LOCKED
-                    LIMIT 1
+                    LIMIT %s
                     """,
                     (
                         tenant_id,
                         queue_name,
                         JobStatus.LEASED.value,
                         now,
+                        limit,
                     ),
-                ).fetchone()
+                ).fetchall()
             else:
-                candidate = conn.execute(
+                take = limit
+                if conc_limit is not None:
+                    take = min(limit, conc_limit - leased_count)
+                    take = max(take, 0)
+                if take < 1:
+                    return []
+                candidates = conn.execute(
                     f"""
                     SELECT {_JOB_COLUMNS}
                     FROM jobs
@@ -750,7 +790,7 @@ class JobQueue:
                       )
                     ORDER BY priority DESC, created_at ASC
                     FOR UPDATE SKIP LOCKED
-                    LIMIT 1
+                    LIMIT %s
                     """,
                     (
                         tenant_id,
@@ -759,51 +799,64 @@ class JobQueue:
                         now,
                         JobStatus.LEASED.value,
                         now,
+                        take,
                     ),
-                ).fetchone()
+                ).fetchall()
 
-            if candidate is None:
-                return None
-            return self._claim_locked_job(
-                conn,
-                candidate,
-                worker_id=worker_id,
-                token=token,
-                visibility_timeout_seconds=visibility_timeout_seconds,
-                now=now,
-            )
+            for candidate in candidates:
+                claimed.append(
+                    self._claim_locked_job(
+                        conn,
+                        candidate,
+                        worker_id=worker_id,
+                        token=uuid4(),
+                        visibility_timeout_seconds=visibility_timeout_seconds,
+                        now=now,
+                    )
+                )
+        return claimed
 
-    def _lease_fair(
+    def _lease_fair_batch(
         self,
         *,
         worker_id: str,
         queue_name: str,
         visibility_timeout_seconds: int | None,
-        _max_attempts: int = 64,
-    ) -> Job | None:
-        """Lease fairly across tenants for *queue_name*."""
+        limit: int,
+        _max_skips: int | None = None,
+    ) -> list[Job]:
+        """Lease up to *limit* jobs fairly across tenants for *queue_name*.
+
+        Each claim updates ``tenant_fairness.last_lease_at`` so subsequent
+        jobs in the same batch rotate tenants within a priority lane.
+        """
         now = _utcnow()
+        claimed: list[Job] = []
+        # Allow several skip attempts per desired job (paused / at-cap tenants).
+        max_skips = _max_skips if _max_skips is not None else max(64, limit * 16)
+        skips = 0
 
         with transaction(self._pool) as conn:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
 
-            for _ in range(_max_attempts):
+            while len(claimed) < limit and skips < max_skips:
                 try:
                     # Savepoint so a rejected candidate releases its row lock.
                     with conn.transaction():
-                        claimed = self._try_claim_fair_candidate(
+                        job = self._try_claim_fair_candidate(
                             conn,
                             worker_id=worker_id,
                             queue_name=queue_name,
                             visibility_timeout_seconds=visibility_timeout_seconds,
                             now=now,
                         )
-                        if claimed is None:
-                            return None
-                        return claimed
+                        if job is None:
+                            break
+                        claimed.append(job)
                 except _SkipLeaseCandidate:
+                    skips += 1
                     continue
-            return None
+        return claimed
 
     def _try_claim_fair_candidate(
         self,
@@ -910,14 +963,16 @@ class JobQueue:
             now=now,
         )
         # Record that this tenant was just served (drives next fair pick).
+        # Use clock_timestamp() so successive claims in the same batch get
+        # distinct last_lease_at values and rotate tenants correctly.
         conn.execute(
             """
             INSERT INTO tenant_fairness (tenant_id, last_lease_at)
-            VALUES (%s, %s)
+            VALUES (%s, clock_timestamp())
             ON CONFLICT (tenant_id) DO UPDATE
-            SET last_lease_at = EXCLUDED.last_lease_at
+            SET last_lease_at = clock_timestamp()
             """,
-            (claimed.tenant_id, now),
+            (claimed.tenant_id,),
         )
         return claimed
 

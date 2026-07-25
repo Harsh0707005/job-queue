@@ -125,9 +125,28 @@ class CoordinatorClient:
         queue_name: str = "default",
         visibility_timeout_seconds: int | None = None,
     ) -> Job | None:
+        jobs = self.lease_batch(
+            worker_id=worker_id,
+            limit=1,
+            tenant_id=tenant_id,
+            queue_name=queue_name,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+        )
+        return jobs[0] if jobs else None
+
+    def lease_batch(
+        self,
+        *,
+        worker_id: str,
+        limit: int = 1,
+        tenant_id: str | None = None,
+        queue_name: str = "default",
+        visibility_timeout_seconds: int | None = None,
+    ) -> list[Job]:
         body: dict[str, Any] = {
             "worker_id": worker_id,
             "queue_name": queue_name,
+            "limit": limit,
         }
         if tenant_id is not None:
             body["tenant_id"] = tenant_id
@@ -149,12 +168,15 @@ class CoordinatorClient:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     if int(resp.getcode()) == 204:
-                        return None
+                        return []
                     raw = resp.read()
                     if not raw:
-                        return None
+                        return []
                     payload = json.loads(raw.decode("utf-8"))
-                    return job_from_dict(payload["job"])
+                    jobs_raw = payload.get("jobs")
+                    if jobs_raw is None and payload.get("job") is not None:
+                        jobs_raw = [payload["job"]]
+                    return [job_from_dict(j) for j in (jobs_raw or [])]
             except urllib.error.HTTPError as exc:
                 if 500 <= int(exc.code) < 600:
                     last_err = exc
@@ -333,6 +355,7 @@ class RemoteWorkerAgent:
         poll_interval_seconds: float = 0.5,
         heartbeat_interval_seconds: float = 2.0,
         visibility_timeout_seconds: int = 30,
+        batch_size: int = 1,
     ) -> None:
         self.client = client
         self.worker_id = worker_id or f"remote-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
@@ -340,6 +363,9 @@ class RemoteWorkerAgent:
         self.poll_interval_seconds = poll_interval_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.visibility_timeout_seconds = visibility_timeout_seconds
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.batch_size = batch_size
         self._stop = threading.Event()
         self.processed = 0
 
@@ -348,15 +374,17 @@ class RemoteWorkerAgent:
 
     def run(self) -> int:
         logger.info(
-            "remote worker %s starting (tenant=%s fair=%s)",
+            "remote worker %s starting (tenant=%s fair=%s batch_size=%d)",
             self.worker_id,
             self.tenant_id,
             self.tenant_id is None,
+            self.batch_size,
         )
         while not self._stop.is_set():
             try:
-                job = self.client.lease(
+                jobs = self.client.lease_batch(
                     worker_id=self.worker_id,
+                    limit=self.batch_size,
                     tenant_id=self.tenant_id,
                     visibility_timeout_seconds=self.visibility_timeout_seconds,
                 )
@@ -365,17 +393,23 @@ class RemoteWorkerAgent:
                 self._stop.wait(min(5.0, self.poll_interval_seconds * 4))
                 continue
 
-            if job is None:
+            if not jobs:
                 self._stop.wait(self.poll_interval_seconds)
                 continue
 
-            try:
-                self._process(job)
-                self.processed += 1
-            except LeaseError:
-                logger.warning("lease lost for job %s", job.id)
-            except Exception:
-                logger.exception("processing failed for job %s", job.id)
+            logger.debug(
+                "worker %s leased batch of %d", self.worker_id, len(jobs)
+            )
+            for job in jobs:
+                if self._stop.is_set():
+                    break
+                try:
+                    self._process(job)
+                    self.processed += 1
+                except LeaseError:
+                    logger.warning("lease lost for job %s", job.id)
+                except Exception:
+                    logger.exception("processing failed for job %s", job.id)
         logger.info("remote worker %s stopped after %d jobs", self.worker_id, self.processed)
         return self.processed
 
@@ -600,6 +634,12 @@ def worker_main(argv: list[str] | None = None) -> int:
         type=int,
         default=int(_env("VISIBILITY_TIMEOUT", "30") or "30"),
     )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(_env("BATCH_SIZE", "1") or "1"),
+        help="Jobs to lease per pull (default 1; use >1 for batch pulls)",
+    )
     args = p.parse_args(argv)
     client = CoordinatorClient(args.coordinator)
     client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
@@ -609,6 +649,7 @@ def worker_main(argv: list[str] | None = None) -> int:
     agent = RemoteWorkerAgent(
         client,
         worker_id=args.worker_id,
+        batch_size=args.batch_size,
         tenant_id=tenant,
         poll_interval_seconds=args.poll,
         visibility_timeout_seconds=args.visibility_timeout,
