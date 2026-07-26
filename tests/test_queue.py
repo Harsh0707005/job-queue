@@ -877,6 +877,94 @@ def test_concurrent_lease_respects_tenant_cap(queue: JobQueue):
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 3
 
 
+def test_pending_limit_rejects_enqueue_at_cap(queue: JobQueue):
+    queue.set_pending_limit("t1", 2)
+    assert queue.get_pending_limit("t1") == 2
+
+    queue.enqueue(tenant_id="t1", payload={"i": 1})
+    queue.enqueue(tenant_id="t1", payload={"i": 2})
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue(tenant_id="t1", payload={"i": 3})
+
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 2
+
+    # Lease one → pending drops; enqueue allowed again.
+    j = queue.lease(tenant_id="t1", worker_id="w1")
+    assert j is not None
+    queue.enqueue(tenant_id="t1", payload={"i": 4})
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 2
+
+
+def test_pending_limit_is_per_tenant(queue: JobQueue):
+    queue.set_pending_limit("alpha", 1)
+    queue.set_pending_limit("beta", 1)
+    queue.enqueue(tenant_id="alpha", payload={"a": 1})
+    queue.enqueue(tenant_id="beta", payload={"b": 1})
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue(tenant_id="alpha", payload={"a": 2})
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue(tenant_id="beta", payload={"b": 2})
+
+
+def test_pending_limit_clear(queue: JobQueue):
+    queue.set_pending_limit("t1", 1)
+    queue.enqueue(tenant_id="t1", payload={"i": 1})
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue(tenant_id="t1", payload={"i": 2})
+    queue.set_pending_limit("t1", None)
+    assert queue.get_pending_limit("t1") is None
+    queue.enqueue(tenant_id="t1", payload={"i": 2})
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 2
+
+
+def test_pending_limit_dedupe_existing_does_not_fail(queue: JobQueue):
+    queue.set_pending_limit("t1", 1)
+    j1 = queue.enqueue(tenant_id="t1", payload={"i": 1}, dedupe_key="k1")
+    # Same dedupe returns existing row without counting as a new pending.
+    j2 = queue.enqueue(tenant_id="t1", payload={"i": 1}, dedupe_key="k1")
+    assert j1.id == j2.id
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue(tenant_id="t1", payload={"i": 2}, dedupe_key="k2")
+
+
+def test_pending_limit_tenant_stats(queue: JobQueue):
+    queue.set_pending_limit("t1", 5)
+    queue.set_concurrency_limit("t1", 2)
+    stats = queue.get_tenant_stats("t1")
+    assert stats.max_pending_jobs == 5
+    assert stats.max_concurrent_leases == 2
+
+
+def test_concurrent_enqueue_respects_pending_cap(queue: JobQueue):
+    queue.set_pending_limit("t1", 10)
+    barrier = threading.Barrier(20)
+    ok = 0
+    rejected = 0
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        nonlocal ok, rejected
+        barrier.wait()
+        try:
+            queue.enqueue(tenant_id="t1", payload={"i": i})
+            with lock:
+                ok += 1
+        except ValueError:
+            with lock:
+                rejected += 1
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert ok == 10
+    assert rejected == 10
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 10
+
+
+
 def test_at_limit_can_still_reclaim_expired_lease(queue: JobQueue):
     queue.set_concurrency_limit("t1", 1)
     queue.enqueue(

@@ -139,6 +139,7 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "tenant_id": stats.tenant_id,
         "paused": stats.paused,
         "max_concurrent_leases": stats.max_concurrent_leases,
+        "max_pending_jobs": stats.max_pending_jobs,
         "pending": stats.pending,
         "leased": stats.leased,
         "completed": stats.completed,

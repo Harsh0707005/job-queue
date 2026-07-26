@@ -873,19 +873,49 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	if body.Payload == nil {
 		body.Payload = map[string]any{}
 	}
-	// Reject enqueue while offboarding.
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback(ctx)
+
 	var offboarding bool
-	err := s.pool.QueryRow(ctx, `SELECT offboarding FROM tenant_settings WHERE tenant_id=$1`, body.TenantID).Scan(&offboarding)
+	err = tx.QueryRow(ctx, `SELECT offboarding FROM tenant_settings WHERE tenant_id=$1`, body.TenantID).Scan(&offboarding)
 	if err == nil && offboarding {
 		writeJSON(w, 400, map[string]any{"error": fmt.Sprintf("tenant %q is offboarding; enqueue is rejected", body.TenantID)})
 		return
 	}
+
+	// Serialize pending-cap decisions for this tenant.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, body.TenantID); err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	var maxPending *int
+	_ = tx.QueryRow(ctx, `SELECT max_pending_jobs FROM tenant_settings WHERE tenant_id=$1`, body.TenantID).Scan(&maxPending)
+	if maxPending != nil {
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*)::int FROM jobs WHERE tenant_id=$1 AND status='pending'`, body.TenantID).Scan(&n); err != nil {
+			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		if n >= *maxPending {
+			writeJSON(w, 400, map[string]any{"error": fmt.Sprintf(
+				"tenant %q pending job cap reached (%d/%d); enqueue is rejected",
+				body.TenantID, n, *maxPending,
+			)})
+			return
+		}
+	}
+
 	payload, _ := json.Marshal(body.Payload)
 	now := time.Now().UTC()
 	id := uuid.New()
-	row := s.pool.QueryRow(ctx, `
+	row := tx.QueryRow(ctx, `
 INSERT INTO jobs (
   id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
@@ -907,6 +937,10 @@ RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_at
 		body.VisibilityTimeoutSeconds, body.MaxRuntimeSeconds, now)
 	job, err := scanJob(row)
 	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}

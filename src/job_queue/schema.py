@@ -137,11 +137,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_depends_on
 CREATE TABLE IF NOT EXISTS tenant_settings (
     tenant_id              TEXT PRIMARY KEY,
     max_concurrent_leases  INTEGER,
+    max_pending_jobs       INTEGER,
     paused                 BOOLEAN NOT NULL DEFAULT FALSE,
     offboarding            BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT tenant_settings_max_concurrent_check CHECK (
         max_concurrent_leases IS NULL OR max_concurrent_leases >= 1
+    ),
+    CONSTRAINT tenant_settings_max_pending_check CHECK (
+        max_pending_jobs IS NULL OR max_pending_jobs >= 1
     )
 );
 
@@ -154,6 +158,12 @@ ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS offboarding BOOLEAN;
 UPDATE tenant_settings SET offboarding = FALSE WHERE offboarding IS NULL;
 ALTER TABLE tenant_settings ALTER COLUMN offboarding SET DEFAULT FALSE;
 ALTER TABLE tenant_settings ALTER COLUMN offboarding SET NOT NULL;
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS max_pending_jobs INTEGER;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_max_pending_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_max_pending_check CHECK (
+    max_pending_jobs IS NULL OR max_pending_jobs >= 1
+);
 
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.
 CREATE TABLE IF NOT EXISTS tenant_fairness (

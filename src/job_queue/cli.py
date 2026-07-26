@@ -30,10 +30,16 @@ def _format_stats(stats: TenantStats) -> str:
         if stats.max_concurrent_leases is not None
         else "unlimited"
     )
+    pending_cap = (
+        str(stats.max_pending_jobs)
+        if stats.max_pending_jobs is not None
+        else "unlimited"
+    )
     return (
         f"tenant={stats.tenant_id}\n"
         f"  paused={paused}\n"
         f"  max_concurrent_leases={limit}\n"
+        f"  max_pending_jobs={pending_cap}\n"
         f"  pending={stats.pending}\n"
         f"  leased={stats.leased}\n"
         f"  claimable={stats.claimable}\n"

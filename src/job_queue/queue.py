@@ -23,6 +23,9 @@ Design notes
 * **Tenant concurrency limit**: at most N jobs may be ``leased`` for a tenant
   at once (``set_concurrency_limit``). Enforced under a per-tenant advisory
   lock so concurrent workers cannot exceed the cap.
+* **Tenant pending cap**: at most N jobs may be ``pending`` for a tenant
+  (``set_pending_limit``). Further ``enqueue`` / schedule ticks / replays
+  raise ``ValueError`` until pending drops (e.g. after lease or cancel).
 * **Cancel**: ``cancel`` stops *pending* or *leased* (running) jobs. Cancelling
   a leased job clears the fencing ``lease_token`` so the holding worker's
   heartbeat / ack / nack fail with ``LeaseError`` and cannot complete it.
@@ -317,27 +320,19 @@ class JobQueue:
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
                 )
-                VALUES (%s, %s, FALSE, FALSE, %s)
+                VALUES (%s, %s, NULL, FALSE, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET max_concurrent_leases = EXCLUDED.max_concurrent_leases,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (tenant_id, max_concurrent, now),
             )
-            # Drop empty settings rows (no limit, not paused, not offboarding).
+            # Drop empty settings rows (no limits, not paused, not offboarding).
             if max_concurrent is None:
-                conn.execute(
-                    """
-                    DELETE FROM tenant_settings
-                    WHERE tenant_id = %s
-                      AND max_concurrent_leases IS NULL
-                      AND paused = FALSE
-                      AND offboarding = FALSE
-                    """,
-                    (tenant_id,),
-                )
+                self._delete_empty_tenant_settings(conn, tenant_id)
 
     def get_concurrency_limit(self, tenant_id: str) -> int | None:
         """Return the tenant's max concurrent leases, or None if unlimited."""
@@ -355,6 +350,49 @@ class JobQueue:
             if row is None:
                 return None
             return row["max_concurrent_leases"]
+
+    def set_pending_limit(
+        self,
+        tenant_id: str,
+        max_pending: int | None,
+    ) -> None:
+        """Set how many *pending* jobs a tenant may hold in the queue.
+
+        When the cap is reached, further ``enqueue`` (and schedule ticks /
+        dead-letter replay that would create a new pending row) fail with
+        ``ValueError``. Pass ``None`` to clear (unlimited). Does not clear
+        *paused* / concurrency / offboarding. ``max_pending`` must be >= 1
+        when set.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if max_pending is not None and max_pending < 1:
+            raise ValueError("max_pending must be >= 1 or None")
+
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
+                )
+                VALUES (%s, NULL, %s, FALSE, FALSE, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET max_pending_jobs = EXCLUDED.max_pending_jobs,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, max_pending, now),
+            )
+            if max_pending is None:
+                self._delete_empty_tenant_settings(conn, tenant_id)
+
+    def get_pending_limit(self, tenant_id: str) -> int | None:
+        """Return the tenant's max pending jobs, or None if unlimited."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            return self._read_pending_limit(conn, tenant_id)
 
     def pause_tenant(self, tenant_id: str) -> None:
         """Pause a tenant: no new leases, no schedule fires, no reclaim.
@@ -374,9 +412,10 @@ class JobQueue:
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
                 )
-                VALUES (%s, NULL, TRUE, FALSE, %s)
+                VALUES (%s, NULL, NULL, TRUE, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET paused = TRUE,
                     updated_at = EXCLUDED.updated_at
@@ -403,9 +442,10 @@ class JobQueue:
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
                 )
-                VALUES (%s, NULL, FALSE, FALSE, %s)
+                VALUES (%s, NULL, NULL, FALSE, FALSE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET paused = FALSE,
                     updated_at = EXCLUDED.updated_at
@@ -426,16 +466,7 @@ class JobQueue:
                 """,
                 (now, now, tenant_id, now),
             )
-            conn.execute(
-                """
-                DELETE FROM tenant_settings
-                WHERE tenant_id = %s
-                  AND max_concurrent_leases IS NULL
-                  AND paused = FALSE
-                  AND offboarding = FALSE
-                """,
-                (tenant_id,),
-            )
+            self._delete_empty_tenant_settings(conn, tenant_id)
     def is_tenant_paused(self, tenant_id: str) -> bool:
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -474,9 +505,10 @@ class JobQueue:
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
-                    tenant_id, max_concurrent_leases, paused, offboarding, updated_at
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
                 )
-                VALUES (%s, NULL, TRUE, TRUE, %s)
+                VALUES (%s, NULL, NULL, TRUE, TRUE, %s)
                 ON CONFLICT (tenant_id) DO UPDATE
                 SET paused = TRUE,
                     offboarding = TRUE,
@@ -749,6 +781,9 @@ class JobQueue:
                 if existing is not None:
                     return _row_to_job(existing)
 
+                # New pending row: enforce per-tenant pending cap.
+                self._assert_pending_capacity(conn, tenant_id)
+
                 # ON CONFLICT remains a safety net for any missed paths.
                 row = conn.execute(
                     f"""
@@ -807,6 +842,8 @@ class JobQueue:
                         )
                     return _row_to_job(existing)
                 return _row_to_job(row)
+
+            self._assert_pending_capacity(conn, tenant_id)
 
             row = conn.execute(
                 f"""
@@ -1980,6 +2017,11 @@ class JobQueue:
                     f"(status={job.status.value})",
                     job=job,
                 )
+
+            try:
+                self._assert_pending_capacity(conn, tenant_id)
+            except ValueError as exc:
+                raise ReplayError(str(exc), job=job) from exc
 
             # Hold the same advisory lock as enqueue(dedupe_key=...) so the
             # check + status flip is atomic w.r.t. concurrent inserts.
@@ -3181,6 +3223,13 @@ class JobQueue:
 
                 try:
                     with conn.transaction():
+                        try:
+                            self._assert_pending_capacity(
+                                conn, sched_row["tenant_id"]
+                            )
+                        except ValueError:
+                            # At pending cap: skip this schedule tick (no job).
+                            continue
                         job_row = conn.execute(
                             f"""
                             INSERT INTO jobs (
@@ -3322,6 +3371,71 @@ class JobQueue:
         if row is None:
             return False
         return bool(row["paused"])
+
+    @staticmethod
+    def _read_pending_limit(conn: Any, tenant_id: str) -> int | None:
+        row = conn.execute(
+            """
+            SELECT max_pending_jobs
+            FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["max_pending_jobs"]
+
+    @staticmethod
+    def _count_pending(conn: Any, tenant_id: str) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM jobs
+            WHERE tenant_id = %s
+              AND status = %s
+            """,
+            (tenant_id, JobStatus.PENDING.value),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def _assert_pending_capacity(self, conn: Any, tenant_id: str) -> None:
+        """Raise ValueError if tenant is at its pending job cap.
+
+        Serializes with other enqueue / schedule / replay paths for this
+        tenant via a transaction-scoped advisory lock.
+        """
+        limit = self._read_pending_limit(conn, tenant_id)
+        if limit is None:
+            return
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (tenant_id,),
+        )
+        # Re-read under lock in case settings changed (same txn usually static).
+        limit = self._read_pending_limit(conn, tenant_id)
+        if limit is None:
+            return
+        n = self._count_pending(conn, tenant_id)
+        if n >= limit:
+            raise ValueError(
+                f"tenant {tenant_id!r} pending job cap reached "
+                f"({n}/{limit}); enqueue is rejected"
+            )
+
+    @staticmethod
+    def _delete_empty_tenant_settings(conn: Any, tenant_id: str) -> None:
+        conn.execute(
+            """
+            DELETE FROM tenant_settings
+            WHERE tenant_id = %s
+              AND max_concurrent_leases IS NULL
+              AND max_pending_jobs IS NULL
+              AND paused = FALSE
+              AND offboarding = FALSE
+            """,
+            (tenant_id,),
+        )
 
     @staticmethod
     def _is_tenant_offboarding(conn: Any, tenant_id: str) -> bool:
@@ -3670,7 +3784,7 @@ class JobQueue:
 
         settings = conn.execute(
             """
-            SELECT max_concurrent_leases, paused
+            SELECT max_concurrent_leases, max_pending_jobs, paused
             FROM tenant_settings
             WHERE tenant_id = %s
             """,
@@ -3678,6 +3792,7 @@ class JobQueue:
         ).fetchone()
         paused = bool(settings["paused"]) if settings else False
         max_conc = settings["max_concurrent_leases"] if settings else None
+        max_pending = settings["max_pending_jobs"] if settings else None
 
         if paused:
             claimable = 0
@@ -3700,6 +3815,7 @@ class JobQueue:
             tenant_id=tenant_id,
             paused=paused,
             max_concurrent_leases=max_conc,
+            max_pending_jobs=max_pending,
             pending=counts[JobStatus.PENDING.value],
             leased=counts[JobStatus.LEASED.value],
             completed=counts[JobStatus.COMPLETED.value],

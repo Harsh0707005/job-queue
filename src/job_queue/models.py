@@ -102,6 +102,7 @@ class TenantStats:
     tenant_id: str
     paused: bool
     max_concurrent_leases: int | None
+    max_pending_jobs: int | None
     pending: int
     leased: int
     completed: int
