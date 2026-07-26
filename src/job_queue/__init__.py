@@ -15,6 +15,8 @@ from job_queue.models import (
     WebhookEvent,
 )
 from job_queue.queue import (
+    ApprovalError,
+    ApprovalRequested,
     CancelError,
     DependencyError,
     JobQueue,
@@ -32,6 +34,8 @@ from job_queue.coordinator import Coordinator
 from job_queue.remote import CoordinatorClient, RemoteWorkerAgent, ScheduleNode, WebhookNode
 
 __all__ = [
+    "ApprovalError",
+    "ApprovalRequested",
     "CancelError",
     "ClaimedWebhook",
     "Coordinator",

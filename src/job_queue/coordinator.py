@@ -73,8 +73,18 @@ class Coordinator:
             return self._job_action(path, body, "nack")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/checkpoint"):
             return self._job_action(path, body, "checkpoint")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/request-approval"):
+            return self._job_action(path, body, "request_approval")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/approve"):
+            return self._approve_job(path, body)
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/reject"):
+            return self._reject_job(path, body)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/cancel"):
             return self._cancel_job(path, body)
+        if method == "POST" and path == "/v1/approvals/process-timeouts":
+            return self._process_approval_timeouts(body)
+        if method == "GET" and path == "/v1/approvals":
+            return self._list_approvals(query)
         if method == "GET" and path.startswith("/v1/jobs/"):
             return self._get_job(path, query)
 
@@ -302,6 +312,23 @@ class Coordinator:
                     lease_token=token,
                     progress=progress,
                 )
+            elif action == "request_approval":
+                from job_queue.queue import ApprovalError
+
+                try:
+                    job = self.queue.request_approval(
+                        job_id,
+                        tenant_id=str(tenant_id),
+                        worker_id=str(worker_id),
+                        lease_token=token,
+                        message=body.get("message"),
+                        timeout_seconds=float(
+                            body.get("timeout_seconds") or 3600
+                        ),
+                        progress=body.get("progress"),
+                    )
+                except ApprovalError as exc:
+                    return 409, {"error": str(exc), "code": "approval_error"}
             else:
                 return 400, {"error": f"unknown action {action}"}
         except LeaseError as exc:
@@ -310,6 +337,89 @@ class Coordinator:
             return 400, {"error": str(exc)}
 
         return 200, {"job": job_to_dict(job)}
+
+    def _approve_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        from job_queue.queue import ApprovalError
+
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id required"}
+        try:
+            job = self.queue.approve(UUID(job_id_s), tenant_id=str(tenant_id))
+        except ApprovalError as exc:
+            return 409, {"error": str(exc), "code": "approval_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
+
+    def _reject_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        from job_queue.queue import ApprovalError
+
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id required"}
+        try:
+            job = self.queue.reject(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                reason=body.get("reason"),
+            )
+        except ApprovalError as exc:
+            return 409, {"error": str(exc), "code": "approval_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
+
+    def _process_approval_timeouts(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            jobs = self.queue.process_approval_timeouts(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 100),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(jobs),
+            "jobs": [job_to_dict(j) for j in jobs],
+        }
+
+    def _list_approvals(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        limit = int((query.get("limit") or ["100"])[0])
+        offset = int((query.get("offset") or ["0"])[0])
+        try:
+            jobs = self.queue.list_awaiting_approvals(
+                tenant_id=str(tenants[0]),
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"jobs": [job_to_dict(j) for j in jobs], "count": len(jobs)}
 
     def _get_job(
         self, path: str, query: dict[str, list[str]]

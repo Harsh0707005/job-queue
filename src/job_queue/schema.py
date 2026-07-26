@@ -59,7 +59,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Status check kept replaceable so upgrades can add new statuses.
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
-    status IN ('pending', 'leased', 'completed', 'failed', 'dead', 'cancelled')
+    status IN (
+        'pending', 'leased', 'awaiting_approval',
+        'completed', 'failed', 'dead', 'cancelled'
+    )
 );
 
 -- Backward-compatible column adds for older installs.
@@ -87,6 +90,17 @@ UPDATE jobs SET preempt_count = 0 WHERE preempt_count IS NULL;
 ALTER TABLE jobs ALTER COLUMN preempt_count SET DEFAULT 0;
 ALTER TABLE jobs ALTER COLUMN preempt_count SET NOT NULL;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_preempted_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_requested_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_deadline_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_message TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_outcome TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_resolved_at TIMESTAMPTZ;
+
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_approval_outcome_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_approval_outcome_check CHECK (
+    approval_outcome IS NULL
+    OR approval_outcome IN ('approved', 'rejected', 'timeout')
+);
 
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_estimated_duration_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_estimated_duration_check CHECK (
@@ -171,15 +185,27 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_leased
     ON jobs (tenant_id)
     WHERE status = 'leased';
 
--- At most one active (pending/leased) job per dedupe key within a tenant queue.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active
+-- At most one active (pending/leased/awaiting_approval) job per dedupe key.
+DROP INDEX IF EXISTS idx_jobs_dedupe_active;
+CREATE UNIQUE INDEX idx_jobs_dedupe_active
     ON jobs (tenant_id, queue_name, dedupe_key)
-    WHERE dedupe_key IS NOT NULL AND status IN ('pending', 'leased');
+    WHERE dedupe_key IS NOT NULL
+      AND status IN ('pending', 'leased', 'awaiting_approval');
 
 -- At most one in-flight job per recurring schedule (no overlapping runs).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_schedule_active
+DROP INDEX IF EXISTS idx_jobs_schedule_active;
+CREATE UNIQUE INDEX idx_jobs_schedule_active
     ON jobs (schedule_id)
-    WHERE schedule_id IS NOT NULL AND status IN ('pending', 'leased');
+    WHERE schedule_id IS NOT NULL
+      AND status IN ('pending', 'leased', 'awaiting_approval');
+
+CREATE INDEX IF NOT EXISTS idx_jobs_approval_deadline
+    ON jobs (approval_deadline_at ASC)
+    WHERE status = 'awaiting_approval';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_awaiting_approval
+    ON jobs (tenant_id, approval_deadline_at ASC)
+    WHERE status = 'awaiting_approval';
 
 CREATE INDEX IF NOT EXISTS idx_jobs_schedule_id
     ON jobs (schedule_id)

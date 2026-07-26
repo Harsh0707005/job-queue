@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from job_queue.models import Job
-from job_queue.queue import JobQueue, LeaseError
+from job_queue.queue import ApprovalRequested, JobQueue, LeaseError
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,34 @@ class LeaseContext:
         )
         self.job = updated
         return updated
+
+    def request_approval(
+        self,
+        *,
+        message: str | None = None,
+        timeout_seconds: float | int = 3600,
+        progress: Any = None,
+    ) -> Job:
+        """Park the job for tenant approval and raise :class:`ApprovalRequested`.
+
+        Releases the lease so concurrency is freed. Callers/handlers should not
+        ack or nack after this — the exception signals a clean stop.
+        """
+        if self.lease_lost.is_set():
+            raise LeaseError(f"job {self.job.id} lease lost (cancel signalled)")
+        assert self.job.lease_token is not None
+        updated = self.queue.request_approval(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            worker_id=self.worker_id,
+            lease_token=self.job.lease_token,
+            message=message,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+        )
+        self.job = updated
+        self.lease_lost.set()
+        raise ApprovalRequested(updated)
 
 
 class Worker:
@@ -233,6 +261,9 @@ class Worker:
                 result=handler_result,
             )
             logger.info("acked job %s", job.id)
+        except ApprovalRequested as exc:
+            # Job intentionally parked; do not nack.
+            logger.info("job %s awaiting approval", exc.job.id)
         except LeaseError:
             # Lease no longer ours — do not nack; job is free or held elsewhere.
             logger.warning("lease error for job %s; not nacking", job.id)

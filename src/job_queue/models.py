@@ -12,6 +12,7 @@ from uuid import UUID
 class JobStatus(str, Enum):
     PENDING = "pending"
     LEASED = "leased"
+    AWAITING_APPROVAL = "awaiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
     DEAD = "dead"
@@ -41,6 +42,12 @@ class Job:
     ``preemptible`` controls whether this job may be the victim; checkpoint
     is kept on preemption and the fencing token is cleared so it cannot
     finish twice.
+
+    ``awaiting_approval`` parks a job without a lease (no concurrency slot).
+    Workers call ``request_approval`` under a live lease; ``approve`` /
+    ``reject`` are tenant-scoped and idempotent. Unresolved requests past
+    ``approval_deadline_at`` auto-reject. Checkpoint is kept so approve
+    resumes work.
 
     ``available_at`` is the earliest time a pending job may be claimed.
     ``dedupe_key`` identifies a logical job for enqueue-time deduplication.
@@ -80,6 +87,11 @@ class Job:
     preemptible: bool
     preempt_count: int
     last_preempted_at: datetime | None
+    approval_requested_at: datetime | None
+    approval_deadline_at: datetime | None
+    approval_message: str | None
+    approval_outcome: str | None
+    approval_resolved_at: datetime | None
     last_error: str | None
 
     @property
@@ -89,6 +101,10 @@ class Job:
             and self.leased_by is not None
             and self.lease_token is not None
         )
+
+    @property
+    def is_awaiting_approval(self) -> bool:
+        return self.status == JobStatus.AWAITING_APPROVAL
 
 
 @dataclass(frozen=True, slots=True)

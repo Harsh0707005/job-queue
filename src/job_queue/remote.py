@@ -16,7 +16,7 @@ from uuid import UUID
 
 from job_queue.codec import job_from_dict
 from job_queue.models import Job
-from job_queue.queue import LeaseError
+from job_queue.queue import ApprovalRequested, LeaseError
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,12 @@ class CoordinatorClient:
                     payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
                 if exc.code == 409 and payload.get("code") == "lease_error":
                     raise LeaseError(payload.get("error") or "lease error") from exc
+                if exc.code == 409 and payload.get("code") == "approval_error":
+                    from job_queue.queue import ApprovalError
+
+                    raise ApprovalError(
+                        payload.get("error") or "approval error"
+                    ) from exc
                 if exc.code == 409 and payload.get("code") == "cancel_error":
                     from job_queue.queue import CancelError
 
@@ -278,6 +284,66 @@ class CoordinatorClient:
         payload = self._request("POST", f"/v1/jobs/{job_id}/checkpoint", body)
         assert payload is not None
         return job_from_dict(payload["job"])
+
+    def request_approval(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        message: str | None = None,
+        timeout_seconds: float | int = 3600,
+        progress: Any = None,
+    ) -> Job:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "worker_id": worker_id,
+            "lease_token": str(lease_token),
+            "timeout_seconds": timeout_seconds,
+        }
+        if message is not None:
+            body["message"] = message
+        if progress is not None:
+            body["progress"] = progress
+        payload = self._request(
+            "POST", f"/v1/jobs/{job_id}/request-approval", body
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def approve(self, job_id: UUID | str, *, tenant_id: str) -> Job:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/approve",
+            {"tenant_id": tenant_id},
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def reject(
+        self,
+        job_id: UUID | str,
+        *,
+        tenant_id: str,
+        reason: str | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if reason is not None:
+            body["reason"] = reason
+        payload = self._request("POST", f"/v1/jobs/{job_id}/reject", body)
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def process_approval_timeouts(
+        self, *, tenant_id: str | None = None, limit: int = 100
+    ) -> list[Job]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/approvals/process-timeouts", body)
+        assert payload is not None
+        return [job_from_dict(j) for j in (payload.get("jobs") or [])]
 
     def get_job(self, job_id: UUID | str, *, tenant_id: str) -> Job | None:
         payload = self._request(
@@ -471,6 +537,8 @@ class RemoteWorkerAgent:
                 try:
                     self._process(job)
                     self.processed += 1
+                except ApprovalRequested as exc:
+                    logger.info("job %s awaiting approval", exc.job.id)
                 except LeaseError:
                     logger.warning("lease lost for job %s", job.id)
                 except Exception:
@@ -518,6 +586,8 @@ class RemoteWorkerAgent:
                 result=result,
             )
             logger.info("acked job %s tenant=%s", job.id, job.tenant_id)
+        except ApprovalRequested:
+            raise
         except LeaseError:
             raise
         except Exception as exc:
@@ -579,11 +649,54 @@ class RemoteWorkerAgent:
                 start > 0,
                 self.worker_id,
             )
+            approval_after = payload.get("approval_after_step")
+            try:
+                approval_after_i = (
+                    int(approval_after) if approval_after is not None else None
+                )
+            except (TypeError, ValueError):
+                approval_after_i = None
+            already_approved = job.approval_outcome == "approved"
+            try:
+                approval_timeout = float(
+                    payload.get("approval_timeout_seconds") or 3600
+                )
+            except (TypeError, ValueError):
+                approval_timeout = 3600.0
+
             for step in range(start, total):
                 if lease_lost.is_set():
                     raise LeaseError(
                         f"job {job.id} lease lost during step {step}/{total}"
                     )
+                # Approval gate: park after finishing steps up to the gate.
+                if (
+                    approval_after_i is not None
+                    and not already_approved
+                    and step == approval_after_i
+                ):
+                    try:
+                        parked = self.client.request_approval(
+                            job.id,
+                            tenant_id=job.tenant_id,
+                            worker_id=self.worker_id,
+                            lease_token=job.lease_token,  # type: ignore[arg-type]
+                            message=str(
+                                payload.get("approval_message")
+                                or f"approval required after step {approval_after_i}"
+                            ),
+                            timeout_seconds=approval_timeout,
+                            progress={
+                                "step": step,
+                                "total": total,
+                                "approval_gate": approval_after_i,
+                            },
+                        )
+                    except LeaseError:
+                        lease_lost.set()
+                        raise
+                    raise ApprovalRequested(parked)
+
                 # Simulate unit of work for this step.
                 deadline = time.time() + (max(0, step_ms) / 1000.0)
                 while time.time() < deadline:
@@ -619,6 +732,7 @@ class RemoteWorkerAgent:
                 "started_step": start,
                 "steps": total,
                 "resumed": start > 0,
+                "approved_resume": already_approved and start > 0,
                 "schedule_id": str(job.schedule_id) if job.schedule_id else None,
             }
 

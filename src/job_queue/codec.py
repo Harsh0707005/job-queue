@@ -62,6 +62,11 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "preemptible": job.preemptible,
         "preempt_count": job.preempt_count,
         "last_preempted_at": _dt(job.last_preempted_at),
+        "approval_requested_at": _dt(job.approval_requested_at),
+        "approval_deadline_at": _dt(job.approval_deadline_at),
+        "approval_message": job.approval_message,
+        "approval_outcome": job.approval_outcome,
+        "approval_resolved_at": _dt(job.approval_resolved_at),
         "last_error": job.last_error,
     }
 
@@ -117,6 +122,11 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         preemptible=bool(data["preemptible"]) if data.get("preemptible") is not None else True,
         preempt_count=int(data.get("preempt_count") or 0),
         last_preempted_at=parse_dt("last_preempted_at"),
+        approval_requested_at=parse_dt("approval_requested_at"),
+        approval_deadline_at=parse_dt("approval_deadline_at"),
+        approval_message=data.get("approval_message"),
+        approval_outcome=data.get("approval_outcome"),
+        approval_resolved_at=parse_dt("approval_resolved_at"),
         last_error=data.get("last_error"),
     )
 
