@@ -46,9 +46,11 @@ Design notes
   After approve the job becomes pending and resumes from its checkpoint.
 * **Immutable audit**: every job state change appends a
   ``job_audit_events`` row in the **same transaction** (ordered ``seq`` per
-  job). Tenants replay via ``list_job_audit`` / ``list_tenant_audit``.
-  After crashes, ``verify_job_audit`` checks the stream's final
-  ``to_status`` matches the job row (no desync possible on commit).
+  job). Event rows keep the tenant at write time. After ``merge_tenant``,
+  ``list_job_audit`` / ``verify_job_audit`` authorize on **current** job
+  ownership and return the **full** per-job ``seq`` stream (including
+  pre-merge events still stamped with the source tenant). Tenant-wide
+  catch-up also includes events for jobs currently owned by the tenant.
 * **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
   jobs (pending + running + history), schedules, and webhooks to *target*
   without stopping workers. Lease fencing tokens stay valid. Heartbeat /
@@ -4501,7 +4503,14 @@ class JobQueue:
         after_seq: int = 0,
         limit: int = 1000,
     ) -> list[JobAuditEvent]:
-        """Replay-ordered audit events for one job (tenant-scoped)."""
+        """Replay-ordered audit events for one job (tenant-authorized).
+
+        Authorization: the job's **current** owner must be *tenant_id*. Events
+        themselves keep the tenant id at write time (immutable), so after
+        ``merge_tenant`` pre-merge rows still store the source tenant. This
+        method returns the **full** per-job ``seq`` stream (all tenants on
+        the event rows) so history is continuous across ownership transfer.
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if after_seq < 0:
@@ -4509,11 +4518,10 @@ class JobQueue:
         if limit < 1:
             raise ValueError("limit must be >= 1")
         with self._pool.connection() as conn:
-            # Ensure job belongs to tenant (or had events under this tenant).
-            job = conn.execute(
-                "SELECT id FROM jobs WHERE id = %s AND tenant_id = %s",
-                (job_id, tenant_id),
-            ).fetchone()
+            if not self._tenant_can_read_job_audit(
+                conn, job_id=job_id, tenant_id=tenant_id
+            ):
+                return []
             rows = conn.execute(
                 """
                 SELECT
@@ -4521,15 +4529,12 @@ class JobQueue:
                     from_status, to_status, actor, detail, created_at
                 FROM job_audit_events
                 WHERE job_id = %s
-                  AND tenant_id = %s
                   AND seq > %s
                 ORDER BY seq ASC
                 LIMIT %s
                 """,
-                (job_id, tenant_id, after_seq, limit),
+                (job_id, after_seq, limit),
             ).fetchall()
-            if job is None and not rows:
-                return []
             return [self._row_to_audit(r) for r in rows]
 
     def list_tenant_audit(
@@ -4540,44 +4545,63 @@ class JobQueue:
         after_event_id: UUID | None = None,
         limit: int = 500,
     ) -> list[JobAuditEvent]:
-        """Tenant-wide audit stream ordered by time (for catch-up consumers)."""
+        """Tenant-wide audit stream ordered by time (for catch-up consumers).
+
+        Includes:
+        * events originally written under *tenant_id*, and
+        * events for jobs **currently** owned by *tenant_id* (so after a
+          merge, the target tenant can catch up pre-merge history of jobs
+          they now own without mutating immutable event rows).
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        # Events visible to this tenant: written under them, or belonging to
+        # a job they currently own (covers merge without rewriting history).
+        ownership = """
+            (
+                e.tenant_id = %s
+                OR EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.id = e.job_id AND j.tenant_id = %s
+                )
+            )
+        """
         with self._pool.connection() as conn:
             if after_created_at is None:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
-                        event_id, tenant_id, job_id, seq, event_type,
-                        from_status, to_status, actor, detail, created_at
-                    FROM job_audit_events
-                    WHERE tenant_id = %s
-                    ORDER BY created_at ASC, event_id ASC
+                        e.event_id, e.tenant_id, e.job_id, e.seq, e.event_type,
+                        e.from_status, e.to_status, e.actor, e.detail, e.created_at
+                    FROM job_audit_events e
+                    WHERE {ownership}
+                    ORDER BY e.created_at ASC, e.event_id ASC
                     LIMIT %s
                     """,
-                    (tenant_id, limit),
+                    (tenant_id, tenant_id, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT
-                        event_id, tenant_id, job_id, seq, event_type,
-                        from_status, to_status, actor, detail, created_at
-                    FROM job_audit_events
-                    WHERE tenant_id = %s
+                        e.event_id, e.tenant_id, e.job_id, e.seq, e.event_type,
+                        e.from_status, e.to_status, e.actor, e.detail, e.created_at
+                    FROM job_audit_events e
+                    WHERE {ownership}
                       AND (
-                            created_at > %s
+                            e.created_at > %s
                             OR (
-                                created_at = %s
-                                AND event_id > %s
+                                e.created_at = %s
+                                AND e.event_id > %s
                             )
                           )
-                    ORDER BY created_at ASC, event_id ASC
+                    ORDER BY e.created_at ASC, e.event_id ASC
                     LIMIT %s
                     """,
                     (
+                        tenant_id,
                         tenant_id,
                         after_created_at,
                         after_created_at,
@@ -4593,10 +4617,10 @@ class JobQueue:
         *,
         tenant_id: str,
     ) -> AuditConsistencyReport:
-        """Replay audit for *job_id* and compare final status to the job row.
+        """Replay full audit for *job_id* and compare final status to the job row.
 
-        Ensures: non-empty history when job exists, contiguous ``seq`` from 1,
-        and last ``to_status`` equals current ``jobs.status`` (same-txn invariant).
+        Uses the complete per-job ``seq`` stream (including pre-merge events
+        still stamped with a prior tenant). Access requires current ownership.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -4605,27 +4629,28 @@ class JobQueue:
                 "SELECT id, tenant_id, status FROM jobs WHERE id = %s AND tenant_id = %s",
                 (job_id, tenant_id),
             ).fetchone()
+            if job_row is None:
+                return AuditConsistencyReport(
+                    job_id=job_id,
+                    tenant_id=tenant_id,
+                    ok=False,
+                    job_status=None,
+                    audit_final_status=None,
+                    event_count=0,
+                    gaps=(),
+                    error="job not found for tenant",
+                )
+            # Full job history by job_id (not filtered by event.tenant_id).
             events = conn.execute(
                 """
-                SELECT seq, to_status, event_type
+                SELECT seq, to_status, event_type, tenant_id
                 FROM job_audit_events
-                WHERE job_id = %s AND tenant_id = %s
+                WHERE job_id = %s
                 ORDER BY seq ASC
                 """,
-                (job_id, tenant_id),
+                (job_id,),
             ).fetchall()
 
-        if job_row is None:
-            return AuditConsistencyReport(
-                job_id=job_id,
-                tenant_id=tenant_id,
-                ok=False,
-                job_status=None,
-                audit_final_status=None,
-                event_count=len(events),
-                gaps=(),
-                error="job not found for tenant",
-            )
         if not events:
             return AuditConsistencyReport(
                 job_id=job_id,
@@ -4668,6 +4693,20 @@ class JobQueue:
             gaps=tuple(gaps),
             error=err,
         )
+
+    @staticmethod
+    def _tenant_can_read_job_audit(
+        conn: Any,
+        *,
+        job_id: UUID,
+        tenant_id: str,
+    ) -> bool:
+        """True if *tenant_id* currently owns the job (post-merge target)."""
+        row = conn.execute(
+            "SELECT 1 FROM jobs WHERE id = %s AND tenant_id = %s",
+            (job_id, tenant_id),
+        ).fetchone()
+        return row is not None
 
     def verify_tenant_audit(
         self,

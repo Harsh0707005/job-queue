@@ -5077,3 +5077,70 @@ def test_verify_tenant_audit_all_ok(queue: JobQueue):
     reports = queue.verify_tenant_audit("t1")
     assert len(reports) == 5
     assert all(r.ok for r in reports)
+
+
+def test_audit_history_survives_tenant_merge(queue: JobQueue):
+    """After merge, target owner sees full seq including pre-merge events."""
+    job = queue.enqueue(tenant_id="alpha", payload={"m": 1})
+    leased = queue.lease(tenant_id="alpha", worker_id="w1")
+    assert leased is not None
+    queue.checkpoint(
+        leased.id,
+        tenant_id="alpha",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        progress={"step": 1},
+    )
+    pre = queue.list_job_audit(job.id, tenant_id="alpha")
+    assert [e.event_type for e in pre] == ["enqueued", "leased", "checkpointed"]
+    assert all(e.tenant_id == "alpha" for e in pre)
+    assert [e.seq for e in pre] == [1, 2, 3]
+
+    queue.merge_tenant("alpha", "beta")
+    assert queue.get(job.id, tenant_id="alpha") is None
+    moved = queue.get(job.id, tenant_id="beta")
+    assert moved is not None
+    assert moved.status == JobStatus.LEASED
+
+    # Target sees full history; pre-merge rows still stamped alpha.
+    full = queue.list_job_audit(job.id, tenant_id="beta")
+    types = [e.event_type for e in full]
+    assert types[:3] == ["enqueued", "leased", "checkpointed"]
+    assert "tenant_merged" in types
+    assert [e.seq for e in full] == list(range(1, len(full) + 1))
+    assert full[0].tenant_id == "alpha"
+    merge_ev = next(e for e in full if e.event_type == "tenant_merged")
+    assert merge_ev.tenant_id == "beta"
+    assert merge_ev.detail.get("from_tenant") == "alpha"
+    assert merge_ev.detail.get("to_tenant") == "beta"
+
+    # Source no longer owns the job → no access via list_job_audit.
+    assert queue.list_job_audit(job.id, tenant_id="alpha") == []
+
+    # Unrelated tenant blocked.
+    assert queue.list_job_audit(job.id, tenant_id="gamma") == []
+
+    report = queue.verify_job_audit(job.id, tenant_id="beta")
+    assert report.ok is True
+    assert report.event_count >= 4
+    assert report.job_status == "leased"
+    assert report.audit_final_status == "leased"
+
+    # Tenant-wide catch-up for beta includes pre-merge events for owned jobs.
+    stream = queue.list_tenant_audit("beta", limit=100)
+    job_events = [e for e in stream if e.job_id == job.id]
+    assert len(job_events) >= 4
+    assert any(e.tenant_id == "alpha" for e in job_events)
+
+    # Finish under beta; history remains contiguous.
+    queue.ack(
+        moved.id,
+        tenant_id="beta",
+        worker_id="w1",
+        lease_token=moved.lease_token,
+        result={"ok": True},
+    )
+    final = queue.list_job_audit(job.id, tenant_id="beta")
+    assert final[-1].event_type == "completed"
+    assert final[-1].seq == len(final)
+    assert queue.verify_job_audit(job.id, tenant_id="beta").ok
