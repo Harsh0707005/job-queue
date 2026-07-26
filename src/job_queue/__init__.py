@@ -1,8 +1,10 @@
 """Multi-tenant job queue with lease, heartbeat, and visibility timeout."""
 
 from job_queue.models import (
+    AuditConsistencyReport,
     ClaimedWebhook,
     Job,
+    JobAuditEvent,
     JobStatus,
     Schedule,
     ScheduleFire,
@@ -36,12 +38,14 @@ from job_queue.remote import CoordinatorClient, RemoteWorkerAgent, ScheduleNode,
 __all__ = [
     "ApprovalError",
     "ApprovalRequested",
+    "AuditConsistencyReport",
     "CancelError",
     "ClaimedWebhook",
     "Coordinator",
     "CoordinatorClient",
     "DependencyError",
     "Job",
+    "JobAuditEvent",
     "JobStatus",
     "JobQueue",
     "LeaseContext",

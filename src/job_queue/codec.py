@@ -7,8 +7,10 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.models import (
+    AuditConsistencyReport,
     ClaimedWebhook,
     Job,
+    JobAuditEvent,
     JobStatus,
     PreemptResult,
     Schedule,
@@ -143,6 +145,36 @@ def preempt_result_to_dict(result: PreemptResult) -> dict[str, Any]:
             if result.victim_slack_seconds != float("inf")
             else None
         ),
+    }
+
+
+def job_audit_event_to_dict(ev: JobAuditEvent) -> dict[str, Any]:
+    return {
+        "event_id": str(ev.event_id),
+        "tenant_id": ev.tenant_id,
+        "job_id": str(ev.job_id),
+        "seq": ev.seq,
+        "event_type": ev.event_type,
+        "from_status": ev.from_status,
+        "to_status": ev.to_status,
+        "actor": ev.actor,
+        "detail": ev.detail,
+        "created_at": _dt(ev.created_at),
+    }
+
+
+def audit_consistency_report_to_dict(
+    report: AuditConsistencyReport,
+) -> dict[str, Any]:
+    return {
+        "job_id": str(report.job_id),
+        "tenant_id": report.tenant_id,
+        "ok": report.ok,
+        "job_status": report.job_status,
+        "audit_final_status": report.audit_final_status,
+        "event_count": report.event_count,
+        "gaps": list(report.gaps),
+        "error": report.error,
     }
 
 

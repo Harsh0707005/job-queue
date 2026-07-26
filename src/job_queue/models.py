@@ -198,6 +198,36 @@ class PreemptResult:
     victim_slack_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class JobAuditEvent:
+    """Immutable job history event (append-only audit stream)."""
+
+    event_id: UUID
+    tenant_id: str
+    job_id: UUID
+    seq: int
+    event_type: str
+    from_status: str | None
+    to_status: str | None
+    actor: str | None
+    detail: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AuditConsistencyReport:
+    """Result of replaying audit history against a job's final state."""
+
+    job_id: UUID
+    tenant_id: str
+    ok: bool
+    job_status: str | None
+    audit_final_status: str | None
+    event_count: int
+    gaps: tuple[int, ...]
+    error: str | None = None
+
+
 class WebhookEvent(str, Enum):
     JOB_COMPLETED = "job.completed"
     JOB_FAILED = "job.failed"

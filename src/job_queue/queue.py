@@ -44,6 +44,11 @@ Design notes
   Tenant-scoped ``approve`` / ``reject`` are idempotent; unresolved requests
   past ``approval_deadline_at`` auto-reject via ``process_approval_timeouts``.
   After approve the job becomes pending and resumes from its checkpoint.
+* **Immutable audit**: every job state change appends a
+  ``job_audit_events`` row in the **same transaction** (ordered ``seq`` per
+  job). Tenants replay via ``list_job_audit`` / ``list_tenant_audit``.
+  After crashes, ``verify_job_audit`` checks the stream's final
+  ``to_status`` matches the job row (no desync possible on commit).
 * **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
   jobs (pending + running + history), schedules, and webhooks to *target*
   without stopping workers. Lease fencing tokens stay valid. Heartbeat /
@@ -115,7 +120,9 @@ from psycopg_pool import ConnectionPool
 
 from job_queue.db import init_schema, transaction
 from job_queue.models import (
+    AuditConsistencyReport,
     Job,
+    JobAuditEvent,
     JobStatus,
     PreemptResult,
     Schedule,
@@ -629,6 +636,17 @@ class JobQueue:
                 if updated is None:
                     continue
                 pending_cancelled += 1
+                self._append_job_audit(
+                    conn,
+                    job_id=prow["id"],
+                    tenant_id=tenant_id,
+                    event_type="cancelled",
+                    from_status=JobStatus.PENDING.value,
+                    to_status=JobStatus.CANCELLED.value,
+                    actor="system",
+                    detail={"reason": "tenant offboard"},
+                    now=now,
+                )
                 self._cascade_cancel_dependents(
                     conn,
                     parent_id=prow["id"],
@@ -850,6 +868,21 @@ class JobQueue:
                 """,
                 (target, now, source),
             ).fetchall()
+            for jm in jobs_moved:
+                self._append_job_audit(
+                    conn,
+                    job_id=jm["id"],
+                    tenant_id=target,
+                    event_type="tenant_merged",
+                    from_status=jm["status"],
+                    to_status=jm["status"],
+                    actor="system",
+                    detail={
+                        "from_tenant": source,
+                        "to_tenant": target,
+                    },
+                    now=now,
+                )
             leased_moved = sum(
                 1 for r in jobs_moved if r["status"] == JobStatus.LEASED.value
             )
@@ -1141,7 +1174,23 @@ class JobQueue:
                             "conflict without an active row"
                         )
                     return _row_to_job(existing)
-                return _row_to_job(row)
+                job = _row_to_job(row)
+                self._append_job_audit(
+                    conn,
+                    job_id=job.id,
+                    tenant_id=tenant_id,
+                    event_type="enqueued",
+                    from_status=None,
+                    to_status=JobStatus.PENDING.value,
+                    actor=None,
+                    detail={
+                        "queue_name": queue_name,
+                        "priority": priority,
+                        "dedupe_key": dedupe_key,
+                    },
+                    now=now,
+                )
+                return job
 
             self._assert_pending_capacity(conn, tenant_id)
 
@@ -1188,7 +1237,19 @@ class JobQueue:
                 ),
             ).fetchone()
             assert row is not None
-            return _row_to_job(row)
+            job = _row_to_job(row)
+            self._append_job_audit(
+                conn,
+                job_id=job.id,
+                tenant_id=tenant_id,
+                event_type="enqueued",
+                from_status=None,
+                to_status=JobStatus.PENDING.value,
+                actor=None,
+                detail={"queue_name": queue_name, "priority": priority},
+                now=now,
+            )
+            return job
 
     # ------------------------------------------------------------------
     # Lease
@@ -1607,6 +1668,7 @@ class JobQueue:
         if lease_expires > hard:
             lease_expires = hard
 
+        from_status = candidate["status"]
         row = conn.execute(
             f"""
             UPDATE jobs
@@ -1639,7 +1701,22 @@ class JobQueue:
             ),
         ).fetchone()
         assert row is not None
-        return _row_to_job(row)
+        job = _row_to_job(row)
+        self._append_job_audit(
+            conn,
+            job_id=job.id,
+            tenant_id=job.tenant_id,
+            event_type="leased",
+            from_status=from_status,
+            to_status=JobStatus.LEASED.value,
+            actor=worker_id,
+            detail={
+                "attempts": new_attempts,
+                "reclaim": from_status == JobStatus.LEASED.value,
+            },
+            now=now,
+        )
+        return job
 
     def _hard_deadline(self, row: dict[str, Any]) -> datetime | None:
         started = row.get("lease_started_at")
@@ -1672,7 +1749,7 @@ class JobQueue:
             )
             if force_terminal and attempts < max_attempts:
                 error = "max runtime exceeded during tenant offboard"
-            conn.execute(
+            updated = conn.execute(
                 f"""
                 UPDATE jobs
                 SET status = %s,
@@ -1687,6 +1764,7 @@ class JobQueue:
                 WHERE id = %s
                   AND tenant_id = %s
                   AND status = %s
+                RETURNING id
                 """,
                 (
                     terminal,
@@ -1699,7 +1777,23 @@ class JobQueue:
                     tenant_id,
                     JobStatus.LEASED.value,
                 ),
-            )
+            ).fetchone()
+            if updated is not None:
+                self._append_job_audit(
+                    conn,
+                    job_id=row["id"],
+                    tenant_id=tenant_id,
+                    event_type=(
+                        "cancelled"
+                        if terminal == JobStatus.CANCELLED.value
+                        else "dead_lettered"
+                    ),
+                    from_status=JobStatus.LEASED.value,
+                    to_status=terminal,
+                    actor="system",
+                    detail={"reason": error},
+                    now=now,
+                )
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=row["id"],
@@ -1728,7 +1822,7 @@ class JobQueue:
                 max_seconds=300 if cap is None else int(cap),
             )
             next_available = now + timedelta(seconds=backoff)
-            conn.execute(
+            updated = conn.execute(
                 f"""
                 UPDATE jobs
                 SET status = %s,
@@ -1743,6 +1837,7 @@ class JobQueue:
                 WHERE id = %s
                   AND tenant_id = %s
                   AND status = %s
+                RETURNING id
                 """,
                 (
                     JobStatus.PENDING.value,
@@ -1753,7 +1848,19 @@ class JobQueue:
                     tenant_id,
                     JobStatus.LEASED.value,
                 ),
-            )
+            ).fetchone()
+            if updated is not None:
+                self._append_job_audit(
+                    conn,
+                    job_id=row["id"],
+                    tenant_id=tenant_id,
+                    event_type="requeued",
+                    from_status=JobStatus.LEASED.value,
+                    to_status=JobStatus.PENDING.value,
+                    actor="system",
+                    detail={"reason": error},
+                    now=now,
+                )
 
     def _dead_letter_exhausted_leases(
         self,
@@ -1822,6 +1929,17 @@ class JobQueue:
         for dead in dead_rows:
             tid = dead["tenant_id"]
             tenants.add(tid)
+            self._append_job_audit(
+                conn,
+                job_id=dead["id"],
+                tenant_id=tid,
+                event_type="dead_lettered",
+                from_status=JobStatus.LEASED.value,
+                to_status=JobStatus.DEAD.value,
+                actor="system",
+                detail={"reason": "exceeded max_attempts after lease expiry"},
+                now=now,
+            )
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=dead["id"],
@@ -1945,6 +2063,17 @@ class JobQueue:
                     f"(status changed during cancel)",
                     job=current_job,
                 )
+            self._append_job_audit(
+                conn,
+                job_id=job_id,
+                tenant_id=tenant_id,
+                event_type="cancelled",
+                from_status=job.status.value,
+                to_status=JobStatus.CANCELLED.value,
+                actor=None,
+                detail={"was_running": was_running},
+                now=now,
+            )
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=job_id,
@@ -2092,6 +2221,17 @@ class JobQueue:
                 if updated is None:
                     raise LeaseError(f"job {job_id} lease lost during ack")
                 job = _row_to_job(updated)
+                self._append_job_audit(
+                    conn,
+                    job_id=job.id,
+                    tenant_id=job.tenant_id,
+                    event_type="completed",
+                    from_status=JobStatus.LEASED.value,
+                    to_status=JobStatus.COMPLETED.value,
+                    actor=worker_id,
+                    detail={"has_result": result is not None},
+                    now=now,
+                )
                 self._record_job_duration(conn, job=job, now=now)
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
@@ -2184,6 +2324,27 @@ class JobQueue:
             ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during nack")
+
+            event_type = (
+                "requeued"
+                if new_status == JobStatus.PENDING.value
+                else (
+                    "dead_lettered"
+                    if new_status == JobStatus.DEAD.value
+                    else "failed"
+                )
+            )
+            self._append_job_audit(
+                conn,
+                job_id=job_id,
+                tenant_id=owner_tenant,
+                event_type=event_type,
+                from_status=JobStatus.LEASED.value,
+                to_status=new_status,
+                actor=worker_id,
+                detail={"error": error, "requeue": requeue},
+                now=now,
+            )
 
             if new_status in (JobStatus.DEAD.value, JobStatus.FAILED.value):
                 self._cascade_cancel_dependents(
@@ -2278,7 +2439,19 @@ class JobQueue:
             ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during checkpoint")
-            return _row_to_job(updated)
+            job = _row_to_job(updated)
+            self._append_job_audit(
+                conn,
+                job_id=job.id,
+                tenant_id=job.tenant_id,
+                event_type="checkpointed",
+                from_status=JobStatus.LEASED.value,
+                to_status=JobStatus.LEASED.value,
+                actor=worker_id,
+                detail={"checkpoint": progress},
+                now=now,
+            )
+            return job
 
     def request_approval(
         self,
@@ -2400,7 +2573,22 @@ class JobQueue:
                 ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during request_approval")
-            return _row_to_job(updated)
+            job = _row_to_job(updated)
+            self._append_job_audit(
+                conn,
+                job_id=job.id,
+                tenant_id=tenant_id,
+                event_type="approval_requested",
+                from_status=JobStatus.LEASED.value,
+                to_status=JobStatus.AWAITING_APPROVAL.value,
+                actor=worker_id,
+                detail={
+                    "message": msg,
+                    "timeout_seconds": float(timeout_seconds),
+                },
+                now=now,
+            )
+            return job
 
     def approve(
         self,
@@ -2466,7 +2654,19 @@ class JobQueue:
                         f"job {job_id} approval race",
                         job=job,
                     )
-                return _row_to_job(updated)
+                out = _row_to_job(updated)
+                self._append_job_audit(
+                    conn,
+                    job_id=job_id,
+                    tenant_id=tenant_id,
+                    event_type="approved",
+                    from_status=JobStatus.AWAITING_APPROVAL.value,
+                    to_status=JobStatus.PENDING.value,
+                    actor=None,
+                    detail={},
+                    now=now,
+                )
+                return out
 
             # Idempotent: already approved path.
             if job.approval_outcome == "approved" and status in (
@@ -2561,6 +2761,17 @@ class JobQueue:
                 ).fetchone()
                 if updated is None:
                     raise ApprovalError(f"job {job_id} reject race", job=job)
+                self._append_job_audit(
+                    conn,
+                    job_id=job_id,
+                    tenant_id=tenant_id,
+                    event_type="rejected",
+                    from_status=JobStatus.AWAITING_APPROVAL.value,
+                    to_status=JobStatus.CANCELLED.value,
+                    actor=None,
+                    detail={"reason": err},
+                    now=now,
+                )
                 self._cascade_cancel_dependents(
                     conn,
                     parent_id=job_id,
@@ -2947,7 +3158,19 @@ class JobQueue:
                     f"job {job_id} could not be replayed (status changed)",
                     job=job,
                 )
-            return _row_to_job(updated)
+            out = _row_to_job(updated)
+            self._append_job_audit(
+                conn,
+                job_id=job_id,
+                tenant_id=tenant_id,
+                event_type="replayed",
+                from_status=JobStatus.DEAD.value,
+                to_status=JobStatus.PENDING.value,
+                actor=None,
+                detail={"reset_attempts": reset_attempts},
+                now=now,
+            )
+            return out
 
     def replay_dead_letters(
         self,
@@ -4117,6 +4340,20 @@ class JobQueue:
                                 now,
                             ),
                         ).fetchone()
+                        if job_row is not None:
+                            self._append_job_audit(
+                                conn,
+                                job_id=job_id,
+                                tenant_id=sched_row["tenant_id"],
+                                event_type="enqueued",
+                                from_status=None,
+                                to_status=JobStatus.PENDING.value,
+                                actor="schedule",
+                                detail={
+                                    "schedule_id": str(sched_row["id"]),
+                                },
+                                now=now,
+                            )
                 except UniqueViolation:
                     # Race: another ticker inserted an active job for this schedule.
                     continue
@@ -4176,8 +4413,284 @@ class JobQueue:
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # Approval helpers
+    # Immutable audit stream
     # ------------------------------------------------------------------
+
+    def _append_job_audit(
+        self,
+        conn: Any,
+        *,
+        job_id: UUID,
+        tenant_id: str,
+        event_type: str,
+        from_status: str | None,
+        to_status: str | None,
+        actor: str | None = None,
+        detail: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> JobAuditEvent:
+        """Append one immutable audit row (same transaction as the mutation).
+
+        Caller must already hold locks that serialize this job's updates
+        (typically ``FOR UPDATE`` on the job row) so ``seq`` has no gaps under
+        concurrency. Crashes before commit roll back both job and audit.
+        """
+        ts = now or _utcnow()
+        detail_obj = detail or {}
+        event_id = uuid4()
+        row = conn.execute(
+            """
+            INSERT INTO job_audit_events (
+                event_id, tenant_id, job_id, seq, event_type,
+                from_status, to_status, actor, detail, created_at
+            )
+            SELECT
+                %s, %s, %s,
+                COALESCE((
+                    SELECT MAX(e.seq) FROM job_audit_events e WHERE e.job_id = %s
+                ), 0) + 1,
+                %s, %s, %s, %s, %s, %s
+            RETURNING
+                event_id, tenant_id, job_id, seq, event_type,
+                from_status, to_status, actor, detail, created_at
+            """,
+            (
+                event_id,
+                tenant_id,
+                job_id,
+                job_id,
+                event_type,
+                from_status,
+                to_status,
+                actor,
+                Jsonb(detail_obj),
+                ts,
+            ),
+        ).fetchone()
+        assert row is not None
+        return self._row_to_audit(row)
+
+    @staticmethod
+    def _row_to_audit(row: dict[str, Any]) -> JobAuditEvent:
+        detail = row.get("detail") or {}
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except json.JSONDecodeError:
+                detail = {}
+        if not isinstance(detail, dict):
+            detail = {"value": detail}
+        return JobAuditEvent(
+            event_id=row["event_id"],
+            tenant_id=row["tenant_id"],
+            job_id=row["job_id"],
+            seq=int(row["seq"]),
+            event_type=row["event_type"],
+            from_status=row.get("from_status"),
+            to_status=row.get("to_status"),
+            actor=row.get("actor"),
+            detail=detail,
+            created_at=row["created_at"],
+        )
+
+    def list_job_audit(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        after_seq: int = 0,
+        limit: int = 1000,
+    ) -> list[JobAuditEvent]:
+        """Replay-ordered audit events for one job (tenant-scoped)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if after_seq < 0:
+            raise ValueError("after_seq must be >= 0")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        with self._pool.connection() as conn:
+            # Ensure job belongs to tenant (or had events under this tenant).
+            job = conn.execute(
+                "SELECT id FROM jobs WHERE id = %s AND tenant_id = %s",
+                (job_id, tenant_id),
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT
+                    event_id, tenant_id, job_id, seq, event_type,
+                    from_status, to_status, actor, detail, created_at
+                FROM job_audit_events
+                WHERE job_id = %s
+                  AND tenant_id = %s
+                  AND seq > %s
+                ORDER BY seq ASC
+                LIMIT %s
+                """,
+                (job_id, tenant_id, after_seq, limit),
+            ).fetchall()
+            if job is None and not rows:
+                return []
+            return [self._row_to_audit(r) for r in rows]
+
+    def list_tenant_audit(
+        self,
+        tenant_id: str,
+        *,
+        after_created_at: datetime | None = None,
+        after_event_id: UUID | None = None,
+        limit: int = 500,
+    ) -> list[JobAuditEvent]:
+        """Tenant-wide audit stream ordered by time (for catch-up consumers)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        with self._pool.connection() as conn:
+            if after_created_at is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        event_id, tenant_id, job_id, seq, event_type,
+                        from_status, to_status, actor, detail, created_at
+                    FROM job_audit_events
+                    WHERE tenant_id = %s
+                    ORDER BY created_at ASC, event_id ASC
+                    LIMIT %s
+                    """,
+                    (tenant_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        event_id, tenant_id, job_id, seq, event_type,
+                        from_status, to_status, actor, detail, created_at
+                    FROM job_audit_events
+                    WHERE tenant_id = %s
+                      AND (
+                            created_at > %s
+                            OR (
+                                created_at = %s
+                                AND event_id > %s
+                            )
+                          )
+                    ORDER BY created_at ASC, event_id ASC
+                    LIMIT %s
+                    """,
+                    (
+                        tenant_id,
+                        after_created_at,
+                        after_created_at,
+                        after_event_id or UUID(int=0),
+                        limit,
+                    ),
+                ).fetchall()
+            return [self._row_to_audit(r) for r in rows]
+
+    def verify_job_audit(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+    ) -> AuditConsistencyReport:
+        """Replay audit for *job_id* and compare final status to the job row.
+
+        Ensures: non-empty history when job exists, contiguous ``seq`` from 1,
+        and last ``to_status`` equals current ``jobs.status`` (same-txn invariant).
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            job_row = conn.execute(
+                "SELECT id, tenant_id, status FROM jobs WHERE id = %s AND tenant_id = %s",
+                (job_id, tenant_id),
+            ).fetchone()
+            events = conn.execute(
+                """
+                SELECT seq, to_status, event_type
+                FROM job_audit_events
+                WHERE job_id = %s AND tenant_id = %s
+                ORDER BY seq ASC
+                """,
+                (job_id, tenant_id),
+            ).fetchall()
+
+        if job_row is None:
+            return AuditConsistencyReport(
+                job_id=job_id,
+                tenant_id=tenant_id,
+                ok=False,
+                job_status=None,
+                audit_final_status=None,
+                event_count=len(events),
+                gaps=(),
+                error="job not found for tenant",
+            )
+        if not events:
+            return AuditConsistencyReport(
+                job_id=job_id,
+                tenant_id=tenant_id,
+                ok=False,
+                job_status=job_row["status"],
+                audit_final_status=None,
+                event_count=0,
+                gaps=(),
+                error="no audit events for job",
+            )
+
+        gaps: list[int] = []
+        expected = 1
+        last_status: str | None = None
+        for ev in events:
+            seq = int(ev["seq"])
+            if seq != expected:
+                gaps.append(seq)
+            expected = seq + 1
+            if ev["to_status"] is not None:
+                last_status = ev["to_status"]
+
+        job_status = job_row["status"]
+        ok = not gaps and last_status == job_status
+        err = None
+        if gaps:
+            err = f"seq gaps near {gaps[:5]!r}"
+        elif last_status != job_status:
+            err = (
+                f"audit final status {last_status!r} != job status {job_status!r}"
+            )
+        return AuditConsistencyReport(
+            job_id=job_id,
+            tenant_id=tenant_id,
+            ok=ok,
+            job_status=job_status,
+            audit_final_status=last_status,
+            event_count=len(events),
+            gaps=tuple(gaps),
+            error=err,
+        )
+
+    def verify_tenant_audit(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 10_000,
+    ) -> list[AuditConsistencyReport]:
+        """Verify audit consistency for up to *limit* jobs of a tenant."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE tenant_id = %s
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (tenant_id, limit),
+            ).fetchall()
+        return [
+            self.verify_job_audit(r["id"], tenant_id=tenant_id) for r in rows
+        ]
 
     def _expire_approval_timeouts_locked(
         self,
@@ -4252,6 +4765,17 @@ class JobQueue:
             ).fetchone()
             if updated is None:
                 continue
+            self._append_job_audit(
+                conn,
+                job_id=row["id"],
+                tenant_id=row["tenant_id"],
+                event_type="approval_timeout",
+                from_status=JobStatus.AWAITING_APPROVAL.value,
+                to_status=JobStatus.CANCELLED.value,
+                actor="system",
+                detail={},
+                now=now,
+            )
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=row["id"],
@@ -4485,6 +5009,18 @@ class JobQueue:
                 JobStatus.LEASED.value,
             ),
         ).fetchone()
+        if updated is not None:
+            self._append_job_audit(
+                conn,
+                job_id=victim["id"],
+                tenant_id=victim["tenant_id"],
+                event_type="preempted",
+                from_status=JobStatus.LEASED.value,
+                to_status=JobStatus.PENDING.value,
+                actor="system",
+                detail={"reason": reason[:500]},
+                now=now,
+            )
         return updated
 
     def _try_preempt_for_tenant(
@@ -5360,11 +5896,12 @@ class JobQueue:
             ).fetchall()
             for child in children:
                 was_running = child["status"] == JobStatus.LEASED.value
+                from_status = child["status"]
                 err = reason
                 if was_running:
                     err = f"{reason} (stopped while running)"
-                conn.execute(
-                    """
+                updated = conn.execute(
+                    f"""
                     UPDATE jobs
                     SET status = %s,
                         leased_by = NULL,
@@ -5379,6 +5916,7 @@ class JobQueue:
                     WHERE id = %s
                       AND tenant_id = %s
                       AND status IN (%s, %s)
+                    RETURNING id
                     """,
                     (
                         JobStatus.CANCELLED.value,
@@ -5389,7 +5927,19 @@ class JobQueue:
                         JobStatus.PENDING.value,
                         JobStatus.LEASED.value,
                     ),
-                )
+                ).fetchone()
+                if updated is not None:
+                    self._append_job_audit(
+                        conn,
+                        job_id=child["id"],
+                        tenant_id=tenant_id,
+                        event_type="cascade_cancelled",
+                        from_status=from_status,
+                        to_status=JobStatus.CANCELLED.value,
+                        actor="system",
+                        detail={"reason": err},
+                        now=now,
+                    )
                 frontier.append(child["id"])
 
     @staticmethod

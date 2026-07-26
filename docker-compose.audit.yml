@@ -1,0 +1,139 @@
+# Hard audit resilience soak under coordinator chaos.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.audit.yml \
+#     up --build --abort-on-container-exit --exit-code-from audit-soak audit-soak
+
+services:
+  soak:
+    profiles: ["off"]
+
+  worker-1: &w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "12"
+      LOG_LEVEL: INFO
+  worker-2:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "12"
+      LOG_LEVEL: INFO
+  worker-3:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "12"
+      LOG_LEVEL: INFO
+  worker-4:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "12"
+      LOG_LEVEL: INFO
+
+  worker-5:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-5
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "12"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  worker-6:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-6
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "12"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  chaos:
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-job-queue}
+      CHAOS_INTERVAL_SECONDS: "20"
+      CHAOS_ROUNDS: "10"
+    command:
+      - |
+        set -eu
+        echo "chaos: settle"
+        sleep 25
+        i=0
+        while [ "$$i" -lt "$$CHAOS_ROUNDS" ]; do
+          i=$$((i+1))
+          echo "chaos round $$i: kill coordinator-1"
+          docker kill $$(docker ps -q -f name=coordinator-1) 2>/dev/null || true
+          sleep 4
+          docker start $$(docker ps -aq -f name=coordinator-1 | head -1) 2>/dev/null || true
+          sleep 3
+          echo "chaos round $$i: kill coordinator-2"
+          docker kill $$(docker ps -q -f name=coordinator-2) 2>/dev/null || true
+          sleep 4
+          docker start $$(docker ps -aq -f name=coordinator-2 | head -1) 2>/dev/null || true
+          sleep 3
+          echo "chaos round $$i: kill worker-$$((i % 6 + 1))"
+          docker kill $$(docker ps -q -f name=worker-$$((i % 6 + 1))) 2>/dev/null || true
+          sleep 2
+          docker start $$(docker ps -aq -f name=worker-$$((i % 6 + 1)) | head -1) 2>/dev/null || true
+          sleep "$$CHAOS_INTERVAL_SECONDS"
+        done
+        echo "chaos finished"
+        sleep 3600
+
+  audit-soak:
+    build: .
+    command: ["python", "scripts/audit_chaos_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "12"
+      JOBS_PER_TENANT: "40"
+      TARGET_COMPLETED_RATIO: "0.80"
+      MAX_WALL_SECONDS: "360"
+      POLL_SECONDS: "2"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      chaos:
+        condition: service_started

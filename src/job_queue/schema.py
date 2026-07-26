@@ -366,4 +366,35 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_job
 
 CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_id
     ON webhook_endpoints (id);
+
+-- Immutable per-job audit stream (append-only). Written in the same
+-- transaction as each job state change so crashes cannot desync history
+-- from final job rows. Tenants replay by (tenant_id, job_id, seq).
+CREATE TABLE IF NOT EXISTS job_audit_events (
+    event_id        UUID PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    job_id          UUID NOT NULL,
+    seq             BIGINT NOT NULL,
+    event_type      TEXT NOT NULL,
+    from_status     TEXT,
+    to_status       TEXT,
+    actor           TEXT,
+    detail          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT job_audit_events_seq_check CHECK (seq >= 1),
+    CONSTRAINT job_audit_events_job_seq_unique UNIQUE (job_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_audit_tenant_job_seq
+    ON job_audit_events (tenant_id, job_id, seq ASC);
+
+CREATE INDEX IF NOT EXISTS idx_job_audit_tenant_created
+    ON job_audit_events (tenant_id, created_at ASC, event_id ASC);
+
+CREATE INDEX IF NOT EXISTS idx_job_audit_job_seq
+    ON job_audit_events (job_id, seq ASC);
+
+-- Deny application-level mutation of history (still allow SELECT/INSERT).
+-- Superuser maintenance can DROP; normal role should not UPDATE/DELETE.
+REVOKE UPDATE, DELETE ON job_audit_events FROM PUBLIC;
 """

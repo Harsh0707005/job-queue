@@ -21,6 +21,8 @@ from job_queue.codec import (
     claimed_webhook_to_dict,
     job_to_dict,
     schedule_to_dict,
+    audit_consistency_report_to_dict,
+    job_audit_event_to_dict,
     preempt_result_to_dict,
     tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
@@ -85,6 +87,14 @@ class Coordinator:
             return self._process_approval_timeouts(body)
         if method == "GET" and path == "/v1/approvals":
             return self._list_approvals(query)
+        if method == "GET" and path.startswith("/v1/jobs/") and path.endswith("/audit/verify"):
+            return self._job_audit_verify(path, query)
+        if method == "GET" and path.startswith("/v1/jobs/") and path.endswith("/audit"):
+            return self._job_audit(path, query)
+        if method == "GET" and path.startswith("/v1/tenants/") and path.endswith("/audit/verify"):
+            return self._tenant_audit_verify(path, query)
+        if method == "GET" and path.startswith("/v1/tenants/") and path.endswith("/audit"):
+            return self._tenant_audit(path, query)
         if method == "GET" and path.startswith("/v1/jobs/"):
             return self._get_job(path, query)
 
@@ -438,6 +448,89 @@ class Coordinator:
         if job is None:
             return 404, {"error": "job not found"}
         return 200, {"job": job_to_dict(job)}
+
+    def _job_audit(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        # /v1/jobs/{uuid}/audit?tenant_id=
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid audit path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        after_seq = int((query.get("after_seq") or ["0"])[0])
+        limit = int((query.get("limit") or ["1000"])[0])
+        try:
+            events = self.queue.list_job_audit(
+                UUID(job_id_s),
+                tenant_id=str(tenants[0]),
+                after_seq=after_seq,
+                limit=limit,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "events": [job_audit_event_to_dict(e) for e in events],
+            "count": len(events),
+        }
+
+    def _job_audit_verify(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        # /v1/jobs/{uuid}/audit/verify?tenant_id=
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid audit verify path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        report = self.queue.verify_job_audit(
+            UUID(job_id_s), tenant_id=str(tenants[0])
+        )
+        return 200, {"report": audit_consistency_report_to_dict(report)}
+
+    def _tenant_audit(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant audit path"}
+        tenant_id = parts[2]
+        limit = int((query.get("limit") or ["500"])[0])
+        try:
+            events = self.queue.list_tenant_audit(tenant_id, limit=limit)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "events": [job_audit_event_to_dict(e) for e in events],
+            "count": len(events),
+        }
+
+    def _tenant_audit_verify(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid tenant audit verify path"}
+        tenant_id = parts[2]
+        limit = int((query.get("limit") or ["10000"])[0])
+        reports = self.queue.verify_tenant_audit(tenant_id, limit=limit)
+        bad = [r for r in reports if not r.ok]
+        return 200, {
+            "ok": len(bad) == 0,
+            "checked": len(reports),
+            "mismatches": len(bad),
+            "reports": [
+                audit_consistency_report_to_dict(r) for r in (bad or reports[:20])
+            ],
+        }
 
     # ------------------------------------------------------------------
     # Scheduler / webhook nodes
