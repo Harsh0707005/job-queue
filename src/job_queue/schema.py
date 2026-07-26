@@ -257,6 +257,11 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
     ON webhook_deliveries (next_attempt_at ASC)
     WHERE status = 'pending';
 
+-- Hot claim path: due pending ordered by next_attempt_at under large backlog.
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_claim_pending
+    ON webhook_deliveries (next_attempt_at ASC, id ASC)
+    WHERE status = 'pending';
+
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_stuck
     ON webhook_deliveries (delivering_until ASC)
     WHERE status = 'delivering';
@@ -266,4 +271,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_status
 
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_job
     ON webhook_deliveries (job_id);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_id
+    ON webhook_endpoints (id);
 """

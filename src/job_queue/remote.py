@@ -575,20 +575,24 @@ class WebhookNode:
         self._stop.set()
 
     def run_once(self) -> int:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         from job_queue.webhooks import post_webhook
 
         payload = self.client.claim_webhooks(
             limit=self.batch_limit,
             http_timeout_seconds=self.http_timeout_seconds,
         )
+        claimed = list(payload.get("claimed") or [])
         n = 0
-        for item in payload.get("claimed") or []:
+
+        def _one(item: dict[str, Any]) -> tuple[bool, bool]:
+            """Return (handled, success)."""
             delivery = item["delivery"]
             did = delivery["id"]
             if not item.get("endpoint_enabled") or not item.get("url"):
                 self.client.finalize_webhook(did, endpoint_missing=True)
-                n += 1
-                continue
+                return True, False
             code, detail = post_webhook(
                 item["url"],
                 delivery.get("payload") or {},
@@ -601,9 +605,33 @@ class WebhookNode:
                 status_code=code,
                 error=None if 200 <= code < 300 else detail,
             )
-            n += 1
-            if 200 <= code < 300:
-                self.delivered += 1
+            return True, 200 <= code < 300
+
+        # Parallel POST+finalize within the claimed batch (I/O bound).
+        # Cap concurrency: too many simultaneous finalize calls thrash the
+        # coordinator DB pool and leave stuck delivering rows until reclaim.
+        # Default sequential: high parallelism often thrash finalize + reclaim.
+        max_par = int(os.environ.get("WEBHOOK_PARALLEL_POST", "1") or "1")
+        if max_par < 1:
+            max_par = 1
+        workers = min(max_par, max(1, len(claimed)))
+        if workers == 1 or len(claimed) <= 1:
+            for item in claimed:
+                handled, ok = _one(item)
+                if handled:
+                    n += 1
+                if ok:
+                    self.delivered += 1
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(_one, item) for item in claimed]
+                for fut in as_completed(futs):
+                    handled, ok = fut.result()
+                    if handled:
+                        n += 1
+                    if ok:
+                        self.delivered += 1
+
         auto = payload.get("auto_finalized") or []
         n += len(auto)
         for r in auto:
@@ -729,10 +757,26 @@ def webhook_main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="job-queue-webhook-node")
     p.add_argument("--coordinator", default=_coord_url())
     p.add_argument("--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5"))
+    p.add_argument(
+        "--batch-limit",
+        type=int,
+        default=int(_env("BATCH_LIMIT", "50") or "50"),
+        help="Deliveries to claim per pull",
+    )
+    p.add_argument(
+        "--http-timeout",
+        type=float,
+        default=float(_env("HTTP_TIMEOUT", "10") or "10"),
+    )
     args = p.parse_args(argv)
     client = CoordinatorClient(args.coordinator)
     client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
-    node = WebhookNode(client, poll_interval_seconds=args.poll)
+    node = WebhookNode(
+        client,
+        poll_interval_seconds=args.poll,
+        batch_limit=args.batch_limit,
+        http_timeout_seconds=args.http_timeout,
+    )
     try:
         node.run()
     except KeyboardInterrupt:

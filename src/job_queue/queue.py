@@ -2317,6 +2317,10 @@ class JobQueue:
 
         Claim commits ``status=delivering`` before return so a crash mid-POST
         cannot leave the row as pending.
+
+        Hot path uses a **set-based** ``UPDATE ... FROM (SELECT ... FOR UPDATE
+        SKIP LOCKED LIMIT n)`` plus a single join to endpoints so large pending
+        backlogs do not N-round-trip per row.
         """
         from job_queue.models import ClaimedWebhook
         from job_queue.webhooks import WebhookDeliveryResult
@@ -2334,171 +2338,173 @@ class JobQueue:
         auto_finalized: list[Any] = []
 
         with transaction(self._pool) as conn:
-            # Abandoned claims on offboarding tenants must not stick forever
-            # (pause blocks normal reclaim of pending work).
-            self._reap_offboarding_expired_webhooks(conn, now=now, tenant_id=None)
+            # Cheap gate: only scan offboarding reaper when needed.
+            has_offboard = conn.execute(
+                """
+                SELECT 1 FROM tenant_settings
+                WHERE offboarding = TRUE
+                LIMIT 1
+                """
+            ).fetchone()
+            if has_offboard is not None:
+                self._reap_offboarding_expired_webhooks(
+                    conn, now=now, tenant_id=None
+                )
 
-            due = conn.execute(
+            # 1) Auto-succeed expired delivering claims that already have 2xx
+            #    evidence (crash after POST, before status flip).
+            auto_rows = conn.execute(
                 f"""
-                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
-                FROM webhook_deliveries
-                WHERE (
-                        (
-                            status = 'pending'
-                        AND next_attempt_at <= %s
-                        )
-                     OR (
-                            status = 'delivering'
-                        AND delivering_until IS NOT NULL
-                        AND delivering_until < %s
-                     )
+                UPDATE webhook_deliveries d
+                SET status = 'succeeded',
+                    delivering_until = NULL,
+                    last_error = NULL,
+                    updated_at = %s,
+                    completed_at = COALESCE(d.completed_at, %s)
+                WHERE d.id IN (
+                    SELECT d2.id
+                    FROM webhook_deliveries d2
+                    WHERE d2.status = 'delivering'
+                      AND d2.delivering_until IS NOT NULL
+                      AND d2.delivering_until < %s
+                      AND d2.last_status_code IS NOT NULL
+                      AND d2.last_status_code >= 200
+                      AND d2.last_status_code < 300
+                      AND NOT EXISTS (
+                            SELECT 1 FROM tenant_settings ts
+                            WHERE ts.tenant_id = d2.tenant_id
+                              AND ts.paused = TRUE
+                              AND ts.offboarding = FALSE
+                      )
+                    FOR UPDATE OF d2 SKIP LOCKED
+                    LIMIT %s
                 )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM tenant_settings ts
-                    WHERE ts.tenant_id = webhook_deliveries.tenant_id
-                      AND ts.paused = TRUE
-                )
-                ORDER BY next_attempt_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT %s
+                RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
                 """,
-                (now, now, limit),
+                (now, now, now, limit),
             ).fetchall()
+            for u in auto_rows:
+                auto_finalized.append(
+                    WebhookDeliveryResult(
+                        delivery=self._row_to_webhook_delivery(u),
+                        success=True,
+                        status_code=int(u["last_status_code"]),
+                        error=None,
+                    )
+                )
 
-            for drow in due:
-                if self._is_tenant_paused(conn, drow["tenant_id"]):
-                    code = drow.get("last_status_code")
-                    if (
-                        drow["status"] == "delivering"
-                        and code is not None
-                        and 200 <= int(code) < 300
-                    ):
-                        updated = conn.execute(
-                            f"""
-                            UPDATE webhook_deliveries
-                            SET status = 'succeeded',
-                                delivering_until = NULL,
-                                last_error = NULL,
-                                updated_at = %s,
-                                completed_at = COALESCE(completed_at, %s)
-                            WHERE id = %s
-                              AND status = 'delivering'
-                            RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                            """,
-                            (now, now, drow["id"]),
-                        ).fetchone()
-                        if updated is not None:
-                            auto_finalized.append(
-                                WebhookDeliveryResult(
-                                    delivery=self._row_to_webhook_delivery(updated),
-                                    success=True,
-                                    status_code=int(code),
-                                    error=None,
-                                )
-                            )
-                            self._maybe_finalize_offboard(
-                                conn, tenant_id=drow["tenant_id"], now=now
-                            )
-                    continue
+            remaining = max(0, limit - len(auto_rows))
+            if remaining < 1:
+                return claimed, auto_finalized
 
-                is_reclaim = drow["status"] == "delivering"
-                if is_reclaim:
-                    code = drow.get("last_status_code")
-                    if code is not None and 200 <= int(code) < 300:
-                        updated = conn.execute(
-                            f"""
-                            UPDATE webhook_deliveries
-                            SET status = 'succeeded',
-                                delivering_until = NULL,
-                                last_error = NULL,
-                                updated_at = %s,
-                                completed_at = COALESCE(completed_at, %s)
-                            WHERE id = %s
-                              AND status = 'delivering'
-                            RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                            """,
-                            (now, now, drow["id"]),
-                        ).fetchone()
-                        if updated is not None:
-                            auto_finalized.append(
-                                WebhookDeliveryResult(
-                                    delivery=self._row_to_webhook_delivery(updated),
-                                    success=True,
-                                    status_code=int(code),
-                                    error=None,
-                                )
+            # 2) Set-based claim of pending + stuck delivering (no 2xx evidence).
+            #    Also dead-letter pending rows that already exhausted attempts.
+            claimed_rows = conn.execute(
+                f"""
+                WITH due AS (
+                    SELECT d.id, d.status, d.attempts, d.max_attempts
+                    FROM webhook_deliveries d
+                    WHERE (
+                            (
+                                d.status = 'pending'
+                            AND d.next_attempt_at <= %s
                             )
-                        continue
-                    updated = conn.execute(
-                        f"""
-                        UPDATE webhook_deliveries
-                        SET status = 'delivering',
-                            delivering_until = %s,
-                            updated_at = %s,
-                            last_error = COALESCE(
-                                last_error,
+                         OR (
+                                d.status = 'delivering'
+                            AND d.delivering_until IS NOT NULL
+                            AND d.delivering_until < %s
+                            AND (
+                                d.last_status_code IS NULL
+                             OR d.last_status_code < 200
+                             OR d.last_status_code >= 300
+                            )
+                         )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM tenant_settings ts
+                        WHERE ts.tenant_id = d.tenant_id
+                          AND ts.paused = TRUE
+                    )
+                    ORDER BY d.next_attempt_at ASC
+                    FOR UPDATE OF d SKIP LOCKED
+                    LIMIT %s
+                ),
+                updated AS (
+                    UPDATE webhook_deliveries d
+                    SET
+                        status = CASE
+                            WHEN d.status = 'pending'
+                                 AND d.attempts + 1 > d.max_attempts
+                            THEN 'dead'
+                            ELSE 'delivering'
+                        END,
+                        attempts = CASE
+                            WHEN d.status = 'pending'
+                            THEN d.attempts + 1
+                            ELSE d.attempts
+                        END,
+                        delivering_until = CASE
+                            WHEN d.status = 'pending'
+                                 AND d.attempts + 1 > d.max_attempts
+                            THEN NULL
+                            ELSE %s
+                        END,
+                        last_error = CASE
+                            WHEN d.status = 'pending'
+                                 AND d.attempts + 1 > d.max_attempts
+                            THEN COALESCE(d.last_error, 'max attempts exceeded')
+                            WHEN d.status = 'delivering'
+                            THEN COALESCE(
+                                d.last_error,
                                 'reclaimed stuck delivering claim'
                             )
-                        WHERE id = %s
-                          AND status = 'delivering'
-                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                        """,
-                        (claim_until, now, drow["id"]),
-                    ).fetchone()
-                else:
-                    new_attempts = int(drow["attempts"]) + 1
-                    if new_attempts > int(drow["max_attempts"]):
-                        updated = conn.execute(
-                            f"""
-                            UPDATE webhook_deliveries
-                            SET status = 'dead',
-                                last_error = COALESCE(last_error, 'max attempts exceeded'),
-                                updated_at = %s,
-                                completed_at = %s,
-                                delivering_until = NULL
-                            WHERE id = %s
-                            RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                            """,
-                            (now, now, drow["id"]),
-                        ).fetchone()
-                        if updated is not None:
-                            auto_finalized.append(
-                                WebhookDeliveryResult(
-                                    delivery=self._row_to_webhook_delivery(updated),
-                                    success=False,
-                                    status_code=None,
-                                    error="max attempts exceeded",
-                                )
-                            )
-                        continue
-                    updated = conn.execute(
-                        f"""
-                        UPDATE webhook_deliveries
-                        SET status = 'delivering',
-                            attempts = %s,
-                            delivering_until = %s,
-                            updated_at = %s
-                        WHERE id = %s
-                          AND status = 'pending'
-                        RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
-                        """,
-                        (new_attempts, claim_until, now, drow["id"]),
-                    ).fetchone()
+                            ELSE d.last_error
+                        END,
+                        completed_at = CASE
+                            WHEN d.status = 'pending'
+                                 AND d.attempts + 1 > d.max_attempts
+                            THEN %s
+                            ELSE d.completed_at
+                        END,
+                        updated_at = %s
+                    FROM due
+                    WHERE d.id = due.id
+                    RETURNING
+                        d.id, d.endpoint_id, d.tenant_id, d.job_id, d.event,
+                        d.payload, d.status, d.attempts, d.max_attempts,
+                        d.backoff_base_seconds, d.backoff_max_seconds,
+                        d.next_attempt_at, d.delivering_until, d.last_error,
+                        d.last_status_code, d.created_at, d.updated_at,
+                        d.completed_at
+                )
+                SELECT
+                    u.*,
+                    e.url AS _ep_url,
+                    e.secret AS _ep_secret,
+                    e.enabled AS _ep_enabled
+                FROM updated u
+                LEFT JOIN webhook_endpoints e ON e.id = u.endpoint_id
+                """,
+                (now, now, remaining, claim_until, now, now),
+            ).fetchall()
 
-                if updated is None:
+            for row in claimed_rows:
+                if row["status"] == "dead":
+                    auto_finalized.append(
+                        WebhookDeliveryResult(
+                            delivery=self._row_to_webhook_delivery(row),
+                            success=False,
+                            status_code=None,
+                            error="max attempts exceeded",
+                        )
+                    )
                     continue
-
-                endpoint = conn.execute(
-                    f"""
-                    SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
-                    FROM webhook_endpoints
-                    WHERE id = %s
-                    """,
-                    (updated["endpoint_id"],),
-                ).fetchone()
-                delivery = self._row_to_webhook_delivery(updated)
-                if endpoint is None:
+                delivery = self._row_to_webhook_delivery(row)
+                url = row.get("_ep_url")
+                secret = row.get("_ep_secret")
+                enabled = row.get("_ep_enabled")
+                if url is None:
                     claimed.append(
                         ClaimedWebhook(
                             delivery=delivery,
@@ -2511,9 +2517,9 @@ class JobQueue:
                     claimed.append(
                         ClaimedWebhook(
                             delivery=delivery,
-                            url=endpoint["url"],
-                            secret=endpoint["secret"],
-                            endpoint_enabled=bool(endpoint["enabled"]),
+                            url=url,
+                            secret=secret,
+                            endpoint_enabled=bool(enabled),
                         )
                     )
 
@@ -2597,18 +2603,9 @@ class JobQueue:
             offboarding = self._is_tenant_offboarding(conn, tenant_id)
 
             if success:
-                # Evidence of 2xx before status flip (crash-safe).
-                conn.execute(
-                    """
-                    UPDATE webhook_deliveries
-                    SET last_status_code = %s,
-                        last_error = NULL,
-                        updated_at = %s
-                    WHERE id = %s
-                      AND status = 'delivering'
-                    """,
-                    (int(status_code), now, delivery_id),
-                )
+                # Single UPDATE: persist 2xx evidence and terminal status together.
+                # (Crash mid-statement still leaves status=delivering; reclaim
+                # auto-succeeds when last_status_code is 2xx.)
                 updated = conn.execute(
                     f"""
                     UPDATE webhook_deliveries

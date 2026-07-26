@@ -1,0 +1,118 @@
+{
+  "label": "peak-b50-seq",
+  "ok": true,
+  "tenants": 20,
+  "deliveries_per_tenant": 200,
+  "total": 4000,
+  "seeded": 4000,
+  "seed_seconds": 0.4019,
+  "drain_seconds": 5.567,
+  "drain_deliveries_per_sec": 718.52,
+  "time_to_first_success_seconds": 0.0,
+  "final_backlog": {
+    "jobs": {
+      "pending": 0,
+      "leased": 0,
+      "failed": 0,
+      "dead": 0,
+      "completed": 0,
+      "cancelled": 0
+    },
+    "webhooks": {
+      "pending": 0,
+      "delivering": 0,
+      "dead": 0,
+      "succeeded": 4000
+    }
+  },
+  "samples": [
+    {
+      "t": 0.0,
+      "pending": 3800,
+      "delivering": 83,
+      "succeeded": 117,
+      "dead": 0,
+      "inst_succ_per_sec": 234.0
+    },
+    {
+      "t": 0.504,
+      "pending": 3400,
+      "delivering": 95,
+      "succeeded": 505,
+      "dead": 0,
+      "inst_succ_per_sec": 776.0
+    },
+    {
+      "t": 1.008,
+      "pending": 3000,
+      "delivering": 118,
+      "succeeded": 882,
+      "dead": 0,
+      "inst_succ_per_sec": 754.0
+    },
+    {
+      "t": 1.514,
+      "pending": 2600,
+      "delivering": 158,
+      "succeeded": 1242,
+      "dead": 0,
+      "inst_succ_per_sec": 720.0
+    },
+    {
+      "t": 2.021,
+      "pending": 2200,
+      "delivering": 160,
+      "succeeded": 1640,
+      "dead": 0,
+      "inst_succ_per_sec": 796.0
+    },
+    {
+      "t": 2.526,
+      "pending": 1800,
+      "delivering": 138,
+      "succeeded": 2062,
+      "dead": 0,
+      "inst_succ_per_sec": 844.0
+    },
+    {
+      "t": 3.033,
+      "pending": 1450,
+      "delivering": 135,
+      "succeeded": 2415,
+      "dead": 0,
+      "inst_succ_per_sec": 706.0
+    },
+    {
+      "t": 3.537,
+      "pending": 1000,
+      "delivering": 116,
+      "succeeded": 2884,
+      "dead": 0,
+      "inst_succ_per_sec": 938.0
+    },
+    {
+      "t": 4.041,
+      "pending": 600,
+      "delivering": 86,
+      "succeeded": 3314,
+      "dead": 0,
+      "inst_succ_per_sec": 860.0
+    },
+    {
+      "t": 4.547,
+      "pending": 150,
+      "delivering": 85,
+      "succeeded": 3765,
+      "dead": 0,
+      "inst_succ_per_sec": 902.0
+    },
+    {
+      "t": 5.052,
+      "pending": 0,
+      "delivering": 0,
+      "succeeded": 4000,
+      "dead": 0,
+      "inst_succ_per_sec": 470.0
+    }
+  ]
+}

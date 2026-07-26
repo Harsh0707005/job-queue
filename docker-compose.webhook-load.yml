@@ -1,0 +1,108 @@
+# Webhook claim/finalize load: pre-seeded deliveries, multi-agent drain.
+#
+# Baseline:
+#   docker compose -f docker-compose.yml -f docker-compose.webhook-load.yml down -v
+#   docker compose -f docker-compose.yml -f docker-compose.webhook-load.yml up --build \
+#     --abort-on-container-exit --exit-code-from webhook-load-soak webhook-load-soak
+
+x-wh-agent: &wh_agent_env
+  COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+  POLL_INTERVAL: "0.05"
+  BATCH_LIMIT: "50"
+  HTTP_TIMEOUT: "5"
+  WEBHOOK_PARALLEL_POST: "1"
+  LOG_LEVEL: WARNING
+
+services:
+  chaos:
+    profiles: ["disabled"]
+  soak:
+    profiles: ["disabled"]
+  scheduler:
+    profiles: ["disabled"]
+  worker-1:
+    profiles: ["disabled"]
+  worker-2:
+    profiles: ["disabled"]
+  worker-3:
+    profiles: ["disabled"]
+  worker-4:
+    profiles: ["disabled"]
+
+  postgres:
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+
+  webhook-sink:
+    environment:
+      LOG_LEVEL: WARNING
+      SLOW_MS: "0"
+
+  webhook-1:
+    environment:
+      <<: *wh_agent_env
+  webhook-2:
+    environment:
+      <<: *wh_agent_env
+
+  # Extra agents for drain capacity.
+  webhook-3:
+    build: .
+    command: ["job-queue-webhook-node"]
+    environment:
+      <<: *wh_agent_env
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+
+  webhook-4:
+    build: .
+    command: ["job-queue-webhook-node"]
+    environment:
+      <<: *wh_agent_env
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+
+  webhook-load-soak:
+    build: .
+    command: ["python", "scripts/load_webhook_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      SINK_URL: http://webhook-sink:8090
+      WEBHOOK_URL: http://webhook-sink:8090/hook
+      TENANTS: "20"
+      DELIVERIES_PER_TENANT: "200"
+      MAX_WALL_SECONDS: "600"
+      POLL_SECONDS: "0.5"
+      LOAD_LABEL: webhook-baseline
+      RESULTS_PATH: /results/webhook-baseline.json
+      LOG_LEVEL: INFO
+    volumes:
+      - ./deploy/webhook-load-results:/results
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+      webhook-1:
+        condition: service_started
+      webhook-2:
+        condition: service_started
+      webhook-3:
+        condition: service_started
+      webhook-4:
+        condition: service_started

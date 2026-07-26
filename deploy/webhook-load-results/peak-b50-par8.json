@@ -1,0 +1,206 @@
+{
+  "label": "peak-b50-par8",
+  "ok": true,
+  "tenants": 20,
+  "deliveries_per_tenant": 200,
+  "total": 4000,
+  "seeded": 4000,
+  "seed_seconds": 0.5349,
+  "drain_seconds": 11.2497,
+  "drain_deliveries_per_sec": 355.57,
+  "time_to_first_success_seconds": 0.0,
+  "final_backlog": {
+    "jobs": {
+      "pending": 0,
+      "leased": 0,
+      "failed": 0,
+      "dead": 0,
+      "completed": 0,
+      "cancelled": 0
+    },
+    "webhooks": {
+      "pending": 0,
+      "delivering": 0,
+      "dead": 0,
+      "succeeded": 4000
+    }
+  },
+  "samples": [
+    {
+      "t": 0.0,
+      "pending": 3800,
+      "delivering": 16,
+      "succeeded": 184,
+      "dead": 0,
+      "inst_succ_per_sec": 368.0
+    },
+    {
+      "t": 0.507,
+      "pending": 3800,
+      "delivering": 16,
+      "succeeded": 184,
+      "dead": 0,
+      "inst_succ_per_sec": 0.0
+    },
+    {
+      "t": 1.018,
+      "pending": 3604,
+      "delivering": 95,
+      "succeeded": 301,
+      "dead": 0,
+      "inst_succ_per_sec": 234.0
+    },
+    {
+      "t": 1.546,
+      "pending": 3604,
+      "delivering": 17,
+      "succeeded": 379,
+      "dead": 0,
+      "inst_succ_per_sec": 156.0
+    },
+    {
+      "t": 2.065,
+      "pending": 3606,
+      "delivering": 0,
+      "succeeded": 394,
+      "dead": 0,
+      "inst_succ_per_sec": 30.0
+    },
+    {
+      "t": 2.572,
+      "pending": 3256,
+      "delivering": 10,
+      "succeeded": 734,
+      "dead": 0,
+      "inst_succ_per_sec": 680.0
+    },
+    {
+      "t": 3.076,
+      "pending": 3006,
+      "delivering": 53,
+      "succeeded": 941,
+      "dead": 0,
+      "inst_succ_per_sec": 414.0
+    },
+    {
+      "t": 3.584,
+      "pending": 2756,
+      "delivering": 5,
+      "succeeded": 1239,
+      "dead": 0,
+      "inst_succ_per_sec": 596.0
+    },
+    {
+      "t": 4.094,
+      "pending": 2756,
+      "delivering": 5,
+      "succeeded": 1239,
+      "dead": 0,
+      "inst_succ_per_sec": 0.0
+    },
+    {
+      "t": 4.611,
+      "pending": 2556,
+      "delivering": 12,
+      "succeeded": 1432,
+      "dead": 0,
+      "inst_succ_per_sec": 386.0
+    },
+    {
+      "t": 5.119,
+      "pending": 2556,
+      "delivering": 12,
+      "succeeded": 1432,
+      "dead": 0,
+      "inst_succ_per_sec": 0.0
+    },
+    {
+      "t": 5.626,
+      "pending": 2360,
+      "delivering": 122,
+      "succeeded": 1518,
+      "dead": 0,
+      "inst_succ_per_sec": 172.0
+    },
+    {
+      "t": 6.15,
+      "pending": 2360,
+      "delivering": 16,
+      "succeeded": 1624,
+      "dead": 0,
+      "inst_succ_per_sec": 212.0
+    },
+    {
+      "t": 6.66,
+      "pending": 2365,
+      "delivering": 2,
+      "succeeded": 1633,
+      "dead": 0,
+      "inst_succ_per_sec": 18.0
+    },
+    {
+      "t": 7.163,
+      "pending": 1865,
+      "delivering": 68,
+      "succeeded": 2067,
+      "dead": 0,
+      "inst_succ_per_sec": 868.0
+    },
+    {
+      "t": 7.672,
+      "pending": 1465,
+      "delivering": 42,
+      "succeeded": 2493,
+      "dead": 0,
+      "inst_succ_per_sec": 852.0
+    },
+    {
+      "t": 8.191,
+      "pending": 915,
+      "delivering": 18,
+      "succeeded": 3067,
+      "dead": 0,
+      "inst_succ_per_sec": 1148.0
+    },
+    {
+      "t": 8.697,
+      "pending": 515,
+      "delivering": 35,
+      "succeeded": 3450,
+      "dead": 0,
+      "inst_succ_per_sec": 766.0
+    },
+    {
+      "t": 9.202,
+      "pending": 115,
+      "delivering": 50,
+      "succeeded": 3835,
+      "dead": 0,
+      "inst_succ_per_sec": 770.0
+    },
+    {
+      "t": 9.709,
+      "pending": 0,
+      "delivering": 7,
+      "succeeded": 3993,
+      "dead": 0,
+      "inst_succ_per_sec": 316.0
+    },
+    {
+      "t": 10.223,
+      "pending": 0,
+      "delivering": 7,
+      "succeeded": 3993,
+      "dead": 0,
+      "inst_succ_per_sec": 0.0
+    },
+    {
+      "t": 10.733,
+      "pending": 0,
+      "delivering": 0,
+      "succeeded": 4000,
+      "dead": 0,
+      "inst_succ_per_sec": 14.0
+    }
+  ]
+}

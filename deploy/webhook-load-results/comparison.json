@@ -1,0 +1,123 @@
+{
+  "scenario": {
+    "tenants": 20,
+    "load": "pre-seeded pending webhook_deliveries, claim+POST+finalize via 4 agents",
+    "sink": "SLOW_MS=0"
+  },
+  "legacy_per_row_claim": {
+    "label": "legacy-per-row-claim",
+    "total": 4000,
+    "drain_s": 8.68,
+    "rate": 461.02,
+    "ok": true
+  },
+  "peak": {
+    "label": "webhook-baseline",
+    "total": 4000,
+    "drain_s": 5.07,
+    "rate": 788.55,
+    "ok": true
+  },
+  "speedup_vs_legacy_x": 1.71,
+  "all_runs_sorted_by_rate": [
+    {
+      "label": "webhook-baseline",
+      "total": 4000,
+      "drain_s": 5.07,
+      "rate": 788.55,
+      "ok": true
+    },
+    {
+      "label": "peak-b50-seq-8k",
+      "total": 8000,
+      "drain_s": 10.68,
+      "rate": 748.75,
+      "ok": true
+    },
+    {
+      "label": "peak-b50-seq",
+      "total": 4000,
+      "drain_s": 5.57,
+      "rate": 718.52,
+      "ok": true
+    },
+    {
+      "label": "peak-b100-seq",
+      "total": 4000,
+      "drain_s": 5.61,
+      "rate": 713.06,
+      "ok": true
+    },
+    {
+      "label": "peak-b100-par4",
+      "total": 4000,
+      "drain_s": 7.71,
+      "rate": 518.82,
+      "ok": true
+    },
+    {
+      "label": "legacy-per-row-claim",
+      "total": 4000,
+      "drain_s": 8.68,
+      "rate": 461.02,
+      "ok": true
+    },
+    {
+      "label": "peak-b50-par8",
+      "total": 4000,
+      "drain_s": 11.25,
+      "rate": 355.57,
+      "ok": true
+    },
+    {
+      "label": "sweep-b200-p02-8k",
+      "total": 8000,
+      "drain_s": 36.8,
+      "rate": 217.41,
+      "ok": true
+    },
+    {
+      "label": "sweep-b50-p05-8k",
+      "total": 8000,
+      "drain_s": 65.55,
+      "rate": 122.05,
+      "ok": true
+    },
+    {
+      "label": "sweep-b50-p05",
+      "total": 4000,
+      "drain_s": 35.2,
+      "rate": 113.63,
+      "ok": true
+    },
+    {
+      "label": "sweep-b200-p02",
+      "total": 4000,
+      "drain_s": 37.2,
+      "rate": 107.52,
+      "ok": true
+    },
+    {
+      "label": "sweep-b100-p05",
+      "total": 4000,
+      "drain_s": 44.39,
+      "rate": 90.11,
+      "ok": true
+    }
+  ],
+  "findings": [
+    "Bottleneck was per-row UPDATE + per-row endpoint SELECT inside claim_webhook_deliveries.",
+    "Set-based claim (UPDATE...FROM SELECT FOR UPDATE SKIP LOCKED LIMIT n) + join endpoints is the big win.",
+    "Single-row finalize success (one UPDATE) reduces finalize RTTs.",
+    "Sequential agent POST within batch beats high parallel finalize (DB pool thrash + long reclaim tails).",
+    "Best knobs: BATCH_LIMIT\u224850\u2013100, POLL\u22480.05, WEBHOOK_PARALLEL_POST=1, 4 agents.",
+    "Larger batches help claim but sequential POST still ~700+/s; 8k backlog holds ~750/s."
+  ],
+  "improvements_shipped": [
+    "set-based claim + endpoint join",
+    "single-update finalize on success",
+    "cheap offboarding reaper gate",
+    "idx_webhook_deliveries_claim_pending",
+    "BATCH_LIMIT / WEBHOOK_PARALLEL_POST agent knobs"
+  ]
+}
