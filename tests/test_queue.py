@@ -395,32 +395,47 @@ def test_cross_tenant_get_returns_none(queue: JobQueue):
     assert queue.get(job.id, tenant_id="beta") is None
 
 
-def test_lease_ops_fence_on_token_not_caller_tenant(queue: JobQueue):
-    """Heartbeat/ack/nack fence on lease_token (+ worker), not caller tenant_id.
-
-    After ``merge_tenant``, workers still send the pre-merge tenant string; the
-    row may already live under the target. A wrong/stale tenant_id with a valid
-    token must still succeed. Inspection APIs (``get``) stay tenant-scoped.
-    """
+def test_cross_tenant_ack_heartbeat_nack_rejected(queue: JobQueue):
+    """Unrelated tenant cannot heartbeat/ack/nack even with a valid lease token."""
     from uuid import uuid4
 
     queue.enqueue(tenant_id="alpha", payload={})
     job = queue.lease(tenant_id="alpha", worker_id="w1")
     assert job is not None
     assert job.lease_token is not None
+    assert job.lease_tenant_id == "alpha"
 
-    # Stale / wrong tenant_id is tolerated when the fencing token matches
-    # (ownership-transfer safe).
-    hb = queue.heartbeat(
-        job.id,
-        tenant_id="beta",
-        worker_id="w1",
-        lease_token=job.lease_token,
-    )
-    assert hb.tenant_id == "alpha"
-    assert hb.lease_token == job.lease_token
+    with pytest.raises(LeaseError, match="not found for tenant"):
+        queue.ack(
+            job.id,
+            tenant_id="beta",
+            worker_id="w1",
+            lease_token=job.lease_token,
+        )
+    with pytest.raises(LeaseError, match="not found for tenant"):
+        queue.heartbeat(
+            job.id,
+            tenant_id="beta",
+            worker_id="w1",
+            lease_token=job.lease_token,
+        )
+    with pytest.raises(LeaseError, match="not found for tenant"):
+        queue.nack(
+            job.id,
+            tenant_id="beta",
+            worker_id="w1",
+            lease_token=job.lease_token,
+            error="nope",
+        )
+    with pytest.raises(LeaseError, match="not found for tenant"):
+        queue.ensure_lease(
+            job.id,
+            tenant_id="beta",
+            worker_id="w1",
+            lease_token=job.lease_token,
+        )
 
-    # Wrong token still rejected regardless of tenant_id.
+    # Wrong token still rejected for the owning tenant.
     with pytest.raises(LeaseError):
         queue.heartbeat(
             job.id,
@@ -428,31 +443,9 @@ def test_lease_ops_fence_on_token_not_caller_tenant(queue: JobQueue):
             worker_id="w1",
             lease_token=uuid4(),
         )
-    with pytest.raises(LeaseError):
-        queue.ack(
-            job.id,
-            tenant_id="alpha",
-            worker_id="w1",
-            lease_token=uuid4(),
-        )
-    with pytest.raises(LeaseError):
-        queue.nack(
-            job.id,
-            tenant_id="alpha",
-            worker_id="w1",
-            lease_token=uuid4(),
-            error="nope",
-        )
 
-    # Completing with a non-owner tenant_id still works; job remains under alpha.
-    acked = queue.ack(
-        job.id,
-        tenant_id="beta",
-        worker_id="w1",
-        lease_token=job.lease_token,
-    )
-    assert acked.status == JobStatus.COMPLETED
-    assert acked.tenant_id == "alpha"
+    # Owning tenant can still complete.
+    _ack(queue, job, "w1")
     assert queue.get(job.id, tenant_id="alpha") is not None
     assert queue.get(job.id, tenant_id="beta") is None
     final = queue.get(job.id, tenant_id="alpha")
@@ -4133,11 +4126,12 @@ def test_merge_moves_pending_jobs_and_empties_source(queue: JobQueue):
 
 
 def test_merge_moves_running_job_without_stopping_worker(queue: JobQueue):
-    """Worker still heartbeats/acks with pre-merge tenant_id."""
+    """Worker still heartbeats/acks with pre-merge tenant via lease_tenant_id."""
     job = queue.enqueue(tenant_id="alpha", payload={"run": True})
     leased = queue.lease(tenant_id="alpha", worker_id="w1")
     assert leased is not None
     assert leased.tenant_id == "alpha"
+    assert leased.lease_tenant_id == "alpha"
     assert leased.lease_token is not None
 
     result = queue.merge_tenant("alpha", "beta")
@@ -4145,24 +4139,43 @@ def test_merge_moves_running_job_without_stopping_worker(queue: JobQueue):
     assert result.jobs_leased_moved == 1
     assert queue.tenant_is_empty("alpha") is True
 
-    # Row now lives under beta, but worker still has alpha in hand.
+    # Row now lives under beta; claim tenant remains alpha.
     moved = queue.get(leased.id, tenant_id="beta")
     assert moved is not None
     assert moved.status == JobStatus.LEASED
+    assert moved.tenant_id == "beta"
+    assert moved.lease_tenant_id == "alpha"
     assert moved.lease_token == leased.lease_token
     assert moved.leased_by == "w1"
 
-    # Heartbeat with OLD tenant_id still works (fencing = token).
+    # Pre-merge tenant still works (lease_tenant_id).
     hb = queue.heartbeat(
         leased.id,
-        tenant_id="alpha",  # pre-merge
+        tenant_id="alpha",
         worker_id="w1",
         lease_token=leased.lease_token,
     )
     assert hb.tenant_id == "beta"
-    assert hb.lease_token == leased.lease_token
+    assert hb.lease_tenant_id == "alpha"
 
-    # ensure_lease also merge-tolerant
+    # Current owner also works.
+    hb2 = queue.heartbeat(
+        leased.id,
+        tenant_id="beta",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+    )
+    assert hb2.tenant_id == "beta"
+
+    # Unrelated third tenant still rejected even with valid token.
+    with pytest.raises(LeaseError, match="not found for tenant"):
+        queue.heartbeat(
+            leased.id,
+            tenant_id="gamma",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+        )
+
     held = queue.ensure_lease(
         leased.id,
         tenant_id="alpha",
@@ -4170,6 +4183,7 @@ def test_merge_moves_running_job_without_stopping_worker(queue: JobQueue):
         lease_token=leased.lease_token,
     )
     assert held.tenant_id == "beta"
+    assert held.lease_tenant_id == "alpha"
 
     acked = queue.ack(
         leased.id,
@@ -4180,6 +4194,7 @@ def test_merge_moves_running_job_without_stopping_worker(queue: JobQueue):
     )
     assert acked.status == JobStatus.COMPLETED
     assert acked.tenant_id == "beta"
+    assert acked.lease_tenant_id is None
     assert queue.get_result(acked.id, tenant_id="beta") == {"ok": True}
 
 

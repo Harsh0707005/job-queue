@@ -251,6 +251,7 @@ claimed AS (
   SET status = 'leased',
       leased_by = $4,
       lease_token = gen_random_uuid(),
+      lease_tenant_id = j.tenant_id,
       lease_expires_at = $2 + make_interval(secs => LEAST(
         COALESCE($5::int, j.visibility_timeout_seconds),
         COALESCE(j.max_runtime_seconds, 3600)
@@ -277,7 +278,7 @@ SELECT
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 FROM claimed
 ORDER BY priority DESC, created_at ASC
@@ -390,6 +391,7 @@ UPDATE jobs j
 SET status = 'leased',
     leased_by = $5,
     lease_token = gen_random_uuid(),
+    lease_tenant_id = j.tenant_id,
     lease_expires_at = $3 + make_interval(secs => LEAST(
       COALESCE($6::int, j.visibility_timeout_seconds),
       COALESCE(j.max_runtime_seconds, 3600)
@@ -406,7 +408,7 @@ RETURNING
   j.visibility_timeout_seconds, j.max_runtime_seconds,
   j.retry_backoff_base_seconds, j.retry_backoff_max_seconds,
   j.available_at, j.dedupe_key, j.schedule_id, j.depends_on,
-  j.leased_by, j.lease_token, j.lease_expires_at, j.lease_started_at,
+  j.leased_by, j.lease_token, j.lease_tenant_id, j.lease_expires_at, j.lease_started_at,
   j.created_at, j.updated_at, j.completed_at, j.result, j.last_error
 `
 	// When at cap, only reclaim path: filter pending out by setting take on expired only.
@@ -426,6 +428,7 @@ UPDATE jobs j
 SET status = 'leased',
     leased_by = $5,
     lease_token = gen_random_uuid(),
+    lease_tenant_id = j.tenant_id,
     lease_expires_at = $3 + make_interval(secs => LEAST(
       COALESCE($6::int, j.visibility_timeout_seconds),
       COALESCE(j.max_runtime_seconds, 3600)
@@ -442,7 +445,7 @@ RETURNING
   j.visibility_timeout_seconds, j.max_runtime_seconds,
   j.retry_backoff_base_seconds, j.retry_backoff_max_seconds,
   j.available_at, j.dedupe_key, j.schedule_id, j.depends_on,
-  j.leased_by, j.lease_token, j.lease_expires_at, j.lease_started_at,
+  j.leased_by, j.lease_token, j.lease_tenant_id, j.lease_expires_at, j.lease_started_at,
   j.created_at, j.updated_at, j.completed_at, j.result, j.last_error
 `
 		rows, err = tx.Query(ctx, reclaim, tenantID, queueName, now, take, workerID, vtArg)
@@ -470,6 +473,7 @@ UPDATE jobs
 SET status = 'dead',
     leased_by = NULL,
     lease_token = NULL,
+    lease_tenant_id = NULL,
     lease_expires_at = NULL,
     lease_started_at = NULL,
     last_error = COALESCE(last_error, 'exceeded max_attempts after lease expiry'),
@@ -486,6 +490,7 @@ UPDATE jobs
 SET status = 'dead',
     leased_by = NULL,
     lease_token = NULL,
+    lease_tenant_id = NULL,
     lease_expires_at = NULL,
     lease_started_at = NULL,
     last_error = COALESCE(last_error, 'exceeded max_attempts after lease expiry'),
@@ -515,6 +520,7 @@ func scanJob(row pgx.Row) (map[string]any, error) {
 		id, leaseToken, scheduleID                                          *uuid.UUID
 		idVal                                                               uuid.UUID
 		tenantID, queueName, status, leasedBy, lastError, dedupeKey         *string
+		leaseTenantID                                                      *string
 		tenant, queue, st                                                   string
 		payload                                                             []byte
 		priority, attempts, maxAttempts, vt, maxRT, bb, bm                  int
@@ -527,7 +533,7 @@ func scanJob(row pgx.Row) (map[string]any, error) {
 		&idVal, &tenant, &queue, &payload, &st, &priority, &attempts, &maxAttempts,
 		&vt, &maxRT, &bb, &bm,
 		&availableAt, &dedupeKey, &scheduleID, &dependsOn,
-		&leasedBy, &leaseToken, &leaseExpires, &leaseStarted,
+		&leasedBy, &leaseToken, &leaseTenantID, &leaseExpires, &leaseStarted,
 		&createdAt, &updatedAt, &completedAt, &result, &lastError,
 	)
 	if err != nil {
@@ -572,6 +578,7 @@ func scanJob(row pgx.Row) (map[string]any, error) {
 		"depends_on":                   deps,
 		"leased_by":                    derefStr(leasedBy),
 		"lease_token":                  uuidPtr(leaseToken),
+		"lease_tenant_id":              derefStr(leaseTenantID),
 		"lease_expires_at":             timePtr(leaseExpires),
 		"lease_started_at":             timePtr(leaseStarted),
 		"created_at":                   createdAt.UTC().Format(time.RFC3339Nano),
@@ -655,19 +662,21 @@ func (s *Server) heartbeat(ctx context.Context, jobID uuid.UUID, tenant, worker 
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	_ = tenant // optional; lease fencing is token (merge-tolerant)
 	row := tx.QueryRow(ctx, `
 SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 FROM jobs WHERE id=$1 FOR UPDATE
 `, jobID)
 	job, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("job not found")
+	}
+	if err := assertLeaseTenant(job, tenant); err != nil {
+		return nil, err
 	}
 	if err := assertHolder(job, worker, token); err != nil {
 		return nil, err
@@ -679,7 +688,7 @@ FROM jobs WHERE id=$1 FOR UPDATE
 			// Force release to pending/dead simplified as pending requeue.
 			_, _ = tx.Exec(ctx, `
 UPDATE jobs SET status='pending', leased_by=NULL, lease_token=NULL,
-  lease_expires_at=NULL, lease_started_at=NULL, last_error='max runtime exceeded',
+  lease_tenant_id=NULL, lease_expires_at=NULL, lease_started_at=NULL, last_error='max runtime exceeded',
   available_at=$1, updated_at=$1
 WHERE id=$2 AND status='leased'`, now, jobID)
 			_ = tx.Commit(ctx)
@@ -705,7 +714,7 @@ RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_at
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 `, newExp, now, jobID, token)
 	out, err := scanJob(row)
@@ -725,19 +734,21 @@ func (s *Server) ack(ctx context.Context, jobID uuid.UUID, tenant, worker string
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	_ = tenant // optional; lease fencing is token (merge-tolerant)
 	row := tx.QueryRow(ctx, `
 SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 FROM jobs WHERE id=$1 FOR UPDATE
 `, jobID)
 	job, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("job not found")
+	}
+	if err := assertLeaseTenant(job, tenant); err != nil {
+		return nil, err
 	}
 	if err := assertHolder(job, worker, token); err != nil {
 		return nil, err
@@ -751,13 +762,13 @@ FROM jobs WHERE id=$1 FOR UPDATE
 	}
 	row = tx.QueryRow(ctx, `
 UPDATE jobs SET status='completed', leased_by=NULL, lease_token=NULL,
-  lease_expires_at=NULL, lease_started_at=NULL, completed_at=$1, result=$2, updated_at=$1
+  lease_tenant_id=NULL, lease_expires_at=NULL, lease_started_at=NULL, completed_at=$1, result=$2, updated_at=$1
 WHERE id=$3 AND lease_token=$4 AND status='leased'
 RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 `, now, resultArg, jobID, token)
 	out, err := scanJob(row)
@@ -777,19 +788,21 @@ func (s *Server) nack(ctx context.Context, jobID uuid.UUID, tenant, worker strin
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	_ = tenant // optional; lease fencing is token (merge-tolerant)
 	row := tx.QueryRow(ctx, `
 SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 FROM jobs WHERE id=$1 FOR UPDATE
 `, jobID)
 	job, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("job not found")
+	}
+	if err := assertLeaseTenant(job, tenant); err != nil {
+		return nil, err
 	}
 	if err := assertHolder(job, worker, token); err != nil {
 		return nil, err
@@ -820,13 +833,13 @@ FROM jobs WHERE id=$1 FOR UPDATE
 	}
 	row = tx.QueryRow(ctx, `
 UPDATE jobs SET status=$1, leased_by=NULL, lease_token=NULL,
-  lease_expires_at=NULL, lease_started_at=NULL, available_at=$2, last_error=$3, updated_at=$4
+  lease_tenant_id=NULL, lease_expires_at=NULL, lease_started_at=NULL, available_at=$2, last_error=$3, updated_at=$4
 WHERE id=$5 AND lease_token=$6 AND status='leased'
 RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 `, status, nextAvail, errMsg, now, jobID, token)
 	out, err := scanJob(row)
@@ -934,7 +947,7 @@ RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_at
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
-  leased_by, lease_token, lease_expires_at, lease_started_at,
+  leased_by, lease_token, lease_tenant_id, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
 `, id, body.TenantID, body.QueueName, payload, body.Priority, body.MaxAttempts,
 		body.VisibilityTimeoutSeconds, body.MaxRuntimeSeconds, now)
@@ -1053,6 +1066,18 @@ func ensureLeaseIndexes(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	return nil
+}
+
+func assertLeaseTenant(job map[string]any, tenant string) error {
+	cur := asString(job["tenant_id"])
+	if tenant == cur {
+		return nil
+	}
+	claim := asString(job["lease_tenant_id"])
+	if claim != "" && tenant == claim {
+		return nil
+	}
+	return fmt.Errorf("job not found for tenant %q", tenant)
 }
 
 func assertHolder(job map[string]any, worker string, token uuid.UUID) error {

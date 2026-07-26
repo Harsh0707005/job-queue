@@ -26,6 +26,11 @@ class Job:
     Heartbeat / ack / nack must present the same token; after a reclaim the
     previous token is invalid so a zombie worker cannot complete the job.
 
+    ``lease_tenant_id`` is the tenant frozen at claim time. Lease ops accept
+    either the current ``tenant_id`` or this value so mid-flight
+    ``merge_tenant`` does not break workers, while unrelated tenants are
+    still rejected even with a valid token.
+
     ``available_at`` is the earliest time a pending job may be claimed.
     ``dedupe_key`` identifies a logical job for enqueue-time deduplication.
     ``depends_on`` lists parent job ids that must be ``completed`` before this
@@ -50,6 +55,7 @@ class Job:
     depends_on: tuple[UUID, ...]
     leased_by: str | None
     lease_token: UUID | None
+    lease_tenant_id: str | None
     lease_expires_at: datetime | None
     lease_started_at: datetime | None
     created_at: datetime

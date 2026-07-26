@@ -28,10 +28,11 @@ Design notes
   raise ``ValueError`` until pending drops (e.g. after lease or cancel).
 * **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
   jobs (pending + running + history), schedules, and webhooks to *target*
-  without stopping workers. Lease fencing tokens stay valid; heartbeat /
-  ack / nack still succeed when the worker still sends the pre-merge
-  ``tenant_id`` (ops lock by job id + lease token). After merge *source*
-  is empty (no jobs / schedules / webhooks / settings).
+  without stopping workers. Lease fencing tokens stay valid. Heartbeat /
+  ack / nack still require a matching tenant: either the job's current
+  ``tenant_id`` or ``lease_tenant_id`` (frozen at claim time, so pre-merge
+  workers keep working). Unrelated tenants are rejected even with a valid
+  token. After merge *source* is empty.
 * **Cancel**: ``cancel`` stops *pending* or *leased* (running) jobs. Cancelling
   a leased job clears the fencing ``lease_token`` so the holding worker's
   heartbeat / ack / nack fail with ``LeaseError`` and cannot complete it.
@@ -117,8 +118,8 @@ _JOB_COLUMNS = """
     max_attempts, visibility_timeout_seconds, max_runtime_seconds,
     retry_backoff_base_seconds, retry_backoff_max_seconds, available_at,
     dedupe_key, schedule_id, depends_on, leased_by, lease_token,
-    lease_expires_at, lease_started_at, created_at, updated_at, completed_at,
-    result, last_error
+    lease_tenant_id, lease_expires_at, lease_started_at, created_at,
+    updated_at, completed_at, result, last_error
 """
 
 # Pending job is claimable only when every depends_on parent is completed.
@@ -179,6 +180,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         depends_on=tuple(deps),
         leased_by=row["leased_by"],
         lease_token=row["lease_token"],
+        lease_tenant_id=row.get("lease_tenant_id"),
         lease_expires_at=row["lease_expires_at"],
         lease_started_at=row.get("lease_started_at"),
         created_at=row["created_at"],
@@ -547,6 +549,7 @@ class JobQueue:
                     SET status = %s,
                         leased_by = NULL,
                         lease_token = NULL,
+                        lease_tenant_id = NULL,
                         lease_expires_at = NULL,
                         lease_started_at = NULL,
                         last_error = COALESCE(last_error, 'tenant offboarded'),
@@ -665,10 +668,10 @@ class JobQueue:
         * schedules
         * webhook endpoints and deliveries (including ``delivering``)
 
-        Lease fencing tokens and ``leased_by`` are preserved so in-flight
-        workers keep heartbeating / acking. Heartbeat / ack / nack accept the
-        pre-merge ``tenant_id`` when the lease token still matches (ops lock
-        by job id + token, not the caller's tenant string).
+        Lease fencing tokens, ``leased_by``, and ``lease_tenant_id`` are
+        preserved so in-flight workers keep heartbeating / acking with the
+        pre-merge tenant (lease ops accept current owner **or** the frozen
+        claim tenant). Unrelated tenants remain rejected.
 
         Conflict handling (so unique indexes cannot fail the transfer):
 
@@ -1480,6 +1483,7 @@ class JobQueue:
             SET status = %s,
                 leased_by = %s,
                 lease_token = %s,
+                lease_tenant_id = %s,
                 lease_expires_at = %s,
                 lease_started_at = %s,
                 attempts = %s,
@@ -1494,6 +1498,7 @@ class JobQueue:
                 JobStatus.LEASED.value,
                 worker_id,
                 token,
+                candidate["tenant_id"],
                 lease_expires,
                 now,
                 new_attempts,
@@ -1543,6 +1548,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     last_error = %s,
@@ -1598,6 +1604,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     last_error = %s,
@@ -1633,6 +1640,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     last_error = COALESCE(
                         last_error,
@@ -1660,6 +1668,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     last_error = COALESCE(
                         last_error,
@@ -1757,6 +1766,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     last_error = CASE
@@ -1816,9 +1826,10 @@ class JobQueue:
     ) -> Job:
         """Extend the lease held by *worker_id* under *lease_token*.
 
-        Requires matching worker and fencing token. *tenant_id* is accepted for
-        API compatibility; after a mid-flight ``merge_tenant`` the caller's
-        tenant may differ from the row (lock is by job id + token). Raises
+        Requires matching worker, fencing token, and tenant. Tenant matches
+        when *tenant_id* equals the job's current owner **or**
+        ``lease_tenant_id`` (frozen at claim; allows mid-flight merge). An
+        unrelated tenant is rejected even with a valid token. Raises
         ``LeaseError`` if the lease was reclaimed, expired, completed, or the
         hard ``max_runtime_seconds`` deadline has been exceeded (the job is
         force-released so a stuck worker cannot heartbeat forever).
@@ -1827,6 +1838,7 @@ class JobQueue:
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
             self._assert_lease_holder(row, worker_id, lease_token)
             hard = self._hard_deadline(row)
             if hard is not None and now >= hard:
@@ -1888,14 +1900,15 @@ class JobQueue:
         """Mark a leased job completed. Only the current lease holder may ack.
 
         Optional *result* is stored as JSON on the job and can be read later
-        via ``get`` / ``get_result``. *tenant_id* may be the pre-merge tenant
-        after ownership transfer; fencing is the lease token.
+        via ``get`` / ``get_result``. *tenant_id* must match the current owner
+        or ``lease_tenant_id`` (pre-merge claim tenant).
         """
         now = _utcnow()
         result_json = Jsonb(result) if result is not None else None
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
             self._assert_lease_holder(row, worker_id, lease_token)
             hard = self._hard_deadline(row)
             if hard is not None and now >= hard:
@@ -1911,6 +1924,7 @@ class JobQueue:
                     SET status = %s,
                         leased_by = NULL,
                         lease_token = NULL,
+                        lease_tenant_id = NULL,
                         lease_expires_at = NULL,
                         lease_started_at = NULL,
                         completed_at = %s,
@@ -1965,13 +1979,14 @@ class JobQueue:
         backoff (base * 2^(attempts-1), capped by the job's max backoff) so
         it is not immediately leaseable again. When attempts are exhausted
         (or requeue is False), the job is ``dead`` / ``failed`` and dependents
-        are cascade-cancelled. *tenant_id* may be the pre-merge tenant after
-        ownership transfer; fencing is the lease token.
+        are cascade-cancelled. *tenant_id* must match the current owner or
+        ``lease_tenant_id`` (pre-merge claim tenant).
         """
         now = _utcnow()
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
 
             attempts = row["attempts"]
@@ -2001,6 +2016,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     available_at = %s,
@@ -2061,12 +2077,13 @@ class JobQueue:
     ) -> Job:
         """Return the job if this worker still holds a live lease; else raise.
 
-        After ``merge_tenant``, *tenant_id* may be the pre-merge value; the
-        lease token is the source of truth.
+        After ``merge_tenant``, *tenant_id* may be the pre-merge claim tenant
+        (``lease_tenant_id``); an unrelated tenant is still rejected.
         """
         now = _utcnow()
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
             return _row_to_job(row)
 
@@ -2287,6 +2304,7 @@ class JobQueue:
                             available_at = %s,
                             leased_by = NULL,
                             lease_token = NULL,
+                            lease_tenant_id = NULL,
                             lease_expires_at = NULL,
                             completed_at = NULL,
                             last_error = %s,
@@ -3575,13 +3593,13 @@ class JobQueue:
         *,
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """Lock a job for heartbeat / ack / nack / ensure_lease.
+        """Lock a job for heartbeat / ack / nack / ensure_lease by id.
 
-        Locks by job id only so mid-flight ``merge_tenant`` (ownership
-        transfer) does not break workers that still send the pre-merge
-        tenant_id. Fencing is the lease token + worker_id, not the tenant
-        string. *tenant_id* is optional and only used for a clearer error
-        when the job is missing entirely.
+        Tenant authorization is applied separately via
+        :meth:`_assert_lease_tenant` (current owner **or** frozen
+        ``lease_tenant_id``). Locking by id allows the row to be found after
+        ``merge_tenant`` moved ``tenant_id`` while the worker still holds the
+        pre-merge tenant string.
         """
         row = conn.execute(
             f"""
@@ -3599,6 +3617,29 @@ class JobQueue:
                 )
             raise LeaseError(f"job {job_id} not found")
         return row
+
+    @staticmethod
+    def _assert_lease_tenant(row: dict[str, Any], tenant_id: str) -> None:
+        """Reject lease ops from tenants that neither own nor claimed the job.
+
+        Accepts:
+        * current ``tenant_id`` (owner after merge or normal path)
+        * ``lease_tenant_id`` frozen at claim (pre-merge worker after transfer)
+
+        Rejects any other tenant even when the lease token is valid — that is
+        the cross-tenant safety boundary.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        current = row["tenant_id"]
+        claim_tenant = row.get("lease_tenant_id")
+        if tenant_id == current:
+            return
+        if claim_tenant is not None and tenant_id == claim_tenant:
+            return
+        raise LeaseError(
+            f"job {row['id']} not found for tenant {tenant_id!r}"
+        )
 
     @staticmethod
     def _read_concurrency_limit(conn: Any, tenant_id: str) -> int | None:
@@ -3961,6 +4002,7 @@ class JobQueue:
                 SET status = %s,
                     leased_by = NULL,
                     lease_token = NULL,
+                    lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     last_error = COALESCE(
@@ -4199,6 +4241,7 @@ class JobQueue:
                     SET status = %s,
                         leased_by = NULL,
                         lease_token = NULL,
+                        lease_tenant_id = NULL,
                         lease_expires_at = NULL,
                         lease_started_at = NULL,
                         last_error = %s,

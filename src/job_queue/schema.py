@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     depends_on                  UUID[] NOT NULL DEFAULT '{}',
     leased_by                   TEXT,
     lease_token                 UUID,
+    -- Tenant id frozen at claim time; used for lease-op tenant checks so a
+    -- mid-flight merge_tenant can move tenant_id while workers still send the
+    -- pre-merge tenant. Cleared when the lease ends.
+    lease_tenant_id             TEXT,
     lease_expires_at            TIMESTAMPTZ,
     lease_started_at            TIMESTAMPTZ,
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -44,6 +48,7 @@ ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
 
 -- Backward-compatible column adds for older installs.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_token UUID;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_tenant_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS schedule_id UUID;
