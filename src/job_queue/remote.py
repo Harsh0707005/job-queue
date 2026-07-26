@@ -328,6 +328,17 @@ class CoordinatorClient:
         assert payload is not None
         return payload
 
+    def merge_tenant(
+        self, source_tenant_id: str, target_tenant_id: str
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{source_tenant_id}/merge",
+            {"target_tenant_id": target_tenant_id},
+        )
+        assert payload is not None
+        return payload
+
     def create_schedule(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/schedules", kwargs)
         assert payload is not None

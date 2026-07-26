@@ -11,6 +11,7 @@ from job_queue.models import (
     Job,
     JobStatus,
     Schedule,
+    TenantMergeResult,
     TenantOffboardResult,
     TenantStats,
     WebhookDelivery,
@@ -163,6 +164,22 @@ def tenant_offboard_result_to_dict(result: TenantOffboardResult) -> dict[str, An
         "webhooks_delivering_remaining": result.webhooks_delivering_remaining,
         "offboarding": result.offboarding,
         "empty": result.empty,
+    }
+
+
+def tenant_merge_result_to_dict(result: TenantMergeResult) -> dict[str, Any]:
+    """Serialize :class:`~job_queue.models.TenantMergeResult`."""
+    return {
+        "source_tenant_id": result.source_tenant_id,
+        "target_tenant_id": result.target_tenant_id,
+        "jobs_moved": result.jobs_moved,
+        "jobs_leased_moved": result.jobs_leased_moved,
+        "schedules_moved": result.schedules_moved,
+        "webhook_endpoints_moved": result.webhook_endpoints_moved,
+        "webhook_deliveries_moved": result.webhook_deliveries_moved,
+        "dedupe_keys_cleared": result.dedupe_keys_cleared,
+        "schedule_names_renamed": result.schedule_names_renamed,
+        "source_empty": result.source_empty,
     }
 
 

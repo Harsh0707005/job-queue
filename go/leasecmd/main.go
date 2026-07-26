@@ -655,6 +655,7 @@ func (s *Server) heartbeat(ctx context.Context, jobID uuid.UUID, tenant, worker 
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
+	_ = tenant // optional; lease fencing is token (merge-tolerant)
 	row := tx.QueryRow(ctx, `
 SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
@@ -662,8 +663,8 @@ SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attem
   available_at, dedupe_key, schedule_id, depends_on,
   leased_by, lease_token, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
-FROM jobs WHERE id=$1 AND tenant_id=$2 FOR UPDATE
-`, jobID, tenant)
+FROM jobs WHERE id=$1 FOR UPDATE
+`, jobID)
 	job, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("job not found")
@@ -699,14 +700,14 @@ WHERE id=$2 AND status='leased'`, now, jobID)
 	}
 	row = tx.QueryRow(ctx, `
 UPDATE jobs SET lease_expires_at=$1, updated_at=$2
-WHERE id=$3 AND tenant_id=$4 AND lease_token=$5 AND status='leased'
+WHERE id=$3 AND lease_token=$4 AND status='leased'
 RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
   leased_by, lease_token, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
-`, newExp, now, jobID, tenant, token)
+`, newExp, now, jobID, token)
 	out, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("lease lost during heartbeat")
@@ -724,6 +725,7 @@ func (s *Server) ack(ctx context.Context, jobID uuid.UUID, tenant, worker string
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
+	_ = tenant // optional; lease fencing is token (merge-tolerant)
 	row := tx.QueryRow(ctx, `
 SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
@@ -731,8 +733,8 @@ SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attem
   available_at, dedupe_key, schedule_id, depends_on,
   leased_by, lease_token, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
-FROM jobs WHERE id=$1 AND tenant_id=$2 FOR UPDATE
-`, jobID, tenant)
+FROM jobs WHERE id=$1 FOR UPDATE
+`, jobID)
 	job, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("job not found")
@@ -750,14 +752,14 @@ FROM jobs WHERE id=$1 AND tenant_id=$2 FOR UPDATE
 	row = tx.QueryRow(ctx, `
 UPDATE jobs SET status='completed', leased_by=NULL, lease_token=NULL,
   lease_expires_at=NULL, lease_started_at=NULL, completed_at=$1, result=$2, updated_at=$1
-WHERE id=$3 AND tenant_id=$4 AND lease_token=$5 AND status='leased'
+WHERE id=$3 AND lease_token=$4 AND status='leased'
 RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
   leased_by, lease_token, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
-`, now, resultArg, jobID, tenant, token)
+`, now, resultArg, jobID, token)
 	out, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("lease lost during ack")
@@ -775,6 +777,7 @@ func (s *Server) nack(ctx context.Context, jobID uuid.UUID, tenant, worker strin
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
+	_ = tenant // optional; lease fencing is token (merge-tolerant)
 	row := tx.QueryRow(ctx, `
 SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
@@ -782,8 +785,8 @@ SELECT id, tenant_id, queue_name, payload, status, priority, attempts, max_attem
   available_at, dedupe_key, schedule_id, depends_on,
   leased_by, lease_token, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
-FROM jobs WHERE id=$1 AND tenant_id=$2 FOR UPDATE
-`, jobID, tenant)
+FROM jobs WHERE id=$1 FOR UPDATE
+`, jobID)
 	job, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("job not found")
@@ -818,14 +821,14 @@ FROM jobs WHERE id=$1 AND tenant_id=$2 FOR UPDATE
 	row = tx.QueryRow(ctx, `
 UPDATE jobs SET status=$1, leased_by=NULL, lease_token=NULL,
   lease_expires_at=NULL, lease_started_at=NULL, available_at=$2, last_error=$3, updated_at=$4
-WHERE id=$5 AND tenant_id=$6 AND lease_token=$7 AND status='leased'
+WHERE id=$5 AND lease_token=$6 AND status='leased'
 RETURNING id, tenant_id, queue_name, payload, status, priority, attempts, max_attempts,
   visibility_timeout_seconds, max_runtime_seconds,
   retry_backoff_base_seconds, retry_backoff_max_seconds,
   available_at, dedupe_key, schedule_id, depends_on,
   leased_by, lease_token, lease_expires_at, lease_started_at,
   created_at, updated_at, completed_at, result, last_error
-`, status, nextAvail, errMsg, now, jobID, tenant, token)
+`, status, nextAvail, errMsg, now, jobID, token)
 	out, err := scanJob(row)
 	if err != nil {
 		return nil, fmt.Errorf("lease lost during nack")

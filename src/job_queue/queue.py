@@ -26,6 +26,12 @@ Design notes
 * **Tenant pending cap**: at most N jobs may be ``pending`` for a tenant
   (``set_pending_limit``). Further ``enqueue`` / schedule ticks / replays
   raise ``ValueError`` until pending drops (e.g. after lease or cancel).
+* **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
+  jobs (pending + running + history), schedules, and webhooks to *target*
+  without stopping workers. Lease fencing tokens stay valid; heartbeat /
+  ack / nack still succeed when the worker still sends the pre-merge
+  ``tenant_id`` (ops lock by job id + lease token). After merge *source*
+  is empty (no jobs / schedules / webhooks / settings).
 * **Cancel**: ``cancel`` stops *pending* or *leased* (running) jobs. Cancelling
   a leased job clears the fencing ``lease_token`` so the holding worker's
   heartbeat / ack / nack fail with ``LeaseError`` and cannot complete it.
@@ -94,6 +100,7 @@ from job_queue.models import (
     JobStatus,
     Schedule,
     ScheduleFire,
+    TenantMergeResult,
     TenantOffboardResult,
     TenantStats,
     WebhookDelivery,
@@ -234,6 +241,10 @@ class ReplayError(Exception):
 
 class DependencyError(Exception):
     """Raised when job dependency setup is invalid."""
+
+
+class MergeError(Exception):
+    """Raised when a tenant ownership transfer cannot complete."""
 
 
 class _SkipLeaseCandidate(Exception):
@@ -640,6 +651,209 @@ class JobQueue:
                 empty=empty,
             )
 
+    def merge_tenant(
+        self,
+        source_tenant_id: str,
+        target_tenant_id: str,
+    ) -> TenantMergeResult:
+        """Transfer ownership of *source* into *target* without stopping workers.
+
+        Moves **all** of the source tenant's rows to the target in one
+        transaction:
+
+        * jobs (pending, leased/running, and terminal history)
+        * schedules
+        * webhook endpoints and deliveries (including ``delivering``)
+
+        Lease fencing tokens and ``leased_by`` are preserved so in-flight
+        workers keep heartbeating / acking. Heartbeat / ack / nack accept the
+        pre-merge ``tenant_id`` when the lease token still matches (ops lock
+        by job id + token, not the caller's tenant string).
+
+        Conflict handling (so unique indexes cannot fail the transfer):
+
+        * Active ``dedupe_key`` collisions with the target → clear the
+          *source* job's dedupe key (job itself still moves).
+        * Schedule ``name`` collisions → rename source schedule to
+          ``{name}__from_{source_tenant_id}``.
+
+        Source is blocked for new work (paused + offboarding) for the
+        duration of the transfer, then its settings / fairness rows are
+        deleted. Target settings (pause, caps, offboarding) are unchanged.
+        Refuses to merge into an offboarding target, or if the target's
+        pending-job cap would be exceeded by the combined pending set.
+
+        After a successful call, ``tenant_is_empty(source)`` is True.
+        """
+        if not source_tenant_id or not target_tenant_id:
+            raise ValueError("source_tenant_id and target_tenant_id are required")
+        if source_tenant_id == target_tenant_id:
+            raise ValueError("source_tenant_id and target_tenant_id must differ")
+
+        now = _utcnow()
+        source = source_tenant_id
+        target = target_tenant_id
+
+        with transaction(self._pool) as conn:
+            # Serialize with enqueue / pending-cap / other merges for both
+            # tenants (ordered lock acquisition avoids deadlocks).
+            for tid in sorted((source, target)):
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (tid,),
+                )
+
+            if self._is_tenant_offboarding(conn, target):
+                raise MergeError(
+                    f"cannot merge into tenant {target!r}: target is offboarding"
+                )
+
+            # Block concurrent source enqueue / schedule / webhook registration.
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
+                )
+                VALUES (%s, NULL, NULL, TRUE, TRUE, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET paused = TRUE,
+                    offboarding = TRUE,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (source, now),
+            )
+
+            # Pending-cap: refuse if target would exceed after absorbing source.
+            target_limit = self._read_pending_limit(conn, target)
+            if target_limit is not None:
+                source_pending = self._count_pending(conn, source)
+                target_pending = self._count_pending(conn, target)
+                if source_pending + target_pending > target_limit:
+                    raise MergeError(
+                        f"cannot merge tenant {source!r} into {target!r}: "
+                        f"pending job cap would be exceeded "
+                        f"({source_pending}+{target_pending} > {target_limit}); "
+                        f"raise or clear the target pending limit first"
+                    )
+
+            # Resolve active dedupe collisions (prefer target's active key).
+            dedupe_cleared = conn.execute(
+                """
+                UPDATE jobs j
+                SET dedupe_key = NULL,
+                    updated_at = %s
+                WHERE j.tenant_id = %s
+                  AND j.dedupe_key IS NOT NULL
+                  AND j.status IN ('pending', 'leased')
+                  AND EXISTS (
+                        SELECT 1
+                        FROM jobs t
+                        WHERE t.tenant_id = %s
+                          AND t.queue_name = j.queue_name
+                          AND t.dedupe_key = j.dedupe_key
+                          AND t.status IN ('pending', 'leased')
+                  )
+                RETURNING j.id
+                """,
+                (now, source, target),
+            ).fetchall()
+
+            # Resolve schedule name collisions (unique per tenant when set).
+            names_renamed = conn.execute(
+                """
+                UPDATE schedules s
+                SET name = s.name || %s,
+                    updated_at = %s
+                WHERE s.tenant_id = %s
+                  AND s.name IS NOT NULL
+                  AND EXISTS (
+                        SELECT 1
+                        FROM schedules t
+                        WHERE t.tenant_id = %s
+                          AND t.name = s.name
+                  )
+                RETURNING s.id
+                """,
+                (f"__from_{source}", now, source, target),
+            ).fetchall()
+
+            jobs_moved = conn.execute(
+                """
+                UPDATE jobs
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id, status
+                """,
+                (target, now, source),
+            ).fetchall()
+            leased_moved = sum(
+                1 for r in jobs_moved if r["status"] == JobStatus.LEASED.value
+            )
+
+            sched_moved = conn.execute(
+                """
+                UPDATE schedules
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+
+            # Endpoints before deliveries is fine (no tenant FK); both move.
+            ep_moved = conn.execute(
+                """
+                UPDATE webhook_endpoints
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+            del_moved = conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+
+            # Drop source control-plane state (settings + fairness).
+            conn.execute(
+                "DELETE FROM tenant_settings WHERE tenant_id = %s",
+                (source,),
+            )
+            conn.execute(
+                "DELETE FROM tenant_fairness WHERE tenant_id = %s",
+                (source,),
+            )
+
+            if not self._tenant_is_empty(conn, source):
+                # Should be unreachable; surface loudly if a new table is added.
+                raise MergeError(
+                    f"merge left residual state on source tenant {source!r}"
+                )
+
+            return TenantMergeResult(
+                source_tenant_id=source,
+                target_tenant_id=target,
+                jobs_moved=len(jobs_moved),
+                jobs_leased_moved=leased_moved,
+                schedules_moved=len(sched_moved),
+                webhook_endpoints_moved=len(ep_moved),
+                webhook_deliveries_moved=len(del_moved),
+                dedupe_keys_cleared=len(dedupe_cleared),
+                schedule_names_renamed=len(names_renamed),
+                source_empty=True,
+            )
+
     def tenant_is_empty(self, tenant_id: str) -> bool:
         """True when tenant has no jobs, schedules, webhooks, or settings."""
         if not tenant_id:
@@ -755,6 +969,11 @@ class JobQueue:
             raise DependencyError("a job cannot depend on itself")
 
         with transaction(self._pool) as conn:
+            # Serialize with merge_tenant / pending-cap for this tenant.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (tenant_id,),
+            )
             if self._is_tenant_offboarding(conn, tenant_id):
                 raise ValueError(
                     f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
@@ -1597,7 +1816,9 @@ class JobQueue:
     ) -> Job:
         """Extend the lease held by *worker_id* under *lease_token*.
 
-        Requires matching tenant, worker, and fencing token. Raises
+        Requires matching worker and fencing token. *tenant_id* is accepted for
+        API compatibility; after a mid-flight ``merge_tenant`` the caller's
+        tenant may differ from the row (lock is by job id + token). Raises
         ``LeaseError`` if the lease was reclaimed, expired, completed, or the
         hard ``max_runtime_seconds`` deadline has been exceeded (the job is
         force-released so a stuck worker cannot heartbeat forever).
@@ -1605,7 +1826,7 @@ class JobQueue:
         now = _utcnow()
 
         with transaction(self._pool) as conn:
-            row = self._lock_job_for_tenant(conn, job_id, tenant_id)
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_lease_holder(row, worker_id, lease_token)
             hard = self._hard_deadline(row)
             if hard is not None and now >= hard:
@@ -1628,7 +1849,6 @@ class JobQueue:
                     SET lease_expires_at = %s,
                         updated_at = %s
                     WHERE id = %s
-                      AND tenant_id = %s
                       AND lease_token = %s
                       AND status = %s
                     RETURNING {_JOB_COLUMNS}
@@ -1637,7 +1857,6 @@ class JobQueue:
                         new_expiry,
                         now,
                         job_id,
-                        tenant_id,
                         lease_token,
                         JobStatus.LEASED.value,
                     ),
@@ -1669,13 +1888,14 @@ class JobQueue:
         """Mark a leased job completed. Only the current lease holder may ack.
 
         Optional *result* is stored as JSON on the job and can be read later
-        via ``get`` / ``get_result``.
+        via ``get`` / ``get_result``. *tenant_id* may be the pre-merge tenant
+        after ownership transfer; fencing is the lease token.
         """
         now = _utcnow()
         result_json = Jsonb(result) if result is not None else None
 
         with transaction(self._pool) as conn:
-            row = self._lock_job_for_tenant(conn, job_id, tenant_id)
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_lease_holder(row, worker_id, lease_token)
             hard = self._hard_deadline(row)
             if hard is not None and now >= hard:
@@ -1697,7 +1917,6 @@ class JobQueue:
                         result = %s,
                         updated_at = %s
                     WHERE id = %s
-                      AND tenant_id = %s
                       AND lease_token = %s
                       AND status = %s
                     RETURNING {_JOB_COLUMNS}
@@ -1708,7 +1927,6 @@ class JobQueue:
                         result_json,
                         now,
                         job_id,
-                        tenant_id,
                         lease_token,
                         JobStatus.LEASED.value,
                     ),
@@ -1720,7 +1938,7 @@ class JobQueue:
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
                 )
                 self._maybe_finalize_offboard(
-                    conn, tenant_id=tenant_id, now=now
+                    conn, tenant_id=job.tenant_id, now=now
                 )
                 return job
 
@@ -1747,16 +1965,18 @@ class JobQueue:
         backoff (base * 2^(attempts-1), capped by the job's max backoff) so
         it is not immediately leaseable again. When attempts are exhausted
         (or requeue is False), the job is ``dead`` / ``failed`` and dependents
-        are cascade-cancelled.
+        are cascade-cancelled. *tenant_id* may be the pre-merge tenant after
+        ownership transfer; fencing is the lease token.
         """
         now = _utcnow()
 
         with transaction(self._pool) as conn:
-            row = self._lock_job_for_tenant(conn, job_id, tenant_id)
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
 
             attempts = row["attempts"]
             max_attempts = row["max_attempts"]
+            owner_tenant = row["tenant_id"]
 
             if requeue and attempts < max_attempts:
                 new_status = JobStatus.PENDING.value
@@ -1787,7 +2007,6 @@ class JobQueue:
                     last_error = %s,
                     updated_at = %s
                 WHERE id = %s
-                  AND tenant_id = %s
                   AND lease_token = %s
                   AND status = %s
                 RETURNING {_JOB_COLUMNS}
@@ -1798,7 +2017,6 @@ class JobQueue:
                     error,
                     now,
                     job_id,
-                    tenant_id,
                     lease_token,
                     JobStatus.LEASED.value,
                 ),
@@ -1810,7 +2028,7 @@ class JobQueue:
                 self._cascade_cancel_dependents(
                     conn,
                     parent_id=job_id,
-                    tenant_id=tenant_id,
+                    tenant_id=owner_tenant,
                     reason=(
                         f"parent job {job_id} ended as {new_status}"
                         + (f": {error}" if error else "")
@@ -1828,7 +2046,9 @@ class JobQueue:
                 )
             # Offboarding: requeued pending is purged when no leases remain;
             # terminal nacks also trigger purge when this was the last holder.
-            self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
+            self._maybe_finalize_offboard(
+                conn, tenant_id=job.tenant_id, now=now
+            )
             return job
 
     def ensure_lease(
@@ -1839,10 +2059,14 @@ class JobQueue:
         worker_id: str,
         lease_token: UUID,
     ) -> Job:
-        """Return the job if this worker still holds a live lease; else raise."""
+        """Return the job if this worker still holds a live lease; else raise.
+
+        After ``merge_tenant``, *tenant_id* may be the pre-merge value; the
+        lease token is the source of truth.
+        """
         now = _utcnow()
         with transaction(self._pool) as conn:
-            row = self._lock_job_for_tenant(conn, job_id, tenant_id)
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
             return _row_to_job(row)
 
@@ -3342,6 +3566,38 @@ class JobQueue:
         ).fetchone()
         if row is None:
             raise LeaseError(f"job {job_id} not found for tenant {tenant_id!r}")
+        return row
+
+    def _lock_job_for_lease(
+        self,
+        conn: Any,
+        job_id: UUID,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Lock a job for heartbeat / ack / nack / ensure_lease.
+
+        Locks by job id only so mid-flight ``merge_tenant`` (ownership
+        transfer) does not break workers that still send the pre-merge
+        tenant_id. Fencing is the lease token + worker_id, not the tenant
+        string. *tenant_id* is optional and only used for a clearer error
+        when the job is missing entirely.
+        """
+        row = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            if tenant_id is not None:
+                raise LeaseError(
+                    f"job {job_id} not found for tenant {tenant_id!r}"
+                )
+            raise LeaseError(f"job {job_id} not found")
         return row
 
     @staticmethod

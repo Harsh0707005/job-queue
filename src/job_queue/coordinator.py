@@ -21,6 +21,7 @@ from job_queue.codec import (
     claimed_webhook_to_dict,
     job_to_dict,
     schedule_to_dict,
+    tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
     tenant_stats_to_dict,
     webhook_delivery_to_dict,
@@ -91,6 +92,8 @@ class Coordinator:
             return self._resume_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/offboard"):
             return self._offboard_tenant(path)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/merge"):
+            return self._merge_tenant(path, body)
 
         if method == "GET" and path == "/v1/admin/backlog":
             return self._backlog()
@@ -371,6 +374,39 @@ class Coordinator:
             "offboarding": result.offboarding,
             "leased_remaining": result.leased_remaining,
             "webhooks_delivering_remaining": result.webhooks_delivering_remaining,
+        }
+
+    def _merge_tenant(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {source_id} / merge
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        source_tenant_id = parts[2]
+        target_tenant_id = body.get("target_tenant_id") or body.get("into")
+        if not target_tenant_id:
+            return 400, {"error": "target_tenant_id required"}
+        try:
+            result = self.queue.merge_tenant(
+                source_tenant_id, str(target_tenant_id)
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except Exception as exc:
+            # MergeError (and unexpected) surface as 409 conflict / 400.
+            from job_queue.queue import MergeError
+
+            if isinstance(exc, MergeError):
+                return 409, {"error": str(exc), "code": "merge_error"}
+            raise
+        return 200, {
+            "result": tenant_merge_result_to_dict(result),
+            "source_tenant_id": result.source_tenant_id,
+            "target_tenant_id": result.target_tenant_id,
+            "source_empty": result.source_empty,
+            "jobs_moved": result.jobs_moved,
+            "jobs_leased_moved": result.jobs_leased_moved,
         }
 
     # ------------------------------------------------------------------

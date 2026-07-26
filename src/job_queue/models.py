@@ -130,6 +130,21 @@ class TenantOffboardResult:
     empty: bool
 
 
+@dataclass(frozen=True, slots=True)
+class TenantMergeResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.merge_tenant` (source → target)."""
+
+    source_tenant_id: str
+    target_tenant_id: str
+    jobs_moved: int
+    jobs_leased_moved: int
+    schedules_moved: int
+    webhook_endpoints_moved: int
+    webhook_deliveries_moved: int
+    dedupe_keys_cleared: int
+    schedule_names_renamed: int
+    source_empty: bool
+
 
 class WebhookEvent(str, Enum):
     JOB_COMPLETED = "job.completed"
