@@ -31,6 +31,14 @@ Design notes
   On reclaim after a worker death, the new lease returns the same job with
   ``checkpoint`` set so work can resume instead of restarting. Progress
   survives nack requeue; only cancel clears it.
+* **Deadlines + preemption**: jobs may set ``deadline_at`` and optional
+  ``estimated_duration_seconds``. Slack = deadline − now − remaining work
+  (checkpoint fraction and learned EWMAs refine remaining). When a tenant is
+  at its concurrency cap and a deadline job cannot wait for a less-urgent
+  holder to finish, the least-urgent *preemptible* leased job is returned to
+  pending (token cleared, checkpoint kept) so the urgent job can lease.
+  Preempt count caps thrashing; jobs without deadlines are not preemption
+  *requesters*. ``process_deadlines`` runs the same logic proactively.
 * **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
   jobs (pending + running + history), schedules, and webhooks to *target*
   without stopping workers. Lease fencing tokens stay valid. Heartbeat /
@@ -104,6 +112,7 @@ from job_queue.db import init_schema, transaction
 from job_queue.models import (
     Job,
     JobStatus,
+    PreemptResult,
     Schedule,
     ScheduleFire,
     TenantMergeResult,
@@ -113,6 +122,11 @@ from job_queue.models import (
     WebhookEndpoint,
     WebhookEvent,
 )
+
+# Defaults for deadline / preemption heuristics.
+_DEFAULT_ESTIMATE_SECONDS = 60.0
+_EWMA_ALPHA = 0.3
+_MAX_PREEMPTS_PER_JOB = 8
 
 # Namespace for pg_advisory_xact_lock(classid, hash) so dedupe locks never
 # collide with tenant concurrency locks (which use single-arg hashtext).
@@ -124,7 +138,9 @@ _JOB_COLUMNS = """
     retry_backoff_base_seconds, retry_backoff_max_seconds, available_at,
     dedupe_key, schedule_id, depends_on, leased_by, lease_token,
     lease_tenant_id, lease_expires_at, lease_started_at, created_at,
-    updated_at, completed_at, result, checkpoint, checkpointed_at, last_error
+    updated_at, completed_at, result, checkpoint, checkpointed_at,
+    deadline_at, estimated_duration_seconds, preemptible, preempt_count,
+    last_preempted_at, last_error
 """
 
 # Pending job is claimable only when every depends_on parent is completed.
@@ -194,6 +210,15 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         result=row.get("result"),
         checkpoint=row.get("checkpoint"),
         checkpointed_at=row.get("checkpointed_at"),
+        deadline_at=row.get("deadline_at"),
+        estimated_duration_seconds=(
+            None
+            if row.get("estimated_duration_seconds") is None
+            else int(row["estimated_duration_seconds"])
+        ),
+        preemptible=bool(row["preemptible"]) if row.get("preemptible") is not None else True,
+        preempt_count=int(row["preempt_count"] or 0),
+        last_preempted_at=row.get("last_preempted_at"),
         last_error=row["last_error"],
     )
 
@@ -916,6 +941,9 @@ class JobQueue:
         dedupe_key: str | None = None,
         depends_on: UUID | Sequence[UUID] | None = None,
         job_id: UUID | None = None,
+        deadline_at: datetime | None = None,
+        estimated_duration_seconds: int | None = None,
+        preemptible: bool = True,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -944,6 +972,14 @@ class JobQueue:
         retry_backoff_base_seconds / retry_backoff_max_seconds:
             On nack requeue, delay is ``base * 2^(attempt-1)`` seconds, capped
             by max. After ``max_attempts`` failures the job is dead-lettered.
+        deadline_at:
+            Absolute deadline. When set, the job may preempt less-urgent
+            work if concurrency is full and waiting would miss the deadline.
+        estimated_duration_seconds:
+            Hint for remaining-work / slack calculations. When omitted the
+            queue uses learned EWMAs (by payload kind) or a default.
+        preemptible:
+            If False this job will not be chosen as a preemption victim.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -963,6 +999,8 @@ class JobQueue:
             raise ValueError("delay_seconds must be >= 0")
         if dedupe_key is not None and dedupe_key == "":
             raise ValueError("dedupe_key must be non-empty when provided")
+        if estimated_duration_seconds is not None and estimated_duration_seconds < 1:
+            raise ValueError("estimated_duration_seconds must be >= 1 when set")
 
         dep_ids = self._normalize_depends_on(depends_on)
 
@@ -973,6 +1011,7 @@ class JobQueue:
             run_at = now + timedelta(seconds=float(delay_seconds))
         else:
             run_at = now
+        deadline = _as_utc(deadline_at) if deadline_at is not None else None
 
         jid = job_id or uuid4()
         if jid in dep_ids:
@@ -1022,6 +1061,7 @@ class JobQueue:
                         max_runtime_seconds,
                         retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
+                        deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
@@ -1029,6 +1069,7 @@ class JobQueue:
                         %s,
                         %s, %s,
                         %s, %s, NULL, %s,
+                        %s, %s, %s,
                         %s, %s
                     )
                     ON CONFLICT (tenant_id, queue_name, dedupe_key)
@@ -1052,6 +1093,9 @@ class JobQueue:
                         run_at,
                         dedupe_key,
                         dep_ids,
+                        deadline,
+                        estimated_duration_seconds,
+                        bool(preemptible),
                         now,
                         now,
                     ),
@@ -1082,6 +1126,7 @@ class JobQueue:
                     max_runtime_seconds,
                     retry_backoff_base_seconds, retry_backoff_max_seconds,
                     available_at, dedupe_key, schedule_id, depends_on,
+                    deadline_at, estimated_duration_seconds, preemptible,
                     created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
@@ -1089,6 +1134,7 @@ class JobQueue:
                     %s,
                     %s, %s,
                     %s, NULL, NULL, %s,
+                    %s, %s, %s,
                     %s, %s
                 )
                 RETURNING {_JOB_COLUMNS}
@@ -1107,6 +1153,9 @@ class JobQueue:
                     retry_backoff_max_seconds,
                     run_at,
                     dep_ids,
+                    deadline,
+                    estimated_duration_seconds,
+                    bool(preemptible),
                     now,
                     now,
                 ),
@@ -1228,6 +1277,17 @@ class JobQueue:
             conc_limit = self._read_concurrency_limit(conn, tenant_id)
             leased_count = self._count_leased(conn, tenant_id)
 
+            # Deadline preemption: free a slot when an urgent pending job
+            # cannot wait for less-urgent holders to finish.
+            if conc_limit is not None and leased_count >= conc_limit:
+                if self._try_preempt_for_tenant(
+                    conn,
+                    tenant_id=tenant_id,
+                    queue_name=queue_name,
+                    now=now,
+                ):
+                    leased_count = self._count_leased(conn, tenant_id)
+
             if conc_limit is not None and leased_count >= conc_limit:
                 # Only reclaim expired leases (does not increase concurrent
                 # holders beyond the cap in steady state).
@@ -1240,7 +1300,10 @@ class JobQueue:
                       AND status = %s
                       AND lease_expires_at < %s
                       AND attempts < max_attempts
-                    ORDER BY priority DESC, created_at ASC
+                    ORDER BY priority DESC,
+                      (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
+                        - COALESCE(estimated_duration_seconds, 60)) ASC,
+                      created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
                     """,
@@ -1248,6 +1311,8 @@ class JobQueue:
                         tenant_id,
                         queue_name,
                         JobStatus.LEASED.value,
+                        now,
+                        now,
                         now,
                         limit,
                     ),
@@ -1277,7 +1342,11 @@ class JobQueue:
                             AND attempts < max_attempts
                          )
                       )
-                    ORDER BY priority DESC, created_at ASC
+                    ORDER BY priority DESC,
+                      CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
+                      (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
+                        - COALESCE(estimated_duration_seconds, 60)) ASC,
+                      created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
                     """,
@@ -1287,6 +1356,8 @@ class JobQueue:
                         JobStatus.PENDING.value,
                         now,
                         JobStatus.LEASED.value,
+                        now,
+                        now,
                         now,
                         take,
                     ),
@@ -1328,6 +1399,10 @@ class JobQueue:
         with transaction(self._pool) as conn:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
             self._reap_offboarding_expired_leases(conn, now=now, tenant_id=None)
+            # Free slots for deadline-critical pending work before claiming.
+            self._preempt_blocked_urgent(
+                conn, queue_name=queue_name, now=now, limit=max(4, limit)
+            )
 
             while len(claimed) < limit and skips < max_skips:
                 try:
@@ -1406,6 +1481,9 @@ class JobQueue:
               )
             ORDER BY
               priority DESC,
+              CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
+              (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
+                - COALESCE(estimated_duration_seconds, 60)) ASC,
               COALESCE(
                 (
                     SELECT tf.last_lease_at
@@ -1425,6 +1503,8 @@ class JobQueue:
                 JobStatus.LEASED.value,
                 JobStatus.LEASED.value,
                 now,
+                now,
+                now,
             ),
         ).fetchone()
 
@@ -1442,7 +1522,19 @@ class JobQueue:
             limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
             leased_count = self._count_leased(conn, candidate["tenant_id"])
             if limit is not None and leased_count >= limit:
-                raise _SkipLeaseCandidate("tenant at concurrency limit")
+                # Try deadline preemption once under the tenant lock.
+                if self._try_preempt_for_tenant(
+                    conn,
+                    tenant_id=candidate["tenant_id"],
+                    queue_name=queue_name,
+                    now=now,
+                    urgent_hint=candidate,
+                ):
+                    leased_count = self._count_leased(
+                        conn, candidate["tenant_id"]
+                    )
+                if leased_count >= limit:
+                    raise _SkipLeaseCandidate("tenant at concurrency limit")
 
         claimed = self._claim_locked_job(
             conn,
@@ -1957,6 +2049,7 @@ class JobQueue:
                 if updated is None:
                     raise LeaseError(f"job {job_id} lease lost during ack")
                 job = _row_to_job(updated)
+                self._record_job_duration(conn, job=job, now=now)
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
                 )
@@ -2143,6 +2236,65 @@ class JobQueue:
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during checkpoint")
             return _row_to_job(updated)
+
+    def process_deadlines(
+        self,
+        *,
+        tenant_id: str | None = None,
+        queue_name: str = "default",
+        limit: int = 20,
+    ) -> list[PreemptResult]:
+        """Proactively preempt less-urgent work for deadline-critical pending.
+
+        Safe to call from a scheduler loop. Returns one
+        :class:`~job_queue.models.PreemptResult` per successful preemption.
+        Lease paths also invoke the same logic when a tenant is at its
+        concurrency cap.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        now = _utcnow()
+        results: list[PreemptResult] = []
+        with transaction(self._pool) as conn:
+            if tenant_id is not None:
+                tenants = [tenant_id]
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT tenant_id
+                    FROM jobs
+                    WHERE queue_name = %s
+                      AND status = %s
+                      AND deadline_at IS NOT NULL
+                      AND available_at <= %s
+                    LIMIT %s
+                    """,
+                    (
+                        queue_name,
+                        JobStatus.PENDING.value,
+                        now,
+                        max(limit * 4, 20),
+                    ),
+                ).fetchall()
+                tenants = [r["tenant_id"] for r in rows]
+            for tid in tenants:
+                if len(results) >= limit:
+                    break
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (tid,),
+                )
+                if self._is_tenant_paused(conn, tid):
+                    continue
+                pr = self._try_preempt_for_tenant(
+                    conn,
+                    tenant_id=tid,
+                    queue_name=queue_name,
+                    now=now,
+                )
+                if pr is not None:
+                    results.append(pr)
+        return results
 
     # ------------------------------------------------------------------
     # Inspection helpers
@@ -3621,6 +3773,437 @@ class JobQueue:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Deadline / preemption helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _payload_kind(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("kind", "job_type", "type"):
+            val = payload.get(key)
+            if val is not None and str(val):
+                return str(val)[:128]
+        return ""
+
+    def _lookup_ewma_seconds(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        queue_name: str,
+        kind: str,
+    ) -> float | None:
+        row = conn.execute(
+            """
+            SELECT ewma_seconds
+            FROM duration_estimates
+            WHERE tenant_id = %s
+              AND queue_name = %s
+              AND kind = %s
+            """,
+            (tenant_id, queue_name, kind),
+        ).fetchone()
+        if row is None:
+            return None
+        return float(row["ewma_seconds"])
+
+    def _record_job_duration(
+        self,
+        conn: Any,
+        *,
+        job: Job,
+        now: datetime,
+    ) -> None:
+        """Update EWMA of observed runtimes for future remaining estimates."""
+        started = job.lease_started_at or job.created_at
+        if started is None:
+            return
+        duration = max(0.1, (now - _as_utc(started)).total_seconds())
+        # Cap outliers so one stuck lease does not poison the estimate.
+        duration = min(duration, float(job.max_runtime_seconds or 3600))
+        kind = self._payload_kind(job.payload)
+        existing = conn.execute(
+            """
+            SELECT ewma_seconds, samples
+            FROM duration_estimates
+            WHERE tenant_id = %s AND queue_name = %s AND kind = %s
+            FOR UPDATE
+            """,
+            (job.tenant_id, job.queue_name, kind),
+        ).fetchone()
+        if existing is None:
+            ewma = duration
+            samples = 1
+        else:
+            prev = float(existing["ewma_seconds"])
+            samples = int(existing["samples"]) + 1
+            ewma = _EWMA_ALPHA * duration + (1.0 - _EWMA_ALPHA) * prev
+        conn.execute(
+            """
+            INSERT INTO duration_estimates (
+                tenant_id, queue_name, kind, ewma_seconds, samples, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, queue_name, kind) DO UPDATE
+            SET ewma_seconds = EXCLUDED.ewma_seconds,
+                samples = EXCLUDED.samples,
+                updated_at = EXCLUDED.updated_at
+            """,
+            (job.tenant_id, job.queue_name, kind, ewma, samples, now),
+        )
+
+    def _base_estimate_seconds(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+    ) -> float:
+        if row.get("estimated_duration_seconds") is not None:
+            return float(row["estimated_duration_seconds"])
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        kind = self._payload_kind(payload)
+        ewma = self._lookup_ewma_seconds(
+            conn,
+            tenant_id=row["tenant_id"],
+            queue_name=row["queue_name"],
+            kind=kind,
+        )
+        if ewma is not None and ewma > 0:
+            return float(ewma)
+        # Payload steps heuristic for demo workers.
+        if isinstance(payload, dict) and payload.get("steps") is not None:
+            try:
+                steps = max(1, int(payload["steps"]))
+                step_ms = int(payload.get("step_ms") or 200)
+                return max(1.0, steps * step_ms / 1000.0)
+            except (TypeError, ValueError):
+                pass
+        return _DEFAULT_ESTIMATE_SECONDS
+
+    def _remaining_estimate_seconds(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> float:
+        base = self._base_estimate_seconds(conn, row)
+        cp = row.get("checkpoint")
+        if isinstance(cp, str):
+            try:
+                cp = json.loads(cp)
+            except json.JSONDecodeError:
+                cp = None
+        if isinstance(cp, dict):
+            step = cp.get("step")
+            total = cp.get("total")
+            try:
+                if step is not None and total is not None and int(total) > 0:
+                    frac = min(1.0, max(0.0, int(step) / int(total)))
+                    return max(0.05 * base, base * (1.0 - frac))
+                if step is not None and row.get("payload"):
+                    payload = row["payload"]
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    if isinstance(payload, dict) and payload.get("steps"):
+                        total_s = max(1, int(payload["steps"]))
+                        frac = min(1.0, max(0.0, int(step) / total_s))
+                        return max(0.05 * base, base * (1.0 - frac))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if row.get("status") == JobStatus.LEASED.value and row.get(
+            "lease_started_at"
+        ):
+            elapsed = (now - _as_utc(row["lease_started_at"])).total_seconds()
+            return max(0.1 * base, base - elapsed)
+        return base
+
+    def _slack_seconds(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> float:
+        """Seconds of schedule margin: deadline − now − remaining work.
+
+        ``+inf`` when the job has no deadline (never deadline-urgent).
+        """
+        deadline = row.get("deadline_at")
+        if deadline is None:
+            return float("inf")
+        rem = self._remaining_estimate_seconds(conn, row, now=now)
+        return (_as_utc(deadline) - now).total_seconds() - rem
+
+    def _urgency_tuple(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> tuple[int, float, int, int]:
+        """Sort key: smaller = more urgent."""
+        slack = self._slack_seconds(conn, row, now=now)
+        has_deadline = 0 if row.get("deadline_at") is not None else 1
+        priority = -int(row.get("priority") or 0)
+        preempts = int(row.get("preempt_count") or 0)
+        return (has_deadline, slack, priority, preempts)
+
+    def _preempt_leased_job(
+        self,
+        conn: Any,
+        victim: dict[str, Any],
+        *,
+        now: datetime,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Park a leased job as pending; clear fence; keep checkpoint.
+
+        Does **not** burn an attempt. Returns updated row or None if lost race.
+        """
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = NULL,
+                lease_token = NULL,
+                lease_tenant_id = NULL,
+                lease_expires_at = NULL,
+                lease_started_at = NULL,
+                available_at = %s,
+                preempt_count = preempt_count + 1,
+                last_preempted_at = %s,
+                last_error = %s,
+                updated_at = %s
+            WHERE id = %s
+              AND status = %s
+              AND lease_token IS NOT NULL
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.PENDING.value,
+                now,
+                now,
+                reason[:500],
+                now,
+                victim["id"],
+                JobStatus.LEASED.value,
+            ),
+        ).fetchone()
+        return updated
+
+    def _try_preempt_for_tenant(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        queue_name: str,
+        now: datetime,
+        urgent_hint: dict[str, Any] | None = None,
+    ) -> PreemptResult | None | bool:
+        """If an urgent pending job needs a slot, preempt one less-urgent lease.
+
+        Returns :class:`PreemptResult` on success, ``None``/``False`` otherwise.
+        When used as a bool (lease paths), truthy means a slot was freed.
+        """
+        conc = self._read_concurrency_limit(conn, tenant_id)
+        if conc is None:
+            return None
+        leased_n = self._count_leased(conn, tenant_id)
+        if leased_n < conc:
+            return None
+
+        # Claimable deadline pending ordered by urgency (low slack first).
+        pending_rows = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE tenant_id = %s
+              AND queue_name = %s
+              AND status = %s
+              AND available_at <= %s
+              AND deadline_at IS NOT NULL
+              AND {_DEPS_SATISFIED_SQL}
+            ORDER BY priority DESC,
+              (EXTRACT(EPOCH FROM (deadline_at - %s))
+                - COALESCE(estimated_duration_seconds, 60)) ASC,
+              created_at ASC
+            LIMIT 16
+            """,
+            (
+                tenant_id,
+                queue_name,
+                JobStatus.PENDING.value,
+                now,
+                now,
+            ),
+        ).fetchall()
+        if not pending_rows and urgent_hint is not None:
+            if (
+                urgent_hint.get("tenant_id") == tenant_id
+                and urgent_hint.get("status") == JobStatus.PENDING.value
+                and urgent_hint.get("deadline_at") is not None
+            ):
+                pending_rows = [urgent_hint]
+        if not pending_rows:
+            return None
+
+        leased_rows = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE tenant_id = %s
+              AND queue_name = %s
+              AND status = %s
+            FOR UPDATE
+            """,
+            (tenant_id, queue_name, JobStatus.LEASED.value),
+        ).fetchall()
+        if not leased_rows:
+            return None
+
+        # Score pending candidates.
+        scored_pending: list[tuple[tuple, dict[str, Any], float]] = []
+        for prow in pending_rows:
+            slack = self._slack_seconds(conn, prow, now=now)
+            if slack == float("inf"):
+                continue
+            scored_pending.append(
+                (self._urgency_tuple(conn, prow, now=now), prow, slack)
+            )
+        if not scored_pending:
+            return None
+        scored_pending.sort(key=lambda x: x[0])
+        urgent_key, urgent, urgent_slack = scored_pending[0]
+
+        # Victims: preemptible, under max preempts, strictly less urgent.
+        candidates: list[tuple[tuple, dict[str, Any], float]] = []
+        for vrow in leased_rows:
+            if not bool(vrow.get("preemptible", True)):
+                continue
+            if int(vrow.get("preempt_count") or 0) >= _MAX_PREEMPTS_PER_JOB:
+                continue
+            v_key = self._urgency_tuple(conn, vrow, now=now)
+            # Strictly less urgent than the pending job.
+            if v_key <= urgent_key:
+                continue
+            v_slack = self._slack_seconds(conn, vrow, now=now)
+            rem = self._remaining_estimate_seconds(conn, vrow, now=now)
+            candidates.append((v_key, vrow, rem if rem > 0 else 0.0))
+
+        if not candidates:
+            return None
+
+        # Can we wait for the soonest less-urgent holder to finish?
+        min_wait = min(c[2] for c in candidates)
+        # Only preempt if waiting would risk the deadline (slack < wait).
+        # Small buffer (0.5s) avoids thrash on equal estimates.
+        if urgent_slack >= min_wait - 0.5:
+            return None
+
+        # Prefer victim that is least urgent, then longest remaining (free
+        # more useful work later), then lowest preempt_count (anti thrash).
+        def victim_rank(item: tuple) -> tuple:
+            v_key, vrow, rem = item
+            return (
+                v_key[0],
+                -v_key[1] if v_key[1] != float("inf") else -1e18,
+                v_key[2],
+                -rem,
+                int(vrow.get("preempt_count") or 0),
+            )
+
+        # Actually sort by least urgent first: largest urgency tuple.
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        # Among equal urgency, pick higher remaining then lower preempt_count.
+        best = candidates[0]
+        for c in candidates[1:]:
+            if c[0] == best[0]:
+                if c[2] > best[2] or (
+                    c[2] == best[2]
+                    and int(c[1].get("preempt_count") or 0)
+                    < int(best[1].get("preempt_count") or 0)
+                ):
+                    best = c
+            else:
+                break
+        _, victim, _ = best
+        victim_slack = self._slack_seconds(conn, victim, now=now)
+
+        updated = self._preempt_leased_job(
+            conn,
+            victim,
+            now=now,
+            reason=(
+                f"preempted for deadline job {urgent['id']} "
+                f"(urgent_slack={urgent_slack:.1f}s)"
+            ),
+        )
+        if updated is None:
+            return None
+        return PreemptResult(
+            tenant_id=tenant_id,
+            queue_name=queue_name,
+            urgent_job_id=urgent["id"],
+            victim_job_id=victim["id"],
+            urgent_slack_seconds=float(urgent_slack),
+            victim_slack_seconds=(
+                float(victim_slack)
+                if victim_slack != float("inf")
+                else float("inf")
+            ),
+        )
+
+    def _preempt_blocked_urgent(
+        self,
+        conn: Any,
+        *,
+        queue_name: str,
+        now: datetime,
+        limit: int = 8,
+    ) -> int:
+        """Run preemption for tenants with deadline pending blocked by caps."""
+        rows = conn.execute(
+            """
+            SELECT DISTINCT j.tenant_id
+            FROM jobs j
+            JOIN tenant_settings ts ON ts.tenant_id = j.tenant_id
+            WHERE j.queue_name = %s
+              AND j.status = %s
+              AND j.deadline_at IS NOT NULL
+              AND j.available_at <= %s
+              AND ts.max_concurrent_leases IS NOT NULL
+              AND ts.paused = FALSE
+            LIMIT %s
+            """,
+            (
+                queue_name,
+                JobStatus.PENDING.value,
+                now,
+                max(limit * 2, 8),
+            ),
+        ).fetchall()
+        n = 0
+        for r in rows:
+            if n >= limit:
+                break
+            tid = r["tenant_id"]
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (tid,),
+            )
+            if self._try_preempt_for_tenant(
+                conn, tenant_id=tid, queue_name=queue_name, now=now
+            ):
+                n += 1
+        return n
 
     def _lock_job_for_tenant(
         self,

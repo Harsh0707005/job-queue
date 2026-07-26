@@ -1,0 +1,72 @@
+# Deadline preemption soak under tight per-tenant concurrency.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.deadline.yml \
+#     up --build --abort-on-container-exit --exit-code-from deadline-soak deadline-soak
+#
+# Tear down:
+#   docker compose -f docker-compose.yml -f docker-compose.deadline.yml down -v
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  worker-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.25"
+      VISIBILITY_TIMEOUT: "15"
+      LOG_LEVEL: INFO
+  worker-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.25"
+      VISIBILITY_TIMEOUT: "15"
+      LOG_LEVEL: INFO
+  worker-3:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.25"
+      VISIBILITY_TIMEOUT: "15"
+      LOG_LEVEL: INFO
+  worker-4:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.25"
+      VISIBILITY_TIMEOUT: "15"
+      LOG_LEVEL: INFO
+
+  deadline-soak:
+    build: .
+    command: ["python", "scripts/deadline_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANT: deadline
+      CONCURRENCY: "2"
+      LONG_JOBS: "6"
+      LONG_STEPS: "40"
+      LONG_STEP_MS: "450"
+      MAX_WALL_SECONDS: "300"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

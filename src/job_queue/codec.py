@@ -10,6 +10,7 @@ from job_queue.models import (
     ClaimedWebhook,
     Job,
     JobStatus,
+    PreemptResult,
     Schedule,
     TenantMergeResult,
     TenantOffboardResult,
@@ -56,6 +57,11 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "result": job.result,
         "checkpoint": job.checkpoint,
         "checkpointed_at": _dt(job.checkpointed_at),
+        "deadline_at": _dt(job.deadline_at),
+        "estimated_duration_seconds": job.estimated_duration_seconds,
+        "preemptible": job.preemptible,
+        "preempt_count": job.preempt_count,
+        "last_preempted_at": _dt(job.last_preempted_at),
         "last_error": job.last_error,
     }
 
@@ -102,8 +108,32 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         result=data.get("result"),
         checkpoint=data.get("checkpoint"),
         checkpointed_at=parse_dt("checkpointed_at"),
+        deadline_at=parse_dt("deadline_at"),
+        estimated_duration_seconds=(
+            None
+            if data.get("estimated_duration_seconds") is None
+            else int(data["estimated_duration_seconds"])
+        ),
+        preemptible=bool(data["preemptible"]) if data.get("preemptible") is not None else True,
+        preempt_count=int(data.get("preempt_count") or 0),
+        last_preempted_at=parse_dt("last_preempted_at"),
         last_error=data.get("last_error"),
     )
+
+
+def preempt_result_to_dict(result: PreemptResult) -> dict[str, Any]:
+    return {
+        "tenant_id": result.tenant_id,
+        "queue_name": result.queue_name,
+        "urgent_job_id": str(result.urgent_job_id),
+        "victim_job_id": str(result.victim_job_id),
+        "urgent_slack_seconds": result.urgent_slack_seconds,
+        "victim_slack_seconds": (
+            result.victim_slack_seconds
+            if result.victim_slack_seconds != float("inf")
+            else None
+        ),
+    }
 
 
 def schedule_to_dict(sched: Schedule) -> dict[str, Any]:

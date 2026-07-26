@@ -21,6 +21,7 @@ from job_queue.codec import (
     claimed_webhook_to_dict,
     job_to_dict,
     schedule_to_dict,
+    preempt_result_to_dict,
     tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
     tenant_stats_to_dict,
@@ -62,6 +63,8 @@ class Coordinator:
             return self._enqueue(body)
         if method == "POST" and path == "/v1/lease":
             return self._lease(body)
+        if method == "POST" and path == "/v1/deadlines/process":
+            return self._process_deadlines(body)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/heartbeat"):
             return self._job_action(path, body, "heartbeat")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/ack"):
@@ -94,6 +97,8 @@ class Coordinator:
             return self._pause_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/resume"):
             return self._resume_tenant(path)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/concurrency"):
+            return self._set_concurrency(path, body)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/offboard"):
             return self._offboard_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/merge"):
@@ -133,6 +138,18 @@ class Coordinator:
                     dep_ids = _UUID(str(deps))
                 else:
                     dep_ids = [_UUID(str(x)) for x in deps]
+            deadline_raw = body.get("deadline_at")
+            deadline_at = None
+            if deadline_raw is not None:
+                from datetime import datetime
+
+                if isinstance(deadline_raw, str):
+                    deadline_at = datetime.fromisoformat(
+                        deadline_raw.replace("Z", "+00:00")
+                    )
+                else:
+                    return 400, {"error": "deadline_at must be an ISO-8601 string"}
+            est = body.get("estimated_duration_seconds")
             job = self.queue.enqueue(
                 tenant_id=str(body["tenant_id"]),
                 payload=dict(body.get("payload") or {}),
@@ -144,10 +161,31 @@ class Coordinator:
                 ),
                 max_runtime_seconds=int(body.get("max_runtime_seconds") or 3600),
                 depends_on=dep_ids,
+                deadline_at=deadline_at,
+                estimated_duration_seconds=(
+                    None if est is None else int(est)
+                ),
+                preemptible=bool(body.get("preemptible", True)),
             )
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job)}
+
+    def _process_deadlines(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        try:
+            results = self.queue.process_deadlines(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                queue_name=str(body.get("queue_name") or "default"),
+                limit=int(body.get("limit") or 20),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(results),
+            "preemptions": [preempt_result_to_dict(r) for r in results],
+        }
 
     def _lease(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         worker_id = body.get("worker_id")
@@ -378,6 +416,27 @@ class Coordinator:
         tenant_id = parts[2]
         self.queue.pause_tenant(tenant_id)
         return 200, {"tenant_id": tenant_id, "paused": True}
+
+    def _set_concurrency(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / concurrency
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if "max_concurrent_leases" not in body and "limit" not in body:
+            return 400, {"error": "max_concurrent_leases required (or null to clear)"}
+        raw = body.get("max_concurrent_leases", body.get("limit"))
+        try:
+            limit = None if raw is None else int(raw)
+            self.queue.set_concurrency_limit(tenant_id, limit)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "tenant_id": tenant_id,
+            "max_concurrent_leases": limit,
+        }
 
     def _resume_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")

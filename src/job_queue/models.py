@@ -35,6 +35,13 @@ class Job:
     It survives reclaim / nack requeue so a new worker can resume. Cleared
     only when the job is cancelled (or explicitly overwritten).
 
+    ``deadline_at`` is an absolute wall-clock deadline. Combined with
+    ``estimated_duration_seconds`` (and learned EWMAs) the queue computes
+    *slack* and may preempt a less-urgent leased job so this one can start.
+    ``preemptible`` controls whether this job may be the victim; checkpoint
+    is kept on preemption and the fencing token is cleared so it cannot
+    finish twice.
+
     ``available_at`` is the earliest time a pending job may be claimed.
     ``dedupe_key`` identifies a logical job for enqueue-time deduplication.
     ``depends_on`` lists parent job ids that must be ``completed`` before this
@@ -68,6 +75,11 @@ class Job:
     result: dict[str, Any] | list[Any] | str | int | float | bool | None
     checkpoint: dict[str, Any] | list[Any] | str | int | float | bool | None
     checkpointed_at: datetime | None
+    deadline_at: datetime | None
+    estimated_duration_seconds: int | None
+    preemptible: bool
+    preempt_count: int
+    last_preempted_at: datetime | None
     last_error: str | None
 
     @property
@@ -156,6 +168,18 @@ class TenantMergeResult:
     dedupe_keys_cleared: int
     schedule_names_renamed: int
     source_empty: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreemptResult:
+    """One preemption: urgent pending gained a slot by parking a leased job."""
+
+    tenant_id: str
+    queue_name: str
+    urgent_job_id: UUID
+    victim_job_id: UUID
+    urgent_slack_seconds: float
+    victim_slack_seconds: float
 
 
 class WebhookEvent(str, Enum):

@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- current lease holder via checkpoint().
     checkpoint                  JSONB,
     checkpointed_at             TIMESTAMPTZ,
+    -- Absolute deadline; NULL = no deadline. Used with estimated duration for
+    -- urgency / preemption (slack = deadline - now - remaining_work).
+    deadline_at                 TIMESTAMPTZ,
+    estimated_duration_seconds  INTEGER,
+    preemptible                 BOOLEAN NOT NULL DEFAULT TRUE,
+    preempt_count               INTEGER NOT NULL DEFAULT 0,
+    last_preempted_at           TIMESTAMPTZ,
     last_error                  TEXT,
 
     CONSTRAINT jobs_attempts_check CHECK (attempts >= 0),
@@ -42,7 +49,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     CONSTRAINT jobs_visibility_check CHECK (visibility_timeout_seconds >= 1),
     CONSTRAINT jobs_max_runtime_check CHECK (max_runtime_seconds >= 1),
     CONSTRAINT jobs_backoff_base_check CHECK (retry_backoff_base_seconds >= 0),
-    CONSTRAINT jobs_backoff_max_check CHECK (retry_backoff_max_seconds >= 0)
+    CONSTRAINT jobs_backoff_max_check CHECK (retry_backoff_max_seconds >= 0),
+    CONSTRAINT jobs_estimated_duration_check CHECK (
+        estimated_duration_seconds IS NULL OR estimated_duration_seconds >= 1
+    ),
+    CONSTRAINT jobs_preempt_count_check CHECK (preempt_count >= 0)
 );
 
 -- Status check kept replaceable so upgrades can add new statuses.
@@ -65,6 +76,35 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS max_runtime_seconds INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_started_at TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS checkpoint JSONB;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS checkpointed_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS estimated_duration_seconds INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preemptible BOOLEAN;
+UPDATE jobs SET preemptible = TRUE WHERE preemptible IS NULL;
+ALTER TABLE jobs ALTER COLUMN preemptible SET DEFAULT TRUE;
+ALTER TABLE jobs ALTER COLUMN preemptible SET NOT NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_count INTEGER;
+UPDATE jobs SET preempt_count = 0 WHERE preempt_count IS NULL;
+ALTER TABLE jobs ALTER COLUMN preempt_count SET DEFAULT 0;
+ALTER TABLE jobs ALTER COLUMN preempt_count SET NOT NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_preempted_at TIMESTAMPTZ;
+
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_estimated_duration_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_estimated_duration_check CHECK (
+    estimated_duration_seconds IS NULL OR estimated_duration_seconds >= 1
+);
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_preempt_count_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_preempt_count_check CHECK (preempt_count >= 0);
+
+-- EWMA of observed runtimes for smarter remaining-time estimates.
+CREATE TABLE IF NOT EXISTS duration_estimates (
+    tenant_id       TEXT NOT NULL,
+    queue_name      TEXT NOT NULL,
+    kind            TEXT NOT NULL DEFAULT '',
+    ewma_seconds    DOUBLE PRECISION NOT NULL,
+    samples         INTEGER NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, queue_name, kind)
+);
 
 UPDATE jobs
 SET retry_backoff_base_seconds = 1
@@ -122,6 +162,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry
 
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status
     ON jobs (tenant_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_deadline_pending
+    ON jobs (tenant_id, queue_name, deadline_at ASC)
+    WHERE status = 'pending' AND deadline_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_leased
     ON jobs (tenant_id)
