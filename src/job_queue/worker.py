@@ -58,6 +58,25 @@ class LeaseContext:
             lease_token=self.job.lease_token,
         )
 
+    def checkpoint(self, progress: Any) -> Job:
+        """Persist durable progress so a reclaim can resume.
+
+        Raises ``LeaseError`` if the lease was lost. Updates ``self.job`` with
+        the row that includes the new ``checkpoint`` / ``checkpointed_at``.
+        """
+        if self.lease_lost.is_set():
+            raise LeaseError(f"job {self.job.id} lease lost (cancel signalled)")
+        assert self.job.lease_token is not None
+        updated = self.queue.checkpoint(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            worker_id=self.worker_id,
+            lease_token=self.job.lease_token,
+            progress=progress,
+        )
+        self.job = updated
+        return updated
+
 
 class Worker:
     """Poll a queue, process jobs, and keep leases alive via heartbeat.

@@ -54,6 +54,8 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "updated_at": _dt(job.updated_at),
         "completed_at": _dt(job.completed_at),
         "result": job.result,
+        "checkpoint": job.checkpoint,
+        "checkpointed_at": _dt(job.checkpointed_at),
         "last_error": job.last_error,
     }
 
@@ -98,6 +100,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         updated_at=parse_dt("updated_at") or datetime.now().astimezone(),
         completed_at=parse_dt("completed_at"),
         result=data.get("result"),
+        checkpoint=data.get("checkpoint"),
+        checkpointed_at=parse_dt("checkpointed_at"),
         last_error=data.get("last_error"),
     )
 

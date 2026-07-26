@@ -31,6 +31,10 @@ class Job:
     ``merge_tenant`` does not break workers, while unrelated tenants are
     still rejected even with a valid token.
 
+    ``checkpoint`` is durable progress JSON written by the lease holder.
+    It survives reclaim / nack requeue so a new worker can resume. Cleared
+    only when the job is cancelled (or explicitly overwritten).
+
     ``available_at`` is the earliest time a pending job may be claimed.
     ``dedupe_key`` identifies a logical job for enqueue-time deduplication.
     ``depends_on`` lists parent job ids that must be ``completed`` before this
@@ -62,6 +66,8 @@ class Job:
     updated_at: datetime
     completed_at: datetime | None
     result: dict[str, Any] | list[Any] | str | int | float | bool | None
+    checkpoint: dict[str, Any] | list[Any] | str | int | float | bool | None
+    checkpointed_at: datetime | None
     last_error: str | None
 
     @property

@@ -68,8 +68,12 @@ class Coordinator:
             return self._job_action(path, body, "ack")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/nack"):
             return self._job_action(path, body, "nack")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/checkpoint"):
+            return self._job_action(path, body, "checkpoint")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/cancel"):
             return self._cancel_job(path, body)
+        if method == "GET" and path.startswith("/v1/jobs/"):
+            return self._get_job(path, query)
 
         if method == "POST" and path == "/v1/schedules/process-due":
             return self._process_due(body)
@@ -249,6 +253,17 @@ class Coordinator:
                     error=body.get("error"),
                     requeue=bool(body.get("requeue", True)),
                 )
+            elif action == "checkpoint":
+                if "progress" not in body and "checkpoint" not in body:
+                    return 400, {"error": "progress required"}
+                progress = body.get("progress", body.get("checkpoint"))
+                job = self.queue.checkpoint(
+                    job_id,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    progress=progress,
+                )
             else:
                 return 400, {"error": f"unknown action {action}"}
         except LeaseError as exc:
@@ -256,6 +271,24 @@ class Coordinator:
         except ValueError as exc:
             return 400, {"error": str(exc)}
 
+        return 200, {"job": job_to_dict(job)}
+
+    def _get_job(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        # /v1/jobs/{uuid}?tenant_id=
+        parts = path.strip("/").split("/")
+        if len(parts) != 3 or parts[0] != "v1" or parts[1] != "jobs":
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        job = self.queue.get(UUID(job_id_s), tenant_id=str(tenants[0]))
+        if job is None:
+            return 404, {"error": "job not found"}
         return 200, {"job": job_to_dict(job)}
 
     # ------------------------------------------------------------------

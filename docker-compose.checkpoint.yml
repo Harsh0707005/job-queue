@@ -1,0 +1,83 @@
+# Checkpoint reclaim soak: long stepped job, kill holder, resume from checkpoint.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.checkpoint.yml \
+#     up --build --abort-on-container-exit --exit-code-from checkpoint-soak checkpoint-soak
+#
+# Tear down:
+#   docker compose -f docker-compose.yml -f docker-compose.checkpoint.yml down -v
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  # Short VT so a killed worker is reclaimed quickly; single-job steps.
+  worker-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "3"
+      LOG_LEVEL: INFO
+  worker-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "3"
+      LOG_LEVEL: INFO
+  worker-3:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "3"
+      LOG_LEVEL: INFO
+  worker-4:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      BATCH_SIZE: "1"
+      POLL_INTERVAL: "0.2"
+      VISIBILITY_TIMEOUT: "3"
+      LOG_LEVEL: INFO
+
+  checkpoint-soak:
+    # docker CLI + python so we can kill the lease holder mid-job.
+    image: docker:27-cli
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache python3 >/dev/null
+        exec python3 /scripts/checkpoint_soak.py
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/scripts:ro
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-job-queue}
+      TENANT: ckpt
+      STEPS: "10"
+      STEP_MS: "400"
+      MIN_CHECKPOINT_STEP: "3"
+      VISIBILITY_TIMEOUT: "3"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

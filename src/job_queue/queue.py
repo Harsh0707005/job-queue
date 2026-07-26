@@ -26,6 +26,11 @@ Design notes
 * **Tenant pending cap**: at most N jobs may be ``pending`` for a tenant
   (``set_pending_limit``). Further ``enqueue`` / schedule ticks / replays
   raise ``ValueError`` until pending drops (e.g. after lease or cancel).
+* **Checkpoints**: long-running handlers call ``checkpoint`` (or
+  ``LeaseContext.checkpoint``) under a live lease to persist progress JSON.
+  On reclaim after a worker death, the new lease returns the same job with
+  ``checkpoint`` set so work can resume instead of restarting. Progress
+  survives nack requeue; only cancel clears it.
 * **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
   jobs (pending + running + history), schedules, and webhooks to *target*
   without stopping workers. Lease fencing tokens stay valid. Heartbeat /
@@ -119,7 +124,7 @@ _JOB_COLUMNS = """
     retry_backoff_base_seconds, retry_backoff_max_seconds, available_at,
     dedupe_key, schedule_id, depends_on, leased_by, lease_token,
     lease_tenant_id, lease_expires_at, lease_started_at, created_at,
-    updated_at, completed_at, result, last_error
+    updated_at, completed_at, result, checkpoint, checkpointed_at, last_error
 """
 
 # Pending job is claimable only when every depends_on parent is completed.
@@ -187,6 +192,8 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
         result=row.get("result"),
+        checkpoint=row.get("checkpoint"),
+        checkpointed_at=row.get("checkpointed_at"),
         last_error=row["last_error"],
     )
 
@@ -1769,6 +1776,8 @@ class JobQueue:
                     lease_tenant_id = NULL,
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
+                    checkpoint = NULL,
+                    checkpointed_at = NULL,
                     last_error = CASE
                         WHEN %s THEN 'cancelled while running'
                         ELSE last_error
@@ -2086,6 +2095,54 @@ class JobQueue:
             self._assert_lease_tenant(row, tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
             return _row_to_job(row)
+
+    def checkpoint(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        progress: Any,
+    ) -> Job:
+        """Persist progress JSON for a leased job (survives reclaim).
+
+        Only the current lease holder may write. *progress* is stored as JSON
+        on the job (``checkpoint`` / ``checkpointed_at``) and returned on
+        subsequent ``lease`` / ``get`` so a replacement worker can resume.
+        Does not clear on nack requeue or lease expiry; cancel clears it.
+        """
+        now = _utcnow()
+        progress_json = Jsonb(progress) if progress is not None else None
+
+        with transaction(self._pool) as conn:
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
+            self._assert_active_lease(row, worker_id, lease_token, now)
+
+            updated = conn.execute(
+                f"""
+                UPDATE jobs
+                SET checkpoint = %s,
+                    checkpointed_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND lease_token = %s
+                  AND status = %s
+                RETURNING {_JOB_COLUMNS}
+                """,
+                (
+                    progress_json,
+                    now,
+                    now,
+                    job_id,
+                    lease_token,
+                    JobStatus.LEASED.value,
+                ),
+            ).fetchone()
+            if updated is None:
+                raise LeaseError(f"job {job_id} lease lost during checkpoint")
+            return _row_to_job(updated)
 
     # ------------------------------------------------------------------
     # Inspection helpers
@@ -4244,6 +4301,8 @@ class JobQueue:
                         lease_tenant_id = NULL,
                         lease_expires_at = NULL,
                         lease_started_at = NULL,
+                        checkpoint = NULL,
+                        checkpointed_at = NULL,
                         last_error = %s,
                         updated_at = %s
                     WHERE id = %s

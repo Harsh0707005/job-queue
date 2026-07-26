@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at                TIMESTAMPTZ,
     result                      JSONB,
+    -- Durable progress for long-running work. Survives lease reclaim so a
+    -- new worker can resume instead of restarting. Written only by the
+    -- current lease holder via checkpoint().
+    checkpoint                  JSONB,
+    checkpointed_at             TIMESTAMPTZ,
     last_error                  TEXT,
 
     CONSTRAINT jobs_attempts_check CHECK (attempts >= 0),
@@ -58,6 +63,8 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_backoff_base_seconds INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_backoff_max_seconds INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS max_runtime_seconds INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_started_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS checkpoint JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS checkpointed_at TIMESTAMPTZ;
 
 UPDATE jobs
 SET retry_backoff_base_seconds = 1
