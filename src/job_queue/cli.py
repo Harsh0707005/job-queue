@@ -23,6 +23,14 @@ def _resolve_dsn(explicit: str | None) -> str:
     )
 
 
+def _format_rate(rate: float | None, burst: int | None) -> str:
+    if rate is None:
+        return "unlimited"
+    if burst is not None:
+        return f"{rate:g}/s burst={burst}"
+    return f"{rate:g}/s"
+
+
 def _format_stats(stats: TenantStats) -> str:
     paused = "yes" if stats.paused else "no"
     limit = (
@@ -40,6 +48,8 @@ def _format_stats(stats: TenantStats) -> str:
         f"  paused={paused}\n"
         f"  max_concurrent_leases={limit}\n"
         f"  max_pending_jobs={pending_cap}\n"
+        f"  enqueue_rate={_format_rate(stats.enqueue_rate_per_sec, stats.enqueue_burst)}\n"
+        f"  lease_rate={_format_rate(stats.lease_rate_per_sec, stats.lease_burst)}\n"
         f"  pending={stats.pending}\n"
         f"  leased={stats.leased}\n"
         f"  claimable={stats.claimable}\n"

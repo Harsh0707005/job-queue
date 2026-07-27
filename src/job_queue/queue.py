@@ -26,6 +26,13 @@ Design notes
 * **Tenant pending cap**: at most N jobs may be ``pending`` for a tenant
   (``set_pending_limit``). Further ``enqueue`` / schedule ticks / replays
   raise ``ValueError`` until pending drops (e.g. after lease or cancel).
+* **Tenant rate limits** (token bucket, optional): ``set_enqueue_rate_limit``
+  and ``set_lease_rate_limit`` cap how fast a tenant may enqueue or have
+  jobs claimed. Default is unlimited (no settings / NULL rate). Fair
+  multi-tenant lease skips a rate-limited tenant and rotates LRS so other
+  tenants keep progressing; expired-lease reclaim is not rate-limited so
+  recovery is not blocked. Enqueue over the limit raises
+  :class:`RateLimitError`.
 * **Checkpoints**: long-running handlers call ``checkpoint`` (or
   ``LeaseContext.checkpoint``) under a live lease to persist progress JSON.
   On reclaim after a worker death, the new lease returns the same job with
@@ -118,6 +125,7 @@ Design notes
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -285,6 +293,23 @@ class LeaseError(Exception):
     """Raised when a lease operation is invalid (wrong owner/tenant/token, expired, etc.)."""
 
 
+class RateLimitError(Exception):
+    """Raised when a tenant exceeds its enqueue (or similar) rate limit."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tenant_id: str,
+        kind: str,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.tenant_id = tenant_id
+        self.kind = kind
+        self.retry_after_seconds = retry_after_seconds
+
+
 class CancelError(Exception):
     """Raised when a job cannot be cancelled (wrong state / tenant / missing)."""
 
@@ -342,6 +367,11 @@ class RebuildError(Exception):
 
 class _SkipLeaseCandidate(Exception):
     """Internal: abandon a locked fair-lease candidate and try another."""
+
+    def __init__(self, reason: str, *, tenant_id: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.tenant_id = tenant_id
 
 
 class ScheduleError(Exception):
@@ -497,6 +527,175 @@ class JobQueue:
             raise ValueError("tenant_id is required")
         with self._pool.connection() as conn:
             return self._read_pending_limit(conn, tenant_id)
+
+    def set_enqueue_rate_limit(
+        self,
+        tenant_id: str,
+        per_second: float | None,
+        *,
+        burst: int | None = None,
+    ) -> None:
+        """Cap how fast *tenant_id* may enqueue new jobs (token bucket).
+
+        *per_second* is the steady refill rate. *burst* is the max bucket
+        size (defaults to ``max(1, ceil(per_second))``). Pass ``None`` for
+        *per_second* to clear (unlimited). Does not clear pause / other caps.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rate, burst_n = self._normalize_rate_limit(per_second, burst)
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            if rate is None:
+                conn.execute(
+                    """
+                    INSERT INTO tenant_settings (
+                        tenant_id, max_concurrent_leases, max_pending_jobs,
+                        paused, offboarding, updated_at
+                    )
+                    VALUES (%s, NULL, NULL, FALSE, FALSE, %s)
+                    ON CONFLICT (tenant_id) DO UPDATE
+                    SET enqueue_rate_per_sec = NULL,
+                        enqueue_burst = NULL,
+                        enqueue_tokens = NULL,
+                        enqueue_tokens_at = NULL,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (tenant_id, now),
+                )
+                self._delete_empty_tenant_settings(conn, tenant_id)
+                return
+            assert burst_n is not None
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding,
+                    enqueue_rate_per_sec, enqueue_burst,
+                    enqueue_tokens, enqueue_tokens_at,
+                    updated_at
+                )
+                VALUES (
+                    %s, NULL, NULL, FALSE, FALSE,
+                    %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET enqueue_rate_per_sec = EXCLUDED.enqueue_rate_per_sec,
+                    enqueue_burst = EXCLUDED.enqueue_burst,
+                    enqueue_tokens = EXCLUDED.enqueue_tokens,
+                    enqueue_tokens_at = EXCLUDED.enqueue_tokens_at,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, rate, burst_n, float(burst_n), now, now),
+            )
+
+    def get_enqueue_rate_limit(
+        self, tenant_id: str
+    ) -> tuple[float | None, int | None]:
+        """Return ``(per_second, burst)`` or ``(None, None)`` if unlimited."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT enqueue_rate_per_sec, enqueue_burst
+                FROM tenant_settings
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None or row["enqueue_rate_per_sec"] is None:
+                return None, None
+            return float(row["enqueue_rate_per_sec"]), (
+                int(row["enqueue_burst"])
+                if row["enqueue_burst"] is not None
+                else None
+            )
+
+    def set_lease_rate_limit(
+        self,
+        tenant_id: str,
+        per_second: float | None,
+        *,
+        burst: int | None = None,
+    ) -> None:
+        """Cap how fast *tenant_id* jobs may be claimed (token bucket).
+
+        Applies to new pending claims (scoped and fair multi-tenant). Expired
+        lease reclaim is not rate-limited. Fair lease skips a rate-limited
+        tenant and rotates LRS so others keep getting work. Pass ``None`` for
+        *per_second* to clear.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        rate, burst_n = self._normalize_rate_limit(per_second, burst)
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            if rate is None:
+                conn.execute(
+                    """
+                    INSERT INTO tenant_settings (
+                        tenant_id, max_concurrent_leases, max_pending_jobs,
+                        paused, offboarding, updated_at
+                    )
+                    VALUES (%s, NULL, NULL, FALSE, FALSE, %s)
+                    ON CONFLICT (tenant_id) DO UPDATE
+                    SET lease_rate_per_sec = NULL,
+                        lease_burst = NULL,
+                        lease_tokens = NULL,
+                        lease_tokens_at = NULL,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (tenant_id, now),
+                )
+                self._delete_empty_tenant_settings(conn, tenant_id)
+                return
+            assert burst_n is not None
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding,
+                    lease_rate_per_sec, lease_burst,
+                    lease_tokens, lease_tokens_at,
+                    updated_at
+                )
+                VALUES (
+                    %s, NULL, NULL, FALSE, FALSE,
+                    %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET lease_rate_per_sec = EXCLUDED.lease_rate_per_sec,
+                    lease_burst = EXCLUDED.lease_burst,
+                    lease_tokens = EXCLUDED.lease_tokens,
+                    lease_tokens_at = EXCLUDED.lease_tokens_at,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, rate, burst_n, float(burst_n), now, now),
+            )
+
+    def get_lease_rate_limit(
+        self, tenant_id: str
+    ) -> tuple[float | None, int | None]:
+        """Return ``(per_second, burst)`` or ``(None, None)`` if unlimited."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT lease_rate_per_sec, lease_burst
+                FROM tenant_settings
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None or row["lease_rate_per_sec"] is None:
+                return None, None
+            return float(row["lease_rate_per_sec"]), (
+                int(row["lease_burst"])
+                if row["lease_burst"] is not None
+                else None
+            )
 
     def pause_tenant(self, tenant_id: str) -> None:
         """Pause a tenant: no new leases, no schedule fires, no reclaim.
@@ -1150,8 +1349,9 @@ class JobQueue:
                 if existing is not None:
                     return _row_to_job(existing)
 
-                # New pending row: enforce per-tenant pending cap.
+                # New pending row: enforce per-tenant pending cap + rate.
                 self._assert_pending_capacity(conn, tenant_id)
+                self._consume_enqueue_rate(conn, tenant_id, now=now)
 
                 # ON CONFLICT remains a safety net for any missed paths.
                 row = conn.execute(
@@ -1232,6 +1432,7 @@ class JobQueue:
                 return job
 
             self._assert_pending_capacity(conn, tenant_id)
+            self._consume_enqueue_rate(conn, tenant_id, now=now)
 
             row = conn.execute(
                 f"""
@@ -1492,6 +1693,13 @@ class JobQueue:
                 ).fetchall()
 
             for candidate in candidates:
+                # Rate-limit new pending claims only; reclaim is free so
+                # recovery is not blocked by a noisy tenant's throttle.
+                if candidate["status"] == JobStatus.PENDING.value:
+                    if not self._try_consume_lease_rate(
+                        conn, tenant_id, now=now
+                    ):
+                        break
                 claimed.append(
                     self._claim_locked_job(
                         conn,
@@ -1523,6 +1731,9 @@ class JobQueue:
         # Allow several skip attempts per desired job (paused / at-cap tenants).
         max_skips = _max_skips if _max_skips is not None else max(64, limit * 16)
         skips = 0
+        # Tenants that hit lease rate limit this batch are excluded so a
+        # high-priority noisy tenant cannot burn the skip budget.
+        rate_limited_tenants: set[str] = set()
 
         with transaction(self._pool) as conn:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
@@ -1543,12 +1754,18 @@ class JobQueue:
                             queue_name=queue_name,
                             visibility_timeout_seconds=visibility_timeout_seconds,
                             now=now,
+                            exclude_tenants=rate_limited_tenants,
                         )
                         if job is None:
                             break
                         claimed.append(job)
-                except _SkipLeaseCandidate:
+                except _SkipLeaseCandidate as skip:
                     skips += 1
+                    if (
+                        skip.tenant_id
+                        and skip.reason == "tenant lease rate limited"
+                    ):
+                        rate_limited_tenants.add(skip.tenant_id)
                     continue
         return claimed
 
@@ -1560,6 +1777,7 @@ class JobQueue:
         queue_name: str,
         visibility_timeout_seconds: int | None,
         now: datetime,
+        exclude_tenants: set[str] | None = None,
     ) -> Job | None:
         token = uuid4()
         # Priority lanes first (higher priority always before lower), then
@@ -1567,11 +1785,29 @@ class JobQueue:
         # -infinity). A noisy tenant's high-priority flood still rotates with
         # other tenants at the same priority; it cannot leapfrog higher-priority
         # work of quieter tenants, and low-priority noise cannot starve high.
+        excluded = sorted(exclude_tenants or ())
+        exclude_sql = ""
+        params: list[Any] = [queue_name]
+        if excluded:
+            exclude_sql = "AND jobs.tenant_id <> ALL(%s)"
+            params.append(excluded)
+        params.extend(
+            [
+                JobStatus.PENDING.value,
+                now,
+                JobStatus.LEASED.value,
+                JobStatus.LEASED.value,
+                now,
+                now,
+                now,
+            ]
+        )
         candidate = conn.execute(
             f"""
             SELECT {_JOB_COLUMNS}
             FROM jobs
             WHERE queue_name = %s
+              {exclude_sql}
               AND NOT EXISTS (
                     SELECT 1
                     FROM tenant_settings ts
@@ -1625,16 +1861,7 @@ class JobQueue:
             FOR UPDATE OF jobs SKIP LOCKED
             LIMIT 1
             """,
-            (
-                queue_name,
-                JobStatus.PENDING.value,
-                now,
-                JobStatus.LEASED.value,
-                JobStatus.LEASED.value,
-                now,
-                now,
-                now,
-            ),
+            tuple(params),
         ).fetchone()
 
         if candidate is None:
@@ -1646,7 +1873,9 @@ class JobQueue:
             (candidate["tenant_id"],),
         )
         if self._is_tenant_paused(conn, candidate["tenant_id"]):
-            raise _SkipLeaseCandidate("tenant paused")
+            raise _SkipLeaseCandidate(
+                "tenant paused", tenant_id=candidate["tenant_id"]
+            )
         if candidate["status"] == JobStatus.PENDING.value:
             limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
             leased_count = self._count_leased(conn, candidate["tenant_id"])
@@ -1663,7 +1892,28 @@ class JobQueue:
                         conn, candidate["tenant_id"]
                     )
                 if leased_count >= limit:
-                    raise _SkipLeaseCandidate("tenant at concurrency limit")
+                    raise _SkipLeaseCandidate(
+                        "tenant at concurrency limit",
+                        tenant_id=candidate["tenant_id"],
+                    )
+            # Token-bucket lease rate: skip + rotate LRS so other tenants
+            # keep getting work while this tenant waits for tokens.
+            if not self._try_consume_lease_rate(
+                conn, candidate["tenant_id"], now=now
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO tenant_fairness (tenant_id, last_lease_at)
+                    VALUES (%s, clock_timestamp())
+                    ON CONFLICT (tenant_id) DO UPDATE
+                    SET last_lease_at = clock_timestamp()
+                    """,
+                    (candidate["tenant_id"],),
+                )
+                raise _SkipLeaseCandidate(
+                    "tenant lease rate limited",
+                    tenant_id=candidate["tenant_id"],
+                )
 
         claimed = self._claim_locked_job(
             conn,
@@ -3529,7 +3779,10 @@ class JobQueue:
 
             try:
                 self._assert_pending_capacity(conn, tenant_id)
+                self._consume_enqueue_rate(conn, tenant_id, now=now)
             except ValueError as exc:
+                raise ReplayError(str(exc), job=job) from exc
+            except RateLimitError as exc:
                 raise ReplayError(str(exc), job=job) from exc
 
             # Hold the same advisory lock as enqueue(dedupe_key=...) so the
@@ -4748,8 +5001,11 @@ class JobQueue:
                             self._assert_pending_capacity(
                                 conn, sched_row["tenant_id"]
                             )
-                        except ValueError:
-                            # At pending cap: skip this schedule tick (no job).
+                            self._consume_enqueue_rate(
+                                conn, sched_row["tenant_id"], now=now
+                            )
+                        except (ValueError, RateLimitError):
+                            # At pending cap or rate-limited: skip tick (no job).
                             continue
                         job_row = conn.execute(
                             f"""
@@ -6372,6 +6628,158 @@ class JobQueue:
             )
 
     @staticmethod
+    def _normalize_rate_limit(
+        per_second: float | None,
+        burst: int | None,
+    ) -> tuple[float | None, int | None]:
+        if per_second is None:
+            if burst is not None:
+                raise ValueError("burst requires per_second to be set")
+            return None, None
+        rate = float(per_second)
+        if rate <= 0:
+            raise ValueError("per_second must be > 0 or None")
+        if burst is None:
+            burst_n = max(1, int(math.ceil(rate)))
+        else:
+            burst_n = int(burst)
+            if burst_n < 1:
+                raise ValueError("burst must be >= 1")
+        return rate, burst_n
+
+    def _consume_enqueue_rate(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        now: datetime,
+    ) -> None:
+        """Consume one enqueue token or raise :class:`RateLimitError`."""
+        ok, retry_after = self._try_consume_rate_tokens(
+            conn,
+            tenant_id,
+            kind="enqueue",
+            now=now,
+            cost=1.0,
+        )
+        if ok:
+            return
+        raise RateLimitError(
+            f"tenant {tenant_id!r} enqueue rate limit exceeded"
+            + (
+                f"; retry after ~{retry_after:.3f}s"
+                if retry_after is not None
+                else ""
+            ),
+            tenant_id=tenant_id,
+            kind="enqueue",
+            retry_after_seconds=retry_after,
+        )
+
+    def _try_consume_lease_rate(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Consume one lease token; False if rate-limited (no exception)."""
+        ok, _ = self._try_consume_rate_tokens(
+            conn,
+            tenant_id,
+            kind="lease",
+            now=now,
+            cost=1.0,
+        )
+        return ok
+
+    def _try_consume_rate_tokens(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        kind: str,
+        now: datetime,
+        cost: float = 1.0,
+    ) -> tuple[bool, float | None]:
+        """Token-bucket consume under the tenant advisory lock.
+
+        Returns ``(True, None)`` if allowed (or unlimited), else
+        ``(False, retry_after_seconds)``.
+        """
+        if kind not in ("enqueue", "lease"):
+            raise ValueError(f"unknown rate kind {kind!r}")
+        rate_col = f"{kind}_rate_per_sec"
+        burst_col = f"{kind}_burst"
+        tokens_col = f"{kind}_tokens"
+        at_col = f"{kind}_tokens_at"
+
+        # Caller often already holds the tenant lock; take it again (re-entrant
+        # xact lock is fine) so standalone paths are safe.
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (tenant_id,),
+        )
+        row = conn.execute(
+            f"""
+            SELECT {rate_col} AS rate, {burst_col} AS burst,
+                   {tokens_col} AS tokens, {at_col} AS tokens_at
+            FROM tenant_settings
+            WHERE tenant_id = %s
+            FOR UPDATE
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if row is None or row["rate"] is None:
+            return True, None
+
+        rate = float(row["rate"])
+        if rate <= 0:
+            return True, None
+        burst = int(row["burst"] or max(1, int(math.ceil(rate))))
+        tokens = row["tokens"]
+        tokens_at = row["tokens_at"]
+        if tokens is None:
+            tokens = float(burst)
+        else:
+            tokens = float(tokens)
+        if tokens_at is None:
+            tokens_at = now
+        else:
+            tokens_at = _as_utc(tokens_at)
+
+        elapsed = max(0.0, (now - tokens_at).total_seconds())
+        tokens = min(float(burst), tokens + elapsed * rate)
+        if tokens + 1e-12 < cost:
+            need = cost - tokens
+            retry_after = need / rate if rate > 0 else None
+            # Persist refilled (but not consumed) tokens so time advances.
+            conn.execute(
+                f"""
+                UPDATE tenant_settings
+                SET {tokens_col} = %s,
+                    {at_col} = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                """,
+                (tokens, now, now, tenant_id),
+            )
+            return False, retry_after
+
+        tokens -= cost
+        conn.execute(
+            f"""
+            UPDATE tenant_settings
+            SET {tokens_col} = %s,
+                {at_col} = %s,
+                updated_at = %s
+            WHERE tenant_id = %s
+            """,
+            (tokens, now, now, tenant_id),
+        )
+        return True, None
+
+    @staticmethod
     def _delete_empty_tenant_settings(conn: Any, tenant_id: str) -> None:
         conn.execute(
             """
@@ -6379,6 +6787,8 @@ class JobQueue:
             WHERE tenant_id = %s
               AND max_concurrent_leases IS NULL
               AND max_pending_jobs IS NULL
+              AND enqueue_rate_per_sec IS NULL
+              AND lease_rate_per_sec IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,
@@ -6733,7 +7143,9 @@ class JobQueue:
 
         settings = conn.execute(
             """
-            SELECT max_concurrent_leases, max_pending_jobs, paused
+            SELECT max_concurrent_leases, max_pending_jobs, paused,
+                   enqueue_rate_per_sec, enqueue_burst,
+                   lease_rate_per_sec, lease_burst
             FROM tenant_settings
             WHERE tenant_id = %s
             """,
@@ -6742,6 +7154,26 @@ class JobQueue:
         paused = bool(settings["paused"]) if settings else False
         max_conc = settings["max_concurrent_leases"] if settings else None
         max_pending = settings["max_pending_jobs"] if settings else None
+        enq_rate = (
+            float(settings["enqueue_rate_per_sec"])
+            if settings and settings["enqueue_rate_per_sec"] is not None
+            else None
+        )
+        enq_burst = (
+            int(settings["enqueue_burst"])
+            if settings and settings["enqueue_burst"] is not None
+            else None
+        )
+        lease_rate = (
+            float(settings["lease_rate_per_sec"])
+            if settings and settings["lease_rate_per_sec"] is not None
+            else None
+        )
+        lease_burst = (
+            int(settings["lease_burst"])
+            if settings and settings["lease_burst"] is not None
+            else None
+        )
 
         if paused:
             claimable = 0
@@ -6765,6 +7197,10 @@ class JobQueue:
             paused=paused,
             max_concurrent_leases=max_conc,
             max_pending_jobs=max_pending,
+            enqueue_rate_per_sec=enq_rate,
+            enqueue_burst=enq_burst,
+            lease_rate_per_sec=lease_rate,
+            lease_burst=lease_burst,
             pending=counts[JobStatus.PENDING.value],
             leased=counts[JobStatus.LEASED.value],
             completed=counts[JobStatus.COMPLETED.value],

@@ -32,7 +32,13 @@ from job_queue.codec import (
     webhook_endpoint_to_dict,
 )
 from job_queue.models import JobStatus
-from job_queue.queue import CancelError, JobQueue, LeaseError, ScheduleError
+from job_queue.queue import (
+    CancelError,
+    JobQueue,
+    LeaseError,
+    RateLimitError,
+    ScheduleError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +144,14 @@ class Coordinator:
             return self._resume_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/concurrency"):
             return self._set_concurrency(path, body)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith(
+            "/rate-limits"
+        ):
+            return self._set_rate_limits(path, body)
+        if method == "GET" and path.startswith("/v1/tenants/") and path.endswith(
+            "/rate-limits"
+        ):
+            return self._get_rate_limits(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/offboard"):
             return self._offboard_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/merge"):
@@ -206,6 +220,16 @@ class Coordinator:
                 ),
                 preemptible=bool(body.get("preemptible", True)),
             )
+        except RateLimitError as exc:
+            payload: dict[str, Any] = {
+                "error": str(exc),
+                "code": "rate_limited",
+                "kind": exc.kind,
+                "tenant_id": exc.tenant_id,
+            }
+            if exc.retry_after_seconds is not None:
+                payload["retry_after_seconds"] = exc.retry_after_seconds
+            return 429, payload
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job)}
@@ -857,6 +881,74 @@ class Coordinator:
         return 200, {
             "tenant_id": tenant_id,
             "max_concurrent_leases": limit,
+        }
+
+    def _set_rate_limits(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / rate-limits
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if (
+            "enqueue_per_second" not in body
+            and "lease_per_second" not in body
+            and "enqueue_rate_per_sec" not in body
+            and "lease_rate_per_sec" not in body
+        ):
+            return 400, {
+                "error": "enqueue_per_second and/or lease_per_second required "
+                "(null clears that limit)"
+            }
+        try:
+            if "enqueue_per_second" in body or "enqueue_rate_per_sec" in body:
+                raw = body.get(
+                    "enqueue_per_second", body.get("enqueue_rate_per_sec")
+                )
+                burst = body.get("enqueue_burst")
+                rate = None if raw is None else float(raw)
+                self.queue.set_enqueue_rate_limit(
+                    tenant_id,
+                    rate,
+                    burst=None if burst is None else int(burst),
+                )
+            if "lease_per_second" in body or "lease_rate_per_sec" in body:
+                raw = body.get(
+                    "lease_per_second", body.get("lease_rate_per_sec")
+                )
+                burst = body.get("lease_burst")
+                rate = None if raw is None else float(raw)
+                self.queue.set_lease_rate_limit(
+                    tenant_id,
+                    rate,
+                    burst=None if burst is None else int(burst),
+                )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        enq = self.queue.get_enqueue_rate_limit(tenant_id)
+        lease = self.queue.get_lease_rate_limit(tenant_id)
+        return 200, {
+            "tenant_id": tenant_id,
+            "enqueue_rate_per_sec": enq[0],
+            "enqueue_burst": enq[1],
+            "lease_rate_per_sec": lease[0],
+            "lease_burst": lease[1],
+        }
+
+    def _get_rate_limits(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        enq = self.queue.get_enqueue_rate_limit(tenant_id)
+        lease = self.queue.get_lease_rate_limit(tenant_id)
+        return 200, {
+            "tenant_id": tenant_id,
+            "enqueue_rate_per_sec": enq[0],
+            "enqueue_burst": enq[1],
+            "lease_rate_per_sec": lease[0],
+            "lease_burst": lease[1],
         }
 
     def _resume_tenant(self, path: str) -> tuple[int, dict[str, Any]]:

@@ -216,18 +216,42 @@ CREATE INDEX IF NOT EXISTS idx_jobs_depends_on
     ON jobs USING GIN (depends_on);
 
 -- Per-tenant concurrency limits + pause flag (NULL row / missing = unlimited, not paused).
+-- Optional token-bucket rate limits (NULL rate = unlimited):
+--   enqueue_rate_per_sec / lease_rate_per_sec refill tokens over time;
+--   burst is the max bucket size. Tokens state is updated under the same
+--   per-tenant advisory lock used by enqueue / lease.
 CREATE TABLE IF NOT EXISTS tenant_settings (
     tenant_id              TEXT PRIMARY KEY,
     max_concurrent_leases  INTEGER,
     max_pending_jobs       INTEGER,
     paused                 BOOLEAN NOT NULL DEFAULT FALSE,
     offboarding            BOOLEAN NOT NULL DEFAULT FALSE,
+    enqueue_rate_per_sec   DOUBLE PRECISION,
+    enqueue_burst          INTEGER,
+    enqueue_tokens         DOUBLE PRECISION,
+    enqueue_tokens_at      TIMESTAMPTZ,
+    lease_rate_per_sec     DOUBLE PRECISION,
+    lease_burst            INTEGER,
+    lease_tokens           DOUBLE PRECISION,
+    lease_tokens_at        TIMESTAMPTZ,
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT tenant_settings_max_concurrent_check CHECK (
         max_concurrent_leases IS NULL OR max_concurrent_leases >= 1
     ),
     CONSTRAINT tenant_settings_max_pending_check CHECK (
         max_pending_jobs IS NULL OR max_pending_jobs >= 1
+    ),
+    CONSTRAINT tenant_settings_enqueue_rate_check CHECK (
+        enqueue_rate_per_sec IS NULL OR enqueue_rate_per_sec > 0
+    ),
+    CONSTRAINT tenant_settings_enqueue_burst_check CHECK (
+        enqueue_burst IS NULL OR enqueue_burst >= 1
+    ),
+    CONSTRAINT tenant_settings_lease_rate_check CHECK (
+        lease_rate_per_sec IS NULL OR lease_rate_per_sec > 0
+    ),
+    CONSTRAINT tenant_settings_lease_burst_check CHECK (
+        lease_burst IS NULL OR lease_burst >= 1
     )
 );
 
@@ -245,6 +269,31 @@ ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS max_pending_jobs INTEGER;
 ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_max_pending_check;
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_max_pending_check CHECK (
     max_pending_jobs IS NULL OR max_pending_jobs >= 1
+);
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_rate_per_sec DOUBLE PRECISION;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_burst INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_tokens DOUBLE PRECISION;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_tokens_at TIMESTAMPTZ;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS lease_rate_per_sec DOUBLE PRECISION;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS lease_burst INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS lease_tokens DOUBLE PRECISION;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS lease_tokens_at TIMESTAMPTZ;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_enqueue_rate_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_enqueue_rate_check CHECK (
+    enqueue_rate_per_sec IS NULL OR enqueue_rate_per_sec > 0
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_enqueue_burst_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_enqueue_burst_check CHECK (
+    enqueue_burst IS NULL OR enqueue_burst >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_lease_rate_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_lease_rate_check CHECK (
+    lease_rate_per_sec IS NULL OR lease_rate_per_sec > 0
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_lease_burst_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_lease_burst_check CHECK (
+    lease_burst IS NULL OR lease_burst >= 1
 );
 
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.

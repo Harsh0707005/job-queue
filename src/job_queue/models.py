@@ -143,6 +143,10 @@ class TenantStats:
     paused: bool
     max_concurrent_leases: int | None
     max_pending_jobs: int | None
+    enqueue_rate_per_sec: float | None
+    enqueue_burst: int | None
+    lease_rate_per_sec: float | None
+    lease_burst: int | None
     pending: int
     leased: int
     completed: int

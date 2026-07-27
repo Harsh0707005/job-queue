@@ -954,6 +954,106 @@ def test_pending_limit_tenant_stats(queue: JobQueue):
     stats = queue.get_tenant_stats("t1")
     assert stats.max_pending_jobs == 5
     assert stats.max_concurrent_leases == 2
+    assert stats.enqueue_rate_per_sec is None
+    assert stats.lease_rate_per_sec is None
+
+
+def test_enqueue_rate_limit_rejects_burst_flood(queue: JobQueue):
+    from job_queue import RateLimitError
+
+    queue.set_enqueue_rate_limit("noisy", 2.0, burst=2)
+    rate, burst = queue.get_enqueue_rate_limit("noisy")
+    assert rate == 2.0 and burst == 2
+    queue.enqueue(tenant_id="noisy", payload={"i": 1})
+    queue.enqueue(tenant_id="noisy", payload={"i": 2})
+    with pytest.raises(RateLimitError, match="enqueue rate limit") as ei:
+        queue.enqueue(tenant_id="noisy", payload={"i": 3})
+    assert ei.value.kind == "enqueue"
+    assert ei.value.tenant_id == "noisy"
+    assert ei.value.retry_after_seconds is not None
+    assert ei.value.retry_after_seconds > 0
+    # Quiet tenant is unaffected.
+    queue.enqueue(tenant_id="quiet", payload={"ok": True})
+    # After refill window, enqueue works again.
+    time.sleep(0.6)
+    queue.enqueue(tenant_id="noisy", payload={"i": 4})
+
+
+def test_enqueue_rate_limit_clear(queue: JobQueue):
+    from job_queue import RateLimitError
+
+    queue.set_enqueue_rate_limit("t1", 1.0, burst=1)
+    queue.enqueue(tenant_id="t1", payload={"i": 1})
+    with pytest.raises(RateLimitError):
+        queue.enqueue(tenant_id="t1", payload={"i": 2})
+    queue.set_enqueue_rate_limit("t1", None)
+    assert queue.get_enqueue_rate_limit("t1") == (None, None)
+    queue.enqueue(tenant_id="t1", payload={"i": 2})
+
+
+def test_lease_rate_limit_scoped_partial_batch(queue: JobQueue):
+    queue.set_lease_rate_limit("t1", 1.0, burst=1)
+    for i in range(5):
+        queue.enqueue(tenant_id="t1", payload={"i": i})
+    first = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=5)
+    assert len(first) == 1
+    # Still pending others; no more tokens yet.
+    second = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=5)
+    assert second == []
+    time.sleep(1.1)
+    third = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=5)
+    assert len(third) == 1
+
+
+def test_lease_rate_limit_fair_rotates_to_other_tenants(queue: JobQueue):
+    """Noisy tenant at lease rate cap does not starve fair multi-tenant lease."""
+    queue.set_lease_rate_limit("noisy", 1.0, burst=1)
+    for i in range(20):
+        queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=10)
+    for i in range(5):
+        queue.enqueue(tenant_id="quiet", payload={"i": i}, priority=0)
+
+    # First fair claim may go to noisy (higher priority).
+    got = queue.lease_batch(worker_id="fair", limit=6)
+    tenants = {j.tenant_id for j in got}
+    # With lease rate 1, noisy can take at most 1; rest should be quiet.
+    noisy_n = sum(1 for j in got if j.tenant_id == "noisy")
+    quiet_n = sum(1 for j in got if j.tenant_id == "quiet")
+    assert noisy_n <= 1
+    assert quiet_n >= 1
+    assert "quiet" in tenants
+
+
+def test_lease_rate_limit_does_not_block_reclaim(queue: JobQueue):
+    queue.set_lease_rate_limit("t1", 1.0, burst=1)
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        visibility_timeout_seconds=1,
+        max_attempts=5,
+        retry_backoff_base_seconds=0,
+    )
+    j1 = queue.lease(tenant_id="t1", worker_id="w1", visibility_timeout_seconds=1)
+    assert j1 is not None and j1.id == job.id
+    # Burst spent; pending lease would be blocked, but reclaim after expiry is free.
+    queue.enqueue(tenant_id="t1", payload={"other": 1})
+    assert queue.lease(tenant_id="t1", worker_id="w2") is None
+    time.sleep(1.2)
+    reclaimed = queue.lease(
+        tenant_id="t1", worker_id="w2", visibility_timeout_seconds=30
+    )
+    assert reclaimed is not None
+    assert reclaimed.id == job.id
+
+
+def test_rate_limit_tenant_stats(queue: JobQueue):
+    queue.set_enqueue_rate_limit("t1", 5.0, burst=10)
+    queue.set_lease_rate_limit("t1", 3.0, burst=3)
+    stats = queue.get_tenant_stats("t1")
+    assert stats.enqueue_rate_per_sec == 5.0
+    assert stats.enqueue_burst == 10
+    assert stats.lease_rate_per_sec == 3.0
+    assert stats.lease_burst == 3
 
 
 def test_concurrent_enqueue_respects_pending_cap(queue: JobQueue):
