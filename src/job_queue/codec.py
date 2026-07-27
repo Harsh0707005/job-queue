@@ -204,6 +204,8 @@ def schedule_to_dict(sched: Schedule) -> dict[str, Any]:
         "queue_name": sched.queue_name,
         "payload": sched.payload,
         "interval_seconds": sched.interval_seconds,
+        "cron_expr": sched.cron_expr,
+        "timezone": sched.timezone,
         "priority": sched.priority,
         "max_attempts": sched.max_attempts,
         "visibility_timeout_seconds": sched.visibility_timeout_seconds,

@@ -145,6 +145,10 @@ class Coordinator:
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/concurrency"):
             return self._set_concurrency(path, body)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith(
+            "/pending-limit"
+        ):
+            return self._set_pending_limit(path, body)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith(
             "/rate-limits"
         ):
             return self._set_rate_limits(path, body)
@@ -883,6 +887,27 @@ class Coordinator:
             "max_concurrent_leases": limit,
         }
 
+    def _set_pending_limit(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / pending-limit
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if "max_pending_jobs" not in body and "limit" not in body:
+            return 400, {"error": "max_pending_jobs required (or null to clear)"}
+        raw = body.get("max_pending_jobs", body.get("limit"))
+        try:
+            limit = None if raw is None else int(raw)
+            self.queue.set_pending_limit(tenant_id, limit)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "tenant_id": tenant_id,
+            "max_pending_jobs": limit,
+        }
+
     def _set_rate_limits(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -1020,10 +1045,15 @@ class Coordinator:
 
     def _create_schedule(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
+            cron = body.get("cron") or body.get("cron_expr")
+            interval_raw = body.get("interval_seconds")
+            interval = None if interval_raw is None else int(interval_raw)
             sched = self.queue.create_schedule(
                 tenant_id=str(body["tenant_id"]),
-                interval_seconds=int(body["interval_seconds"]),
                 payload=dict(body.get("payload") or {}),
+                cron=str(cron) if cron is not None else None,
+                interval_seconds=interval,
+                timezone=str(body.get("timezone") or "UTC"),
                 queue_name=str(body.get("queue_name") or "default"),
                 name=body.get("name"),
                 priority=int(body.get("priority") or 0),
@@ -1117,7 +1147,8 @@ class Coordinator:
             ).fetchall()
             scheds = conn.execute(
                 """
-                SELECT id::text AS id, tenant_id, name, enabled, interval_seconds
+                SELECT id::text AS id, tenant_id, name, enabled,
+                       interval_seconds, cron_expr, timezone
                 FROM schedules
                 ORDER BY tenant_id
                 """

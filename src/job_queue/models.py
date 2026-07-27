@@ -109,14 +109,21 @@ class Job:
 
 @dataclass(frozen=True, slots=True)
 class Schedule:
-    """A recurring schedule that enqueues jobs every ``interval_seconds``."""
+    """A recurring schedule that materializes jobs on a cron or fixed interval.
+
+    Prefer ``cron_expr`` (standard 5-field or 6-field with seconds), e.g.
+    ``\"0 9 * * 1-5\"`` (weekdays 09:00) or ``\"0 0 1 * *\"`` (1st of month).
+    ``interval_seconds`` remains for simple fixed delays.
+    """
 
     id: UUID
     tenant_id: str
     name: str | None
     queue_name: str
     payload: dict[str, Any]
-    interval_seconds: int
+    interval_seconds: int | None
+    cron_expr: str | None
+    timezone: str
     priority: int
     max_attempts: int
     visibility_timeout_seconds: int

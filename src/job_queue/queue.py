@@ -82,10 +82,14 @@ Design notes
   ``tenant_id``; cross-tenant access is rejected.
 * **Ack**: marks the job completed under a still-valid lease only.
 * **Nack**: releases the lease (or dead-letters after max attempts).
-* **Recurring schedules**: ``create_schedule`` registers interval-based work;
-  ``process_due_schedules`` enqueues jobs when due; pause/resume/delete stop them.
-  A schedule never enqueues a new job while a previous one is still
-  ``pending`` or ``leased`` (no overlapping runs).
+* **Recurring schedules**: ``create_schedule`` accepts a **cron** expression
+  (``\"0 9 * * 1-5\"`` weekdays 09:00, ``\"0 0 1 * *\"`` 1st of month, optional
+  6-field with seconds) and/or legacy ``interval_seconds``. Optional IANA
+  ``timezone`` (default UTC). ``process_due_schedules`` materializes due
+  ticks; pause/resume/delete stop them. A schedule never enqueues while a
+  previous job is still ``pending`` / ``leased`` / ``awaiting_approval``.
+  **Schedule fires bypass tenant pending caps and enqueue rate limits** so
+  system timers still run under noisy-tenant throttles.
 * **Dependencies**: ``depends_on`` parent job id(s). A child is not claimable
   until every parent is ``completed``. If a parent ends as failed/dead/cancelled,
   dependents are cascade-cancelled **recursively** — both *pending* and
@@ -383,9 +387,9 @@ class ScheduleError(Exception):
 
 
 _SCHEDULE_COLUMNS = """
-    id, tenant_id, name, queue_name, payload, interval_seconds, priority,
-    max_attempts, visibility_timeout_seconds, enabled, next_run_at,
-    last_enqueued_at, created_at, updated_at
+    id, tenant_id, name, queue_name, payload, interval_seconds, cron_expr,
+    timezone, priority, max_attempts, visibility_timeout_seconds, enabled,
+    next_run_at, last_enqueued_at, created_at, updated_at
 """
 
 
@@ -393,13 +397,18 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
     payload = row["payload"]
     if isinstance(payload, str):
         payload = json.loads(payload)
+    interval = row.get("interval_seconds")
+    cron = row.get("cron_expr")
+    tz = row.get("timezone") or "UTC"
     return Schedule(
         id=row["id"],
         tenant_id=row["tenant_id"],
         name=row["name"],
         queue_name=row["queue_name"],
         payload=payload,
-        interval_seconds=row["interval_seconds"],
+        interval_seconds=int(interval) if interval is not None else None,
+        cron_expr=str(cron) if cron else None,
+        timezone=str(tz),
         priority=row["priority"],
         max_attempts=row["max_attempts"],
         visibility_timeout_seconds=row["visibility_timeout_seconds"],
@@ -4703,8 +4712,10 @@ class JobQueue:
         self,
         *,
         tenant_id: str,
-        interval_seconds: int,
         payload: dict[str, Any],
+        cron: str | None = None,
+        interval_seconds: int | None = None,
+        timezone: str = "UTC",
         queue_name: str = "default",
         name: str | None = None,
         priority: int = 0,
@@ -4714,24 +4725,40 @@ class JobQueue:
         enabled: bool = True,
         schedule_id: UUID | None = None,
     ) -> Schedule:
-        """Register a recurring schedule that enqueues jobs every N seconds.
+        """Register a recurring schedule (cron and/or fixed interval).
 
-        The schedule is stored in Postgres. Call ``process_due_schedules()``
-        (or run ``ScheduleRunner``) to materialize due ticks into jobs.
+        Prefer *cron* (standard crontab). Examples::
+
+            \"0 9 * * 1-5\"     # weekdays at 09:00 in *timezone*
+            \"0 0 1 * *\"       # midnight on the 1st of each month
+            \"*/5 * * * * *\"   # every 5 seconds (6-field)
+
+        *interval_seconds* is still supported for fixed delays. Provide at
+        least one of *cron* or *interval_seconds*.
+
+        Call ``process_due_schedules()`` (or ``ScheduleRunner``) to materialize
+        due ticks. Schedule fires **bypass** tenant pending caps and enqueue
+        rate limits.
 
         Parameters
         ----------
-        interval_seconds:
-            Fire period in seconds (>= 1).
         start_at:
-            First eligible fire time. Defaults to now (due on next tick).
+            Base time for the first ``next_run_at``. For cron, the first fire
+            is the next occurrence **after** this instant (default: now).
+            For interval-only, defaults to now (due on the next tick).
         name:
             Optional unique name per tenant for lookup / idempotent registration.
+        timezone:
+            IANA timezone for cron evaluation (default ``UTC``).
         """
+        from job_queue.cronutil import next_cron_fire, validate_cron, validate_timezone
+
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        if interval_seconds < 1:
-            raise ValueError("interval_seconds must be >= 1")
+        if cron is None and interval_seconds is None:
+            raise ValueError("provide cron and/or interval_seconds")
+        if interval_seconds is not None and interval_seconds < 1:
+            raise ValueError("interval_seconds must be >= 1 or None")
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if visibility_timeout_seconds < 1:
@@ -4739,8 +4766,17 @@ class JobQueue:
         if name is not None and name == "":
             raise ValueError("name must be non-empty when provided")
 
+        cron_expr = validate_cron(cron) if cron is not None else None
+        tz_name = validate_timezone(timezone)
         now = _utcnow()
-        first_run = _as_utc(start_at) if start_at is not None else now
+        base = _as_utc(start_at) if start_at is not None else now
+        if cron_expr is not None:
+            # First fire = next occurrence after base (not base itself unless
+            # it already matches a boundary and caller wants that — croniter
+            # get_next is strict-after).
+            first_run = next_cron_fire(cron_expr, base, timezone_name=tz_name)
+        else:
+            first_run = base
         sid = schedule_id or uuid4()
 
         with transaction(self._pool) as conn:
@@ -4754,12 +4790,14 @@ class JobQueue:
                     f"""
                     INSERT INTO schedules (
                         id, tenant_id, name, queue_name, payload,
-                        interval_seconds, priority, max_attempts,
+                        interval_seconds, cron_expr, timezone,
+                        priority, max_attempts,
                         visibility_timeout_seconds, enabled, next_run_at,
                         created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
+                        %s, %s,
                         %s, %s, %s,
                         %s, %s
                     )
@@ -4772,6 +4810,8 @@ class JobQueue:
                         queue_name,
                         Jsonb(payload),
                         interval_seconds,
+                        cron_expr,
+                        tz_name,
                         priority,
                         max_attempts,
                         visibility_timeout_seconds,
@@ -4901,9 +4941,12 @@ class JobQueue:
 
         Safe for concurrent callers: due rows are claimed with
         ``FOR UPDATE SKIP LOCKED``. Each claimed schedule enqueues at most one
-        job in the same transaction, then sets
-        ``next_run_at = now + interval_seconds`` (fixed delay from fire time,
-        no catch-up burst).
+        job in the same transaction, then advances ``next_run_at`` via cron
+        (next occurrence after *now*) or ``now + interval_seconds`` — no
+        catch-up burst of missed windows.
+
+        **Schedule fires bypass pending caps and enqueue rate limits** so
+        timed work still runs under tenant throttles.
 
         **Paused tenants are skipped entirely** — no jobs are enqueued for their
         schedules while paused, so ticks do not pile up. After ``resume_tenant``,
@@ -4989,7 +5032,17 @@ class JobQueue:
                 if active is not None:
                     continue
 
-                next_run = now + timedelta(seconds=int(sched_row["interval_seconds"]))
+                try:
+                    next_run = self._schedule_next_run(sched_row, now=now)
+                except ValueError:
+                    # Bad stored cron — leave row for ops; skip this tick.
+                    import logging as _logging
+
+                    _logging.getLogger(__name__).exception(
+                        "schedule %s invalid cron; skipping fire",
+                        sched_row["id"],
+                    )
+                    continue
                 job_id = uuid4()
                 payload = sched_row["payload"]
                 if isinstance(payload, str):
@@ -4997,16 +5050,8 @@ class JobQueue:
 
                 try:
                     with conn.transaction():
-                        try:
-                            self._assert_pending_capacity(
-                                conn, sched_row["tenant_id"]
-                            )
-                            self._consume_enqueue_rate(
-                                conn, sched_row["tenant_id"], now=now
-                            )
-                        except (ValueError, RateLimitError):
-                            # At pending cap or rate-limited: skip tick (no job).
-                            continue
+                        # Intentionally no pending-cap / enqueue-rate checks:
+                        # schedule materialization is system-timed work.
                         job_row = conn.execute(
                             f"""
                             INSERT INTO jobs (
@@ -5051,6 +5096,7 @@ class JobQueue:
                                 actor="schedule",
                                 detail={
                                     "schedule_id": str(sched_row["id"]),
+                                    "cron_expr": sched_row.get("cron_expr"),
                                 },
                                 now=now,
                             )
@@ -5107,6 +5153,20 @@ class JobQueue:
                     f"schedule {schedule_id} not found for tenant {tenant_id!r}"
                 )
             return _row_to_schedule(row)
+
+    @staticmethod
+    def _schedule_next_run(sched_row: dict[str, Any], *, now: datetime) -> datetime:
+        """Compute the next fire time after *now* for a schedule row."""
+        cron = sched_row.get("cron_expr")
+        if cron:
+            from job_queue.cronutil import next_cron_fire
+
+            tz = str(sched_row.get("timezone") or "UTC")
+            return next_cron_fire(str(cron), now, timezone_name=tz)
+        interval = sched_row.get("interval_seconds")
+        if interval is None:
+            raise ValueError("schedule has neither cron_expr nor interval_seconds")
+        return now + timedelta(seconds=int(interval))
 
     # ------------------------------------------------------------------
     # Internals

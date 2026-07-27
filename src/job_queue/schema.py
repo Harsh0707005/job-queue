@@ -305,14 +305,18 @@ CREATE TABLE IF NOT EXISTS tenant_fairness (
 CREATE INDEX IF NOT EXISTS idx_tenant_fairness_last_lease
     ON tenant_fairness (last_lease_at ASC);
 
--- Recurring schedules: tick to enqueue jobs every interval_seconds.
+-- Recurring schedules: cron expression and/or fixed interval_seconds.
+-- Prefer cron (5-field min hour dom mon dow, or 6-field with seconds).
+-- interval_seconds remains for simple fixed delays / backward compatibility.
 CREATE TABLE IF NOT EXISTS schedules (
     id                          UUID PRIMARY KEY,
     tenant_id                   TEXT NOT NULL,
     name                        TEXT,
     queue_name                  TEXT NOT NULL,
     payload                     JSONB NOT NULL,
-    interval_seconds            INTEGER NOT NULL,
+    interval_seconds            INTEGER,
+    cron_expr                   TEXT,
+    timezone                    TEXT NOT NULL DEFAULT 'UTC',
     priority                    INTEGER NOT NULL DEFAULT 0,
     max_attempts                INTEGER NOT NULL DEFAULT 3,
     visibility_timeout_seconds  INTEGER NOT NULL DEFAULT 30,
@@ -322,7 +326,13 @@ CREATE TABLE IF NOT EXISTS schedules (
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT schedules_interval_check CHECK (interval_seconds >= 1),
+    CONSTRAINT schedules_interval_check CHECK (
+        interval_seconds IS NULL OR interval_seconds >= 1
+    ),
+    CONSTRAINT schedules_spec_check CHECK (
+        (cron_expr IS NOT NULL AND btrim(cron_expr) <> '')
+        OR (interval_seconds IS NOT NULL AND interval_seconds >= 1)
+    ),
     CONSTRAINT schedules_max_attempts_check CHECK (max_attempts >= 1),
     CONSTRAINT schedules_visibility_check CHECK (visibility_timeout_seconds >= 1)
 );
@@ -338,6 +348,23 @@ CREATE INDEX IF NOT EXISTS idx_schedules_tenant
 CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_tenant_name
     ON schedules (tenant_id, name)
     WHERE name IS NOT NULL;
+
+-- Migrate interval-only schedules → allow cron + nullable interval.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS cron_expr TEXT;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS timezone TEXT;
+UPDATE schedules SET timezone = 'UTC' WHERE timezone IS NULL;
+ALTER TABLE schedules ALTER COLUMN timezone SET DEFAULT 'UTC';
+ALTER TABLE schedules ALTER COLUMN timezone SET NOT NULL;
+ALTER TABLE schedules ALTER COLUMN interval_seconds DROP NOT NULL;
+ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_interval_check;
+ALTER TABLE schedules ADD CONSTRAINT schedules_interval_check CHECK (
+    interval_seconds IS NULL OR interval_seconds >= 1
+);
+ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_spec_check;
+ALTER TABLE schedules ADD CONSTRAINT schedules_spec_check CHECK (
+    (cron_expr IS NOT NULL AND btrim(cron_expr) <> '')
+    OR (interval_seconds IS NOT NULL AND interval_seconds >= 1)
+);
 
 -- HTTP webhooks: endpoints + durable delivery outbox.
 CREATE TABLE IF NOT EXISTS webhook_endpoints (

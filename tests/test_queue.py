@@ -1576,6 +1576,8 @@ def test_create_list_get_schedule(queue: JobQueue):
     assert isinstance(sched, Schedule)
     assert sched.enabled is True
     assert sched.interval_seconds == 30
+    assert sched.cron_expr is None
+    assert sched.timezone == "UTC"
     assert sched.queue_name == "ops"
     assert sched.payload == {"task": "heartbeat-check"}
     assert sched.name == "ops-heartbeat"
@@ -1588,6 +1590,119 @@ def test_create_list_get_schedule(queue: JobQueue):
     listed = queue.list_schedules(tenant_id="t1")
     assert len(listed) == 1
     assert listed[0].id == sched.id
+
+
+def test_create_cron_schedule_weekdays_and_dom(queue: JobQueue):
+    from datetime import datetime, timezone
+
+    # Tuesday 2026-07-28 08:00 UTC → next weekday 09:00 is same day.
+    base = datetime(2026, 7, 28, 8, 0, 0, tzinfo=timezone.utc)
+    weekdays = queue.create_schedule(
+        tenant_id="t1",
+        cron="0 9 * * 1-5",
+        payload={"kind": "standup"},
+        name="weekday-standup",
+        timezone="UTC",
+        start_at=base,
+    )
+    assert weekdays.cron_expr == "0 9 * * 1-5"
+    assert weekdays.interval_seconds is None
+    assert weekdays.next_run_at == datetime(2026, 7, 28, 9, 0, 0, tzinfo=timezone.utc)
+
+    # After the 1st → next is 1st of following month.
+    after_first = datetime(2026, 7, 2, 0, 0, 0, tzinfo=timezone.utc)
+    monthly = queue.create_schedule(
+        tenant_id="t1",
+        cron="0 0 1 * *",
+        payload={"kind": "billing"},
+        name="month-start",
+        start_at=after_first,
+    )
+    assert monthly.next_run_at == datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_cron_schedule_fires_and_advances(queue: JobQueue):
+    # Every second (6-field) so tests stay short.
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        cron="*/1 * * * * *",
+        payload={"tick": True},
+        name="every-sec",
+    )
+    # First next_run is ~1s in the future; wait for due.
+    deadline = time.time() + 3.0
+    fires: list = []
+    while time.time() < deadline and not fires:
+        fires = queue.process_due_schedules(tenant_id="t1")
+        if not fires:
+            time.sleep(0.15)
+    assert len(fires) == 1
+    assert fires[0].job.payload == {"tick": True}
+    assert fires[0].schedule.id == sched.id
+    assert fires[0].schedule.next_run_at > fires[0].schedule.last_enqueued_at  # type: ignore[operator]
+    # Complete so next tick can fire (no-overlap).
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    _ack(queue, leased, "w1")
+    time.sleep(1.2)
+    second = queue.process_due_schedules(tenant_id="t1")
+    assert len(second) == 1
+
+
+def test_schedule_fire_bypasses_pending_cap_and_enqueue_rate(queue: JobQueue):
+    """System timers still materialize under tenant throttles."""
+    from job_queue import RateLimitError
+
+    # --- pending cap bypass ---
+    queue.set_pending_limit("t1", 1)
+    queue.enqueue(tenant_id="t1", payload={"manual": 1})
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue(tenant_id="t1", payload={"manual": 2})
+
+    queue.create_schedule(
+        tenant_id="t1",
+        cron="*/1 * * * * *",
+        payload={"from": "schedule-cap"},
+        name="under-cap",
+    )
+    deadline = time.time() + 3.0
+    fires: list = []
+    while time.time() < deadline and not fires:
+        fires = queue.process_due_schedules(tenant_id="t1")
+        if not fires:
+            time.sleep(0.15)
+    assert len(fires) == 1
+    assert fires[0].job.payload == {"from": "schedule-cap"}
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 2
+
+    # Drain so rate-limit section has a clean pending set.
+    for _ in range(5):
+        j = queue.lease(tenant_id="t1", worker_id="w1")
+        if j is None:
+            break
+        _ack(queue, j, "w1")
+    queue.set_pending_limit("t1", None)
+
+    # --- enqueue rate bypass ---
+    queue.set_enqueue_rate_limit("t1", 1.0, burst=1)
+    queue.enqueue(tenant_id="t1", payload={"manual": 3})
+    with pytest.raises(RateLimitError):
+        queue.enqueue(tenant_id="t1", payload={"manual": 4})
+
+    queue.create_schedule(
+        tenant_id="t1",
+        cron="*/1 * * * * *",
+        payload={"from": "schedule-rate"},
+        name="under-rate",
+    )
+    deadline = time.time() + 3.0
+    rate_fires: list = []
+    while time.time() < deadline and not rate_fires:
+        batch = queue.process_due_schedules(tenant_id="t1")
+        rate_fires = [f for f in batch if f.job.payload.get("from") == "schedule-rate"]
+        if not rate_fires:
+            time.sleep(0.15)
+    assert len(rate_fires) >= 1
 
 
 def test_process_due_schedules_enqueues_job_with_metadata(queue: JobQueue):
