@@ -27,9 +27,9 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any  # noqa: I001 — keep Any with callables
 
-from job_queue.models import Job
+from job_queue.models import Job, JobSideEffect
 from job_queue.queue import ApprovalRequested, JobQueue, LeaseError
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,59 @@ class LeaseContext:
         self.job = updated
         self.lease_lost.set()
         raise ApprovalRequested(updated)
+
+    def side_effect_done(self, effect_key: str) -> bool:
+        """True if this effect already completed (skip re-run after reclaim)."""
+        return self.queue.side_effect_done(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            effect_key=effect_key,
+        )
+
+    def get_side_effect(self, effect_key: str) -> JobSideEffect | None:
+        return self.queue.get_side_effect(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            effect_key=effect_key,
+        )
+
+    def complete_side_effect(
+        self,
+        effect_key: str,
+        *,
+        result: Any = None,
+    ) -> JobSideEffect:
+        """Record that *effect_key* finished successfully under this lease."""
+        if self.lease_lost.is_set():
+            raise LeaseError(f"job {self.job.id} lease lost (cancel signalled)")
+        assert self.job.lease_token is not None
+        return self.queue.complete_side_effect(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            worker_id=self.worker_id,
+            lease_token=self.job.lease_token,
+            effect_key=effect_key,
+            result=result,
+        )
+
+    def run_side_effect_once(
+        self,
+        effect_key: str,
+        fn: Callable[[], Any],
+    ) -> Any:
+        """Run *fn* only if *effect_key* is not already completed.
+
+        Prefer external calls that accept an idempotency key of
+        ``f\"{job.id}:{effect_key}\"`` so a crash after the call but before
+        ``complete_side_effect`` still cannot double-apply.
+        """
+        existing = self.get_side_effect(effect_key)
+        if existing is not None and existing.status == "completed":
+            return existing.result
+        self.ensure_held()
+        out = fn()
+        self.complete_side_effect(effect_key, result=out)
+        return out
 
 
 class Worker:

@@ -397,4 +397,31 @@ CREATE INDEX IF NOT EXISTS idx_job_audit_job_seq
 -- Deny application-level mutation of history (still allow SELECT/INSERT).
 -- Superuser maintenance can DROP; normal role should not UPDATE/DELETE.
 REVOKE UPDATE, DELETE ON job_audit_events FROM PUBLIC;
+
+-- Durable once-only side effects for a job (survive lease reclaim).
+-- Workers record an effect after a successful external call so a reclaiming
+-- worker skips it. Prefer also sending Idempotency-Key = job_id:effect_key
+-- to the external system to cover crash-between-call-and-record.
+CREATE TABLE IF NOT EXISTS job_side_effects (
+    job_id          UUID NOT NULL,
+    effect_key      TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    result          JSONB,
+    completed_by    TEXT,
+    lease_token     UUID,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ,
+    PRIMARY KEY (job_id, effect_key),
+    CONSTRAINT job_side_effects_status_check CHECK (
+        status IN ('completed')
+    ),
+    CONSTRAINT job_side_effects_key_check CHECK (effect_key <> '')
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_side_effects_tenant_job
+    ON job_side_effects (tenant_id, job_id);
+
+CREATE INDEX IF NOT EXISTS idx_job_side_effects_job
+    ON job_side_effects (job_id);
 """

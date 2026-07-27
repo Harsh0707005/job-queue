@@ -19,6 +19,7 @@ job-queue-worker-agent = "job_queue.remote:worker_main"
 job-queue-scheduler-node = "job_queue.remote:scheduler_main"
 job-queue-webhook-node = "job_queue.remote:webhook_main"
 job-queue-webhook-sink = "job_queue.webhook_sink:main"
+job-queue-effect-sink = "job_queue.effect_sink:main"
 
 [project.optional-dependencies]
 dev = [

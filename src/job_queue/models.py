@@ -215,6 +215,21 @@ class JobAuditEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class JobSideEffect:
+    """Durable once-only side-effect marker for a job."""
+
+    job_id: UUID
+    effect_key: str
+    tenant_id: str
+    status: str
+    result: dict[str, Any] | list[Any] | str | int | float | bool | None
+    completed_by: str | None
+    lease_token: UUID | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class AuditConsistencyReport:
     """Result of replaying audit history against a job's final state."""
 

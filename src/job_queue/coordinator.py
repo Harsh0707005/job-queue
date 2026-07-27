@@ -23,6 +23,7 @@ from job_queue.codec import (
     schedule_to_dict,
     audit_consistency_report_to_dict,
     job_audit_event_to_dict,
+    job_side_effect_to_dict,
     preempt_result_to_dict,
     tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
@@ -75,6 +76,12 @@ class Coordinator:
             return self._job_action(path, body, "nack")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/checkpoint"):
             return self._job_action(path, body, "checkpoint")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/side-effects"):
+            return self._complete_side_effect(path, body)
+        if method == "GET" and path.startswith("/v1/jobs/") and "/side-effects/" in path:
+            return self._get_side_effect(path, query)
+        if method == "GET" and path.startswith("/v1/jobs/") and path.endswith("/side-effects"):
+            return self._list_side_effects(path, query)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/request-approval"):
             return self._job_action(path, body, "request_approval")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/approve"):
@@ -605,6 +612,98 @@ class Coordinator:
         return 200, {
             "job_ids": [str(i) for i in ids],
             "count": len(ids),
+        }
+
+    def _complete_side_effect(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / jobs / {id} / side-effects
+        if len(parts) != 4:
+            return 400, {"error": "invalid side-effect path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        worker_id = body.get("worker_id")
+        lease_token = body.get("lease_token")
+        effect_key = body.get("effect_key") or body.get("key")
+        if not tenant_id or not worker_id or not lease_token or not effect_key:
+            return 400, {
+                "error": "tenant_id, worker_id, lease_token, effect_key required"
+            }
+        try:
+            token = UUID(str(lease_token))
+            eff = self.queue.complete_side_effect(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                worker_id=str(worker_id),
+                lease_token=token,
+                effect_key=str(effect_key),
+                result=body.get("result"),
+            )
+        except LeaseError as exc:
+            return 409, {"error": str(exc), "code": "lease_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"effect": job_side_effect_to_dict(eff)}
+
+    def _get_side_effect(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / jobs / {id} / side-effects / {key}
+        if len(parts) != 5:
+            return 400, {"error": "invalid side-effect path"}
+        job_id_s = parts[2]
+        effect_key = parts[4]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        try:
+            from urllib.parse import unquote
+
+            key = unquote(effect_key)
+            done = self.queue.side_effect_done(
+                UUID(job_id_s),
+                tenant_id=str(tenants[0]),
+                effect_key=key,
+            )
+            eff = self.queue.get_side_effect(
+                UUID(job_id_s),
+                tenant_id=str(tenants[0]),
+                effect_key=key,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "done": done,
+            "effect": job_side_effect_to_dict(eff) if eff else None,
+        }
+
+    def _list_side_effects(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid side-effect path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        try:
+            effects = self.queue.list_side_effects(
+                UUID(job_id_s), tenant_id=str(tenants[0])
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "effects": [job_side_effect_to_dict(e) for e in effects],
+            "count": len(effects),
         }
 
     # ------------------------------------------------------------------

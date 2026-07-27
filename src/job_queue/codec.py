@@ -11,6 +11,7 @@ from job_queue.models import (
     ClaimedWebhook,
     Job,
     JobAuditEvent,
+    JobSideEffect,
     JobStatus,
     PreemptResult,
     Schedule,
@@ -175,6 +176,20 @@ def audit_consistency_report_to_dict(
         "event_count": report.event_count,
         "gaps": list(report.gaps),
         "error": report.error,
+    }
+
+
+def job_side_effect_to_dict(eff: JobSideEffect) -> dict[str, Any]:
+    return {
+        "job_id": str(eff.job_id),
+        "effect_key": eff.effect_key,
+        "tenant_id": eff.tenant_id,
+        "status": eff.status,
+        "result": eff.result,
+        "completed_by": eff.completed_by,
+        "lease_token": _uuid(eff.lease_token),
+        "created_at": _dt(eff.created_at),
+        "completed_at": _dt(eff.completed_at),
     }
 
 

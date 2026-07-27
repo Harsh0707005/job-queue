@@ -51,6 +51,11 @@ Design notes
   authorize on **current** job ownership and return the full per-job ``seq``
   stream. If a job row is lost, ``rebuild_job_from_audit`` reconstructs it
   from the last consistent snapshot (or raises :class:`RebuildError`).
+* **Once-only side effects**: long jobs may call external effects (charge,
+  email). ``complete_side_effect`` persists a marker under the live lease so
+  a reclaiming worker sees ``side_effect_done`` and skips re-running. Pair
+  with an external Idempotency-Key of ``{job_id}:{effect_key}`` to cover
+  crash between the external call and the durable mark.
 * **Tenant merge**: ``merge_tenant(source, target)`` moves all of *source*'s
   jobs (pending + running + history), schedules, and webhooks to *target*
   without stopping workers. Lease fencing tokens stay valid. Heartbeat /
@@ -125,6 +130,7 @@ from job_queue.models import (
     AuditConsistencyReport,
     Job,
     JobAuditEvent,
+    JobSideEffect,
     JobStatus,
     PreemptResult,
     Schedule,
@@ -942,6 +948,16 @@ class JobQueue:
                 """,
                 (target, now, source),
             ).fetchall()
+
+            # Side-effect markers follow job ownership (job_id unchanged).
+            conn.execute(
+                """
+                UPDATE job_side_effects
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (target, source),
+            )
 
             # Drop source control-plane state (settings + fairness).
             conn.execute(
@@ -2475,6 +2491,242 @@ class JobQueue:
                 now=now,
             )
             return job
+
+    def side_effect_done(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        effect_key: str,
+    ) -> bool:
+        """True if *effect_key* was already completed for this job (any worker)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        key = self._normalize_effect_key(effect_key)
+        with self._pool.connection() as conn:
+            # Allow read if job currently owned by tenant OR effect row tenant matches
+            # (covers merge: effects stay by job_id).
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM job_side_effects se
+                WHERE se.job_id = %s
+                  AND se.effect_key = %s
+                  AND se.status = 'completed'
+                  AND (
+                        se.tenant_id = %s
+                        OR EXISTS (
+                            SELECT 1 FROM jobs j
+                            WHERE j.id = se.job_id AND j.tenant_id = %s
+                        )
+                  )
+                """,
+                (job_id, key, tenant_id, tenant_id),
+            ).fetchone()
+            return row is not None
+
+    def get_side_effect(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        effect_key: str,
+    ) -> JobSideEffect | None:
+        """Return a completed side-effect marker, or None."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        key = self._normalize_effect_key(effect_key)
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    job_id, effect_key, tenant_id, status, result,
+                    completed_by, lease_token, created_at, completed_at
+                FROM job_side_effects se
+                WHERE se.job_id = %s
+                  AND se.effect_key = %s
+                  AND (
+                        se.tenant_id = %s
+                        OR EXISTS (
+                            SELECT 1 FROM jobs j
+                            WHERE j.id = se.job_id AND j.tenant_id = %s
+                        )
+                  )
+                """,
+                (job_id, key, tenant_id, tenant_id),
+            ).fetchone()
+            return self._row_to_side_effect(row) if row else None
+
+    def list_side_effects(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+    ) -> list[JobSideEffect]:
+        """List completed side effects for a job (tenant-authorized via ownership)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            job = conn.execute(
+                "SELECT 1 FROM jobs WHERE id = %s AND tenant_id = %s",
+                (job_id, tenant_id),
+            ).fetchone()
+            if job is None:
+                # Still allow if effects exist under this tenant (job missing/rebuild).
+                rows = conn.execute(
+                    """
+                    SELECT
+                        job_id, effect_key, tenant_id, status, result,
+                        completed_by, lease_token, created_at, completed_at
+                    FROM job_side_effects
+                    WHERE job_id = %s AND tenant_id = %s
+                    ORDER BY effect_key ASC
+                    """,
+                    (job_id, tenant_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        job_id, effect_key, tenant_id, status, result,
+                        completed_by, lease_token, created_at, completed_at
+                    FROM job_side_effects
+                    WHERE job_id = %s
+                    ORDER BY effect_key ASC
+                    """,
+                    (job_id,),
+                ).fetchall()
+            return [self._row_to_side_effect(r) for r in rows]
+
+    def complete_side_effect(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        effect_key: str,
+        result: Any = None,
+    ) -> JobSideEffect:
+        """Mark a side effect completed under a live lease (idempotent).
+
+        Survives reclaim so another worker will not re-run the effect when
+        ``side_effect_done`` is true. Safe to call again with the same key:
+        returns the existing completed row without changing it.
+
+        Call **after** a successful external side effect (or after an
+        idempotent external call with key ``{job_id}:{effect_key}``).
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if not worker_id:
+            raise ValueError("worker_id is required")
+        key = self._normalize_effect_key(effect_key)
+        now = _utcnow()
+        result_json = Jsonb(result) if result is not None else None
+
+        with transaction(self._pool) as conn:
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
+            self._assert_active_lease(row, worker_id, lease_token, now)
+            owner = row["tenant_id"]
+
+            existing = conn.execute(
+                """
+                SELECT
+                    job_id, effect_key, tenant_id, status, result,
+                    completed_by, lease_token, created_at, completed_at
+                FROM job_side_effects
+                WHERE job_id = %s AND effect_key = %s
+                FOR UPDATE
+                """,
+                (job_id, key),
+            ).fetchone()
+            if existing is not None and existing["status"] == "completed":
+                return self._row_to_side_effect(existing)
+
+            inserted = conn.execute(
+                """
+                INSERT INTO job_side_effects (
+                    job_id, effect_key, tenant_id, status, result,
+                    completed_by, lease_token, created_at, completed_at
+                ) VALUES (
+                    %s, %s, %s, 'completed', %s,
+                    %s, %s, %s, %s
+                )
+                ON CONFLICT (job_id, effect_key) DO NOTHING
+                RETURNING
+                    job_id, effect_key, tenant_id, status, result,
+                    completed_by, lease_token, created_at, completed_at
+                """,
+                (
+                    job_id,
+                    key,
+                    owner,
+                    result_json,
+                    worker_id,
+                    lease_token,
+                    now,
+                    now,
+                ),
+            ).fetchone()
+            if inserted is None:
+                # Concurrent complete won; return existing.
+                existing = conn.execute(
+                    """
+                    SELECT
+                        job_id, effect_key, tenant_id, status, result,
+                        completed_by, lease_token, created_at, completed_at
+                    FROM job_side_effects
+                    WHERE job_id = %s AND effect_key = %s
+                    """,
+                    (job_id, key),
+                ).fetchone()
+                assert existing is not None
+                return self._row_to_side_effect(existing)
+
+            self._append_job_audit(
+                conn,
+                job_row=row,
+                event_type="side_effect_completed",
+                from_status=row["status"],
+                actor=worker_id,
+                detail={
+                    "effect_key": key,
+                    "has_result": result is not None,
+                },
+                now=now,
+            )
+            return self._row_to_side_effect(inserted)
+
+    @staticmethod
+    def _normalize_effect_key(effect_key: str) -> str:
+        if not effect_key or not str(effect_key).strip():
+            raise ValueError("effect_key is required")
+        key = str(effect_key).strip()
+        if len(key) > 256:
+            raise ValueError("effect_key must be <= 256 characters")
+        return key
+
+    @staticmethod
+    def _row_to_side_effect(row: dict[str, Any]) -> JobSideEffect:
+        result = row.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                pass
+        return JobSideEffect(
+            job_id=row["job_id"],
+            effect_key=row["effect_key"],
+            tenant_id=row["tenant_id"],
+            status=row["status"],
+            result=result,
+            completed_by=row.get("completed_by"),
+            lease_token=row.get("lease_token"),
+            created_at=row["created_at"],
+            completed_at=row.get("completed_at"),
+        )
 
     def request_approval(
         self,

@@ -5269,3 +5269,155 @@ def test_rebuild_rejects_seq_gap(queue: JobQueue):
         conn.commit()
     with pytest.raises(RebuildError, match="seq gap"):
         queue.rebuild_job_from_audit(jid)
+
+
+# ---------------------------------------------------------------------------
+# Once-only side effects across reclaim
+# ---------------------------------------------------------------------------
+
+
+def test_side_effect_survives_reclaim_and_skips_second_run(queue: JobQueue):
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={"kind": "side_effects", "effects": ["charge", "email"]},
+        visibility_timeout_seconds=1,
+        max_attempts=5,
+        retry_backoff_base_seconds=0,
+    )
+    j1 = queue.lease(
+        tenant_id="t1",
+        worker_id="w1",
+        visibility_timeout_seconds=1,
+    )
+    assert j1 is not None and j1.lease_token is not None
+    assert queue.side_effect_done(j1.id, tenant_id="t1", effect_key="charge") is False
+    eff = queue.complete_side_effect(
+        j1.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=j1.lease_token,
+        effect_key="charge",
+        result={"amount": 10},
+    )
+    assert eff.status == "completed"
+    assert eff.result == {"amount": 10}
+    # Idempotent complete
+    eff2 = queue.complete_side_effect(
+        j1.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=j1.lease_token,
+        effect_key="charge",
+        result={"amount": 99},
+    )
+    assert eff2.result == {"amount": 10}
+
+    # Expire lease; second worker reclaims.
+    time.sleep(1.2)
+    j2 = queue.lease(
+        tenant_id="t1",
+        worker_id="w2",
+        visibility_timeout_seconds=30,
+    )
+    assert j2 is not None and j2.id == job.id
+    assert j2.leased_by == "w2"
+    assert queue.side_effect_done(j2.id, tenant_id="t1", effect_key="charge") is True
+    assert queue.side_effect_done(j2.id, tenant_id="t1", effect_key="email") is False
+    queue.complete_side_effect(
+        j2.id,
+        tenant_id="t1",
+        worker_id="w2",
+        lease_token=j2.lease_token,
+        effect_key="email",
+        result={"to": "a@b.c"},
+    )
+    keys = {e.effect_key for e in queue.list_side_effects(j2.id, tenant_id="t1")}
+    assert keys == {"charge", "email"}
+    # Old worker cannot complete after reclaim.
+    with pytest.raises(LeaseError):
+        queue.complete_side_effect(
+            j1.id,
+            tenant_id="t1",
+            worker_id="w1",
+            lease_token=j1.lease_token,
+            effect_key="refund",
+        )
+
+
+def test_lease_context_run_side_effect_once(queue: JobQueue):
+    from job_queue.worker import LeaseContext
+
+    job = queue.enqueue(tenant_id="t1", payload={})
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    ctx = LeaseContext(
+        job=leased,
+        queue=queue,
+        worker_id="w1",
+        lease_lost=threading.Event(),
+    )
+    calls = {"n": 0}
+
+    def charge() -> dict:
+        calls["n"] += 1
+        return {"ok": True, "n": calls["n"]}
+
+    r1 = ctx.run_side_effect_once("charge_card", charge)
+    r2 = ctx.run_side_effect_once("charge_card", charge)
+    assert r1 == {"ok": True, "n": 1}
+    assert r2 == {"ok": True, "n": 1}
+    assert calls["n"] == 1
+
+
+def test_side_effect_cross_tenant_rejected(queue: JobQueue):
+    job = queue.enqueue(tenant_id="t1", payload={})
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None and leased.lease_token is not None
+    queue.complete_side_effect(
+        leased.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        effect_key="charge",
+        result={"ok": True},
+    )
+    assert queue.side_effect_done(job.id, tenant_id="t1", effect_key="charge") is True
+    assert queue.side_effect_done(job.id, tenant_id="other", effect_key="charge") is False
+    assert queue.get_side_effect(job.id, tenant_id="other", effect_key="charge") is None
+    assert queue.list_side_effects(job.id, tenant_id="other") == []
+    with pytest.raises(LeaseError, match="not found for tenant"):
+        queue.complete_side_effect(
+            job.id,
+            tenant_id="other",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+            effect_key="email",
+        )
+
+
+def test_side_effect_merge_tenant_preserves_markers(queue: JobQueue):
+    job = queue.enqueue(tenant_id="src", payload={})
+    leased = queue.lease(tenant_id="src", worker_id="w1")
+    assert leased is not None and leased.lease_token is not None
+    queue.complete_side_effect(
+        leased.id,
+        tenant_id="src",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        effect_key="charge",
+        result={"cents": 100},
+    )
+    queue.ack(
+        leased.id,
+        tenant_id="src",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+    )
+    queue.merge_tenant("src", "dst")
+    assert queue.side_effect_done(job.id, tenant_id="dst", effect_key="charge") is True
+    eff = queue.get_side_effect(job.id, tenant_id="dst", effect_key="charge")
+    assert eff is not None
+    assert eff.tenant_id == "dst"
+    assert eff.result == {"cents": 100}
+    keys = {e.effect_key for e in queue.list_side_effects(job.id, tenant_id="dst")}
+    assert keys == {"charge"}

@@ -1,0 +1,185 @@
+# Once-only side effects under worker chaos / reclaim.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.side-effects.yml \
+#     up --build --abort-on-container-exit --exit-code-from side-effect-soak side-effect-soak
+
+services:
+  soak:
+    profiles: ["off"]
+
+  effect-sink:
+    build: .
+    command: ["job-queue-effect-sink"]
+    environment:
+      PORT: "8091"
+      LOG_LEVEL: INFO
+    ports:
+      - "8091:8091"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  worker-1: &w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKER_ID: worker-1
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.12"
+      VISIBILITY_TIMEOUT: "3"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+  worker-2:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKER_ID: worker-2
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "4"
+      LOG_LEVEL: INFO
+  worker-3:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKER_ID: worker-3
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "4"
+      LOG_LEVEL: INFO
+  worker-4:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKER_ID: worker-4
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "4"
+      LOG_LEVEL: INFO
+
+  worker-5:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKER_ID: worker-5
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "4"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+
+  worker-6:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKER_ID: worker-6
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.15"
+      VISIBILITY_TIMEOUT: "4"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+
+  chaos:
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-job-queue}
+      CHAOS_INTERVAL_SECONDS: "6"
+      CHAOS_ROUNDS: "16"
+    command:
+      - |
+        set -eu
+        echo "chaos: settle (short so kills hit mid-effect)"
+        sleep 4
+        i=0
+        while [ "$$i" -lt "$$CHAOS_ROUNDS" ]; do
+          i=$$((i+1))
+          w=$$(( (i % 6) + 1 ))
+          echo "chaos round $$i: kill worker-$$w"
+          docker kill $$(docker ps -q -f name=worker-$$w) 2>/dev/null || true
+          # leave dead long enough for lease to expire (vis=4s)
+          sleep 5
+          docker start $$(docker ps -aq -f name=worker-$$w | head -1) 2>/dev/null || true
+          if [ $$((i % 3)) -eq 0 ]; then
+            echo "chaos round $$i: bounce coordinator-1"
+            docker kill $$(docker ps -q -f name=coordinator-1) 2>/dev/null || true
+            sleep 3
+            docker start $$(docker ps -aq -f name=coordinator-1 | head -1) 2>/dev/null || true
+          fi
+          # occasionally double-kill for multi-worker reclaim races
+          if [ $$((i % 2)) -eq 0 ]; then
+            w2=$$(( ((i + 2) % 6) + 1 ))
+            echo "chaos round $$i: also kill worker-$$w2"
+            docker kill $$(docker ps -q -f name=worker-$$w2) 2>/dev/null || true
+            sleep 4
+            docker start $$(docker ps -aq -f name=worker-$$w2 | head -1) 2>/dev/null || true
+          fi
+          sleep "$$CHAOS_INTERVAL_SECONDS"
+        done
+        echo "chaos finished"
+        sleep 3600
+
+  side-effect-soak:
+    build: .
+    command: ["python", "scripts/side_effect_chaos_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      TENANTS: "10"
+      JOBS_PER_TENANT: "18"
+      EFFECTS_PER_JOB: "4"
+      EFFECT_MS: "450"
+      MAX_WALL_SECONDS: "360"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      chaos:
+        condition: service_started
