@@ -216,13 +216,21 @@ class JobAuditEvent:
 
 @dataclass(frozen=True, slots=True)
 class JobSideEffect:
-    """Durable once-only side-effect marker for a job."""
+    """Durable once-only side-effect marker for a job.
+
+    Two-phase: ``started`` (intent + stable idempotency key, before external
+    call) then ``completed`` (after success). Reclaim of ``started`` must
+    re-invoke the external system with the same ``idempotency_key``.
+    """
 
     job_id: UUID
     effect_key: str
     tenant_id: str
     status: str
+    idempotency_key: str
     result: dict[str, Any] | list[Any] | str | int | float | bool | None
+    started_by: str | None
+    started_at: datetime | None
     completed_by: str | None
     lease_token: UUID | None
     created_at: datetime

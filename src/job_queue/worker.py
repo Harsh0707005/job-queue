@@ -120,6 +120,25 @@ class LeaseContext:
             effect_key=effect_key,
         )
 
+    def begin_side_effect(
+        self,
+        effect_key: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> JobSideEffect:
+        """Record intent before the external call; returns stable idempotency key."""
+        if self.lease_lost.is_set():
+            raise LeaseError(f"job {self.job.id} lease lost (cancel signalled)")
+        assert self.job.lease_token is not None
+        return self.queue.begin_side_effect(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            worker_id=self.worker_id,
+            lease_token=self.job.lease_token,
+            effect_key=effect_key,
+            idempotency_key=idempotency_key,
+        )
+
     def complete_side_effect(
         self,
         effect_key: str,
@@ -142,21 +161,33 @@ class LeaseContext:
     def run_side_effect_once(
         self,
         effect_key: str,
-        fn: Callable[[], Any],
+        fn: Callable[..., Any],
     ) -> Any:
-        """Run *fn* only if *effect_key* is not already completed.
+        """Two-phase once-only: begin → run → complete.
 
-        Prefer external calls that accept an idempotency key of
-        ``f\"{job.id}:{effect_key}\"`` so a crash after the call but before
-        ``complete_side_effect`` still cannot double-apply.
+        1. ``begin_side_effect`` writes ``started`` + stable ``idempotency_key``
+        2. If already ``completed``, return stored result (no re-run)
+        3. Call *fn*; if *fn* accepts one argument, pass the idempotency key
+           so the external system can dedupe on reclaim after a crash between
+           the call and ``complete_side_effect``
+        4. ``complete_side_effect`` marks success
         """
-        existing = self.get_side_effect(effect_key)
-        if existing is not None and existing.status == "completed":
-            return existing.result
+        import inspect
+
         self.ensure_held()
-        out = fn()
-        self.complete_side_effect(effect_key, result=out)
-        return out
+        begun = self.begin_side_effect(effect_key)
+        if begun.status == "completed":
+            return begun.result
+        self.ensure_held()
+        idem = begun.idempotency_key
+        try:
+            sig = inspect.signature(fn)
+            accepts_key = len(sig.parameters) >= 1
+        except (TypeError, ValueError):
+            accepts_key = False
+        out = fn(idem) if accepts_key else fn()
+        completed = self.complete_side_effect(effect_key, result=out)
+        return completed.result if completed.result is not None else out
 
 
 class Worker:

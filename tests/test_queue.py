@@ -5291,6 +5291,15 @@ def test_side_effect_survives_reclaim_and_skips_second_run(queue: JobQueue):
     )
     assert j1 is not None and j1.lease_token is not None
     assert queue.side_effect_done(j1.id, tenant_id="t1", effect_key="charge") is False
+    begun = queue.begin_side_effect(
+        j1.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=j1.lease_token,
+        effect_key="charge",
+    )
+    assert begun.status == "started"
+    assert begun.idempotency_key == f"{j1.id}:charge"
     eff = queue.complete_side_effect(
         j1.id,
         tenant_id="t1",
@@ -5344,6 +5353,87 @@ def test_side_effect_survives_reclaim_and_skips_second_run(queue: JobQueue):
         )
 
 
+def test_side_effect_crash_after_call_before_complete_reuses_idempotency_key(
+    queue: JobQueue,
+):
+    """Die after external call / before complete → reclaim keeps same key.
+
+    External systems that dedupe on the idempotency key will not double-apply.
+    """
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        visibility_timeout_seconds=1,
+        max_attempts=5,
+        retry_backoff_base_seconds=0,
+    )
+    j1 = queue.lease(
+        tenant_id="t1",
+        worker_id="w1",
+        visibility_timeout_seconds=1,
+    )
+    assert j1 is not None and j1.lease_token is not None
+
+    begun = queue.begin_side_effect(
+        j1.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=j1.lease_token,
+        effect_key="charge_card",
+    )
+    assert begun.status == "started"
+    idem = begun.idempotency_key
+    # Simulate successful external call, then worker death before complete.
+    external = {"applied": 0, "by_key": {}}
+
+    def apply_charge(key: str) -> dict:
+        external["applied"] += 1
+        if key in external["by_key"]:
+            return external["by_key"][key]  # idempotent external
+        out = {"charge_id": "ch_1", "attempts": external["applied"]}
+        external["by_key"][key] = out
+        return out
+
+    first = apply_charge(idem)
+    assert first["charge_id"] == "ch_1"
+    assert queue.side_effect_done(j1.id, tenant_id="t1", effect_key="charge_card") is False
+    mid = queue.get_side_effect(j1.id, tenant_id="t1", effect_key="charge_card")
+    assert mid is not None and mid.status == "started"
+
+    time.sleep(1.2)
+    j2 = queue.lease(
+        tenant_id="t1",
+        worker_id="w2",
+        visibility_timeout_seconds=30,
+    )
+    assert j2 is not None and j2.id == job.id
+    reclaim_begin = queue.begin_side_effect(
+        j2.id,
+        tenant_id="t1",
+        worker_id="w2",
+        lease_token=j2.lease_token,
+        effect_key="charge_card",
+    )
+    assert reclaim_begin.status == "started"
+    assert reclaim_begin.idempotency_key == idem  # same key, not a new one
+    second = apply_charge(reclaim_begin.idempotency_key)
+    assert second == first  # external did not double-charge
+    assert external["applied"] == 2  # two attempts, one logical charge
+    assert len(external["by_key"]) == 1
+
+    done = queue.complete_side_effect(
+        j2.id,
+        tenant_id="t1",
+        worker_id="w2",
+        lease_token=j2.lease_token,
+        effect_key="charge_card",
+        result=second,
+    )
+    assert done.status == "completed"
+    assert done.result == first
+    assert queue.side_effect_done(j2.id, tenant_id="t1", effect_key="charge_card") is True
+
+
 def test_lease_context_run_side_effect_once(queue: JobQueue):
     from job_queue.worker import LeaseContext
 
@@ -5357,16 +5447,20 @@ def test_lease_context_run_side_effect_once(queue: JobQueue):
         lease_lost=threading.Event(),
     )
     calls = {"n": 0}
+    keys: list[str] = []
 
-    def charge() -> dict:
+    def charge(idempotency_key: str) -> dict:
         calls["n"] += 1
-        return {"ok": True, "n": calls["n"]}
+        keys.append(idempotency_key)
+        return {"ok": True, "n": calls["n"], "idem": idempotency_key}
 
     r1 = ctx.run_side_effect_once("charge_card", charge)
     r2 = ctx.run_side_effect_once("charge_card", charge)
-    assert r1 == {"ok": True, "n": 1}
-    assert r2 == {"ok": True, "n": 1}
+    assert r1["ok"] is True and r1["n"] == 1
+    assert r2["ok"] is True and r2["n"] == 1
     assert calls["n"] == 1
+    assert len(keys) == 1
+    assert keys[0] == f"{leased.id}:charge_card"
 
 
 def test_side_effect_cross_tenant_rejected(queue: JobQueue):

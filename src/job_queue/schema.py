@@ -399,24 +399,32 @@ CREATE INDEX IF NOT EXISTS idx_job_audit_job_seq
 REVOKE UPDATE, DELETE ON job_audit_events FROM PUBLIC;
 
 -- Durable once-only side effects for a job (survive lease reclaim).
--- Workers record an effect after a successful external call so a reclaiming
--- worker skips it. Prefer also sending Idempotency-Key = job_id:effect_key
--- to the external system to cover crash-between-call-and-record.
+-- Two-phase protocol:
+--   1. begin  → status=started with a stable idempotency_key BEFORE the
+--               external call (charge / email / …).
+--   2. complete → status=completed AFTER success.
+-- If a worker dies between the external call and complete, a reclaiming
+-- worker sees started and MUST re-invoke the external system with the same
+-- idempotency_key (not a fresh key) so the external system dedupes.
 CREATE TABLE IF NOT EXISTS job_side_effects (
-    job_id          UUID NOT NULL,
-    effect_key      TEXT NOT NULL,
-    tenant_id       TEXT NOT NULL,
-    status          TEXT NOT NULL,
-    result          JSONB,
-    completed_by    TEXT,
-    lease_token     UUID,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at    TIMESTAMPTZ,
+    job_id              UUID NOT NULL,
+    effect_key          TEXT NOT NULL,
+    tenant_id           TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    result              JSONB,
+    started_by          TEXT,
+    started_at          TIMESTAMPTZ,
+    completed_by        TEXT,
+    lease_token         UUID,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
     PRIMARY KEY (job_id, effect_key),
     CONSTRAINT job_side_effects_status_check CHECK (
-        status IN ('completed')
+        status IN ('started', 'completed')
     ),
-    CONSTRAINT job_side_effects_key_check CHECK (effect_key <> '')
+    CONSTRAINT job_side_effects_key_check CHECK (effect_key <> ''),
+    CONSTRAINT job_side_effects_idem_check CHECK (idempotency_key <> '')
 );
 
 CREATE INDEX IF NOT EXISTS idx_job_side_effects_tenant_job
@@ -424,4 +432,20 @@ CREATE INDEX IF NOT EXISTS idx_job_side_effects_tenant_job
 
 CREATE INDEX IF NOT EXISTS idx_job_side_effects_job
     ON job_side_effects (job_id);
+
+-- Migrate older single-phase rows (completed-only, no idempotency_key).
+ALTER TABLE job_side_effects ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE job_side_effects ADD COLUMN IF NOT EXISTS started_by TEXT;
+ALTER TABLE job_side_effects ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+UPDATE job_side_effects
+SET idempotency_key = job_id::text || ':' || effect_key
+WHERE idempotency_key IS NULL OR idempotency_key = '';
+ALTER TABLE job_side_effects DROP CONSTRAINT IF EXISTS job_side_effects_status_check;
+ALTER TABLE job_side_effects ADD CONSTRAINT job_side_effects_status_check CHECK (
+    status IN ('started', 'completed')
+);
+ALTER TABLE job_side_effects DROP CONSTRAINT IF EXISTS job_side_effects_idem_check;
+ALTER TABLE job_side_effects ADD CONSTRAINT job_side_effects_idem_check CHECK (
+    idempotency_key IS NOT NULL AND idempotency_key <> ''
+);
 """

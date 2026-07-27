@@ -76,7 +76,13 @@ class Coordinator:
             return self._job_action(path, body, "nack")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/checkpoint"):
             return self._job_action(path, body, "checkpoint")
-        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/side-effects"):
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith(
+            "/side-effects/begin"
+        ):
+            return self._begin_side_effect(path, body)
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith(
+            "/side-effects"
+        ):
             return self._complete_side_effect(path, body)
         if method == "GET" and path.startswith("/v1/jobs/") and "/side-effects/" in path:
             return self._get_side_effect(path, query)
@@ -613,6 +619,44 @@ class Coordinator:
             "job_ids": [str(i) for i in ids],
             "count": len(ids),
         }
+
+    def _begin_side_effect(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / jobs / {id} / side-effects / begin
+        if len(parts) != 5 or parts[4] != "begin":
+            return 400, {"error": "invalid side-effect begin path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        worker_id = body.get("worker_id")
+        lease_token = body.get("lease_token")
+        effect_key = body.get("effect_key") or body.get("key")
+        if not tenant_id or not worker_id or not lease_token or not effect_key:
+            return 400, {
+                "error": "tenant_id, worker_id, lease_token, effect_key required"
+            }
+        try:
+            token = UUID(str(lease_token))
+            eff = self.queue.begin_side_effect(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                worker_id=str(worker_id),
+                lease_token=token,
+                effect_key=str(effect_key),
+                idempotency_key=(
+                    str(body["idempotency_key"])
+                    if body.get("idempotency_key") is not None
+                    else None
+                ),
+            )
+        except LeaseError as exc:
+            return 409, {"error": str(exc), "code": "lease_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"effect": job_side_effect_to_dict(eff)}
 
     def _complete_side_effect(
         self, path: str, body: dict[str, Any]

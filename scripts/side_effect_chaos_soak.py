@@ -197,7 +197,7 @@ def main() -> int:
             keys = {
                 str(e.get("effect_key"))
                 for e in (resp.get("effects") or [])
-                if e.get("status") == "completed" or e.get("effect_key")
+                if e.get("status") == "completed"
             }
             missing = set(effects) - keys
             if missing:
