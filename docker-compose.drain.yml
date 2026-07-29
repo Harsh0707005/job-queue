@@ -14,7 +14,8 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       WORKER_ID: worker-1
-      BATCH_SIZE: "2"
+      # batch>1 exercises drain releasing unprocessed leased jobs immediately
+      BATCH_SIZE: "4"
       POLL_INTERVAL: "0.1"
       VISIBILITY_TIMEOUT: "60"
       DRAIN_TIMEOUT: "5"
@@ -25,7 +26,7 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       WORKER_ID: worker-2
-      BATCH_SIZE: "2"
+      BATCH_SIZE: "4"
       POLL_INTERVAL: "0.1"
       VISIBILITY_TIMEOUT: "60"
       DRAIN_TIMEOUT: "5"
@@ -36,7 +37,7 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       WORKER_ID: worker-3
-      BATCH_SIZE: "2"
+      BATCH_SIZE: "4"
       POLL_INTERVAL: "0.1"
       VISIBILITY_TIMEOUT: "60"
       DRAIN_TIMEOUT: "5"
@@ -47,7 +48,7 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       WORKER_ID: worker-4
-      BATCH_SIZE: "2"
+      BATCH_SIZE: "4"
       POLL_INTERVAL: "0.1"
       VISIBILITY_TIMEOUT: "60"
       DRAIN_TIMEOUT: "5"
@@ -71,9 +72,11 @@ services:
       COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-job-queue}
       VISIBILITY_TIMEOUT: "60"
       DRAIN_TIMEOUT: "5"
-      LONG_MS: "8000"
-      JOBS: "10"
-      MAX_WALL_SECONDS: "90"
+      # Jobs longer than drain timeout so force-release path is exercised,
+      # but short enough that 2 survivors finish all work before full VT.
+      LONG_MS: "4000"
+      JOBS: "16"
+      MAX_WALL_SECONDS: "55"
       LOG_LEVEL: INFO
     depends_on:
       coordinator-1:

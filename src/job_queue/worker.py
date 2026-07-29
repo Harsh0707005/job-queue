@@ -249,8 +249,12 @@ class Worker:
         self._handler: Handler | None = None
         self._stop = threading.Event()
         self._draining = threading.Event()
+        # Currently executing handler (heartbeating).
         self._active: dict[Any, _ActiveJob] = {}
-        self._active_lock = threading.Lock()
+        # Leased jobs not yet finished — includes the full batch queue so
+        # unprocessed batch members are not left locked across drain.
+        self._held: dict[Any, Job] = {}
+        self._lease_lock = threading.Lock()
 
     def handler(self, fn: Handler) -> Handler:
         """Decorator to register the job processing function.
@@ -261,18 +265,22 @@ class Worker:
         return fn
 
     def stop(self) -> None:
-        """Stop the run loop (does not wait for in-flight work). Prefer :meth:`drain`."""
-        self._stop.set()
+        """Stop the run loop. Prefer :meth:`drain` for deploy shutdown."""
         self._draining.set()
+        self._stop.set()
+        # Free leased-but-not-running batch jobs immediately.
+        self._release_held_except_active(reason="stop")
 
     def drain(self, timeout_seconds: float | None = None) -> DrainResult:
         """Graceful shutdown: stop leasing, finish in-flight, release on timeout.
 
         1. Stop claiming new jobs.
-        2. Keep heartbeating and let handlers finish until *timeout_seconds*.
-        3. If still in-flight at the deadline, signal cancel and
-           :meth:`~job_queue.queue.JobQueue.release` each remaining job so
-           another worker can reclaim without waiting for visibility timeout.
+        2. **Immediately release** leased batch jobs that are not yet running
+           (so they are not locked until the current job finishes).
+        3. Keep heartbeating the active job(s) until *timeout_seconds*.
+        4. If still running at the deadline, cancel +
+           :meth:`~job_queue.queue.JobQueue.release` so another worker can
+           reclaim without waiting for visibility timeout.
         """
         timeout = (
             self.drain_timeout_seconds
@@ -282,34 +290,43 @@ class Worker:
         if timeout < 0:
             raise ValueError("timeout_seconds must be >= 0")
         self._draining.set()
-        with self._active_lock:
-            in_flight = len(self._active)
+        with self._lease_lock:
+            in_flight = len(self._held)
+            active_n = len(self._active)
+        # Critical: free the rest of the batch now, not after the active job.
+        released = self._release_held_except_active(reason="drain")
         started = time.monotonic()
         deadline = started + timeout
         while True:
-            with self._active_lock:
+            with self._lease_lock:
                 n = len(self._active)
             if n == 0:
+                # Safety: any straggler held leases.
+                released += self._release_all_held(reason="drain")
                 self._stop.set()
                 waited = time.monotonic() - started
                 logger.info(
-                    "worker %s drain complete in %.2fs (in_flight_at_start=%d)",
+                    "worker %s drain complete in %.2fs "
+                    "(held_at_start=%d active=%d released=%d)",
                     self.worker_id,
                     waited,
                     in_flight,
+                    active_n,
+                    released,
                 )
                 return DrainResult(
                     drained=True,
                     timed_out=False,
                     in_flight_at_start=in_flight,
-                    released=0,
+                    released=released,
                     wait_seconds=waited,
                 )
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
 
-        released = self._force_release_active(reason="drain_timeout")
+        released += self._force_release_active(reason="drain_timeout")
+        released += self._release_all_held(reason="drain_timeout")
         self._stop.set()
         waited = time.monotonic() - started
         logger.warning(
@@ -354,11 +371,16 @@ class Worker:
             visibility_timeout_seconds=self.visibility_timeout_seconds,
             limit=take,
         )
-        for i, job in enumerate(jobs):
+        # Track the whole batch immediately so drain can free unprocessed rows.
+        with self._lease_lock:
+            for job in jobs:
+                self._held[job.id] = job
+        if self._draining.is_set() or self._stop.is_set():
+            self._release_all_held(reason="drain")
+            return jobs
+        for job in jobs:
             if self._draining.is_set() or self._stop.is_set():
-                # Release this and all remaining unprocessed leases.
-                for leftover in jobs[i:]:
-                    self._release_job(leftover, reason="drain")
+                self._release_held_except_active(reason="drain")
                 break
             try:
                 self._process(job)
@@ -402,7 +424,8 @@ class Worker:
         lease_lost = threading.Event()
         stop_hb = threading.Event()
         active = _ActiveJob(job=job, lease_lost=lease_lost, stop_hb=stop_hb)
-        with self._active_lock:
+        with self._lease_lock:
+            self._held.setdefault(job.id, job)
             self._active[job.id] = active
         ctx = LeaseContext(
             job=job,
@@ -467,8 +490,13 @@ class Worker:
         finally:
             stop_hb.set()
             hb_thread.join(timeout=interval + 1)
-            with self._active_lock:
+            with self._lease_lock:
+                still_held = job.id in self._held
                 self._active.pop(job.id, None)
+                self._held.pop(job.id, None)
+            # If cancel was signalled without an explicit release, free the lease.
+            if lease_lost.is_set() and still_held:
+                self._release_job(job, reason="lease_lost_cleanup")
 
     def _release_job(self, job: Job, *, reason: str) -> bool:
         if job.lease_token is None:
@@ -487,8 +515,40 @@ class Worker:
             logger.warning("could not release job %s (lease lost)", job.id)
             return False
 
+    def _release_held_except_active(self, *, reason: str) -> int:
+        """Release leased batch jobs that are not currently running."""
+        with self._lease_lock:
+            active_ids = set(self._active.keys())
+            to_release = [
+                j for jid, j in list(self._held.items()) if jid not in active_ids
+            ]
+            for j in to_release:
+                self._held.pop(j.id, None)
+        released = 0
+        for job in to_release:
+            if self._release_job(job, reason=reason):
+                released += 1
+        if released:
+            logger.info(
+                "worker %s released %d queued batch job(s) reason=%s",
+                self.worker_id,
+                released,
+                reason,
+            )
+        return released
+
+    def _release_all_held(self, *, reason: str) -> int:
+        with self._lease_lock:
+            to_release = list(self._held.values())
+            self._held.clear()
+        released = 0
+        for job in to_release:
+            if self._release_job(job, reason=reason):
+                released += 1
+        return released
+
     def _force_release_active(self, *, reason: str) -> int:
-        with self._active_lock:
+        with self._lease_lock:
             actives = list(self._active.values())
         released = 0
         for active in actives:
@@ -496,10 +556,13 @@ class Worker:
             active.stop_hb.set()
             if self._release_job(active.job, reason=reason):
                 released += 1
+            with self._lease_lock:
+                self._held.pop(active.job.id, None)
+                self._active.pop(active.job.id, None)
         # Wait briefly for handlers to unwind after lease_lost.
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            with self._active_lock:
+            with self._lease_lock:
                 if not self._active:
                     break
             time.sleep(0.05)

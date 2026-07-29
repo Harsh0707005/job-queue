@@ -651,16 +651,22 @@ class RemoteWorkerAgent:
         self._stop = threading.Event()
         self._draining = threading.Event()
         self._active: dict[Any, _ActiveRemoteJob] = {}
-        self._active_lock = threading.Lock()
+        self._held: dict[Any, Job] = {}
+        self._lease_lock = threading.Lock()
         self.processed = 0
 
     def stop(self) -> None:
         """Stop the run loop without waiting. Prefer :meth:`drain` for deploys."""
-        self._stop.set()
         self._draining.set()
+        self._stop.set()
+        self._release_held_except_active(reason="stop")
 
     def drain(self, timeout_seconds: float | None = None) -> DrainResult:
-        """Stop leasing, finish in-flight work, release leftovers on timeout."""
+        """Stop leasing, finish active work, release batch leftovers immediately.
+
+        Unprocessed jobs from the current lease batch are released as soon as
+        drain starts (not only after the running job finishes).
+        """
         timeout = (
             self.drain_timeout_seconds
             if timeout_seconds is None
@@ -669,35 +675,41 @@ class RemoteWorkerAgent:
         if timeout < 0:
             raise ValueError("timeout_seconds must be >= 0")
         self._draining.set()
-        with self._active_lock:
-            in_flight = len(self._active)
+        with self._lease_lock:
+            in_flight = len(self._held)
+            active_n = len(self._active)
+        released = self._release_held_except_active(reason="drain")
         started = time.monotonic()
         deadline = started + timeout
         while True:
-            with self._active_lock:
+            with self._lease_lock:
                 n = len(self._active)
             if n == 0:
+                released += self._release_all_held(reason="drain")
                 self._stop.set()
                 waited = time.monotonic() - started
                 logger.info(
                     "remote worker %s drain complete in %.2fs "
-                    "(in_flight_at_start=%d)",
+                    "(held_at_start=%d active=%d released=%d)",
                     self.worker_id,
                     waited,
                     in_flight,
+                    active_n,
+                    released,
                 )
                 return DrainResult(
                     drained=True,
                     timed_out=False,
                     in_flight_at_start=in_flight,
-                    released=0,
+                    released=released,
                     wait_seconds=waited,
                 )
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
 
-        released = self._force_release_active(reason="drain_timeout")
+        released += self._force_release_active(reason="drain_timeout")
+        released += self._release_all_held(reason="drain_timeout")
         self._stop.set()
         waited = time.monotonic() - started
         logger.warning(
@@ -744,10 +756,15 @@ class RemoteWorkerAgent:
             logger.debug(
                 "worker %s leased batch of %d", self.worker_id, len(jobs)
             )
-            for i, job in enumerate(jobs):
+            with self._lease_lock:
+                for job in jobs:
+                    self._held[job.id] = job
+            if self._draining.is_set() or self._stop.is_set():
+                self._release_all_held(reason="drain")
+                continue
+            for job in jobs:
                 if self._draining.is_set() or self._stop.is_set():
-                    for leftover in jobs[i:]:
-                        self._release_job(leftover, reason="drain")
+                    self._release_held_except_active(reason="drain")
                     break
                 try:
                     self._process(job)
@@ -770,7 +787,8 @@ class RemoteWorkerAgent:
         lease_lost = threading.Event()
         stop_hb = threading.Event()
         active = _ActiveRemoteJob(job, lease_lost, stop_hb)
-        with self._active_lock:
+        with self._lease_lock:
+            self._held.setdefault(job.id, job)
             self._active[job.id] = active
 
         def heartbeat_loop() -> None:
@@ -829,8 +847,12 @@ class RemoteWorkerAgent:
         finally:
             stop_hb.set()
             hb.join(timeout=self.heartbeat_interval_seconds + 1)
-            with self._active_lock:
+            with self._lease_lock:
+                still_held = job.id in self._held
                 self._active.pop(job.id, None)
+                self._held.pop(job.id, None)
+            if lease_lost.is_set() and still_held:
+                self._release_job(job, reason="lease_lost_cleanup")
 
     def _release_job(self, job: Job, *, reason: str) -> bool:
         if job.lease_token is None:
@@ -852,8 +874,39 @@ class RemoteWorkerAgent:
             logger.exception("release failed for job %s", job.id)
             return False
 
+    def _release_held_except_active(self, *, reason: str) -> int:
+        with self._lease_lock:
+            active_ids = set(self._active.keys())
+            to_release = [
+                j for jid, j in list(self._held.items()) if jid not in active_ids
+            ]
+            for j in to_release:
+                self._held.pop(j.id, None)
+        released = 0
+        for job in to_release:
+            if self._release_job(job, reason=reason):
+                released += 1
+        if released:
+            logger.info(
+                "remote worker %s released %d queued batch job(s) reason=%s",
+                self.worker_id,
+                released,
+                reason,
+            )
+        return released
+
+    def _release_all_held(self, *, reason: str) -> int:
+        with self._lease_lock:
+            to_release = list(self._held.values())
+            self._held.clear()
+        released = 0
+        for job in to_release:
+            if self._release_job(job, reason=reason):
+                released += 1
+        return released
+
     def _force_release_active(self, *, reason: str) -> int:
-        with self._active_lock:
+        with self._lease_lock:
             actives = list(self._active.values())
         released = 0
         for active in actives:
@@ -861,9 +914,12 @@ class RemoteWorkerAgent:
             active.stop_hb.set()
             if self._release_job(active.job, reason=reason):
                 released += 1
+            with self._lease_lock:
+                self._held.pop(active.job.id, None)
+                self._active.pop(active.job.id, None)
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            with self._active_lock:
+            with self._lease_lock:
                 if not self._active:
                     break
             time.sleep(0.05)

@@ -159,41 +159,98 @@ def main() -> int:
         logger.error("no jobs leased before drain")
         return 1
 
-    # SIGTERM worker-1 in background so we can observe drain effects live.
+    # Snapshot leased count right before SIGTERM so we can detect batch release.
+    pre_b = backlog()
+    leased_before = int(pre_b.get("leased") or 0)
+    completed_before = int(pre_b.get("completed") or 0)
+    pending_before = int(pre_b.get("pending") or 0)
+    logger.info("pre-sigterm backlog=%s", pre_b)
+
+    # SIGTERM two workers so batch leftovers must free quickly for survivors.
     t0 = time.monotonic()
     stop_err: list[str] = []
 
     def _stop() -> None:
         try:
-            ids = docker_sigterm_service("worker-1")
-            if not ids:
-                stop_err.append("worker-1 container not found")
+            for svc in ("worker-1", "worker-2"):
+                ids = docker_sigterm_service(svc)
+                if not ids:
+                    stop_err.append(f"{svc} container not found")
         except Exception as exc:  # noqa: BLE001
             stop_err.append(str(exc))
 
     import threading
 
     threading.Thread(target=_stop, name="docker-stop", daemon=True).start()
-    logger.info("worker-1 stop started")
+    logger.info("worker-1/2 stop started (batch drain under load)")
 
-    # Within drain window, worker-1 must release or finish so work progresses
-    # without waiting full visibility.
+    # Phase A: within a few seconds of SIGTERM, unprocessed batch members from
+    # drained workers must free (pending↑ and/or leased↓). Regression: only the
+    # active job was released and the rest of the batch stayed LEASED until VT.
+    # Phase B: by DRAIN_TIMEOUT+buffer, force-release of active jobs also lands.
     progress_deadline = t0 + DRAIN_TIMEOUT + 8
     saw_progress = False
+    saw_quick_batch_release = False
+    time_to_batch_release: float | None = None
+    time_to_progress: float | None = None
+    min_leased = leased_before
+    max_pending = pending_before
     while time.monotonic() < progress_deadline:
         b = backlog()
+        leased_now = int(b.get("leased") or 0)
+        completed_now = int(b.get("completed") or 0)
+        pending_now = int(b.get("pending") or 0)
+        min_leased = min(min_leased, leased_now)
+        max_pending = max(max_pending, pending_now)
+        now = time.monotonic()
         logger.info("during-drain backlog=%s", b)
-        if int(b.get("completed") or 0) > 0:
+        # Batch leftovers free immediately → pending rises and/or leased drops
+        # well before full drain timeout (and far before visibility).
+        if not saw_quick_batch_release and (
+            pending_now > pending_before or leased_now < leased_before
+        ):
+            saw_quick_batch_release = True
+            time_to_batch_release = now - t0
+            logger.info(
+                "batch release observed in %.2fs (pending %d→%d leased %d→%d)",
+                time_to_batch_release,
+                pending_before,
+                pending_now,
+                leased_before,
+                leased_now,
+            )
+        if completed_now > completed_before or pending_now > pending_before:
+            if not saw_progress:
+                time_to_progress = now - t0
             saw_progress = True
-        # Released jobs briefly raise pending or other workers absorb them.
-        if int(b.get("pending") or 0) > 0 or int(b.get("completed") or 0) > 0:
-            saw_progress = True
-        time.sleep(0.5)
+        time.sleep(0.3)
     if stop_err:
         logger.error("docker stop failed: %s", stop_err)
         return 1
+    if leased_before >= 4 and not saw_quick_batch_release:
+        logger.error(
+            "no batch release after SIGTERM "
+            "(leased_before=%d min_leased=%d pending_before=%d max_pending=%d); "
+            "queued batch jobs may still be locked until VT",
+            leased_before,
+            min_leased,
+            pending_before,
+            max_pending,
+        )
+        return 1
+    if (
+        time_to_batch_release is not None
+        and time_to_batch_release > DRAIN_TIMEOUT
+    ):
+        logger.error(
+            "batch release took %.1fs > drain_timeout=%ds "
+            "(should free non-active batch immediately)",
+            time_to_batch_release,
+            DRAIN_TIMEOUT,
+        )
+        return 1
 
-    # Finish remaining work on surviving workers (short jobs → quick).
+    # Finish remaining work on surviving workers.
     deadline = time.monotonic() + MAX_WALL
     while time.monotonic() < deadline:
         b = backlog()
@@ -209,14 +266,22 @@ def main() -> int:
 
     b = backlog()
     elapsed = time.monotonic() - t0
-    logger.info("final backlog=%s elapsed=%.1fs", b, elapsed)
+    logger.info(
+        "final backlog=%s elapsed=%.1fs batch_release=%.2fs progress=%.2fs",
+        b,
+        elapsed,
+        time_to_batch_release if time_to_batch_release is not None else -1,
+        time_to_progress if time_to_progress is not None else -1,
+    )
     if int(b.get("completed") or 0) + int(b.get("dead") or 0) < JOBS * 0.9:
         logger.error("too few terminal jobs: %s", b)
         return 1
-    # Must not depend on full visibility timeout to free worker-1's leases.
-    if elapsed >= VISIBILITY * 0.75:
+    # Reclaim path must not wait full visibility. Total wall may include normal
+    # job runtime on survivors; require it still finishes before a full VT so
+    # stuck leases would have been impossible to hide.
+    if elapsed >= VISIBILITY:
         logger.error(
-            "finish took %.1fs (vis=%ds); expected drain release << visibility",
+            "finish took %.1fs >= vis=%ds; drain did not free leases for reclaim",
             elapsed,
             VISIBILITY,
         )
@@ -225,9 +290,11 @@ def main() -> int:
         logger.error("no progress observed during drain window")
         return 1
     logger.info(
-        "DRAIN SOAK PASSED completed=%s elapsed=%.1fs vis=%d drain_timeout=%d",
+        "DRAIN SOAK PASSED completed=%s elapsed=%.1fs "
+        "batch_release=%.2fs vis=%d drain_timeout=%d",
         b.get("completed"),
         elapsed,
+        time_to_batch_release if time_to_batch_release is not None else -1,
         VISIBILITY,
         DRAIN_TIMEOUT,
     )
