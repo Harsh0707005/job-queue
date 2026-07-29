@@ -531,6 +531,41 @@ class CoordinatorClient:
         assert payload is not None
         return payload["schedule"]
 
+    def set_retention(
+        self,
+        *,
+        completed_seconds: int | None = None,
+        dead_seconds: int | None = None,
+        set_completed: bool = True,
+        set_dead: bool = True,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if set_completed:
+            body["completed_retention_seconds"] = completed_seconds
+        if set_dead:
+            body["dead_retention_seconds"] = dead_seconds
+        payload = self._request("POST", "/v1/admin/retention", body)
+        assert payload is not None
+        return payload
+
+    def get_retention(self) -> dict[str, Any]:
+        payload = self._request("GET", "/v1/admin/retention")
+        assert payload is not None
+        return payload
+
+    def purge_expired_jobs(
+        self,
+        *,
+        limit: int = 500,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/admin/purge-expired-jobs", body)
+        assert payload is not None
+        return payload
+
     def backlog(self) -> dict[str, Any]:
         payload = self._request("GET", "/v1/admin/backlog")
         assert payload is not None
@@ -694,6 +729,17 @@ class RemoteWorkerAgent:
         # Once-only external side effects (charge/email style).
         if kind == "side_effects" or payload.get("effects"):
             return self._do_side_effects(job, lease_lost, payload)
+        # Force failure (dead-letter / retry soaks).
+        if kind in ("fail", "error") or payload.get("force_fail"):
+            try:
+                ms = int(payload.get("ms") or payload.get("sleep_ms") or 20)
+            except (TypeError, ValueError):
+                ms = 20
+            if ms > 0:
+                time.sleep(min(ms, 5000) / 1000.0)
+            raise RuntimeError(
+                str(payload.get("error") or "forced failure")
+            )
 
         steps_raw = payload.get("steps")
         use_steps = steps_raw is not None or kind == "steps"
@@ -816,7 +862,11 @@ class RemoteWorkerAgent:
         # Optional payload sleep for cancel/long-job soaks; cooperative cancel.
         sleep_ms = 0
         try:
-            sleep_ms = int(payload.get("sleep_ms") or 0)
+            sleep_ms = int(
+                payload.get("sleep_ms")
+                or payload.get("ms")
+                or 0
+            )
         except (TypeError, ValueError):
             sleep_ms = 0
         if sleep_ms > 0:
@@ -983,6 +1033,51 @@ class RemoteWorkerAgent:
             "effects_resumed": resumed,
             "effects_total": len(effects),
         }
+
+
+class CleanerNode:
+    """Retention agent: call coordinator purge-expired-jobs on an interval."""
+
+    def __init__(
+        self,
+        client: CoordinatorClient,
+        *,
+        poll_interval_seconds: float = 15.0,
+        batch_limit: int = 500,
+    ) -> None:
+        self.client = client
+        self.poll_interval_seconds = poll_interval_seconds
+        self.batch_limit = batch_limit
+        self._stop = threading.Event()
+        self.deleted = 0
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> int:
+        logger.info("cleaner node starting")
+        while not self._stop.is_set():
+            try:
+                # Drain while work remains so large terminal backlogs catch up.
+                while not self._stop.is_set():
+                    result = self.client.purge_expired_jobs(
+                        limit=self.batch_limit
+                    )
+                    n = int(result.get("total_deleted") or 0)
+                    if n:
+                        self.deleted += n
+                        logger.info(
+                            "purged completed=%s dead=%s total=%d",
+                            result.get("completed_deleted"),
+                            result.get("dead_deleted"),
+                            self.deleted,
+                        )
+                    if n == 0:
+                        break
+            except Exception:
+                logger.exception("purge-expired-jobs failed")
+            self._stop.wait(self.poll_interval_seconds)
+        return self.deleted
 
 
 class ScheduleNode:
@@ -1207,6 +1302,41 @@ def scheduler_main(argv: list[str] | None = None) -> int:
     client = CoordinatorClient(args.coordinator)
     client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
     node = ScheduleNode(client, poll_interval_seconds=args.poll)
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        node.stop()
+    return 0
+
+
+def cleaner_main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    logging.basicConfig(
+        level=_env("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    p = argparse.ArgumentParser(prog="job-queue-cleaner-node")
+    p.add_argument("--coordinator", default=_coord_url())
+    p.add_argument(
+        "--poll",
+        type=float,
+        default=float(_env("POLL_INTERVAL", "15") or "15"),
+    )
+    p.add_argument(
+        "--batch-limit",
+        type=int,
+        default=int(_env("BATCH_LIMIT", "500") or "500"),
+    )
+    args = p.parse_args(argv)
+    client = CoordinatorClient(args.coordinator)
+    client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
+    node = CleanerNode(
+        client,
+        poll_interval_seconds=args.poll,
+        batch_limit=args.batch_limit,
+    )
     try:
         node.run()
     except KeyboardInterrupt:

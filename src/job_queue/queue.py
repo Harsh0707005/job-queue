@@ -78,6 +78,11 @@ Design notes
 * **Dead letter**: exhausted jobs land in ``dead``; inspect via
   ``list_dead_letters`` and re-queue with ``replay_dead_letter`` /
   ``replay_dead_letters``.
+* **Terminal retention**: ``set_job_retention`` / per-tenant overrides keep
+  ``completed`` and ``dead`` jobs for a configurable period. The cleaner
+  (``purge_expired_jobs`` / ``job-queue-cleaner-node``) deletes aged rows in
+  batches (and their ``job_side_effects``). Audit history is kept. ``NULL``
+  retention = keep forever (default).
 * **Tenant isolation**: every mutating and read-by-id API requires
   ``tenant_id``; cross-tenant access is rejected.
 * **Ack**: marks the job completed under a still-valid lease only.
@@ -144,9 +149,11 @@ from job_queue.models import (
     AuditConsistencyReport,
     Job,
     JobAuditEvent,
+    JobRetentionSettings,
     JobSideEffect,
     JobStatus,
     PreemptResult,
+    RetentionPurgeResult,
     Schedule,
     ScheduleFire,
     TenantMergeResult,
@@ -704,6 +711,205 @@ class JobQueue:
                 int(row["lease_burst"])
                 if row["lease_burst"] is not None
                 else None
+            )
+
+    def set_job_retention(
+        self,
+        *,
+        completed_seconds: int | None = None,
+        dead_seconds: int | None = None,
+    ) -> JobRetentionSettings:
+        """Set global retention for terminal jobs (seconds).
+
+        Pass ``None`` for a status to keep those jobs forever. ``0`` means
+        eligible for purge on the next cleaner pass. Per-tenant overrides via
+        :meth:`set_tenant_job_retention` take precedence when set.
+        """
+        if completed_seconds is not None and completed_seconds < 0:
+            raise ValueError("completed_seconds must be >= 0 or None")
+        if dead_seconds is not None and dead_seconds < 0:
+            raise ValueError("dead_seconds must be >= 0 or None")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO queue_settings (
+                    id, completed_retention_seconds, dead_retention_seconds,
+                    updated_at
+                ) VALUES (1, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET completed_retention_seconds = EXCLUDED.completed_retention_seconds,
+                    dead_retention_seconds = EXCLUDED.dead_retention_seconds,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (completed_seconds, dead_seconds, now),
+            )
+        return JobRetentionSettings(
+            completed_retention_seconds=completed_seconds,
+            dead_retention_seconds=dead_seconds,
+        )
+
+    def get_job_retention(self) -> JobRetentionSettings:
+        """Return global completed/dead retention (None = keep forever)."""
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT completed_retention_seconds, dead_retention_seconds
+                FROM queue_settings
+                WHERE id = 1
+                """
+            ).fetchone()
+            if row is None:
+                return JobRetentionSettings(None, None)
+            return JobRetentionSettings(
+                completed_retention_seconds=row["completed_retention_seconds"],
+                dead_retention_seconds=row["dead_retention_seconds"],
+            )
+
+    def set_tenant_job_retention(
+        self,
+        tenant_id: str,
+        *,
+        completed_seconds: int | None = None,
+        dead_seconds: int | None = None,
+        clear: bool = False,
+    ) -> JobRetentionSettings:
+        """Override retention for one tenant (or clear back to global).
+
+        When *clear* is True both overrides are removed. Otherwise both
+        values are written (``None`` means keep forever for that status for
+        this tenant, not “inherit global”).
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if not clear:
+            if completed_seconds is not None and completed_seconds < 0:
+                raise ValueError("completed_seconds must be >= 0 or None")
+            if dead_seconds is not None and dead_seconds < 0:
+                raise ValueError("dead_seconds must be >= 0 or None")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            if clear:
+                conn.execute(
+                    """
+                    INSERT INTO tenant_settings (
+                        tenant_id, max_concurrent_leases, max_pending_jobs,
+                        paused, offboarding, updated_at
+                    )
+                    VALUES (%s, NULL, NULL, FALSE, FALSE, %s)
+                    ON CONFLICT (tenant_id) DO UPDATE
+                    SET completed_retention_seconds = NULL,
+                        dead_retention_seconds = NULL,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (tenant_id, now),
+                )
+                self._delete_empty_tenant_settings(conn, tenant_id)
+                return JobRetentionSettings(None, None)
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding,
+                    completed_retention_seconds, dead_retention_seconds,
+                    updated_at
+                )
+                VALUES (%s, NULL, NULL, FALSE, FALSE, %s, %s, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET completed_retention_seconds = EXCLUDED.completed_retention_seconds,
+                    dead_retention_seconds = EXCLUDED.dead_retention_seconds,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_id, completed_seconds, dead_seconds, now),
+            )
+        return JobRetentionSettings(
+            completed_retention_seconds=completed_seconds,
+            dead_retention_seconds=dead_seconds,
+        )
+
+    def get_tenant_job_retention(self, tenant_id: str) -> JobRetentionSettings:
+        """Return per-tenant override; both None if using global defaults."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT completed_retention_seconds, dead_retention_seconds
+                FROM tenant_settings
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                return JobRetentionSettings(None, None)
+            return JobRetentionSettings(
+                completed_retention_seconds=row["completed_retention_seconds"],
+                dead_retention_seconds=row["dead_retention_seconds"],
+            )
+
+    def purge_expired_jobs(
+        self,
+        *,
+        limit: int = 500,
+        tenant_id: str | None = None,
+    ) -> RetentionPurgeResult:
+        """Delete terminal jobs older than their retention window.
+
+        Uses per-tenant override when set, else global ``queue_settings``.
+        Statuses with ``NULL`` retention are never purged. Also deletes
+        matching ``job_side_effects`` rows. Audit events are retained.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if limit > 10_000:
+            raise ValueError("limit must be <= 10000")
+        if tenant_id is not None and not tenant_id:
+            raise ValueError("tenant_id must be non-empty when provided")
+
+        now = _utcnow()
+        half = max(1, limit // 2)
+        with transaction(self._pool) as conn:
+            # Ensure global row exists for JOIN.
+            conn.execute(
+                """
+                INSERT INTO queue_settings (id) VALUES (1)
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
+            completed_ids = self._select_expired_terminal_ids(
+                conn,
+                status=JobStatus.COMPLETED.value,
+                now=now,
+                limit=half,
+                tenant_id=tenant_id,
+            )
+            dead_ids = self._select_expired_terminal_ids(
+                conn,
+                status=JobStatus.DEAD.value,
+                now=now,
+                limit=limit - len(completed_ids),
+                tenant_id=tenant_id,
+            )
+            all_ids = completed_ids + dead_ids
+            side_n = 0
+            if all_ids:
+                se = conn.execute(
+                    """
+                    DELETE FROM job_side_effects
+                    WHERE job_id = ANY(%s)
+                    RETURNING job_id, effect_key
+                    """,
+                    (all_ids,),
+                ).fetchall()
+                side_n = len(se)
+                conn.execute(
+                    "DELETE FROM jobs WHERE id = ANY(%s)",
+                    (all_ids,),
+                )
+            return RetentionPurgeResult(
+                completed_deleted=len(completed_ids),
+                dead_deleted=len(dead_ids),
+                side_effects_deleted=side_n,
             )
 
     def pause_tenant(self, tenant_id: str) -> None:
@@ -2599,6 +2805,16 @@ class JobQueue:
                 new_status = JobStatus.FAILED.value
                 next_available = row["available_at"]
 
+            # Stamp completed_at for terminal outcomes so retention can age them.
+            terminal_at = (
+                now
+                if new_status
+                in (
+                    JobStatus.DEAD.value,
+                    JobStatus.FAILED.value,
+                )
+                else None
+            )
             updated = conn.execute(
                 f"""
                 UPDATE jobs
@@ -2610,6 +2826,7 @@ class JobQueue:
                     lease_started_at = NULL,
                     available_at = %s,
                     last_error = %s,
+                    completed_at = COALESCE(%s, completed_at),
                     updated_at = %s
                 WHERE id = %s
                   AND lease_token = %s
@@ -2620,6 +2837,7 @@ class JobQueue:
                     new_status,
                     next_available,
                     error,
+                    terminal_at,
                     now,
                     job_id,
                     lease_token,
@@ -6849,11 +7067,59 @@ class JobQueue:
               AND max_pending_jobs IS NULL
               AND enqueue_rate_per_sec IS NULL
               AND lease_rate_per_sec IS NULL
+              AND completed_retention_seconds IS NULL
+              AND dead_retention_seconds IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,
             (tenant_id,),
         )
+
+    @staticmethod
+    def _select_expired_terminal_ids(
+        conn: Any,
+        *,
+        status: str,
+        now: datetime,
+        limit: int,
+        tenant_id: str | None,
+    ) -> list[UUID]:
+        """Pick job ids of *status* older than effective retention."""
+        if limit < 1:
+            return []
+        # retention column on tenant_settings / queue_settings
+        ret_col = (
+            "completed_retention_seconds"
+            if status == JobStatus.COMPLETED.value
+            else "dead_retention_seconds"
+        )
+        tenant_clause = ""
+        params: list[Any] = [status]
+        if tenant_id is not None:
+            tenant_clause = "AND j.tenant_id = %s"
+            params.append(tenant_id)
+        params.append(now)
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT j.id
+            FROM jobs j
+            CROSS JOIN queue_settings qs
+            LEFT JOIN tenant_settings ts ON ts.tenant_id = j.tenant_id
+            WHERE j.status = %s
+              {tenant_clause}
+              AND COALESCE(ts.{ret_col}, qs.{ret_col}) IS NOT NULL
+              AND COALESCE(j.completed_at, j.updated_at)
+                  < (%s - make_interval(
+                        secs => COALESCE(ts.{ret_col}, qs.{ret_col})
+                    ))
+            ORDER BY COALESCE(j.completed_at, j.updated_at) ASC
+            LIMIT %s
+            FOR UPDATE OF j SKIP LOCKED
+            """,
+            tuple(params),
+        ).fetchall()
+        return [r["id"] for r in rows]
 
     @staticmethod
     def _is_tenant_offboarding(conn: Any, tenant_id: str) -> bool:

@@ -20,6 +20,8 @@ from uuid import UUID
 from job_queue.codec import (
     claimed_webhook_to_dict,
     job_to_dict,
+    job_retention_to_dict,
+    retention_purge_to_dict,
     schedule_to_dict,
     audit_consistency_report_to_dict,
     job_audit_event_to_dict,
@@ -161,6 +163,12 @@ class Coordinator:
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/merge"):
             return self._merge_tenant(path, body)
 
+        if method == "POST" and path == "/v1/admin/retention":
+            return self._set_retention(body)
+        if method == "GET" and path == "/v1/admin/retention":
+            return self._get_retention()
+        if method == "POST" and path == "/v1/admin/purge-expired-jobs":
+            return self._purge_expired_jobs(body)
         if method == "GET" and path == "/v1/admin/backlog":
             return self._backlog()
         if method == "GET" and path == "/v1/admin/completed-by-schedule":
@@ -1101,6 +1109,65 @@ class Coordinator:
         except ScheduleError as exc:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}
+
+    def _set_retention(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if (
+            "completed_retention_seconds" not in body
+            and "completed_seconds" not in body
+            and "dead_retention_seconds" not in body
+            and "dead_seconds" not in body
+        ):
+            return 400, {
+                "error": "completed_retention_seconds and/or "
+                "dead_retention_seconds required (null = keep forever)"
+            }
+        try:
+            c_raw = body.get(
+                "completed_retention_seconds", body.get("completed_seconds")
+            )
+            d_raw = body.get(
+                "dead_retention_seconds", body.get("dead_seconds")
+            )
+            # Allow partial update: only provided keys change.
+            current = self.queue.get_job_retention()
+            completed = (
+                current.completed_retention_seconds
+                if "completed_retention_seconds" not in body
+                and "completed_seconds" not in body
+                else (None if c_raw is None else int(c_raw))
+            )
+            dead = (
+                current.dead_retention_seconds
+                if "dead_retention_seconds" not in body
+                and "dead_seconds" not in body
+                else (None if d_raw is None else int(d_raw))
+            )
+            settings = self.queue.set_job_retention(
+                completed_seconds=completed,
+                dead_seconds=dead,
+            )
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 200, job_retention_to_dict(settings)
+
+    def _get_retention(self) -> tuple[int, dict[str, Any]]:
+        return 200, job_retention_to_dict(self.queue.get_job_retention())
+
+    def _purge_expired_jobs(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            result = self.queue.purge_expired_jobs(
+                limit=int(body.get("limit") or 500),
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, retention_purge_to_dict(result)
 
     def _backlog(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:

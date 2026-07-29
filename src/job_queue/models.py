@@ -166,6 +166,31 @@ class TenantStats:
 
 
 @dataclass(frozen=True, slots=True)
+class JobRetentionSettings:
+    """How long terminal jobs are kept before the cleaner may delete them.
+
+    ``None`` means keep forever (no automatic purge for that status).
+    ``0`` means eligible for purge immediately on the next cleaner pass.
+    """
+
+    completed_retention_seconds: int | None
+    dead_retention_seconds: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionPurgeResult:
+    """Result of one :meth:`~job_queue.queue.JobQueue.purge_expired_jobs` pass."""
+
+    completed_deleted: int
+    dead_deleted: int
+    side_effects_deleted: int
+
+    @property
+    def total_deleted(self) -> int:
+        return self.completed_deleted + self.dead_deleted
+
+
+@dataclass(frozen=True, slots=True)
 class TenantOffboardResult:
     """Result of :meth:`~job_queue.queue.JobQueue.offboard_tenant`."""
 

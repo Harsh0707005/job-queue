@@ -5730,3 +5730,113 @@ def test_side_effect_merge_tenant_preserves_markers(queue: JobQueue):
     assert eff.result == {"cents": 100}
     keys = {e.effect_key for e in queue.list_side_effects(job.id, tenant_id="dst")}
     assert keys == {"charge"}
+
+
+# ---------------------------------------------------------------------------
+# Terminal job retention + cleaner
+# ---------------------------------------------------------------------------
+
+
+def test_retention_default_keeps_forever(queue: JobQueue):
+    settings = queue.get_job_retention()
+    assert settings.completed_retention_seconds is None
+    assert settings.dead_retention_seconds is None
+    job = queue.enqueue(tenant_id="t1", payload={})
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    _ack(queue, leased, "w1")
+    purged = queue.purge_expired_jobs(limit=100)
+    assert purged.total_deleted == 0
+    assert queue.get(job.id, tenant_id="t1") is not None
+
+
+def test_purge_completed_after_retention(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=1, dead_seconds=None)
+    job = queue.enqueue(tenant_id="t1", payload={"x": 1})
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    _ack(queue, leased, "w1", result={"ok": True})
+    # Still within window.
+    assert queue.purge_expired_jobs().completed_deleted == 0
+    assert queue.get(job.id, tenant_id="t1") is not None
+    time.sleep(1.2)
+    result = queue.purge_expired_jobs()
+    assert result.completed_deleted == 1
+    assert result.dead_deleted == 0
+    assert queue.get(job.id, tenant_id="t1") is None
+
+
+def test_purge_dead_after_retention(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=None, dead_seconds=1)
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        max_attempts=1,
+    )
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    dead = _nack(queue, leased, "w1", error="boom", requeue=True)
+    assert dead.status == JobStatus.DEAD
+    assert dead.completed_at is not None
+    time.sleep(1.2)
+    result = queue.purge_expired_jobs()
+    assert result.dead_deleted == 1
+    assert queue.get(job.id, tenant_id="t1") is None
+
+
+def test_tenant_retention_override(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=3600, dead_seconds=3600)
+    queue.set_tenant_job_retention("fast", completed_seconds=1, dead_seconds=1)
+    # Other tenant uses global (long) retention.
+    a = queue.enqueue(tenant_id="fast", payload={})
+    b = queue.enqueue(tenant_id="slow", payload={})
+    for tid, jid in (("fast", a.id), ("slow", b.id)):
+        leased = queue.lease(tenant_id=tid, worker_id="w1")
+        assert leased is not None and leased.id == jid
+        _ack(queue, leased, "w1")
+    time.sleep(1.2)
+    result = queue.purge_expired_jobs()
+    assert result.completed_deleted == 1
+    assert queue.get(a.id, tenant_id="fast") is None
+    assert queue.get(b.id, tenant_id="slow") is not None
+
+
+def test_purge_deletes_side_effects(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=1, dead_seconds=1)
+    job = queue.enqueue(tenant_id="t1", payload={})
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None and leased.lease_token is not None
+    queue.complete_side_effect(
+        leased.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        effect_key="charge",
+        result={"ok": True},
+    )
+    _ack(queue, leased, "w1")
+    time.sleep(1.2)
+    result = queue.purge_expired_jobs()
+    assert result.completed_deleted == 1
+    assert result.side_effects_deleted >= 1
+    assert queue.list_side_effects(job.id, tenant_id="t1") == []
+
+
+def test_retention_cleaner_run_once(queue: JobQueue):
+    from job_queue import RetentionCleaner
+
+    queue.set_job_retention(completed_seconds=0, dead_seconds=0)
+    for i in range(5):
+        j = queue.enqueue(tenant_id="t1", payload={"i": i})
+        leased = queue.lease(tenant_id="t1", worker_id="w1")
+        assert leased is not None
+        _ack(queue, leased, "w1")
+    cleaner = RetentionCleaner(queue, batch_limit=2)
+    total = 0
+    for _ in range(10):
+        r = cleaner.run_once()
+        total += r.total_deleted
+        if r.total_deleted == 0:
+            break
+    assert total == 5
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0

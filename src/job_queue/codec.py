@@ -254,6 +254,22 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
     }
 
 
+def job_retention_to_dict(settings: Any) -> dict[str, Any]:
+    return {
+        "completed_retention_seconds": settings.completed_retention_seconds,
+        "dead_retention_seconds": settings.dead_retention_seconds,
+    }
+
+
+def retention_purge_to_dict(result: Any) -> dict[str, Any]:
+    return {
+        "completed_deleted": result.completed_deleted,
+        "dead_deleted": result.dead_deleted,
+        "side_effects_deleted": result.side_effects_deleted,
+        "total_deleted": result.total_deleted,
+    }
+
+
 def tenant_offboard_result_to_dict(result: TenantOffboardResult) -> dict[str, Any]:
     """Serialize :class:`~job_queue.models.TenantOffboardResult`."""
     return {

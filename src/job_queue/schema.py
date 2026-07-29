@@ -215,6 +215,34 @@ CREATE INDEX IF NOT EXISTS idx_jobs_schedule_id
 CREATE INDEX IF NOT EXISTS idx_jobs_depends_on
     ON jobs USING GIN (depends_on);
 
+-- Retention cleaner: find old terminal jobs quickly.
+CREATE INDEX IF NOT EXISTS idx_jobs_completed_retention
+    ON jobs (COALESCE(completed_at, updated_at) ASC)
+    WHERE status = 'completed';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_dead_retention
+    ON jobs (COALESCE(completed_at, updated_at) ASC)
+    WHERE status = 'dead';
+
+-- Global retention defaults (single row). NULL = keep forever.
+CREATE TABLE IF NOT EXISTS queue_settings (
+    id                              INTEGER PRIMARY KEY DEFAULT 1
+                                    CHECK (id = 1),
+    completed_retention_seconds     INTEGER,
+    dead_retention_seconds          INTEGER,
+    updated_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT queue_settings_completed_ret_check CHECK (
+        completed_retention_seconds IS NULL
+        OR completed_retention_seconds >= 0
+    ),
+    CONSTRAINT queue_settings_dead_ret_check CHECK (
+        dead_retention_seconds IS NULL
+        OR dead_retention_seconds >= 0
+    )
+);
+
+INSERT INTO queue_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
 -- Per-tenant concurrency limits + pause flag (NULL row / missing = unlimited, not paused).
 -- Optional token-bucket rate limits (NULL rate = unlimited):
 --   enqueue_rate_per_sec / lease_rate_per_sec refill tokens over time;
@@ -234,6 +262,9 @@ CREATE TABLE IF NOT EXISTS tenant_settings (
     lease_burst            INTEGER,
     lease_tokens           DOUBLE PRECISION,
     lease_tokens_at        TIMESTAMPTZ,
+    -- Per-tenant retention override (NULL = use global queue_settings).
+    completed_retention_seconds INTEGER,
+    dead_retention_seconds      INTEGER,
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT tenant_settings_max_concurrent_check CHECK (
         max_concurrent_leases IS NULL OR max_concurrent_leases >= 1
@@ -252,6 +283,14 @@ CREATE TABLE IF NOT EXISTS tenant_settings (
     ),
     CONSTRAINT tenant_settings_lease_burst_check CHECK (
         lease_burst IS NULL OR lease_burst >= 1
+    ),
+    CONSTRAINT tenant_settings_completed_ret_check CHECK (
+        completed_retention_seconds IS NULL
+        OR completed_retention_seconds >= 0
+    ),
+    CONSTRAINT tenant_settings_dead_ret_check CHECK (
+        dead_retention_seconds IS NULL
+        OR dead_retention_seconds >= 0
     )
 );
 
@@ -270,6 +309,18 @@ ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_max_pendin
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_max_pending_check CHECK (
     max_pending_jobs IS NULL OR max_pending_jobs >= 1
 );
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS completed_retention_seconds INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS dead_retention_seconds INTEGER;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_completed_ret_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_completed_ret_check CHECK (
+    completed_retention_seconds IS NULL OR completed_retention_seconds >= 0
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_dead_ret_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_dead_ret_check CHECK (
+    dead_retention_seconds IS NULL OR dead_retention_seconds >= 0
+);
+
 
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_rate_per_sec DOUBLE PRECISION;
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_burst INTEGER;
