@@ -3,6 +3,7 @@
 from job_queue.models import (
     AuditConsistencyReport,
     ClaimedWebhook,
+    DrainResult,
     Job,
     JobAuditEvent,
     JobRetentionSettings,
@@ -57,6 +58,7 @@ __all__ = [
     "Coordinator",
     "CoordinatorClient",
     "DependencyError",
+    "DrainResult",
     "Job",
     "JobAuditEvent",
     "JobRetentionSettings",

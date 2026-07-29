@@ -198,6 +198,17 @@ class RetentionPurgeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DrainResult:
+    """Result of a graceful worker drain."""
+
+    drained: bool
+    timed_out: bool
+    in_flight_at_start: int
+    released: int
+    wait_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class TenantOffboardResult:
     """Result of :meth:`~job_queue.queue.JobQueue.offboard_tenant`."""
 

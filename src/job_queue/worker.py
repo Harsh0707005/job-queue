@@ -29,12 +29,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any  # noqa: I001 — keep Any with callables
 
-from job_queue.models import Job, JobSideEffect
+from job_queue.models import DrainResult, Job, JobSideEffect
 from job_queue.queue import ApprovalRequested, JobQueue, LeaseError
 
 logger = logging.getLogger(__name__)
 
 Handler = Callable[..., Any]
+
+
+@dataclass(slots=True)
+class _ActiveJob:
+    job: Job
+    lease_lost: threading.Event
+    stop_hb: threading.Event
 
 
 @dataclass(slots=True)
@@ -193,6 +200,12 @@ class LeaseContext:
 class Worker:
     """Poll a queue, process jobs, and keep leases alive via heartbeat.
 
+    Graceful drain (deploy / shutdown)::
+
+        worker.drain(timeout_seconds=60)
+        # stops new leases, finishes in-flight with heartbeats, then
+        # releases any still-running jobs so others can reclaim immediately
+
     Example::
 
         queue = JobQueue.connect(dsn)
@@ -219,6 +232,7 @@ class Worker:
         poll_interval_seconds: float = 0.5,
         visibility_timeout_seconds: int | None = None,
         batch_size: int = 1,
+        drain_timeout_seconds: float = 60.0,
     ) -> None:
         self.queue = queue
         self.tenant_id = tenant_id  # None → fair lease across tenants
@@ -231,8 +245,12 @@ class Worker:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         self.batch_size = batch_size
+        self.drain_timeout_seconds = float(drain_timeout_seconds)
         self._handler: Handler | None = None
         self._stop = threading.Event()
+        self._draining = threading.Event()
+        self._active: dict[Any, _ActiveJob] = {}
+        self._active_lock = threading.Lock()
 
     def handler(self, fn: Handler) -> Handler:
         """Decorator to register the job processing function.
@@ -243,7 +261,70 @@ class Worker:
         return fn
 
     def stop(self) -> None:
+        """Stop the run loop (does not wait for in-flight work). Prefer :meth:`drain`."""
         self._stop.set()
+        self._draining.set()
+
+    def drain(self, timeout_seconds: float | None = None) -> DrainResult:
+        """Graceful shutdown: stop leasing, finish in-flight, release on timeout.
+
+        1. Stop claiming new jobs.
+        2. Keep heartbeating and let handlers finish until *timeout_seconds*.
+        3. If still in-flight at the deadline, signal cancel and
+           :meth:`~job_queue.queue.JobQueue.release` each remaining job so
+           another worker can reclaim without waiting for visibility timeout.
+        """
+        timeout = (
+            self.drain_timeout_seconds
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if timeout < 0:
+            raise ValueError("timeout_seconds must be >= 0")
+        self._draining.set()
+        with self._active_lock:
+            in_flight = len(self._active)
+        started = time.monotonic()
+        deadline = started + timeout
+        while True:
+            with self._active_lock:
+                n = len(self._active)
+            if n == 0:
+                self._stop.set()
+                waited = time.monotonic() - started
+                logger.info(
+                    "worker %s drain complete in %.2fs (in_flight_at_start=%d)",
+                    self.worker_id,
+                    waited,
+                    in_flight,
+                )
+                return DrainResult(
+                    drained=True,
+                    timed_out=False,
+                    in_flight_at_start=in_flight,
+                    released=0,
+                    wait_seconds=waited,
+                )
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        released = self._force_release_active(reason="drain_timeout")
+        self._stop.set()
+        waited = time.monotonic() - started
+        logger.warning(
+            "worker %s drain timed out after %.2fs; released=%d",
+            self.worker_id,
+            waited,
+            released,
+        )
+        return DrainResult(
+            drained=False,
+            timed_out=True,
+            in_flight_at_start=in_flight,
+            released=released,
+            wait_seconds=waited,
+        )
 
     def run_once(self) -> Job | None:
         """Lease and process at most one job. Returns the job, or None."""
@@ -255,9 +336,12 @@ class Worker:
 
         Jobs in the batch are processed sequentially with independent heartbeats.
         Returns the list of jobs that were leased (may be shorter than *limit*).
+        Unprocessed jobs (if drain/stop mid-batch) are released immediately.
         """
         if self._handler is None:
             raise RuntimeError("no handler registered; use @worker.handler")
+        if self._draining.is_set() or self._stop.is_set():
+            return []
 
         take = self.batch_size if limit is None else limit
         if take < 1:
@@ -270,8 +354,11 @@ class Worker:
             visibility_timeout_seconds=self.visibility_timeout_seconds,
             limit=take,
         )
-        for job in jobs:
-            if self._stop.is_set():
+        for i, job in enumerate(jobs):
+            if self._draining.is_set() or self._stop.is_set():
+                # Release this and all remaining unprocessed leases.
+                for leftover in jobs[i:]:
+                    self._release_job(leftover, reason="drain")
                 break
             self._process(job)
         return jobs
@@ -279,7 +366,7 @@ class Worker:
     def run(self, *, max_jobs: int | None = None, stop_when_idle: bool = False) -> int:
         """Run the worker loop. Returns the number of jobs processed."""
         processed = 0
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not self._draining.is_set():
             remaining = None
             if max_jobs is not None:
                 remaining = max_jobs - processed
@@ -288,7 +375,7 @@ class Worker:
             take = self.batch_size if remaining is None else min(self.batch_size, remaining)
             jobs = self.run_batch_once(limit=take)
             if not jobs:
-                if stop_when_idle:
+                if stop_when_idle or self._draining.is_set() or self._stop.is_set():
                     break
                 self._stop.wait(self.poll_interval_seconds)
                 continue
@@ -309,6 +396,9 @@ class Worker:
 
         lease_lost = threading.Event()
         stop_hb = threading.Event()
+        active = _ActiveJob(job=job, lease_lost=lease_lost, stop_hb=stop_hb)
+        with self._active_lock:
+            self._active[job.id] = active
         ctx = LeaseContext(
             job=job,
             queue=self.queue,
@@ -372,6 +462,43 @@ class Worker:
         finally:
             stop_hb.set()
             hb_thread.join(timeout=interval + 1)
+            with self._active_lock:
+                self._active.pop(job.id, None)
+
+    def _release_job(self, job: Job, *, reason: str) -> bool:
+        if job.lease_token is None:
+            return False
+        try:
+            self.queue.release(
+                job.id,
+                tenant_id=job.tenant_id,
+                worker_id=self.worker_id,
+                lease_token=job.lease_token,
+                reason=reason,
+            )
+            logger.info("released job %s reason=%s", job.id, reason)
+            return True
+        except LeaseError:
+            logger.warning("could not release job %s (lease lost)", job.id)
+            return False
+
+    def _force_release_active(self, *, reason: str) -> int:
+        with self._active_lock:
+            actives = list(self._active.values())
+        released = 0
+        for active in actives:
+            active.lease_lost.set()
+            active.stop_hb.set()
+            if self._release_job(active.job, reason=reason):
+                released += 1
+        # Wait briefly for handlers to unwind after lease_lost.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with self._active_lock:
+                if not self._active:
+                    break
+            time.sleep(0.05)
+        return released
 
     def _call_handler(self, job: Job, ctx: LeaseContext) -> Any:
         """Run the handler; return value is stored as the job result on ack."""

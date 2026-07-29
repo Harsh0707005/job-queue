@@ -5930,3 +5930,145 @@ def test_retention_cleaner_run_once(queue: JobQueue):
             break
     assert total == 5
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
+
+
+# ---------------------------------------------------------------------------
+# Graceful worker drain
+# ---------------------------------------------------------------------------
+
+
+def test_release_returns_job_pending_immediately(queue: JobQueue):
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={},
+        visibility_timeout_seconds=60,
+        max_attempts=5,
+        retry_backoff_base_seconds=30,
+    )
+    leased = queue.lease(
+        tenant_id="t1",
+        worker_id="w1",
+        visibility_timeout_seconds=60,
+    )
+    assert leased is not None and leased.lease_token is not None
+    released = queue.release(
+        leased.id,
+        tenant_id="t1",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        reason="drain",
+    )
+    assert released.status == JobStatus.PENDING
+    assert released.leased_by is None
+    assert released.lease_token is None
+    # Immediate reclaim by another worker (no visibility wait, no backoff).
+    j2 = queue.lease(tenant_id="t1", worker_id="w2", visibility_timeout_seconds=30)
+    assert j2 is not None and j2.id == job.id
+    assert j2.leased_by == "w2"
+
+
+def test_worker_drain_finishes_in_flight(queue: JobQueue):
+    from job_queue import Worker
+
+    started = threading.Event()
+    finish = threading.Event()
+
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="drain-ok",
+        poll_interval_seconds=0.05,
+        visibility_timeout_seconds=30,
+        drain_timeout_seconds=10,
+    )
+
+    @worker.handler
+    def process(job: Job, lease: LeaseContext) -> dict:
+        started.set()
+        # Wait until test allows finish (or lease lost).
+        while not finish.is_set():
+            lease.ensure_held()
+            if finish.wait(0.05):
+                break
+        return {"ok": True}
+
+    queue.enqueue(tenant_id="t1", payload={"n": 1})
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    assert started.wait(5)
+    # Drain while job is running; allow handler to finish.
+    def _finish_soon() -> None:
+        time.sleep(0.2)
+        finish.set()
+
+    threading.Thread(target=_finish_soon, daemon=True).start()
+    result = worker.drain(timeout_seconds=5)
+    t.join(timeout=5)
+    assert result.drained is True
+    assert result.timed_out is False
+    assert result.released == 0
+    assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
+    assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 0
+
+
+def test_worker_drain_timeout_releases_for_reclaim(queue: JobQueue):
+    from job_queue import Worker
+
+    started = threading.Event()
+    # Handler blocks until lease is lost (drain timeout forces release).
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="drain-to",
+        poll_interval_seconds=0.05,
+        visibility_timeout_seconds=120,
+        drain_timeout_seconds=1,
+    )
+
+    @worker.handler
+    def process(job: Job, lease: LeaseContext) -> dict:
+        started.set()
+        while not lease.lease_lost.is_set():
+            time.sleep(0.05)
+        # Drain force-release sets lease_lost; exit without re-raising so the
+        # worker thread shuts down cleanly.
+        return {"released": True}
+
+    job = queue.enqueue(tenant_id="t1", payload={"long": True})
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    assert started.wait(5)
+    result = worker.drain(timeout_seconds=0.3)
+    t.join(timeout=5)
+    assert result.timed_out is True
+    assert result.released >= 1
+    # Another worker can claim immediately (not wait 120s VT).
+    j2 = queue.lease(
+        tenant_id="t1",
+        worker_id="other",
+        visibility_timeout_seconds=30,
+    )
+    assert j2 is not None and j2.id == job.id
+    assert j2.leased_by == "other"
+    _ack(queue, j2, "other")
+
+
+def test_worker_drain_stops_new_leases(queue: JobQueue):
+    from job_queue import Worker
+
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="drain-nolease",
+        poll_interval_seconds=0.05,
+    )
+
+    @worker.handler
+    def process(job: Job) -> None:
+        return None
+
+    worker._draining.set()  # type: ignore[attr-defined]
+    queue.enqueue(tenant_id="t1", payload={})
+    jobs = worker.run_batch_once()
+    assert jobs == []
+    assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1

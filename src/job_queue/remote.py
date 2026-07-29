@@ -15,10 +15,24 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.codec import job_from_dict
-from job_queue.models import Job
+from job_queue.models import DrainResult, Job
 from job_queue.queue import ApprovalRequested, LeaseError
 
 logger = logging.getLogger(__name__)
+
+
+class _ActiveRemoteJob:
+    __slots__ = ("job", "lease_lost", "stop_hb")
+
+    def __init__(
+        self,
+        job: Job,
+        lease_lost: threading.Event,
+        stop_hb: threading.Event,
+    ) -> None:
+        self.job = job
+        self.lease_lost = lease_lost
+        self.stop_hb = stop_hb
 
 
 class CoordinatorClient:
@@ -263,6 +277,26 @@ class CoordinatorClient:
         if error is not None:
             body["error"] = error
         payload = self._request("POST", f"/v1/jobs/{job_id}/nack", body)
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def release(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        reason: str | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "worker_id": worker_id,
+            "lease_token": str(lease_token),
+        }
+        if reason is not None:
+            body["reason"] = reason
+        payload = self._request("POST", f"/v1/jobs/{job_id}/release", body)
         assert payload is not None
         return job_from_dict(payload["job"])
 
@@ -583,7 +617,14 @@ class CoordinatorClient:
 
 
 class RemoteWorkerAgent:
-    """Remote worker: leases/heartbeats/acks only via coordinator HTTP."""
+    """Remote worker: leases/heartbeats/acks only via coordinator HTTP.
+
+    Graceful drain on deploy/shutdown::
+
+        agent.drain(timeout_seconds=60)
+        # no new leases; finish in-flight with heartbeats; on timeout
+        # release remaining jobs for immediate reclaim by others
+    """
 
     def __init__(
         self,
@@ -595,6 +636,7 @@ class RemoteWorkerAgent:
         heartbeat_interval_seconds: float = 2.0,
         visibility_timeout_seconds: int = 30,
         batch_size: int = 1,
+        drain_timeout_seconds: float = 60.0,
     ) -> None:
         self.client = client
         self.worker_id = worker_id or f"remote-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
@@ -605,21 +647,84 @@ class RemoteWorkerAgent:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         self.batch_size = batch_size
+        self.drain_timeout_seconds = float(drain_timeout_seconds)
         self._stop = threading.Event()
+        self._draining = threading.Event()
+        self._active: dict[Any, _ActiveRemoteJob] = {}
+        self._active_lock = threading.Lock()
         self.processed = 0
 
     def stop(self) -> None:
+        """Stop the run loop without waiting. Prefer :meth:`drain` for deploys."""
         self._stop.set()
+        self._draining.set()
+
+    def drain(self, timeout_seconds: float | None = None) -> DrainResult:
+        """Stop leasing, finish in-flight work, release leftovers on timeout."""
+        timeout = (
+            self.drain_timeout_seconds
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if timeout < 0:
+            raise ValueError("timeout_seconds must be >= 0")
+        self._draining.set()
+        with self._active_lock:
+            in_flight = len(self._active)
+        started = time.monotonic()
+        deadline = started + timeout
+        while True:
+            with self._active_lock:
+                n = len(self._active)
+            if n == 0:
+                self._stop.set()
+                waited = time.monotonic() - started
+                logger.info(
+                    "remote worker %s drain complete in %.2fs "
+                    "(in_flight_at_start=%d)",
+                    self.worker_id,
+                    waited,
+                    in_flight,
+                )
+                return DrainResult(
+                    drained=True,
+                    timed_out=False,
+                    in_flight_at_start=in_flight,
+                    released=0,
+                    wait_seconds=waited,
+                )
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        released = self._force_release_active(reason="drain_timeout")
+        self._stop.set()
+        waited = time.monotonic() - started
+        logger.warning(
+            "remote worker %s drain timed out after %.2fs; released=%d",
+            self.worker_id,
+            waited,
+            released,
+        )
+        return DrainResult(
+            drained=False,
+            timed_out=True,
+            in_flight_at_start=in_flight,
+            released=released,
+            wait_seconds=waited,
+        )
 
     def run(self) -> int:
         logger.info(
-            "remote worker %s starting (tenant=%s fair=%s batch_size=%d)",
+            "remote worker %s starting (tenant=%s fair=%s batch_size=%d "
+            "drain_timeout=%.1fs)",
             self.worker_id,
             self.tenant_id,
             self.tenant_id is None,
             self.batch_size,
+            self.drain_timeout_seconds,
         )
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not self._draining.is_set():
             try:
                 jobs = self.client.lease_batch(
                     worker_id=self.worker_id,
@@ -639,8 +744,10 @@ class RemoteWorkerAgent:
             logger.debug(
                 "worker %s leased batch of %d", self.worker_id, len(jobs)
             )
-            for job in jobs:
-                if self._stop.is_set():
+            for i, job in enumerate(jobs):
+                if self._draining.is_set() or self._stop.is_set():
+                    for leftover in jobs[i:]:
+                        self._release_job(leftover, reason="drain")
                     break
                 try:
                     self._process(job)
@@ -651,13 +758,20 @@ class RemoteWorkerAgent:
                     logger.warning("lease lost for job %s", job.id)
                 except Exception:
                     logger.exception("processing failed for job %s", job.id)
-        logger.info("remote worker %s stopped after %d jobs", self.worker_id, self.processed)
+        logger.info(
+            "remote worker %s stopped after %d jobs",
+            self.worker_id,
+            self.processed,
+        )
         return self.processed
 
     def _process(self, job: Job) -> None:
         assert job.lease_token is not None
         lease_lost = threading.Event()
         stop_hb = threading.Event()
+        active = _ActiveRemoteJob(job, lease_lost, stop_hb)
+        with self._active_lock:
+            self._active[job.id] = active
 
         def heartbeat_loop() -> None:
             while not stop_hb.is_set():
@@ -715,6 +829,45 @@ class RemoteWorkerAgent:
         finally:
             stop_hb.set()
             hb.join(timeout=self.heartbeat_interval_seconds + 1)
+            with self._active_lock:
+                self._active.pop(job.id, None)
+
+    def _release_job(self, job: Job, *, reason: str) -> bool:
+        if job.lease_token is None:
+            return False
+        try:
+            self.client.release(
+                job.id,
+                tenant_id=job.tenant_id,
+                worker_id=self.worker_id,
+                lease_token=job.lease_token,
+                reason=reason,
+            )
+            logger.info("released job %s reason=%s", job.id, reason)
+            return True
+        except LeaseError:
+            logger.warning("could not release job %s (lease lost)", job.id)
+            return False
+        except Exception:
+            logger.exception("release failed for job %s", job.id)
+            return False
+
+    def _force_release_active(self, *, reason: str) -> int:
+        with self._active_lock:
+            actives = list(self._active.values())
+        released = 0
+        for active in actives:
+            active.lease_lost.set()
+            active.stop_hb.set()
+            if self._release_job(active.job, reason=reason):
+                released += 1
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with self._active_lock:
+                if not self._active:
+                    break
+            time.sleep(0.05)
+        return released
 
     def _do_work(self, job: Job, lease_lost: threading.Event) -> dict[str, Any]:
         """Run payload work; supports stepped checkpointed jobs and plain sleep.
@@ -1244,6 +1397,7 @@ def _coord_url() -> str:
 
 def worker_main(argv: list[str] | None = None) -> int:
     import argparse
+    import signal
 
     logging.basicConfig(
         level=_env("LOG_LEVEL", "INFO"),
@@ -1266,6 +1420,13 @@ def worker_main(argv: list[str] | None = None) -> int:
         default=int(_env("BATCH_SIZE", "1") or "1"),
         help="Jobs to lease per pull (default 1; use >1 for batch pulls)",
     )
+    p.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=float(_env("DRAIN_TIMEOUT", "60") or "60"),
+        help="Seconds to finish in-flight work on SIGTERM/SIGINT before "
+        "releasing remaining leases (default 60)",
+    )
     args = p.parse_args(argv)
     client = CoordinatorClient(args.coordinator)
     client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
@@ -1279,11 +1440,37 @@ def worker_main(argv: list[str] | None = None) -> int:
         tenant_id=tenant,
         poll_interval_seconds=args.poll,
         visibility_timeout_seconds=args.visibility_timeout,
+        drain_timeout_seconds=args.drain_timeout,
     )
+    draining = {"done": False}
+
+    def _on_signal(signum: int, _frame: Any) -> None:
+        if draining["done"]:
+            logger.warning("second signal %s: hard stop", signum)
+            agent.stop()
+            return
+        draining["done"] = True
+        logger.info(
+            "signal %s: graceful drain (timeout=%.1fs)",
+            signum,
+            args.drain_timeout,
+        )
+        # Drain from a thread so we don't re-enter the signal handler stack
+        # while the main loop is mid-job.
+        threading.Thread(
+            target=agent.drain,
+            kwargs={"timeout_seconds": args.drain_timeout},
+            name="drain",
+            daemon=True,
+        ).start()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     try:
         agent.run()
     except KeyboardInterrupt:
-        agent.stop()
+        if not draining["done"]:
+            agent.drain(timeout_seconds=args.drain_timeout)
     return 0
 
 

@@ -87,6 +87,9 @@ Design notes
   ``tenant_id``; cross-tenant access is rejected.
 * **Ack**: marks the job completed under a still-valid lease only.
 * **Nack**: releases the lease (or dead-letters after max attempts).
+* **Release**: ``release`` returns a leased job to ``pending`` immediately
+  without counting a failure (no backoff). Used for graceful worker drain so
+  another worker can reclaim without waiting for visibility timeout.
 * **Recurring schedules**: ``create_schedule`` accepts a **cron** expression
   (``\"0 9 * * 1-5\"`` weekdays 09:00, ``\"0 0 1 * *\"`` 1st of month, optional
   6-field with seconds) and/or legacy ``interval_seconds``. Optional IANA
@@ -2833,6 +2836,70 @@ class JobQueue:
                 f"job {job_id} max runtime exceeded; refusing ack"
             )
         raise LeaseError(f"job {job_id} lease lost during ack")
+
+    def release(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        reason: str | None = None,
+    ) -> Job:
+        """Return a leased job to ``pending`` immediately (no failure count).
+
+        Clears the lease so another worker can claim without waiting for
+        visibility timeout. Does **not** change ``attempts`` (the claim already
+        counted). ``available_at`` is set to now. Intended for graceful drain
+        on worker shutdown/deploy.
+        """
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(row, tenant_id)
+            self._assert_active_lease(row, worker_id, lease_token, now)
+            updated = conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_tenant_id = NULL,
+                    lease_expires_at = NULL,
+                    lease_started_at = NULL,
+                    available_at = %s,
+                    last_error = COALESCE(%s, last_error),
+                    updated_at = %s
+                WHERE id = %s
+                  AND lease_token = %s
+                  AND status = %s
+                RETURNING {_JOB_COLUMNS}
+                """,
+                (
+                    JobStatus.PENDING.value,
+                    now,
+                    reason,
+                    now,
+                    job_id,
+                    lease_token,
+                    JobStatus.LEASED.value,
+                ),
+            ).fetchone()
+            if updated is None:
+                raise LeaseError(f"job {job_id} lease lost during release")
+            self._append_job_audit(
+                conn,
+                job_row=updated,
+                event_type="released",
+                from_status=JobStatus.LEASED.value,
+                actor=worker_id,
+                detail={"reason": reason or "drain"},
+                now=now,
+            )
+            self._maybe_finalize_offboard(
+                conn, tenant_id=updated["tenant_id"], now=now
+            )
+            return _row_to_job(updated)
 
     def nack(
         self,

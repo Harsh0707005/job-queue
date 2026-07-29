@@ -82,6 +82,8 @@ class Coordinator:
             return self._job_action(path, body, "ack")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/nack"):
             return self._job_action(path, body, "nack")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/release"):
+            return self._job_action(path, body, "release")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/checkpoint"):
             return self._job_action(path, body, "checkpoint")
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith(
@@ -373,6 +375,14 @@ class Coordinator:
                     lease_token=token,
                     error=body.get("error"),
                     requeue=bool(body.get("requeue", True)),
+                )
+            elif action == "release":
+                job = self.queue.release(
+                    job_id,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    reason=body.get("reason"),
                 )
             elif action == "checkpoint":
                 if "progress" not in body and "checkpoint" not in body:
