@@ -360,7 +360,12 @@ class Worker:
                 for leftover in jobs[i:]:
                     self._release_job(leftover, reason="drain")
                 break
-            self._process(job)
+            try:
+                self._process(job)
+            except LeaseError:
+                logger.warning("lease lost for job %s", job.id)
+            except Exception:
+                logger.exception("processing failed for job %s", job.id)
         return jobs
 
     def run(self, *, max_jobs: int | None = None, stop_when_idle: bool = False) -> int:
