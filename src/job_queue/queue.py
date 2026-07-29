@@ -173,6 +173,11 @@ _MAX_PREEMPTS_PER_JOB = 8
 # collide with tenant concurrency locks (which use single-arg hashtext).
 _DEDUPE_LOCK_CLASS = 884_422_01
 
+# Stored on tenant_settings.*_retention_seconds when the tenant opts out of
+# global retention (keep forever). NULL on tenant_settings means inherit global.
+_TENANT_RETENTION_FOREVER = -1
+_UNSET = object()
+
 _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
     max_attempts, visibility_timeout_seconds, max_runtime_seconds,
@@ -770,23 +775,33 @@ class JobQueue:
         self,
         tenant_id: str,
         *,
-        completed_seconds: int | None = None,
-        dead_seconds: int | None = None,
+        completed_seconds: Any = _UNSET,
+        dead_seconds: Any = _UNSET,
         clear: bool = False,
     ) -> JobRetentionSettings:
         """Override retention for one tenant (or clear back to global).
 
-        When *clear* is True both overrides are removed. Otherwise both
-        values are written (``None`` means keep forever for that status for
-        this tenant, not “inherit global”).
+        When *clear* is True both overrides are removed (inherit global).
+
+        Otherwise pass *completed_seconds* and/or *dead_seconds*:
+        ``None`` means **keep forever for this tenant** (does **not** inherit
+        global). Pass a non-negative int for a finite window. Omitted keys
+        keep their previous override (or inherit if never set). Use *clear*
+        (not ``None``) to fall back to global defaults.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if not clear:
-            if completed_seconds is not None and completed_seconds < 0:
-                raise ValueError("completed_seconds must be >= 0 or None")
-            if dead_seconds is not None and dead_seconds < 0:
-                raise ValueError("dead_seconds must be >= 0 or None")
+            if completed_seconds is not _UNSET:
+                if completed_seconds is not None and int(completed_seconds) < 0:
+                    raise ValueError("completed_seconds must be >= 0 or None")
+            if dead_seconds is not _UNSET:
+                if dead_seconds is not None and int(dead_seconds) < 0:
+                    raise ValueError("dead_seconds must be >= 0 or None")
+            if completed_seconds is _UNSET and dead_seconds is _UNSET:
+                raise ValueError(
+                    "provide completed_seconds and/or dead_seconds, or clear=True"
+                )
         now = _utcnow()
         with transaction(self._pool) as conn:
             if clear:
@@ -805,7 +820,36 @@ class JobQueue:
                     (tenant_id, now),
                 )
                 self._delete_empty_tenant_settings(conn, tenant_id)
-                return JobRetentionSettings(None, None)
+                return JobRetentionSettings(
+                    None,
+                    None,
+                    completed_inherits=True,
+                    dead_inherits=True,
+                )
+            # Merge with existing stored overrides.
+            existing = conn.execute(
+                """
+                SELECT completed_retention_seconds, dead_retention_seconds
+                FROM tenant_settings
+                WHERE tenant_id = %s
+                FOR UPDATE
+                """,
+                (tenant_id,),
+            ).fetchone()
+            prev_c = (
+                existing["completed_retention_seconds"] if existing else None
+            )
+            prev_d = existing["dead_retention_seconds"] if existing else None
+
+            def _to_store(val: Any, prev: Any) -> int | None:
+                if val is _UNSET:
+                    return prev  # may be None (inherit)
+                if val is None:
+                    return _TENANT_RETENTION_FOREVER
+                return int(val)
+
+            c_store = _to_store(completed_seconds, prev_c)
+            d_store = _to_store(dead_seconds, prev_d)
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
@@ -820,15 +864,22 @@ class JobQueue:
                     dead_retention_seconds = EXCLUDED.dead_retention_seconds,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (tenant_id, completed_seconds, dead_seconds, now),
+                (tenant_id, c_store, d_store, now),
             )
-        return JobRetentionSettings(
-            completed_retention_seconds=completed_seconds,
-            dead_retention_seconds=dead_seconds,
-        )
+            return self._decode_tenant_retention_row(
+                {
+                    "completed_retention_seconds": c_store,
+                    "dead_retention_seconds": d_store,
+                }
+            )
 
     def get_tenant_job_retention(self, tenant_id: str) -> JobRetentionSettings:
-        """Return per-tenant override; both None if using global defaults."""
+        """Return per-tenant retention override.
+
+        * ``completed_inherits`` / ``dead_inherits`` True → use global.
+        * inherits False and seconds ``None`` → explicit forever for tenant.
+        * inherits False and seconds ``>= 0`` → finite tenant window.
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         with self._pool.connection() as conn:
@@ -841,11 +892,32 @@ class JobQueue:
                 (tenant_id,),
             ).fetchone()
             if row is None:
-                return JobRetentionSettings(None, None)
-            return JobRetentionSettings(
-                completed_retention_seconds=row["completed_retention_seconds"],
-                dead_retention_seconds=row["dead_retention_seconds"],
-            )
+                return JobRetentionSettings(
+                    None,
+                    None,
+                    completed_inherits=True,
+                    dead_inherits=True,
+                )
+            return self._decode_tenant_retention_row(row)
+
+    @staticmethod
+    def _decode_tenant_retention_row(row: dict[str, Any]) -> JobRetentionSettings:
+        def _one(raw: Any) -> tuple[int | None, bool]:
+            if raw is None:
+                return None, True  # inherit
+            n = int(raw)
+            if n < 0:
+                return None, False  # forever
+            return n, False
+
+        c_sec, c_inh = _one(row.get("completed_retention_seconds"))
+        d_sec, d_inh = _one(row.get("dead_retention_seconds"))
+        return JobRetentionSettings(
+            completed_retention_seconds=c_sec,
+            dead_retention_seconds=d_sec,
+            completed_inherits=c_inh,
+            dead_inherits=d_inh,
+        )
 
     def purge_expired_jobs(
         self,
@@ -855,9 +927,14 @@ class JobQueue:
     ) -> RetentionPurgeResult:
         """Delete terminal jobs older than their retention window.
 
-        Uses per-tenant override when set, else global ``queue_settings``.
-        Statuses with ``NULL`` retention are never purged. Also deletes
-        matching ``job_side_effects`` rows. Audit events are retained.
+        Effective retention per job:
+
+        * tenant override ``>= 0`` → that many seconds
+        * tenant override ``-1`` (API ``None``) → keep forever (ignore global)
+        * tenant override NULL / no row → global setting
+        * global ``NULL`` → keep forever
+
+        Also deletes matching ``job_side_effects`` rows. Audit is retained.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
@@ -7084,10 +7161,13 @@ class JobQueue:
         limit: int,
         tenant_id: str | None,
     ) -> list[UUID]:
-        """Pick job ids of *status* older than effective retention."""
+        """Pick job ids of *status* older than effective retention.
+
+        Tenant column semantics:
+          NULL → inherit global; -1 → never purge; >=0 → seconds.
+        """
         if limit < 1:
             return []
-        # retention column on tenant_settings / queue_settings
         ret_col = (
             "completed_retention_seconds"
             if status == JobStatus.COMPLETED.value
@@ -7100,6 +7180,10 @@ class JobQueue:
             params.append(tenant_id)
         params.append(now)
         params.append(limit)
+        # effective_secs:
+        #   tenant set and >= 0  → tenant value
+        #   tenant set and < 0   → never (NULL)
+        #   tenant NULL          → global (may be NULL forever)
         rows = conn.execute(
             f"""
             SELECT j.id
@@ -7108,11 +7192,25 @@ class JobQueue:
             LEFT JOIN tenant_settings ts ON ts.tenant_id = j.tenant_id
             WHERE j.status = %s
               {tenant_clause}
-              AND COALESCE(ts.{ret_col}, qs.{ret_col}) IS NOT NULL
+              AND (
+                    CASE
+                      WHEN ts.{ret_col} IS NULL THEN qs.{ret_col}
+                      WHEN ts.{ret_col} < 0 THEN NULL
+                      ELSE ts.{ret_col}
+                    END
+                  ) IS NOT NULL
               AND COALESCE(j.completed_at, j.updated_at)
-                  < (%s - make_interval(
-                        secs => COALESCE(ts.{ret_col}, qs.{ret_col})
-                    ))
+                  < (
+                        %s - make_interval(
+                            secs => (
+                                CASE
+                                  WHEN ts.{ret_col} IS NULL THEN qs.{ret_col}
+                                  WHEN ts.{ret_col} < 0 THEN NULL
+                                  ELSE ts.{ret_col}
+                                END
+                            )
+                        )
+                    )
             ORDER BY COALESCE(j.completed_at, j.updated_at) ASC
             LIMIT %s
             FOR UPDATE OF j SKIP LOCKED

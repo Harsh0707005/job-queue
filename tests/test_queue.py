@@ -5801,6 +5801,96 @@ def test_tenant_retention_override(queue: JobQueue):
     assert queue.get(b.id, tenant_id="slow") is not None
 
 
+def test_tenant_retention_none_means_forever_not_global(queue: JobQueue):
+    """Bugfix: tenant None must not COALESCE into short global retention."""
+    queue.set_job_retention(completed_seconds=1, dead_seconds=1)
+    # Explicit forever for this tenant — ignore aggressive global.
+    got = queue.set_tenant_job_retention(
+        "keep", completed_seconds=None, dead_seconds=None
+    )
+    assert got.completed_inherits is False
+    assert got.dead_inherits is False
+    assert got.completed_retention_seconds is None
+    assert got.dead_retention_seconds is None
+    read = queue.get_tenant_job_retention("keep")
+    assert read.completed_inherits is False
+    assert read.dead_inherits is False
+
+    job = queue.enqueue(tenant_id="keep", payload={"x": 1})
+    leased = queue.lease(tenant_id="keep", worker_id="w1")
+    assert leased is not None
+    _ack(queue, leased, "w1")
+    time.sleep(1.3)
+    # Global would have purged; tenant forever must retain.
+    result = queue.purge_expired_jobs()
+    assert result.completed_deleted == 0
+    assert result.dead_deleted == 0
+    assert queue.get(job.id, tenant_id="keep") is not None
+
+
+def test_tenant_retention_none_dead_forever_not_global(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=1, dead_seconds=1)
+    queue.set_tenant_job_retention(
+        "keep-dead", completed_seconds=1, dead_seconds=None
+    )
+    ov = queue.get_tenant_job_retention("keep-dead")
+    assert ov.completed_inherits is False
+    assert ov.completed_retention_seconds == 1
+    assert ov.dead_inherits is False
+    assert ov.dead_retention_seconds is None  # forever
+
+    job = queue.enqueue(
+        tenant_id="keep-dead", payload={}, max_attempts=1
+    )
+    leased = queue.lease(tenant_id="keep-dead", worker_id="w1")
+    assert leased is not None
+    dead = _nack(queue, leased, "w1", error="boom", requeue=True)
+    assert dead.status == JobStatus.DEAD
+    time.sleep(1.3)
+    result = queue.purge_expired_jobs()
+    # completed window is short but this job is dead with forever override.
+    assert result.dead_deleted == 0
+    assert queue.get(job.id, tenant_id="keep-dead") is not None
+
+
+def test_tenant_retention_clear_inherits_global(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=1, dead_seconds=1)
+    queue.set_tenant_job_retention(
+        "t1", completed_seconds=None, dead_seconds=None
+    )
+    queue.set_tenant_job_retention("t1", clear=True)
+    cleared = queue.get_tenant_job_retention("t1")
+    assert cleared.completed_inherits is True
+    assert cleared.dead_inherits is True
+
+    job = queue.enqueue(tenant_id="t1", payload={})
+    leased = queue.lease(tenant_id="t1", worker_id="w1")
+    assert leased is not None
+    _ack(queue, leased, "w1")
+    time.sleep(1.3)
+    result = queue.purge_expired_jobs()
+    assert result.completed_deleted == 1
+    assert queue.get(job.id, tenant_id="t1") is None
+
+
+def test_purge_completed_and_dead_independently(queue: JobQueue):
+    queue.set_job_retention(completed_seconds=1, dead_seconds=3600)
+    c = queue.enqueue(tenant_id="t1", payload={"k": "c"})
+    d = queue.enqueue(tenant_id="t1", payload={"k": "d"}, max_attempts=1)
+    lc = queue.lease(tenant_id="t1", worker_id="w1")
+    assert lc is not None and lc.id == c.id
+    _ack(queue, lc, "w1")
+    ld = queue.lease(tenant_id="t1", worker_id="w1")
+    assert ld is not None and ld.id == d.id
+    _nack(queue, ld, "w1", error="x", requeue=True)
+    time.sleep(1.3)
+    result = queue.purge_expired_jobs()
+    assert result.completed_deleted == 1
+    assert result.dead_deleted == 0
+    assert queue.get(c.id, tenant_id="t1") is None
+    assert queue.get(d.id, tenant_id="t1") is not None
+
+
 def test_purge_deletes_side_effects(queue: JobQueue):
     queue.set_job_retention(completed_seconds=1, dead_seconds=1)
     job = queue.enqueue(tenant_id="t1", payload={})

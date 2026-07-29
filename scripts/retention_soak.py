@@ -264,32 +264,80 @@ def main() -> int:
         logger.error("active backlog not empty: %s", b2)
         return 1
 
-    # Fresh job after purge still works (retention config does not break path).
+    # Phase 3: tenant override None = forever (must not follow short global).
+    keep_tid = "ret-keep"
+    http_json(
+        "POST",
+        f"/v1/tenants/{keep_tid}/retention",
+        {
+            "completed_retention_seconds": None,
+            "dead_retention_seconds": None,
+        },
+    )
+    tr = http_json("GET", f"/v1/tenants/{keep_tid}/retention")
+    if tr.get("completed_inherits") or tr.get("dead_inherits"):
+        logger.error("tenant forever override mis-decoded as inherit: %s", tr)
+        return 1
+    if tr.get("completed_retention_seconds") is not None:
+        logger.error("tenant forever should expose null seconds: %s", tr)
+        return 1
+
     http_json(
         "POST",
         "/v1/jobs",
         {
-            "tenant_id": "ret-00",
+            "tenant_id": keep_tid,
             "payload": {"kind": "work", "ms": 20},
             "max_attempts": 3,
         },
     )
-    deadline = time.monotonic() + 30
+    # Wait for job to complete under workers.
+    keep_done = False
+    deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         b3 = backlog()
-        if int(b3.get("completed") or 0) >= 1 or int(b3.get("leased") or 0) >= 1:
+        # Global retention is short; forever tenant job must still exist.
+        # We cannot see per-tenant counts in backlog; wait past global window
+        # then ensure purge does not remove all jobs if keep tenant still has one.
+        if int(b3.get("completed") or 0) >= 1:
+            keep_done = True
+            break
+        if int(b3.get("pending") or 0) == 0 and int(b3.get("leased") or 0) == 0:
+            # Completed and already purged globally for other tenants; keep may remain.
+            keep_done = True
             break
         time.sleep(0.5)
-    else:
-        # May already complete and still be within retention.
-        b3 = backlog()
+    if not keep_done:
+        logger.error("keep-tenant job never left active states")
+        return 1
+
+    time.sleep(max(COMPLETED_RETENTION, DEAD_RETENTION) + 3)
+    # Force purge; forever tenant must retain its completed job.
+    for _ in range(20):
+        r = http_json(
+            "POST", "/v1/admin/purge-expired-jobs", {"limit": 1000}
+        )
+        if int(r.get("total_deleted") or 0) == 0:
+            break
+    b_keep = backlog()
+    # The keep job should still be counted as completed (global others gone).
+    if int(b_keep.get("completed") or 0) < 1:
+        logger.error(
+            "tenant forever override failed: completed wiped under global "
+            "retention (backlog=%s tenant_ret=%s)",
+            b_keep,
+            tr,
+        )
+        return 1
+
     logger.info(
         "RETENTION SOAK PASSED peak_completed=%d peak_dead=%d "
-        "final=%s purged=%d",
+        "final=%s purged=%d keep_completed=%s",
         completed_peak,
         dead_peak,
         b2,
         total_purged,
+        b_keep.get("completed"),
     )
     return 0
 

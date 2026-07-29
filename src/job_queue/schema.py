@@ -262,7 +262,10 @@ CREATE TABLE IF NOT EXISTS tenant_settings (
     lease_burst            INTEGER,
     lease_tokens           DOUBLE PRECISION,
     lease_tokens_at        TIMESTAMPTZ,
-    -- Per-tenant retention override (NULL = use global queue_settings).
+    -- Per-tenant retention override:
+    --   NULL = inherit global queue_settings
+    --   -1   = keep forever for this tenant (do not use global)
+    --   >=0  = seconds to keep before purge
     completed_retention_seconds INTEGER,
     dead_retention_seconds      INTEGER,
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -286,11 +289,11 @@ CREATE TABLE IF NOT EXISTS tenant_settings (
     ),
     CONSTRAINT tenant_settings_completed_ret_check CHECK (
         completed_retention_seconds IS NULL
-        OR completed_retention_seconds >= 0
+        OR completed_retention_seconds >= -1
     ),
     CONSTRAINT tenant_settings_dead_ret_check CHECK (
         dead_retention_seconds IS NULL
-        OR dead_retention_seconds >= 0
+        OR dead_retention_seconds >= -1
     )
 );
 
@@ -314,11 +317,11 @@ ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS completed_retention_seconds
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS dead_retention_seconds INTEGER;
 ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_completed_ret_check;
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_completed_ret_check CHECK (
-    completed_retention_seconds IS NULL OR completed_retention_seconds >= 0
+    completed_retention_seconds IS NULL OR completed_retention_seconds >= -1
 );
 ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_dead_ret_check;
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_dead_ret_check CHECK (
-    dead_retention_seconds IS NULL OR dead_retention_seconds >= 0
+    dead_retention_seconds IS NULL OR dead_retention_seconds >= -1
 );
 
 

@@ -158,6 +158,14 @@ class Coordinator:
             "/rate-limits"
         ):
             return self._get_rate_limits(path)
+        if method == "POST" and path.startswith("/v1/tenants/") and path.endswith(
+            "/retention"
+        ):
+            return self._set_tenant_retention(path, body)
+        if method == "GET" and path.startswith("/v1/tenants/") and path.endswith(
+            "/retention"
+        ):
+            return self._get_tenant_retention(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/offboard"):
             return self._offboard_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/merge"):
@@ -983,6 +991,66 @@ class Coordinator:
             "lease_rate_per_sec": lease[0],
             "lease_burst": lease[1],
         }
+
+    def _set_tenant_retention(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / retention
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if body.get("clear"):
+            try:
+                settings = self.queue.set_tenant_job_retention(
+                    tenant_id, clear=True
+                )
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            out = job_retention_to_dict(settings)
+            out["tenant_id"] = tenant_id
+            return 200, out
+        kwargs: dict[str, Any] = {}
+        if (
+            "completed_retention_seconds" in body
+            or "completed_seconds" in body
+        ):
+            c_raw = body.get(
+                "completed_retention_seconds", body.get("completed_seconds")
+            )
+            kwargs["completed_seconds"] = (
+                None if c_raw is None else int(c_raw)
+            )
+        if "dead_retention_seconds" in body or "dead_seconds" in body:
+            d_raw = body.get(
+                "dead_retention_seconds", body.get("dead_seconds")
+            )
+            kwargs["dead_seconds"] = None if d_raw is None else int(d_raw)
+        if not kwargs:
+            return 400, {
+                "error": "completed_retention_seconds and/or "
+                "dead_retention_seconds required (null = keep forever "
+                "for this tenant); or clear=true to inherit global"
+            }
+        try:
+            settings = self.queue.set_tenant_job_retention(
+                tenant_id, **kwargs
+            )
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        out = job_retention_to_dict(settings)
+        out["tenant_id"] = tenant_id
+        return 200, out
+
+    def _get_tenant_retention(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        settings = self.queue.get_tenant_job_retention(tenant_id)
+        out = job_retention_to_dict(settings)
+        out["tenant_id"] = tenant_id
+        return 200, out
 
     def _resume_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")

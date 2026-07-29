@@ -258,6 +258,10 @@ def job_retention_to_dict(settings: Any) -> dict[str, Any]:
     return {
         "completed_retention_seconds": settings.completed_retention_seconds,
         "dead_retention_seconds": settings.dead_retention_seconds,
+        "completed_inherits": bool(
+            getattr(settings, "completed_inherits", False)
+        ),
+        "dead_inherits": bool(getattr(settings, "dead_inherits", False)),
     }
 
 

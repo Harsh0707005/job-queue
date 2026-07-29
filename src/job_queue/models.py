@@ -171,10 +171,17 @@ class JobRetentionSettings:
 
     ``None`` means keep forever (no automatic purge for that status).
     ``0`` means eligible for purge immediately on the next cleaner pass.
+
+    For *tenant* overrides (from :meth:`~job_queue.queue.JobQueue.get_tenant_job_retention`):
+    ``completed_inherits`` / ``dead_inherits`` are True when that status uses
+    the global default. When inherits is False and seconds is ``None``, the
+    tenant explicitly keeps that status forever (does **not** follow global).
     """
 
     completed_retention_seconds: int | None
     dead_retention_seconds: int | None
+    completed_inherits: bool = False
+    dead_inherits: bool = False
 
 
 @dataclass(frozen=True, slots=True)
