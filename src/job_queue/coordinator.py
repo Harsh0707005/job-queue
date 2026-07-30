@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
+    bulk_cancel_result_to_dict,
     claimed_webhook_to_dict,
     job_to_dict,
     job_retention_to_dict,
@@ -72,6 +73,10 @@ class Coordinator:
 
         if method == "POST" and path == "/v1/jobs":
             return self._enqueue(body)
+        if method == "GET" and path == "/v1/jobs":
+            return self._list_jobs(query)
+        if method == "POST" and path == "/v1/jobs/cancel-matching":
+            return self._cancel_matching(body)
         if method == "POST" and path == "/v1/lease":
             return self._lease(body)
         if method == "POST" and path == "/v1/deadlines/process":
@@ -235,6 +240,7 @@ class Coordinator:
                 else:
                     return 400, {"error": "deadline_at must be an ISO-8601 string"}
             est = body.get("estimated_duration_seconds")
+            labels = body.get("labels")
             job = self.queue.enqueue(
                 tenant_id=str(body["tenant_id"]),
                 payload=dict(body.get("payload") or {}),
@@ -251,6 +257,7 @@ class Coordinator:
                     None if est is None else int(est)
                 ),
                 preemptible=bool(body.get("preemptible", True)),
+                labels=labels,
             )
         except RateLimitError as exc:
             payload: dict[str, Any] = {
@@ -606,6 +613,57 @@ class Coordinator:
             "count": len(jobs),
             "jobs": [job_to_dict(j) for j in jobs],
         }
+
+    def _list_jobs(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        labels = query.get("label") or query.get("labels") or []
+        statuses = query.get("status") or []
+        queue_names = query.get("queue_name") or []
+        try:
+            limit = int((query.get("limit") or ["100"])[0])
+            offset = int((query.get("offset") or ["0"])[0])
+            jobs = self.queue.list_jobs(
+                tenant_id=str(tenants[0]),
+                labels=labels or None,
+                status=statuses or None,
+                queue_name=(
+                    str(queue_names[0]) if queue_names and queue_names[0] else None
+                ),
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "jobs": [job_to_dict(j) for j in jobs],
+            "count": len(jobs),
+        }
+
+    def _cancel_matching(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id required"}
+        try:
+            result = self.queue.cancel_matching(
+                tenant_id=str(tenant_id),
+                labels=body.get("labels"),
+                status=body.get("status"),
+                queue_name=(
+                    str(body["queue_name"])
+                    if body.get("queue_name") is not None
+                    else None
+                ),
+                limit=int(body.get("limit") or 1000),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, bulk_cancel_result_to_dict(result)
 
     def _get_job(
         self, path: str, query: dict[str, list[str]]

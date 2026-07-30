@@ -59,6 +59,8 @@ Design notes
   siblings are cancelled — it never waits forever. Join deadlines
   (``await_children_deadline_at``) are reaped on the **normal lease path**
   alongside approval timeouts (and via ``process_await_children_timeouts``).
+* **Labels**: jobs may carry free-form string tags (``labels``). List and bulk
+  cancel filter by tenant + optional label set (all must match) + status.
 * **Immutable audit**: every job state change appends a
   ``job_audit_events`` row in the **same transaction** (ordered ``seq`` per
   job) with a full ``detail.job`` snapshot. Event rows keep the tenant at
@@ -159,6 +161,7 @@ from psycopg_pool import ConnectionPool
 from job_queue.db import init_schema, transaction
 from job_queue.models import (
     AuditConsistencyReport,
+    BulkCancelResult,
     Job,
     JobAuditEvent,
     JobRetentionSettings,
@@ -195,7 +198,7 @@ _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
     max_attempts, visibility_timeout_seconds, max_runtime_seconds,
     retry_backoff_base_seconds, retry_backoff_max_seconds, available_at,
-    dedupe_key, schedule_id, depends_on, parent_job_id, waiting_on,
+    dedupe_key, schedule_id, depends_on, parent_job_id, waiting_on, labels,
     leased_by, lease_token, lease_tenant_id, lease_expires_at,
     lease_started_at, created_at, updated_at, completed_at, result,
     checkpoint, checkpointed_at, deadline_at, estimated_duration_seconds,
@@ -205,6 +208,15 @@ _JOB_COLUMNS = """
     await_children_deadline_at, await_children_outcome,
     await_children_resolved_at, last_error
 """
+
+_MAX_LABELS = 32
+_MAX_LABEL_LEN = 128
+_CANCELABLE_STATUSES = (
+    JobStatus.PENDING,
+    JobStatus.LEASED,
+    JobStatus.AWAITING_APPROVAL,
+    JobStatus.AWAITING_CHILDREN,
+)
 
 # Statuses that count as "in flight" for dedupe / schedule uniqueness.
 _ACTIVE_JOB_STATUSES = (
@@ -233,6 +245,54 @@ _DEPS_SATISFIED_SQL = """
 """
 
 
+def _normalize_labels(labels: Sequence[str] | str | None) -> list[str]:
+    """Strip, dedupe, sort labels. Empty input → []."""
+    if labels is None:
+        return []
+    if isinstance(labels, str):
+        raw = [labels]
+    else:
+        raw = list(labels)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError("labels must be strings")
+        lab = item.strip()
+        if not lab:
+            raise ValueError("labels must be non-empty after strip")
+        if len(lab) > _MAX_LABEL_LEN:
+            raise ValueError(
+                f"label longer than {_MAX_LABEL_LEN} characters: {lab[:32]!r}..."
+            )
+        if lab in seen:
+            continue
+        seen.add(lab)
+        out.append(lab)
+    if len(out) > _MAX_LABELS:
+        raise ValueError(f"at most {_MAX_LABELS} labels allowed")
+    out.sort()
+    return out
+
+
+def _normalize_status_filter(
+    status: JobStatus | str | Sequence[JobStatus | str] | None,
+) -> list[str] | None:
+    if status is None:
+        return None
+    if isinstance(status, (JobStatus, str)):
+        items: list[JobStatus | str] = [status]
+    else:
+        items = list(status)
+    out: list[str] = []
+    for s in items:
+        if isinstance(s, JobStatus):
+            out.append(s.value)
+        else:
+            out.append(JobStatus(str(s)).value)
+    return out
+
+
 def _row_to_job(row: dict[str, Any]) -> Job:
     payload = row["payload"]
     if isinstance(payload, str):
@@ -244,6 +304,9 @@ def _row_to_job(row: dict[str, Any]) -> Job:
     waiting = row.get("waiting_on") or []
     if isinstance(waiting, str):
         waiting = []
+    labs = row.get("labels") or []
+    if isinstance(labs, str):
+        labs = []
     return Job(
         id=row["id"],
         tenant_id=row["tenant_id"],
@@ -275,6 +338,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         depends_on=tuple(deps),
         parent_job_id=row.get("parent_job_id"),
         waiting_on=tuple(waiting),
+        labels=tuple(labs),
         leased_by=row["leased_by"],
         lease_token=row["lease_token"],
         lease_tenant_id=row.get("lease_tenant_id"),
@@ -1591,6 +1655,7 @@ class JobQueue:
         deadline_at: datetime | None = None,
         estimated_duration_seconds: int | None = None,
         preemptible: bool = True,
+        labels: Sequence[str] | str | None = None,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -1650,6 +1715,7 @@ class JobQueue:
             raise ValueError("estimated_duration_seconds must be >= 1 when set")
 
         dep_ids = self._normalize_depends_on(depends_on)
+        label_list = _normalize_labels(labels)
 
         now = _utcnow()
         if available_at is not None:
@@ -1709,6 +1775,7 @@ class JobQueue:
                         max_runtime_seconds,
                         retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
+                        labels,
                         deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at
                     ) VALUES (
@@ -1717,6 +1784,7 @@ class JobQueue:
                         %s,
                         %s, %s,
                         %s, %s, NULL, %s,
+                        %s,
                         %s, %s, %s,
                         %s, %s
                     )
@@ -1744,6 +1812,7 @@ class JobQueue:
                         run_at,
                         dedupe_key,
                         dep_ids,
+                        label_list,
                         deadline,
                         estimated_duration_seconds,
                         bool(preemptible),
@@ -1792,6 +1861,7 @@ class JobQueue:
                     max_runtime_seconds,
                     retry_backoff_base_seconds, retry_backoff_max_seconds,
                     available_at, dedupe_key, schedule_id, depends_on,
+                    labels,
                     deadline_at, estimated_duration_seconds, preemptible,
                     created_at, updated_at
                 ) VALUES (
@@ -1800,6 +1870,7 @@ class JobQueue:
                     %s,
                     %s, %s,
                     %s, NULL, NULL, %s,
+                    %s,
                     %s, %s, %s,
                     %s, %s
                 )
@@ -1819,6 +1890,7 @@ class JobQueue:
                     retry_backoff_max_seconds,
                     run_at,
                     dep_ids,
+                    label_list,
                     deadline,
                     estimated_duration_seconds,
                     bool(preemptible),
@@ -1834,7 +1906,11 @@ class JobQueue:
                 event_type="enqueued",
                 from_status=None,
                 actor=None,
-                detail={"queue_name": queue_name, "priority": priority},
+                detail={
+                    "queue_name": queue_name,
+                    "priority": priority,
+                    "labels": label_list,
+                },
                 now=now,
             )
             return job
@@ -2760,6 +2836,238 @@ class JobQueue:
                 )
             self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
             return _row_to_job(updated)
+
+    def list_jobs(
+        self,
+        *,
+        tenant_id: str,
+        labels: Sequence[str] | str | None = None,
+        status: JobStatus | str | Sequence[JobStatus | str] | None = None,
+        queue_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Job]:
+        """List jobs for *tenant_id*, optionally filtered by labels and status.
+
+        *labels*: job must include **all** listed labels (AND). Order is
+        newest ``created_at`` first.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        label_list = _normalize_labels(labels)
+        status_list = _normalize_status_filter(status)
+
+        clauses = ["tenant_id = %s"]
+        params: list[Any] = [tenant_id]
+        if queue_name is not None:
+            clauses.append("queue_name = %s")
+            params.append(queue_name)
+        if status_list:
+            clauses.append("status = ANY(%s)")
+            params.append(status_list)
+        if label_list:
+            clauses.append("labels @> %s::text[]")
+            params.append(label_list)
+        params.extend([limit, offset])
+        where = " AND ".join(clauses)
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE {where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params),
+            ).fetchall()
+            return [_row_to_job(r) for r in rows]
+
+    def cancel_matching(
+        self,
+        *,
+        tenant_id: str,
+        labels: Sequence[str] | str | None = None,
+        status: JobStatus | str | Sequence[JobStatus | str] | None = None,
+        queue_name: str | None = None,
+        limit: int = 1000,
+    ) -> BulkCancelResult:
+        """Cancel all cancelable jobs matching tenant + optional filters.
+
+        Filters:
+          * *labels*: job must include all listed labels
+          * *status*: restrict to these statuses (must still be cancelable)
+          * *queue_name*: optional queue scope
+
+        When *status* is omitted, all cancelable statuses are targeted
+        (pending, leased, awaiting_approval, awaiting_children). Terminal
+        jobs are never cancelled. Cascades dependents / join children like
+        :meth:`cancel`.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        label_list = _normalize_labels(labels)
+        status_list = _normalize_status_filter(status)
+        cancelable_values = {s.value for s in _CANCELABLE_STATUSES}
+        if status_list is None:
+            target_statuses = list(cancelable_values)
+        else:
+            target_statuses = [s for s in status_list if s in cancelable_values]
+            if not target_statuses:
+                raise ValueError(
+                    "status filter has no cancelable statuses "
+                    f"(cancelable={sorted(cancelable_values)})"
+                )
+
+        now = _utcnow()
+        cancelled: list[Job] = []
+        with transaction(self._pool) as conn:
+            clauses = [
+                "tenant_id = %s",
+                "status = ANY(%s)",
+            ]
+            params: list[Any] = [tenant_id, target_statuses]
+            if queue_name is not None:
+                clauses.append("queue_name = %s")
+                params.append(queue_name)
+            if label_list:
+                clauses.append("labels @> %s::text[]")
+                params.append(label_list)
+            params.append(limit)
+            where = " AND ".join(clauses)
+            rows = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE {where}
+                ORDER BY created_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                tuple(params),
+            ).fetchall()
+
+            for row in rows:
+                job = self._cancel_locked_row(
+                    conn,
+                    row=row,
+                    tenant_id=tenant_id,
+                    now=now,
+                    reason="bulk cancel matching filter",
+                )
+                if job is not None:
+                    cancelled.append(job)
+
+            self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
+
+        return BulkCancelResult(
+            tenant_id=tenant_id,
+            cancelled=len(cancelled),
+            jobs=tuple(cancelled),
+        )
+
+    def _cancel_locked_row(
+        self,
+        conn: Any,
+        *,
+        row: dict[str, Any],
+        tenant_id: str,
+        now: datetime,
+        reason: str,
+    ) -> Job | None:
+        """Cancel one already-locked cancelable job row. Returns updated job."""
+        status = row["status"]
+        if status not in {s.value for s in _CANCELABLE_STATUSES}:
+            return None
+        job_id = row["id"]
+        was_running = status == JobStatus.LEASED.value
+        was_awaiting_children = status == JobStatus.AWAITING_CHILDREN.value
+        err = reason
+        if was_running:
+            err = f"{reason} (stopped while running)"
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = NULL,
+                lease_token = NULL,
+                lease_tenant_id = NULL,
+                lease_expires_at = NULL,
+                lease_started_at = NULL,
+                checkpoint = NULL,
+                checkpointed_at = NULL,
+                approval_deadline_at = NULL,
+                approval_outcome = COALESCE(approval_outcome, 'rejected'),
+                approval_resolved_at = COALESCE(approval_resolved_at, %s),
+                await_children_deadline_at = NULL,
+                await_children_outcome = CASE
+                    WHEN status = %s THEN COALESCE(await_children_outcome, 'cancelled')
+                    ELSE await_children_outcome
+                END,
+                await_children_resolved_at = CASE
+                    WHEN status = %s THEN COALESCE(await_children_resolved_at, %s)
+                    ELSE await_children_resolved_at
+                END,
+                last_error = %s,
+                updated_at = %s
+            WHERE id = %s
+              AND tenant_id = %s
+              AND status IN (%s, %s, %s, %s)
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.CANCELLED.value,
+                now,
+                JobStatus.AWAITING_CHILDREN.value,
+                JobStatus.AWAITING_CHILDREN.value,
+                now,
+                err,
+                now,
+                job_id,
+                tenant_id,
+                JobStatus.PENDING.value,
+                JobStatus.LEASED.value,
+                JobStatus.AWAITING_APPROVAL.value,
+                JobStatus.AWAITING_CHILDREN.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return None
+        self._append_job_audit(
+            conn,
+            job_row=updated,
+            event_type="cancelled",
+            from_status=status,
+            actor=None,
+            detail={
+                "was_running": was_running,
+                "was_awaiting_children": was_awaiting_children,
+                "bulk": True,
+                "reason": reason,
+            },
+            now=now,
+        )
+        self._cascade_cancel_dependents(
+            conn,
+            parent_id=job_id,
+            tenant_id=tenant_id,
+            reason=f"parent job {job_id} cancelled",
+            now=now,
+        )
+        if updated.get("parent_job_id") is not None:
+            self._maybe_wake_parent_on_join_locked(
+                conn,
+                parent_id=updated["parent_job_id"],
+                tenant_id=tenant_id,
+                now=now,
+            )
+        return _row_to_job(updated)
 
     # ------------------------------------------------------------------
     # Heartbeat
@@ -6794,6 +7102,8 @@ class JobQueue:
         deps = [UUID(str(d)) for d in deps_raw]
         waiting_raw = snap.get("waiting_on") or []
         waiting = [UUID(str(d)) for d in waiting_raw]
+        labels_raw = snap.get("labels") or []
+        labels = [str(x) for x in labels_raw]
         payload = snap["payload"]
         result = snap.get("result")
         checkpoint = snap.get("checkpoint")
@@ -6806,7 +7116,7 @@ class JobQueue:
                 max_runtime_seconds,
                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                 available_at, dedupe_key, schedule_id, depends_on,
-                parent_job_id, waiting_on,
+                parent_job_id, waiting_on, labels,
                 leased_by, lease_token, lease_tenant_id,
                 lease_expires_at, lease_started_at,
                 created_at, updated_at, completed_at, result,
@@ -6824,7 +7134,7 @@ class JobQueue:
                 %s,
                 %s, %s,
                 %s, %s, %s, %s,
-                %s, %s,
+                %s, %s, %s,
                 %s, %s, %s,
                 %s, %s,
                 %s, %s, %s, %s,
@@ -6857,6 +7167,7 @@ class JobQueue:
                 deps,
                 _parse_uuid("parent_job_id"),
                 waiting,
+                labels,
                 snap.get("leased_by"),
                 _parse_uuid("lease_token"),
                 snap.get("lease_tenant_id"),

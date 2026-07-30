@@ -2,6 +2,7 @@
 
 from job_queue.models import (
     AuditConsistencyReport,
+    BulkCancelResult,
     ClaimedWebhook,
     DrainResult,
     Job,
@@ -55,6 +56,7 @@ __all__ = [
     "ApprovalError",
     "ApprovalRequested",
     "AuditConsistencyReport",
+    "BulkCancelResult",
     "CancelError",
     "ChildrenAwaited",
     "ClaimedWebhook",

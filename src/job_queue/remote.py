@@ -15,7 +15,7 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.codec import job_from_dict
-from job_queue.models import DrainResult, Job, SpawnChildrenResult
+from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
 from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
 
 logger = logging.getLogger(__name__)
@@ -562,6 +562,66 @@ class CoordinatorClient:
         )
         assert payload is not None
         return payload
+
+    def list_jobs(
+        self,
+        *,
+        tenant_id: str,
+        labels: list[str] | None = None,
+        status: str | list[str] | None = None,
+        queue_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Job]:
+        from urllib.parse import urlencode
+
+        q: list[tuple[str, str]] = [
+            ("tenant_id", tenant_id),
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if queue_name is not None:
+            q.append(("queue_name", queue_name))
+        if labels:
+            for lab in labels:
+                q.append(("label", lab))
+        if status is not None:
+            if isinstance(status, str):
+                q.append(("status", status))
+            else:
+                for s in status:
+                    q.append(("status", s))
+        payload = self._request("GET", f"/v1/jobs?{urlencode(q)}")
+        assert payload is not None
+        return [job_from_dict(j) for j in (payload.get("jobs") or [])]
+
+    def cancel_matching(
+        self,
+        *,
+        tenant_id: str,
+        labels: list[str] | None = None,
+        status: str | list[str] | None = None,
+        queue_name: str | None = None,
+        limit: int = 1000,
+    ) -> BulkCancelResult:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "limit": limit,
+        }
+        if labels is not None:
+            body["labels"] = labels
+        if status is not None:
+            body["status"] = status
+        if queue_name is not None:
+            body["queue_name"] = queue_name
+        payload = self._request("POST", "/v1/jobs/cancel-matching", body)
+        assert payload is not None
+        jobs = tuple(job_from_dict(j) for j in (payload.get("jobs") or []))
+        return BulkCancelResult(
+            tenant_id=str(payload.get("tenant_id") or tenant_id),
+            cancelled=int(payload.get("cancelled") or len(jobs)),
+            jobs=jobs,
+        )
 
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(

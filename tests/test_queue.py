@@ -6881,3 +6881,168 @@ def test_spawn_wait_false_keeps_lease(queue: JobQueue):
     assert kids[0].parent_job_id == parent.id
     # Parent can still ack.
     _ack(queue, result.parent, "p1", result={"spawned": True})
+
+
+# ---------------------------------------------------------------------------
+# Labels: list + bulk cancel
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_labels_normalized(queue: JobQueue):
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"x": 1},
+        labels=["env:prod", " batch:42 ", "env:prod", "team:payments"],
+    )
+    assert j.labels == ("batch:42", "env:prod", "team:payments")
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None
+    assert got.labels == j.labels
+
+
+def test_list_jobs_filter_tenant_label_status(queue: JobQueue):
+    a1 = queue.enqueue(
+        tenant_id="ta", payload={"n": 1}, labels=["campaign:x", "tier:gold"]
+    )
+    a2 = queue.enqueue(
+        tenant_id="ta", payload={"n": 2}, labels=["campaign:x", "tier:silver"]
+    )
+    a3 = queue.enqueue(
+        tenant_id="ta", payload={"n": 3}, labels=["campaign:y"]
+    )
+    queue.enqueue(tenant_id="tb", payload={"n": 9}, labels=["campaign:x"])
+
+    # Label filter (AND): both campaign:x and tier:gold
+    gold = queue.list_jobs(tenant_id="ta", labels=["campaign:x", "tier:gold"])
+    assert {j.id for j in gold} == {a1.id}
+
+    # campaign:x only
+    cx = queue.list_jobs(tenant_id="ta", labels=["campaign:x"])
+    assert {j.id for j in cx} == {a1.id, a2.id}
+
+    # Status filter after cancel one
+    queue.cancel(a2.id, tenant_id="ta")
+    pending = queue.list_jobs(
+        tenant_id="ta", labels=["campaign:x"], status=JobStatus.PENDING
+    )
+    assert {j.id for j in pending} == {a1.id}
+    cancelled = queue.list_jobs(
+        tenant_id="ta", labels=["campaign:x"], status="cancelled"
+    )
+    assert {j.id for j in cancelled} == {a2.id}
+
+    # Tenant isolation: tb does not see ta jobs
+    tb = queue.list_jobs(tenant_id="tb", labels=["campaign:x"])
+    assert len(tb) == 1
+    assert tb[0].tenant_id == "tb"
+    assert a3.id not in {j.id for j in cx}
+
+
+def test_cancel_matching_by_label_and_status(queue: JobQueue):
+    ids = []
+    for i in range(5):
+        j = queue.enqueue(
+            tenant_id="t1",
+            payload={"i": i},
+            labels=["run:abc", "kind:work"],
+        )
+        ids.append(j.id)
+    # One other label should survive
+    keep = queue.enqueue(
+        tenant_id="t1", payload={"keep": True}, labels=["run:other"]
+    )
+    # Lease one so bulk cancel covers leased too
+    leased = queue.lease(
+        tenant_id="t1", worker_id="w1", visibility_timeout_seconds=30
+    )
+    assert leased is not None
+
+    result = queue.cancel_matching(
+        tenant_id="t1",
+        labels=["run:abc"],
+        status=["pending", "leased"],
+    )
+    assert result.cancelled >= 5
+    assert all(j.status == JobStatus.CANCELLED for j in result.jobs)
+
+    for jid in ids:
+        row = queue.get(jid, tenant_id="t1")
+        assert row is not None and row.status == JobStatus.CANCELLED
+
+    keep_after = queue.get(keep.id, tenant_id="t1")
+    assert keep_after is not None
+    assert keep_after.status in (JobStatus.PENDING, JobStatus.LEASED)
+
+
+def test_cancel_matching_multi_tenant_isolation(queue: JobQueue):
+    for tid in ("t-a", "t-b"):
+        for i in range(3):
+            queue.enqueue(
+                tenant_id=tid,
+                payload={"i": i},
+                labels=["batch:shared-name"],
+            )
+    res = queue.cancel_matching(tenant_id="t-a", labels=["batch:shared-name"])
+    assert res.cancelled == 3
+    assert all(j.tenant_id == "t-a" for j in res.jobs)
+    remaining = queue.list_jobs(tenant_id="t-b", labels=["batch:shared-name"])
+    assert len(remaining) == 3
+    assert all(j.status == JobStatus.PENDING for j in remaining)
+
+
+def test_cancel_matching_with_workers_mid_flight(queue: JobQueue):
+    """Bulk cancel frees leases; multi-tenant workers cannot complete them."""
+    from job_queue import Worker
+
+    for tid in ("mw-a", "mw-b"):
+        for i in range(4):
+            queue.enqueue(
+                tenant_id=tid,
+                payload={"kind": "slow", "i": i},
+                labels=["wave:1", f"tenant:{tid}"],
+            )
+
+    started = threading.Event()
+    workers = []
+    threads = []
+    for i in range(3):
+        w = Worker(
+            queue,
+            worker_id=f"lbl-w-{i}",
+            poll_interval_seconds=0.05,
+            visibility_timeout_seconds=60,
+        )
+
+        @w.handler
+        def process(job: Job, lease: LeaseContext) -> dict:
+            started.set()
+            # Block until lease lost (cancel) or timeout.
+            for _ in range(200):
+                if lease.lease_lost.is_set():
+                    break
+                time.sleep(0.05)
+            lease.ensure_held()
+            return {"ok": True}
+
+        workers.append(w)
+        th = threading.Thread(target=w.run, daemon=True)
+        th.start()
+        threads.append(th)
+
+    assert started.wait(5)
+    time.sleep(0.3)
+
+    res_a = queue.cancel_matching(tenant_id="mw-a", labels=["wave:1"])
+    res_b = queue.cancel_matching(tenant_id="mw-b", labels=["wave:1"])
+    assert res_a.cancelled + res_b.cancelled == 8
+
+    for tid in ("mw-a", "mw-b"):
+        rows = queue.list_jobs(tenant_id=tid, labels=["wave:1"])
+        assert len(rows) == 4
+        assert all(r.status == JobStatus.CANCELLED for r in rows)
+        assert queue.count(tenant_id=tid, status=JobStatus.LEASED) == 0
+
+    for w in workers:
+        w.stop()
+    for th in threads:
+        th.join(timeout=3)

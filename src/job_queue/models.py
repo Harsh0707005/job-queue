@@ -62,6 +62,7 @@ class Job:
     job is claimable. If a parent ends in failure, dependents are cancelled.
     ``parent_job_id`` links a spawned subtask back to its parent job.
     ``waiting_on`` lists child ids a parked parent is joining on.
+    ``labels`` is a sorted set of free-form string tags for list / bulk cancel.
     """
 
     id: UUID
@@ -82,6 +83,7 @@ class Job:
     depends_on: tuple[UUID, ...]
     parent_job_id: UUID | None
     waiting_on: tuple[UUID, ...]
+    labels: tuple[str, ...]
     leased_by: str | None
     lease_token: UUID | None
     lease_tenant_id: str | None
@@ -132,6 +134,15 @@ class SpawnChildrenResult:
 
     parent: Job
     children: tuple[Job, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BulkCancelResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.cancel_matching`."""
+
+    tenant_id: str
+    cancelled: int
+    jobs: tuple[Job, ...]
 
 
 @dataclass(frozen=True, slots=True)

@@ -107,6 +107,18 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_deadline_at TIMESTAMPTZ
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_outcome TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_resolved_at TIMESTAMPTZ;
 
+-- Free-form string labels (tags) for list / bulk-cancel filters.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS labels TEXT[];
+UPDATE jobs SET labels = '{}' WHERE labels IS NULL;
+ALTER TABLE jobs ALTER COLUMN labels SET DEFAULT '{}';
+ALTER TABLE jobs ALTER COLUMN labels SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_labels_gin
+    ON jobs USING GIN (labels);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status_created
+    ON jobs (tenant_id, status, created_at DESC);
+
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_approval_outcome_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_approval_outcome_check CHECK (
     approval_outcome IS NULL

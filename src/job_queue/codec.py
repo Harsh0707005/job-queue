@@ -8,6 +8,7 @@ from uuid import UUID
 
 from job_queue.models import (
     AuditConsistencyReport,
+    BulkCancelResult,
     ClaimedWebhook,
     Job,
     JobAuditEvent,
@@ -52,6 +53,7 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "depends_on": [str(x) for x in job.depends_on],
         "parent_job_id": _uuid(job.parent_job_id),
         "waiting_on": [str(x) for x in job.waiting_on],
+        "labels": list(job.labels),
         "leased_by": job.leased_by,
         "lease_token": _uuid(job.lease_token),
         "lease_tenant_id": job.lease_tenant_id,
@@ -96,6 +98,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
 
     depends = data.get("depends_on") or []
     waiting = data.get("waiting_on") or []
+    labels = data.get("labels") or []
     return Job(
         id=UUID(str(data["id"])),
         tenant_id=str(data["tenant_id"]),
@@ -115,6 +118,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         depends_on=tuple(UUID(str(x)) for x in depends),
         parent_job_id=parse_uuid("parent_job_id"),
         waiting_on=tuple(UUID(str(x)) for x in waiting),
+        labels=tuple(str(x) for x in labels),
         leased_by=data.get("leased_by"),
         lease_token=parse_uuid("lease_token"),
         lease_tenant_id=data.get("lease_tenant_id"),
@@ -152,6 +156,15 @@ def spawn_children_result_to_dict(result: SpawnChildrenResult) -> dict[str, Any]
     return {
         "parent": job_to_dict(result.parent),
         "children": [job_to_dict(c) for c in result.children],
+    }
+
+
+def bulk_cancel_result_to_dict(result: BulkCancelResult) -> dict[str, Any]:
+    return {
+        "tenant_id": result.tenant_id,
+        "cancelled": result.cancelled,
+        "jobs": [job_to_dict(j) for j in result.jobs],
+        "count": result.cancelled,
     }
 
 
