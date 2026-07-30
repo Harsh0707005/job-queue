@@ -13,6 +13,7 @@ class JobStatus(str, Enum):
     PENDING = "pending"
     LEASED = "leased"
     AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_CHILDREN = "awaiting_children"
     COMPLETED = "completed"
     FAILED = "failed"
     DEAD = "dead"
@@ -49,10 +50,18 @@ class Job:
     ``approval_deadline_at`` auto-reject. Checkpoint is kept so approve
     resumes work.
 
+    ``awaiting_children`` parks a parent after ``spawn_children`` while its
+    subtasks run. The lease is cleared (no concurrency slot); when every
+    child completes the parent becomes ``pending`` again (checkpoint kept).
+    If any child fails, is cancelled, or times out, the parent is terminalized
+    with an error instead of waiting forever.
+
     ``available_at`` is the earliest time a pending job may be claimed.
     ``dedupe_key`` identifies a logical job for enqueue-time deduplication.
     ``depends_on`` lists parent job ids that must be ``completed`` before this
     job is claimable. If a parent ends in failure, dependents are cancelled.
+    ``parent_job_id`` links a spawned subtask back to its parent job.
+    ``waiting_on`` lists child ids a parked parent is joining on.
     """
 
     id: UUID
@@ -71,6 +80,8 @@ class Job:
     dedupe_key: str | None
     schedule_id: UUID | None
     depends_on: tuple[UUID, ...]
+    parent_job_id: UUID | None
+    waiting_on: tuple[UUID, ...]
     leased_by: str | None
     lease_token: UUID | None
     lease_tenant_id: str | None
@@ -92,6 +103,10 @@ class Job:
     approval_message: str | None
     approval_outcome: str | None
     approval_resolved_at: datetime | None
+    await_children_started_at: datetime | None
+    await_children_deadline_at: datetime | None
+    await_children_outcome: str | None
+    await_children_resolved_at: datetime | None
     last_error: str | None
 
     @property
@@ -105,6 +120,18 @@ class Job:
     @property
     def is_awaiting_approval(self) -> bool:
         return self.status == JobStatus.AWAITING_APPROVAL
+
+    @property
+    def is_awaiting_children(self) -> bool:
+        return self.status == JobStatus.AWAITING_CHILDREN
+
+
+@dataclass(frozen=True, slots=True)
+class SpawnChildrenResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.spawn_children`."""
+
+    parent: Job
+    children: tuple[Job, ...]
 
 
 @dataclass(frozen=True, slots=True)

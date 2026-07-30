@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
     status IN (
-        'pending', 'leased', 'awaiting_approval',
+        'pending', 'leased', 'awaiting_approval', 'awaiting_children',
         'completed', 'failed', 'dead', 'cancelled'
     )
 );
@@ -96,10 +96,27 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_message TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_outcome TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approval_resolved_at TIMESTAMPTZ;
 
+-- Parent/child spawn-join: children point at parent; parked parents list waiting_on.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id UUID;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS waiting_on UUID[];
+UPDATE jobs SET waiting_on = '{}' WHERE waiting_on IS NULL;
+ALTER TABLE jobs ALTER COLUMN waiting_on SET DEFAULT '{}';
+ALTER TABLE jobs ALTER COLUMN waiting_on SET NOT NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_started_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_deadline_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_outcome TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS await_children_resolved_at TIMESTAMPTZ;
+
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_approval_outcome_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_approval_outcome_check CHECK (
     approval_outcome IS NULL
     OR approval_outcome IN ('approved', 'rejected', 'timeout')
+);
+
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_await_children_outcome_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_await_children_outcome_check CHECK (
+    await_children_outcome IS NULL
+    OR await_children_outcome IN ('joined', 'failed', 'timeout', 'cancelled')
 );
 
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_estimated_duration_check;
@@ -185,19 +202,35 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_leased
     ON jobs (tenant_id)
     WHERE status = 'leased';
 
--- At most one active (pending/leased/awaiting_approval) job per dedupe key.
+-- At most one active (pending/leased/parked) job per dedupe key.
 DROP INDEX IF EXISTS idx_jobs_dedupe_active;
 CREATE UNIQUE INDEX idx_jobs_dedupe_active
     ON jobs (tenant_id, queue_name, dedupe_key)
     WHERE dedupe_key IS NOT NULL
-      AND status IN ('pending', 'leased', 'awaiting_approval');
+      AND status IN (
+          'pending', 'leased', 'awaiting_approval', 'awaiting_children'
+      );
 
 -- At most one in-flight job per recurring schedule (no overlapping runs).
 DROP INDEX IF EXISTS idx_jobs_schedule_active;
 CREATE UNIQUE INDEX idx_jobs_schedule_active
     ON jobs (schedule_id)
     WHERE schedule_id IS NOT NULL
-      AND status IN ('pending', 'leased', 'awaiting_approval');
+      AND status IN (
+          'pending', 'leased', 'awaiting_approval', 'awaiting_children'
+      );
+
+CREATE INDEX IF NOT EXISTS idx_jobs_parent
+    ON jobs (tenant_id, parent_job_id)
+    WHERE parent_job_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_await_children_deadline
+    ON jobs (await_children_deadline_at)
+    WHERE status = 'awaiting_children' AND await_children_deadline_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_awaiting_children
+    ON jobs (tenant_id, created_at ASC)
+    WHERE status = 'awaiting_children';
 
 CREATE INDEX IF NOT EXISTS idx_jobs_approval_deadline
     ON jobs (approval_deadline_at ASC)

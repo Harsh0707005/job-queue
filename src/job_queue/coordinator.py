@@ -100,6 +100,16 @@ class Coordinator:
             return self._list_side_effects(path, query)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/request-approval"):
             return self._job_action(path, body, "request_approval")
+        if method == "POST" and path.startswith("/v1/jobs/") and path.endswith(
+            "/spawn-children"
+        ):
+            return self._spawn_children(path, body)
+        if method == "GET" and path.startswith("/v1/jobs/") and path.endswith(
+            "/children"
+        ):
+            return self._list_children(path, query)
+        if method == "POST" and path == "/v1/await-children/process-timeouts":
+            return self._process_await_children_timeouts(body)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/approve"):
             return self._approve_job(path, body)
         if method == "POST" and path.startswith("/v1/jobs/") and path.endswith("/reject"):
@@ -503,6 +513,99 @@ class Coordinator:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"jobs": [job_to_dict(j) for j in jobs], "count": len(jobs)}
+
+    def _spawn_children(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        from job_queue.queue import LeaseError, SpawnError
+
+        parts = path.strip("/").split("/")
+        # /v1/jobs/{id}/spawn-children
+        if len(parts) != 4 or parts[0] != "v1" or parts[1] != "jobs":
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        worker_id = body.get("worker_id")
+        lease_token = body.get("lease_token")
+        children = body.get("children")
+        if not tenant_id or not worker_id or not lease_token:
+            return 400, {"error": "tenant_id, worker_id, lease_token required"}
+        if not isinstance(children, list) or not children:
+            return 400, {"error": "children must be a non-empty list"}
+        try:
+            token = UUID(str(lease_token))
+        except ValueError:
+            return 400, {"error": "invalid lease_token"}
+        timeout = body.get("timeout_seconds")
+        try:
+            result = self.queue.spawn_children(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                worker_id=str(worker_id),
+                lease_token=token,
+                children=children,
+                timeout_seconds=(
+                    float(timeout) if timeout is not None else None
+                ),
+                progress=body.get("progress"),
+                wait=bool(body.get("wait", True)),
+            )
+        except LeaseError as exc:
+            return 409, {"error": str(exc), "code": "lease_error"}
+        except SpawnError as exc:
+            return 409, {"error": str(exc), "code": "spawn_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "parent": job_to_dict(result.parent),
+            "children": [job_to_dict(c) for c in result.children],
+        }
+
+    def _list_children(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # /v1/jobs/{id}/children
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenants = query.get("tenant_id") or []
+        if not tenants or not tenants[0]:
+            return 400, {"error": "tenant_id query param required"}
+        limit = int((query.get("limit") or ["500"])[0])
+        try:
+            kids = self.queue.list_children(
+                UUID(job_id_s),
+                tenant_id=str(tenants[0]),
+                limit=limit,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "children": [job_to_dict(j) for j in kids],
+            "count": len(kids),
+        }
+
+    def _process_await_children_timeouts(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            jobs = self.queue.process_await_children_timeouts(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 100),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(jobs),
+            "jobs": [job_to_dict(j) for j in jobs],
+        }
 
     def _get_job(
         self, path: str, query: dict[str, list[str]]

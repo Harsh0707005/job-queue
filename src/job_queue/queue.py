@@ -51,6 +51,14 @@ Design notes
   Tenant-scoped ``approve`` / ``reject`` are idempotent; unresolved requests
   past ``approval_deadline_at`` auto-reject via ``process_approval_timeouts``.
   After approve the job becomes pending and resumes from its checkpoint.
+* **Spawn / join**: a leased worker may ``spawn_children`` to enqueue subtasks
+  and park the parent as ``awaiting_children`` (lease cleared; concurrency
+  freed; checkpoint kept). When every child ``completed``, the parent becomes
+  ``pending`` again and resumes. If any child ends as failed/dead/cancelled,
+  or the join times out, the parent is terminalized with an error and remaining
+  siblings are cancelled — it never waits forever. Join deadlines
+  (``await_children_deadline_at``) are reaped on the **normal lease path**
+  alongside approval timeouts (and via ``process_await_children_timeouts``).
 * **Immutable audit**: every job state change appends a
   ``job_audit_events`` row in the **same transaction** (ordered ``seq`` per
   job) with a full ``detail.job`` snapshot. Event rows keep the tenant at
@@ -95,7 +103,8 @@ Design notes
   6-field with seconds) and/or legacy ``interval_seconds``. Optional IANA
   ``timezone`` (default UTC). ``process_due_schedules`` materializes due
   ticks; pause/resume/delete stop them. A schedule never enqueues while a
-  previous job is still ``pending`` / ``leased`` / ``awaiting_approval``.
+  previous job is still ``pending`` / ``leased`` / ``awaiting_approval`` /
+  ``awaiting_children``.
   **Schedule fires bypass tenant pending caps and enqueue rate limits** so
   system timers still run under noisy-tenant throttles.
 * **Dependencies**: ``depends_on`` parent job id(s). A child is not claimable
@@ -159,6 +168,7 @@ from job_queue.models import (
     RetentionPurgeResult,
     Schedule,
     ScheduleFire,
+    SpawnChildrenResult,
     TenantMergeResult,
     TenantOffboardResult,
     TenantStats,
@@ -185,13 +195,24 @@ _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
     max_attempts, visibility_timeout_seconds, max_runtime_seconds,
     retry_backoff_base_seconds, retry_backoff_max_seconds, available_at,
-    dedupe_key, schedule_id, depends_on, leased_by, lease_token,
-    lease_tenant_id, lease_expires_at, lease_started_at, created_at,
-    updated_at, completed_at, result, checkpoint, checkpointed_at,
-    deadline_at, estimated_duration_seconds, preemptible, preempt_count,
-    last_preempted_at, approval_requested_at, approval_deadline_at,
-    approval_message, approval_outcome, approval_resolved_at, last_error
+    dedupe_key, schedule_id, depends_on, parent_job_id, waiting_on,
+    leased_by, lease_token, lease_tenant_id, lease_expires_at,
+    lease_started_at, created_at, updated_at, completed_at, result,
+    checkpoint, checkpointed_at, deadline_at, estimated_duration_seconds,
+    preemptible, preempt_count, last_preempted_at, approval_requested_at,
+    approval_deadline_at, approval_message, approval_outcome,
+    approval_resolved_at, await_children_started_at,
+    await_children_deadline_at, await_children_outcome,
+    await_children_resolved_at, last_error
 """
+
+# Statuses that count as "in flight" for dedupe / schedule uniqueness.
+_ACTIVE_JOB_STATUSES = (
+    JobStatus.PENDING.value,
+    JobStatus.LEASED.value,
+    JobStatus.AWAITING_APPROVAL.value,
+    JobStatus.AWAITING_CHILDREN.value,
+)
 
 # Pending job is claimable only when every depends_on parent is completed.
 _DEPS_SATISFIED_SQL = """
@@ -220,6 +241,9 @@ def _row_to_job(row: dict[str, Any]) -> Job:
     if isinstance(deps, str):
         # unlikely, but be defensive
         deps = []
+    waiting = row.get("waiting_on") or []
+    if isinstance(waiting, str):
+        waiting = []
     return Job(
         id=row["id"],
         tenant_id=row["tenant_id"],
@@ -249,6 +273,8 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         dedupe_key=row["dedupe_key"],
         schedule_id=row["schedule_id"],
         depends_on=tuple(deps),
+        parent_job_id=row.get("parent_job_id"),
+        waiting_on=tuple(waiting),
         leased_by=row["leased_by"],
         lease_token=row["lease_token"],
         lease_tenant_id=row.get("lease_tenant_id"),
@@ -274,6 +300,10 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         approval_message=row.get("approval_message"),
         approval_outcome=row.get("approval_outcome"),
         approval_resolved_at=row.get("approval_resolved_at"),
+        await_children_started_at=row.get("await_children_started_at"),
+        await_children_deadline_at=row.get("await_children_deadline_at"),
+        await_children_outcome=row.get("await_children_outcome"),
+        await_children_resolved_at=row.get("await_children_resolved_at"),
         last_error=row["last_error"],
     )
 
@@ -366,6 +396,23 @@ class ApprovalRequested(Exception):
 
     def __init__(self, job: Job) -> None:
         super().__init__(f"job {job.id} awaiting approval")
+        self.job = job
+
+
+class ChildrenAwaited(Exception):
+    """Parent parked waiting for subtasks; workers must stop without ack/nack."""
+
+    def __init__(self, job: Job, children: Sequence[Job] = ()) -> None:
+        super().__init__(f"job {job.id} awaiting {len(children)} children")
+        self.job = job
+        self.children = tuple(children)
+
+
+class SpawnError(Exception):
+    """Raised when spawn_children cannot park or enqueue subtasks."""
+
+    def __init__(self, message: str, *, job: Job | None = None) -> None:
+        super().__init__(message)
         self.job = job
 
 
@@ -1347,14 +1394,19 @@ class JobQueue:
                     updated_at = %s
                 WHERE j.tenant_id = %s
                   AND j.dedupe_key IS NOT NULL
-                  AND j.status IN ('pending', 'leased', 'awaiting_approval')
+                  AND j.status IN (
+                      'pending', 'leased', 'awaiting_approval', 'awaiting_children'
+                  )
                   AND EXISTS (
                         SELECT 1
                         FROM jobs t
                         WHERE t.tenant_id = %s
                           AND t.queue_name = j.queue_name
                           AND t.dedupe_key = j.dedupe_key
-                          AND t.status IN ('pending', 'leased', 'awaiting_approval')
+                          AND t.status IN (
+                              'pending', 'leased',
+                              'awaiting_approval', 'awaiting_children'
+                          )
                   )
                 RETURNING j.id
                 """,
@@ -1670,7 +1722,10 @@ class JobQueue:
                     )
                     ON CONFLICT (tenant_id, queue_name, dedupe_key)
                         WHERE dedupe_key IS NOT NULL
-                          AND status IN ('pending', 'leased', 'awaiting_approval')
+                          AND status IN (
+                              'pending', 'leased',
+                              'awaiting_approval', 'awaiting_children'
+                          )
                     DO NOTHING
                     RETURNING {_JOB_COLUMNS}
                     """,
@@ -1889,7 +1944,8 @@ class JobQueue:
             self._reap_offboarding_expired_leases(
                 conn, now=now, tenant_id=tenant_id
             )
-            self._expire_approval_timeouts_locked(
+            # Parked-job deadlines (approval + await-children join).
+            self._expire_parked_timeouts_locked(
                 conn, now=now, tenant_id=tenant_id
             )
 
@@ -2033,7 +2089,8 @@ class JobQueue:
         with transaction(self._pool) as conn:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
             self._reap_offboarding_expired_leases(conn, now=now, tenant_id=None)
-            self._expire_approval_timeouts_locked(conn, now=now, tenant_id=None)
+            # Parked-job deadlines (approval + await-children join) for all tenants.
+            self._expire_parked_timeouts_locked(conn, now=now, tenant_id=None)
             # Free slots for deadline-critical pending work before claiming.
             self._preempt_blocked_urgent(
                 conn, queue_name=queue_name, now=now, limit=max(4, limit)
@@ -2598,15 +2655,17 @@ class JobQueue:
                 JobStatus.PENDING,
                 JobStatus.LEASED,
                 JobStatus.AWAITING_APPROVAL,
+                JobStatus.AWAITING_CHILDREN,
             ):
                 raise CancelError(
                     f"job {job_id} cannot be cancelled "
-                    f"(status={job.status.value}; only pending, leased, or "
-                    f"awaiting_approval jobs cancel)",
+                    f"(status={job.status.value}; only pending, leased, "
+                    f"awaiting_approval, or awaiting_children jobs cancel)",
                     job=job,
                 )
 
             was_running = job.status == JobStatus.LEASED
+            was_awaiting_children = job.status == JobStatus.AWAITING_CHILDREN
             updated = conn.execute(
                 f"""
                 UPDATE jobs
@@ -2621,28 +2680,43 @@ class JobQueue:
                     approval_deadline_at = NULL,
                     approval_outcome = COALESCE(approval_outcome, 'rejected'),
                     approval_resolved_at = COALESCE(approval_resolved_at, %s),
+                    await_children_deadline_at = NULL,
+                    await_children_outcome = CASE
+                        WHEN status = %s THEN COALESCE(await_children_outcome, 'cancelled')
+                        ELSE await_children_outcome
+                    END,
+                    await_children_resolved_at = CASE
+                        WHEN status = %s THEN COALESCE(await_children_resolved_at, %s)
+                        ELSE await_children_resolved_at
+                    END,
                     last_error = CASE
                         WHEN %s THEN 'cancelled while running'
                         WHEN status = %s THEN COALESCE(last_error, 'cancelled while awaiting approval')
+                        WHEN status = %s THEN COALESCE(last_error, 'cancelled while awaiting children')
                         ELSE last_error
                     END,
                     updated_at = %s
                 WHERE id = %s
                   AND tenant_id = %s
-                  AND status IN (%s, %s, %s)
+                  AND status IN (%s, %s, %s, %s)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 (
                     JobStatus.CANCELLED.value,
                     now,
+                    JobStatus.AWAITING_CHILDREN.value,
+                    JobStatus.AWAITING_CHILDREN.value,
+                    now,
                     was_running,
                     JobStatus.AWAITING_APPROVAL.value,
+                    JobStatus.AWAITING_CHILDREN.value,
                     now,
                     job_id,
                     tenant_id,
                     JobStatus.PENDING.value,
                     JobStatus.LEASED.value,
                     JobStatus.AWAITING_APPROVAL.value,
+                    JobStatus.AWAITING_CHILDREN.value,
                 ),
             ).fetchone()
             if updated is None:
@@ -2663,7 +2737,10 @@ class JobQueue:
                 event_type="cancelled",
                 from_status=job.status.value,
                 actor=None,
-                detail={"was_running": was_running},
+                detail={
+                    "was_running": was_running,
+                    "was_awaiting_children": was_awaiting_children,
+                },
                 now=now,
             )
             self._cascade_cancel_dependents(
@@ -2673,6 +2750,14 @@ class JobQueue:
                 reason=f"parent job {job_id} cancelled",
                 now=now,
             )
+            # If this cancelled job was itself a child, wake/fail its parent join.
+            if updated.get("parent_job_id") is not None:
+                self._maybe_wake_parent_on_join_locked(
+                    conn,
+                    parent_id=updated["parent_job_id"],
+                    tenant_id=tenant_id,
+                    now=now,
+                )
             self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
             return _row_to_job(updated)
 
@@ -2826,6 +2911,14 @@ class JobQueue:
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
                 )
+                # Wake parked parent if this was a spawned child.
+                if updated.get("parent_job_id") is not None:
+                    self._maybe_wake_parent_on_join_locked(
+                        conn,
+                        parent_id=updated["parent_job_id"],
+                        tenant_id=updated["tenant_id"],
+                        now=now,
+                    )
                 self._maybe_finalize_offboard(
                     conn, tenant_id=job.tenant_id, now=now
                 )
@@ -3029,6 +3122,21 @@ class JobQueue:
             elif new_status == JobStatus.FAILED.value:
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_FAILED, now=now
+                )
+            # Child terminal fail must wake/fail a parked parent join.
+            if (
+                updated.get("parent_job_id") is not None
+                and new_status
+                in (
+                    JobStatus.DEAD.value,
+                    JobStatus.FAILED.value,
+                )
+            ):
+                self._maybe_wake_parent_on_join_locked(
+                    conn,
+                    parent_id=updated["parent_job_id"],
+                    tenant_id=owner_tenant,
+                    now=now,
                 )
             # Offboarding: requeued pending is purged when no leases remain;
             # terminal nacks also trigger purge when this was the last holder.
@@ -3911,6 +4019,412 @@ class JobQueue:
                 (
                     tenant_id,
                     JobStatus.AWAITING_APPROVAL.value,
+                    limit,
+                    offset,
+                ),
+            ).fetchall()
+            return [_row_to_job(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Spawn children / join
+    # ------------------------------------------------------------------
+
+    def spawn_children(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        children: Sequence[dict[str, Any]],
+        timeout_seconds: float | int | None = None,
+        progress: Any = None,
+        wait: bool = True,
+    ) -> SpawnChildrenResult:
+        """Enqueue subtasks for a leased job; optionally park until they finish.
+
+        Each entry in *children* is a dict with at least ``payload`` (dict).
+        Optional per-child keys: ``priority``, ``queue_name``, ``max_attempts``,
+        ``visibility_timeout_seconds``, ``max_runtime_seconds``, ``dedupe_key``,
+        ``estimated_duration_seconds``, ``preemptible``.
+
+        When *wait* is True (default):
+          * children are inserted with ``parent_job_id`` pointing at *job_id*
+          * parent is parked as ``awaiting_children`` (lease cleared; concurrency
+            slot freed; checkpoint kept / optionally updated via *progress*)
+          * when every child ``completed``, parent becomes ``pending`` again
+          * if any child ends failed/dead/cancelled or the join times out, the
+            parent is cancelled with an error and remaining siblings are stopped
+
+        When *wait* is False, children are enqueued and the parent keeps its
+        lease (fire-and-forget spawn).
+
+        Workers that park should raise / catch :class:`ChildrenAwaited` and
+        must not ack or nack afterward.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if not children:
+            raise ValueError("children must be non-empty")
+        if timeout_seconds is not None and float(timeout_seconds) <= 0:
+            raise ValueError("timeout_seconds must be > 0 when set")
+
+        specs: list[dict[str, Any]] = []
+        for i, raw in enumerate(children):
+            if not isinstance(raw, dict):
+                raise ValueError(f"children[{i}] must be a dict")
+            payload = raw.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError(f"children[{i}].payload must be a dict")
+            specs.append(dict(raw))
+
+        now = _utcnow()
+        deadline = (
+            now + timedelta(seconds=float(timeout_seconds))
+            if timeout_seconds is not None
+            else None
+        )
+
+        with transaction(self._pool) as conn:
+            self._expire_await_children_timeouts_locked(
+                conn, now=now, tenant_id=tenant_id
+            )
+            row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+
+            # Idempotent re-entry if already parked for children.
+            if row["status"] == JobStatus.AWAITING_CHILDREN.value:
+                if row["tenant_id"] != tenant_id:
+                    raise SpawnError(
+                        f"job {job_id} not found for tenant {tenant_id!r}"
+                    )
+                parent = _row_to_job(row)
+                kids = self._list_children_locked(
+                    conn, parent_id=job_id, tenant_id=tenant_id
+                )
+                return SpawnChildrenResult(parent=parent, children=tuple(kids))
+
+            self._assert_lease_tenant(row, tenant_id)
+            self._assert_active_lease(row, worker_id, lease_token, now)
+
+            parent_queue = row["queue_name"]
+            child_jobs: list[Job] = []
+            child_ids: list[UUID] = []
+
+            # Serialize pending-cap with other enqueues for this tenant.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (tenant_id,),
+            )
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise SpawnError(
+                    f"tenant {tenant_id!r} is offboarding; spawn rejected",
+                    job=_row_to_job(row),
+                )
+
+            for i, spec in enumerate(specs):
+                self._assert_pending_capacity(conn, tenant_id)
+                # Spawn under parent lease: still consumes enqueue rate so a
+                # fan-out storm cannot bypass tenant throttles.
+                self._consume_enqueue_rate(conn, tenant_id, now=now)
+
+                payload = spec["payload"]
+                qname = str(spec.get("queue_name") or parent_queue)
+                priority = int(spec.get("priority") or row["priority"])
+                max_attempts = int(spec.get("max_attempts") or row["max_attempts"])
+                vt = int(
+                    spec.get("visibility_timeout_seconds")
+                    or row["visibility_timeout_seconds"]
+                )
+                max_rt = int(
+                    spec.get("max_runtime_seconds") or row["max_runtime_seconds"]
+                )
+                dedupe_key = spec.get("dedupe_key")
+                if dedupe_key is not None and dedupe_key == "":
+                    raise ValueError(
+                        f"children[{i}].dedupe_key must be non-empty when set"
+                    )
+                est = spec.get("estimated_duration_seconds")
+                if est is not None:
+                    est = int(est)
+                    if est < 1:
+                        raise ValueError(
+                            f"children[{i}].estimated_duration_seconds must be >= 1"
+                        )
+                preemptible = (
+                    bool(spec["preemptible"])
+                    if "preemptible" in spec
+                    else True
+                )
+                cid = uuid4()
+                if dedupe_key is not None:
+                    self._lock_dedupe_key(
+                        conn,
+                        tenant_id=tenant_id,
+                        queue_name=qname,
+                        dedupe_key=str(dedupe_key),
+                    )
+                    existing = self._find_active_dedupe(
+                        conn,
+                        tenant_id=tenant_id,
+                        queue_name=qname,
+                        dedupe_key=str(dedupe_key),
+                    )
+                    if existing is not None:
+                        raise SpawnError(
+                            f"children[{i}] dedupe_key {dedupe_key!r} already active",
+                            job=_row_to_job(row),
+                        )
+
+                crow = conn.execute(
+                    f"""
+                    INSERT INTO jobs (
+                        id, tenant_id, queue_name, payload, status, priority,
+                        attempts, max_attempts, visibility_timeout_seconds,
+                        max_runtime_seconds,
+                        retry_backoff_base_seconds, retry_backoff_max_seconds,
+                        available_at, dedupe_key, schedule_id, depends_on,
+                        parent_job_id, waiting_on,
+                        deadline_at, estimated_duration_seconds, preemptible,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        0, %s, %s,
+                        %s,
+                        %s, %s,
+                        %s, %s, NULL, '{{}}'::uuid[],
+                        %s, '{{}}'::uuid[],
+                        NULL, %s, %s,
+                        %s, %s
+                    )
+                    RETURNING {_JOB_COLUMNS}
+                    """,
+                    (
+                        cid,
+                        tenant_id,
+                        qname,
+                        Jsonb(payload),
+                        JobStatus.PENDING.value,
+                        priority,
+                        max_attempts,
+                        vt,
+                        max_rt,
+                        int(row.get("retry_backoff_base_seconds") or 1),
+                        int(row.get("retry_backoff_max_seconds") or 300),
+                        now,
+                        dedupe_key,
+                        job_id,
+                        est,
+                        preemptible,
+                        now,
+                        now,
+                    ),
+                ).fetchone()
+                assert crow is not None
+                child = _row_to_job(crow)
+                child_jobs.append(child)
+                child_ids.append(child.id)
+                self._append_job_audit(
+                    conn,
+                    job_row=crow,
+                    event_type="enqueued",
+                    from_status=None,
+                    actor=worker_id,
+                    detail={
+                        "parent_job_id": str(job_id),
+                        "spawned": True,
+                        "queue_name": qname,
+                    },
+                    now=now,
+                )
+
+            if not wait:
+                return SpawnChildrenResult(
+                    parent=_row_to_job(row),
+                    children=tuple(child_jobs),
+                )
+
+            # Park parent: free lease / concurrency, keep checkpoint.
+            cp_sql = ""
+            cp_params: list[Any] = []
+            if progress is not None:
+                # Merge child ids into checkpoint for resume handlers.
+                progress_out = progress
+                if isinstance(progress, dict):
+                    progress_out = {
+                        **progress,
+                        "waiting_on": [str(x) for x in child_ids],
+                        "phase": "awaiting_children",
+                    }
+                cp_sql = ", checkpoint = %s, checkpointed_at = %s"
+                cp_params = [Jsonb(progress_out), now]
+            else:
+                # Still stamp a minimal join checkpoint if none provided.
+                existing_cp = row.get("checkpoint")
+                if isinstance(existing_cp, dict):
+                    progress_out = {
+                        **existing_cp,
+                        "waiting_on": [str(x) for x in child_ids],
+                        "phase": "awaiting_children",
+                    }
+                else:
+                    progress_out = {
+                        "waiting_on": [str(x) for x in child_ids],
+                        "phase": "awaiting_children",
+                    }
+                cp_sql = ", checkpoint = %s, checkpointed_at = %s"
+                cp_params = [Jsonb(progress_out), now]
+
+            updated = conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_tenant_id = NULL,
+                    lease_expires_at = NULL,
+                    lease_started_at = NULL,
+                    waiting_on = %s,
+                    await_children_started_at = %s,
+                    await_children_deadline_at = %s,
+                    await_children_outcome = NULL,
+                    await_children_resolved_at = NULL,
+                    last_error = NULL,
+                    updated_at = %s
+                    {cp_sql}
+                WHERE id = %s
+                  AND lease_token = %s
+                  AND status = %s
+                RETURNING {_JOB_COLUMNS}
+                """,
+                (
+                    JobStatus.AWAITING_CHILDREN.value,
+                    child_ids,
+                    now,
+                    deadline,
+                    now,
+                    *cp_params,
+                    job_id,
+                    lease_token,
+                    JobStatus.LEASED.value,
+                ),
+            ).fetchone()
+            if updated is None:
+                raise LeaseError(f"job {job_id} lease lost during spawn_children")
+            parent = _row_to_job(updated)
+            self._append_job_audit(
+                conn,
+                job_row=updated,
+                event_type="children_awaited",
+                from_status=JobStatus.LEASED.value,
+                actor=worker_id,
+                detail={
+                    "child_ids": [str(x) for x in child_ids],
+                    "timeout_seconds": (
+                        float(timeout_seconds)
+                        if timeout_seconds is not None
+                        else None
+                    ),
+                },
+                now=now,
+            )
+            # Children may already be terminal if something weird happens; wake.
+            self._maybe_wake_parent_on_join_locked(
+                conn, parent_id=job_id, tenant_id=tenant_id, now=now
+            )
+            parent_row = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (job_id,),
+            ).fetchone()
+            assert parent_row is not None
+            return SpawnChildrenResult(
+                parent=_row_to_job(parent_row),
+                children=tuple(child_jobs),
+            )
+
+    def list_children(
+        self,
+        parent_id: UUID,
+        *,
+        tenant_id: str,
+        limit: int = 500,
+    ) -> list[Job]:
+        """List jobs spawned with ``parent_job_id = parent_id`` for *tenant_id*."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        with transaction(self._pool) as conn:
+            # Authorize: parent must belong to tenant (or any child).
+            parent = conn.execute(
+                "SELECT id FROM jobs WHERE id = %s AND tenant_id = %s",
+                (parent_id, tenant_id),
+            ).fetchone()
+            if parent is None:
+                # Still allow if children exist under tenant (parent deleted).
+                kids = self._list_children_locked(
+                    conn, parent_id=parent_id, tenant_id=tenant_id, limit=limit
+                )
+                if not kids:
+                    raise ValueError(
+                        f"job {parent_id} not found for tenant {tenant_id!r}"
+                    )
+                return kids
+            return self._list_children_locked(
+                conn, parent_id=parent_id, tenant_id=tenant_id, limit=limit
+            )
+
+    def process_await_children_timeouts(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Job]:
+        """Cancel parents parked past ``await_children_deadline_at``.
+
+        Safe to call from a scheduler loop. The normal ``lease`` /
+        ``lease_batch`` path also reaps these opportunistically (same as
+        approval timeouts), so an idle fleet that still leases work will
+        expire timed-out joins without a dedicated ticker.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            return self._expire_await_children_timeouts_locked(
+                conn, now=now, tenant_id=tenant_id, limit=limit
+            )
+
+    def list_awaiting_children(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Job]:
+        """List parents parked waiting for subtasks (deadline ascending)."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            self._expire_await_children_timeouts_locked(
+                conn, now=now, tenant_id=tenant_id
+            )
+            rows = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE tenant_id = %s
+                  AND status = %s
+                ORDER BY await_children_deadline_at ASC NULLS LAST, created_at ASC
+                LIMIT %s OFFSET %s
+                """,
+                (
+                    tenant_id,
+                    JobStatus.AWAITING_CHILDREN.value,
                     limit,
                     offset,
                 ),
@@ -5375,13 +5889,13 @@ class JobQueue:
                 if self._is_tenant_paused(conn, sched_row["tenant_id"]):
                     continue
 
-                # Skip if a prior run is still in flight (incl. approval wait).
+                # Skip if a prior run is still in flight (incl. park waits).
                 active = conn.execute(
                     """
                     SELECT id
                     FROM jobs
                     WHERE schedule_id = %s
-                      AND status IN (%s, %s, %s)
+                      AND status IN (%s, %s, %s, %s)
                     LIMIT 1
                     """,
                     (
@@ -5389,6 +5903,7 @@ class JobQueue:
                         JobStatus.PENDING.value,
                         JobStatus.LEASED.value,
                         JobStatus.AWAITING_APPROVAL.value,
+                        JobStatus.AWAITING_CHILDREN.value,
                     ),
                 ).fetchone()
                 if active is not None:
@@ -6277,6 +6792,8 @@ class JobQueue:
 
         deps_raw = snap.get("depends_on") or []
         deps = [UUID(str(d)) for d in deps_raw]
+        waiting_raw = snap.get("waiting_on") or []
+        waiting = [UUID(str(d)) for d in waiting_raw]
         payload = snap["payload"]
         result = snap.get("result")
         checkpoint = snap.get("checkpoint")
@@ -6289,6 +6806,7 @@ class JobQueue:
                 max_runtime_seconds,
                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                 available_at, dedupe_key, schedule_id, depends_on,
+                parent_job_id, waiting_on,
                 leased_by, lease_token, lease_tenant_id,
                 lease_expires_at, lease_started_at,
                 created_at, updated_at, completed_at, result,
@@ -6297,6 +6815,8 @@ class JobQueue:
                 preempt_count, last_preempted_at,
                 approval_requested_at, approval_deadline_at,
                 approval_message, approval_outcome, approval_resolved_at,
+                await_children_started_at, await_children_deadline_at,
+                await_children_outcome, await_children_resolved_at,
                 last_error
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
@@ -6304,6 +6824,7 @@ class JobQueue:
                 %s,
                 %s, %s,
                 %s, %s, %s, %s,
+                %s, %s,
                 %s, %s, %s,
                 %s, %s,
                 %s, %s, %s, %s,
@@ -6312,6 +6833,8 @@ class JobQueue:
                 %s, %s,
                 %s, %s,
                 %s, %s, %s,
+                %s, %s,
+                %s, %s,
                 %s
             )
             """,
@@ -6332,6 +6855,8 @@ class JobQueue:
                 snap.get("dedupe_key"),
                 _parse_uuid("schedule_id"),
                 deps,
+                _parse_uuid("parent_job_id"),
+                waiting,
                 snap.get("leased_by"),
                 _parse_uuid("lease_token"),
                 snap.get("lease_tenant_id"),
@@ -6357,9 +6882,32 @@ class JobQueue:
                 snap.get("approval_message"),
                 snap.get("approval_outcome"),
                 _parse_dt("approval_resolved_at"),
+                _parse_dt("await_children_started_at"),
+                _parse_dt("await_children_deadline_at"),
+                snap.get("await_children_outcome"),
+                _parse_dt("await_children_resolved_at"),
                 snap.get("last_error"),
             ),
         )
+
+    def _expire_parked_timeouts_locked(
+        self,
+        conn: Any,
+        *,
+        now: datetime,
+        tenant_id: str | None = None,
+        limit: int = 200,
+    ) -> list[Job]:
+        """Reap approval and await-children deadlines (used by the lease path)."""
+        expired = self._expire_approval_timeouts_locked(
+            conn, now=now, tenant_id=tenant_id, limit=limit
+        )
+        expired.extend(
+            self._expire_await_children_timeouts_locked(
+                conn, now=now, tenant_id=tenant_id, limit=limit
+            )
+        )
+        return expired
 
     def _expire_approval_timeouts_locked(
         self,
@@ -7780,11 +8328,19 @@ class JobQueue:
         reason: str,
         now: datetime,
     ) -> None:
-        """Cancel pending *and leased* jobs that depend on *parent_id* (recursive).
+        """Cancel dependents of *parent_id* (recursive).
 
-        Running (leased) children have their fencing token cleared so the worker
-        holding them cannot heartbeat/ack and complete after the parent died.
+        Covers:
+          * jobs with ``depends_on`` containing *parent_id*
+          * spawned subtasks with ``parent_job_id = parent_id``
+
+        Active statuses cancelled: pending, leased, awaiting_approval,
+        awaiting_children. Running (leased) holders have fencing tokens cleared.
         """
+        active_pending = JobStatus.PENDING.value
+        active_leased = JobStatus.LEASED.value
+        active_approval = JobStatus.AWAITING_APPROVAL.value
+        active_children = JobStatus.AWAITING_CHILDREN.value
         frontier: list[UUID] = [parent_id]
         visited: set[UUID] = set()
         while frontier:
@@ -7797,14 +8353,20 @@ class JobQueue:
                 SELECT {_JOB_COLUMNS}
                 FROM jobs
                 WHERE tenant_id = %s
-                  AND status IN (%s, %s)
-                  AND depends_on @> ARRAY[%s]::uuid[]
+                  AND status IN (%s, %s, %s, %s)
+                  AND (
+                      depends_on @> ARRAY[%s]::uuid[]
+                      OR parent_job_id = %s
+                  )
                 FOR UPDATE
                 """,
                 (
                     tenant_id,
-                    JobStatus.PENDING.value,
-                    JobStatus.LEASED.value,
+                    active_pending,
+                    active_leased,
+                    active_approval,
+                    active_children,
+                    current,
                     current,
                 ),
             ).fetchall()
@@ -7825,21 +8387,37 @@ class JobQueue:
                         lease_started_at = NULL,
                         checkpoint = NULL,
                         checkpointed_at = NULL,
+                        await_children_deadline_at = NULL,
+                        await_children_outcome = CASE
+                            WHEN status = %s
+                            THEN COALESCE(await_children_outcome, 'cancelled')
+                            ELSE await_children_outcome
+                        END,
+                        await_children_resolved_at = CASE
+                            WHEN status = %s
+                            THEN COALESCE(await_children_resolved_at, %s)
+                            ELSE await_children_resolved_at
+                        END,
                         last_error = %s,
                         updated_at = %s
                     WHERE id = %s
                       AND tenant_id = %s
-                      AND status IN (%s, %s)
+                      AND status IN (%s, %s, %s, %s)
                     RETURNING {_JOB_COLUMNS}
                     """,
                     (
                         JobStatus.CANCELLED.value,
+                        JobStatus.AWAITING_CHILDREN.value,
+                        JobStatus.AWAITING_CHILDREN.value,
+                        now,
                         err,
                         now,
                         child["id"],
                         tenant_id,
-                        JobStatus.PENDING.value,
-                        JobStatus.LEASED.value,
+                        active_pending,
+                        active_leased,
+                        active_approval,
+                        active_children,
                     ),
                 ).fetchone()
                 if updated is not None:
@@ -7853,6 +8431,326 @@ class JobQueue:
                         now=now,
                     )
                 frontier.append(child["id"])
+
+    def _list_children_locked(
+        self,
+        conn: Any,
+        *,
+        parent_id: UUID,
+        tenant_id: str,
+        limit: int = 500,
+    ) -> list[Job]:
+        rows = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE tenant_id = %s
+              AND parent_job_id = %s
+            ORDER BY created_at ASC
+            LIMIT %s
+            """,
+            (tenant_id, parent_id, limit),
+        ).fetchall()
+        return [_row_to_job(r) for r in rows]
+
+    def _maybe_wake_parent_on_join_locked(
+        self,
+        conn: Any,
+        *,
+        parent_id: UUID,
+        tenant_id: str,
+        now: datetime,
+    ) -> None:
+        """If *parent_id* is awaiting children, resume or fail based on kids.
+
+        * All waiting_on completed → parent ``pending`` (join success).
+        * Any waiting_on failed/dead/cancelled → parent cancelled with error;
+          remaining non-terminal siblings cascade-cancelled.
+        * Otherwise still waiting (no-op).
+        """
+        parent = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE id = %s AND tenant_id = %s
+            FOR UPDATE
+            """,
+            (parent_id, tenant_id),
+        ).fetchone()
+        if parent is None:
+            return
+        if parent["status"] != JobStatus.AWAITING_CHILDREN.value:
+            return
+
+        waiting = list(parent.get("waiting_on") or [])
+        if not waiting:
+            # Nothing to wait on — treat as joined so parent is not stuck.
+            self._resume_parent_join_locked(
+                conn, parent=parent, now=now, child_ids=[]
+            )
+            return
+
+        rows = conn.execute(
+            f"""
+            SELECT id, status, last_error
+            FROM jobs
+            WHERE tenant_id = %s
+              AND id = ANY(%s)
+            """,
+            (tenant_id, waiting),
+        ).fetchall()
+        by_id = {r["id"]: r for r in rows}
+
+        # Missing child rows count as failure (cannot complete join).
+        terminal_fail = {
+            JobStatus.FAILED.value,
+            JobStatus.DEAD.value,
+            JobStatus.CANCELLED.value,
+        }
+        activeish = {
+            JobStatus.PENDING.value,
+            JobStatus.LEASED.value,
+            JobStatus.AWAITING_APPROVAL.value,
+            JobStatus.AWAITING_CHILDREN.value,
+        }
+
+        failed: list[dict[str, Any]] = []
+        still_running = False
+        completed = 0
+        for cid in waiting:
+            row = by_id.get(cid)
+            if row is None:
+                failed.append(
+                    {
+                        "id": cid,
+                        "status": "missing",
+                        "last_error": "child row missing",
+                    }
+                )
+                continue
+            st = row["status"]
+            if st == JobStatus.COMPLETED.value:
+                completed += 1
+            elif st in terminal_fail:
+                failed.append(row)
+            elif st in activeish:
+                still_running = True
+            else:
+                # Unexpected status — treat as failure to avoid hang.
+                failed.append(row)
+
+        if failed:
+            first = failed[0]
+            err = (
+                f"child job {first['id']} ended as {first['status']}"
+                + (
+                    f": {first['last_error']}"
+                    if first.get("last_error")
+                    else ""
+                )
+            )
+            self._fail_parent_join_locked(
+                conn,
+                parent=parent,
+                now=now,
+                reason=err,
+                outcome="failed",
+            )
+            return
+
+        if still_running or completed < len(waiting):
+            return
+
+        # All children completed.
+        self._resume_parent_join_locked(
+            conn, parent=parent, now=now, child_ids=waiting
+        )
+
+    def _resume_parent_join_locked(
+        self,
+        conn: Any,
+        *,
+        parent: dict[str, Any],
+        now: datetime,
+        child_ids: list[UUID],
+    ) -> None:
+        parent_id = parent["id"]
+        cp = parent.get("checkpoint")
+        if isinstance(cp, dict):
+            new_cp = {
+                **cp,
+                "phase": "children_joined",
+                "waiting_on": [str(x) for x in child_ids],
+            }
+        else:
+            new_cp = {
+                "phase": "children_joined",
+                "waiting_on": [str(x) for x in child_ids],
+            }
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                available_at = %s,
+                await_children_outcome = 'joined',
+                await_children_resolved_at = %s,
+                await_children_deadline_at = NULL,
+                checkpoint = %s,
+                checkpointed_at = %s,
+                last_error = NULL,
+                updated_at = %s
+            WHERE id = %s
+              AND status = %s
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.PENDING.value,
+                now,
+                now,
+                Jsonb(new_cp),
+                now,
+                now,
+                parent_id,
+                JobStatus.AWAITING_CHILDREN.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return
+        self._append_job_audit(
+            conn,
+            job_row=updated,
+            event_type="children_joined",
+            from_status=JobStatus.AWAITING_CHILDREN.value,
+            actor="system",
+            detail={"child_ids": [str(x) for x in child_ids]},
+            now=now,
+        )
+
+    def _fail_parent_join_locked(
+        self,
+        conn: Any,
+        *,
+        parent: dict[str, Any],
+        now: datetime,
+        reason: str,
+        outcome: str = "failed",
+    ) -> None:
+        parent_id = parent["id"]
+        tenant_id = parent["tenant_id"]
+        err = (reason or "join failed")[:2000]
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = NULL,
+                lease_token = NULL,
+                lease_tenant_id = NULL,
+                lease_expires_at = NULL,
+                lease_started_at = NULL,
+                await_children_outcome = %s,
+                await_children_resolved_at = %s,
+                await_children_deadline_at = NULL,
+                last_error = %s,
+                completed_at = COALESCE(completed_at, %s),
+                updated_at = %s
+            WHERE id = %s
+              AND status = %s
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.CANCELLED.value,
+                outcome,
+                now,
+                err,
+                now,
+                now,
+                parent_id,
+                JobStatus.AWAITING_CHILDREN.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return
+        self._append_job_audit(
+            conn,
+            job_row=updated,
+            event_type="children_join_failed",
+            from_status=JobStatus.AWAITING_CHILDREN.value,
+            actor="system",
+            detail={"reason": err, "outcome": outcome},
+            now=now,
+        )
+        # Stop remaining siblings / dependents.
+        self._cascade_cancel_dependents(
+            conn,
+            parent_id=parent_id,
+            tenant_id=tenant_id,
+            reason=f"parent job {parent_id} join failed: {err}",
+            now=now,
+        )
+
+    def _expire_await_children_timeouts_locked(
+        self,
+        conn: Any,
+        *,
+        now: datetime,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Job]:
+        """Cancel awaiting_children rows past await_children_deadline_at."""
+        if tenant_id:
+            rows = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE status = %s
+                  AND tenant_id = %s
+                  AND await_children_deadline_at IS NOT NULL
+                  AND await_children_deadline_at <= %s
+                ORDER BY await_children_deadline_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (
+                    JobStatus.AWAITING_CHILDREN.value,
+                    tenant_id,
+                    now,
+                    limit,
+                ),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE status = %s
+                  AND await_children_deadline_at IS NOT NULL
+                  AND await_children_deadline_at <= %s
+                ORDER BY await_children_deadline_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (
+                    JobStatus.AWAITING_CHILDREN.value,
+                    now,
+                    limit,
+                ),
+            ).fetchall()
+        out: list[Job] = []
+        for row in rows:
+            self._fail_parent_join_locked(
+                conn,
+                parent=row,
+                now=now,
+                reason="await children timed out",
+                outcome="timeout",
+            )
+            refreshed = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (row["id"],),
+            ).fetchone()
+            if refreshed is not None:
+                out.append(_row_to_job(refreshed))
+        return out
 
     @staticmethod
     def _find_active_dedupe(
@@ -7869,7 +8767,7 @@ class JobQueue:
             WHERE tenant_id = %s
               AND queue_name = %s
               AND dedupe_key = %s
-              AND status IN (%s, %s, %s)
+              AND status IN (%s, %s, %s, %s)
             LIMIT 1
             """,
             (
@@ -7879,6 +8777,7 @@ class JobQueue:
                 JobStatus.PENDING.value,
                 JobStatus.LEASED.value,
                 JobStatus.AWAITING_APPROVAL.value,
+                JobStatus.AWAITING_CHILDREN.value,
             ),
         ).fetchone()
 

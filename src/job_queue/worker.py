@@ -29,8 +29,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any  # noqa: I001 — keep Any with callables
 
-from job_queue.models import DrainResult, Job, JobSideEffect
-from job_queue.queue import ApprovalRequested, JobQueue, LeaseError
+from job_queue.models import DrainResult, Job, JobSideEffect, SpawnChildrenResult
+from job_queue.queue import (
+    ApprovalRequested,
+    ChildrenAwaited,
+    JobQueue,
+    LeaseError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,45 @@ class LeaseContext:
         self.job = updated
         self.lease_lost.set()
         raise ApprovalRequested(updated)
+
+    def spawn_children(
+        self,
+        children: list[dict[str, Any]],
+        *,
+        timeout_seconds: float | int | None = None,
+        progress: Any = None,
+        wait: bool = True,
+    ) -> Any:
+        """Enqueue subtasks; when *wait* is True park parent and raise
+        :class:`ChildrenAwaited` so the worker frees the lease.
+
+        *children* is a list of dicts with at least ``payload``. See
+        :meth:`JobQueue.spawn_children`.
+        """
+        if self.lease_lost.is_set():
+            raise LeaseError(f"job {self.job.id} lease lost (cancel signalled)")
+        assert self.job.lease_token is not None
+        result: SpawnChildrenResult = self.queue.spawn_children(
+            self.job.id,
+            tenant_id=self.job.tenant_id,
+            worker_id=self.worker_id,
+            lease_token=self.job.lease_token,
+            children=children,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            wait=wait,
+        )
+        self.job = result.parent
+        if wait:
+            self.lease_lost.set()
+            raise ChildrenAwaited(result.parent, result.children)
+        return result
+
+    def list_children(self) -> list[Job]:
+        """List subtasks spawned by the current job."""
+        return self.queue.list_children(
+            self.job.id, tenant_id=self.job.tenant_id
+        )
 
     def side_effect_done(self, effect_key: str) -> bool:
         """True if this effect already completed (skip re-run after reclaim)."""
@@ -466,6 +510,13 @@ class Worker:
         except ApprovalRequested as exc:
             # Job intentionally parked; do not nack.
             logger.info("job %s awaiting approval", exc.job.id)
+        except ChildrenAwaited as exc:
+            # Parent parked waiting for subtasks; lease already cleared.
+            logger.info(
+                "job %s awaiting %d children",
+                exc.job.id,
+                len(exc.children),
+            )
         except LeaseError:
             # Lease no longer ours — do not nack; job is free or held elsewhere.
             logger.warning("lease error for job %s; not nacking", job.id)
@@ -495,6 +546,7 @@ class Worker:
                 self._active.pop(job.id, None)
                 self._held.pop(job.id, None)
             # If cancel was signalled without an explicit release, free the lease.
+            # Parked (approval/children) clears the token first so release is a no-op.
             if lease_lost.is_set() and still_held:
                 self._release_job(job, reason="lease_lost_cleanup")
 

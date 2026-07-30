@@ -15,6 +15,7 @@ from job_queue.models import (
     JobStatus,
     PreemptResult,
     Schedule,
+    SpawnChildrenResult,
     TenantMergeResult,
     TenantOffboardResult,
     TenantStats,
@@ -49,6 +50,8 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "dedupe_key": job.dedupe_key,
         "schedule_id": _uuid(job.schedule_id),
         "depends_on": [str(x) for x in job.depends_on],
+        "parent_job_id": _uuid(job.parent_job_id),
+        "waiting_on": [str(x) for x in job.waiting_on],
         "leased_by": job.leased_by,
         "lease_token": _uuid(job.lease_token),
         "lease_tenant_id": job.lease_tenant_id,
@@ -70,6 +73,10 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "approval_message": job.approval_message,
         "approval_outcome": job.approval_outcome,
         "approval_resolved_at": _dt(job.approval_resolved_at),
+        "await_children_started_at": _dt(job.await_children_started_at),
+        "await_children_deadline_at": _dt(job.await_children_deadline_at),
+        "await_children_outcome": job.await_children_outcome,
+        "await_children_resolved_at": _dt(job.await_children_resolved_at),
         "last_error": job.last_error,
     }
 
@@ -88,6 +95,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         return UUID(str(raw))
 
     depends = data.get("depends_on") or []
+    waiting = data.get("waiting_on") or []
     return Job(
         id=UUID(str(data["id"])),
         tenant_id=str(data["tenant_id"]),
@@ -105,6 +113,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         dedupe_key=data.get("dedupe_key"),
         schedule_id=parse_uuid("schedule_id"),
         depends_on=tuple(UUID(str(x)) for x in depends),
+        parent_job_id=parse_uuid("parent_job_id"),
+        waiting_on=tuple(UUID(str(x)) for x in waiting),
         leased_by=data.get("leased_by"),
         lease_token=parse_uuid("lease_token"),
         lease_tenant_id=data.get("lease_tenant_id"),
@@ -130,8 +140,19 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         approval_message=data.get("approval_message"),
         approval_outcome=data.get("approval_outcome"),
         approval_resolved_at=parse_dt("approval_resolved_at"),
+        await_children_started_at=parse_dt("await_children_started_at"),
+        await_children_deadline_at=parse_dt("await_children_deadline_at"),
+        await_children_outcome=data.get("await_children_outcome"),
+        await_children_resolved_at=parse_dt("await_children_resolved_at"),
         last_error=data.get("last_error"),
     )
+
+
+def spawn_children_result_to_dict(result: SpawnChildrenResult) -> dict[str, Any]:
+    return {
+        "parent": job_to_dict(result.parent),
+        "children": [job_to_dict(c) for c in result.children],
+    }
 
 
 def preempt_result_to_dict(result: PreemptResult) -> dict[str, Any]:
