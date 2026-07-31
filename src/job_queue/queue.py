@@ -6919,33 +6919,44 @@ class JobQueue:
             return out
 
         def _load_snapshot_jobs() -> list[Job]:
+            """Load matching jobs for the initial subscribe snapshot.
+
+            Filtered *job_ids* are loaded by primary key (complete, O(n)).
+            Tenant-wide snapshots paginate ``list_jobs`` so a hard 500-row
+            page cannot silently drop older jobs.
+            """
             jobs_out: list[Job] = []
-            for tid in sorted(tenants):
-                jobs = self.list_jobs(
-                    tenant_id=tid,
-                    labels=label_list or None,
-                    limit=500,
-                )
-                for job in jobs:
-                    if job_filter is not None and str(job.id) not in job_filter:
-                        continue
-                    jobs_out.append(job)
-            # Explicit get for filtered job_ids that may have finished (still
-            # visible) or been missed by list limit.
+            # Narrow path: exact jobs by id (never depend on list order/limit).
             if job_filter is not None:
-                have = {str(j.id) for j in jobs_out}
                 for jid_s in job_filter:
-                    if jid_s in have:
-                        continue
                     for tid in tenants:
                         got = self.get(UUID(jid_s), tenant_id=tid)
-                        if got is not None:
-                            if label_list and not set(label_list).issubset(
-                                set(got.labels)
-                            ):
-                                break
-                            jobs_out.append(got)
+                        if got is None:
+                            continue
+                        if label_list and not set(label_list).issubset(
+                            set(got.labels)
+                        ):
                             break
+                        jobs_out.append(got)
+                        break
+                return jobs_out
+
+            page_size = 500
+            for tid in sorted(tenants):
+                offset = 0
+                while True:
+                    page = self.list_jobs(
+                        tenant_id=tid,
+                        labels=label_list or None,
+                        limit=page_size,
+                        offset=offset,
+                    )
+                    if not page:
+                        break
+                    jobs_out.extend(page)
+                    if len(page) < page_size:
+                        break
+                    offset += page_size
             return jobs_out
 
         started = _time.monotonic()
