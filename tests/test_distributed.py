@@ -322,6 +322,55 @@ def test_schedule_webhook_dlq_management_via_http(queue, coordinator_url):
     assert client.delete_webhook(eid, tenant_id="ops") is True
     assert client.list_webhooks(tenant_id="ops") == []
 
+
+def test_list_webhooks_http_never_returns_plaintext_secret(queue, coordinator_url):
+    """Critical: GET /v1/webhooks must not leak endpoint signing secrets."""
+    import json
+    import urllib.request
+    from urllib.parse import urlencode
+
+    secret = "super-secret-value-do-not-leak"
+    client = CoordinatorClient(coordinator_url)
+    created = client.register_webhook(
+        tenant_id="sec-t",
+        url="http://127.0.0.1:9/hook",
+        events=["job.completed"],
+        secret=secret,
+    )
+    # Create may echo secret (caller just set it); list must never.
+    assert created.get("secret") == secret
+    assert created.get("has_secret") is True
+
+    # Direct HTTP list (not just client helper) so we assert wire format.
+    q = urlencode({"tenant_id": "sec-t"})
+    with urllib.request.urlopen(
+        f"{coordinator_url}/v1/webhooks?{q}", timeout=5
+    ) as resp:
+        raw = resp.read()
+        payload = json.loads(raw.decode("utf-8"))
+
+    assert secret.encode("utf-8") not in raw
+    assert secret not in json.dumps(payload)
+    endpoints = payload.get("endpoints") or []
+    assert len(endpoints) == 1
+    ep = endpoints[0]
+    assert ep["id"] == created["id"]
+    assert ep.get("secret") is None
+    assert ep.get("has_secret") is True
+
+    # set-enabled must also redact.
+    updated = client.set_webhook_enabled(
+        created["id"], tenant_id="sec-t", enabled=False
+    )
+    assert updated.get("secret") is None
+    assert updated.get("has_secret") is True
+    assert updated["enabled"] is False
+
+    # Library row still holds the real secret server-side.
+    rows = queue.list_webhooks(tenant_id="sec-t")
+    assert len(rows) == 1
+    assert rows[0].secret == secret
+
     # Dead-letter + replay
     job = queue.enqueue(tenant_id="ops", payload={"x": 1}, max_attempts=1)
     leased = queue.lease(tenant_id="ops", worker_id="w")

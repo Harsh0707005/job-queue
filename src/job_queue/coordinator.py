@@ -1412,7 +1412,10 @@ class Coordinator:
             )
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
-        return 201, {"endpoint": webhook_endpoint_to_dict(ep)}
+        # Echo secret only on create (caller just set it).
+        return 201, {
+            "endpoint": webhook_endpoint_to_dict(ep, include_secret=True)
+        }
 
     def _rotate_webhook_secret(
         self, path: str, body: dict[str, Any]
@@ -1438,7 +1441,10 @@ class Coordinator:
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
-        return 200, {"endpoint": webhook_endpoint_to_dict(ep)}
+        # Echo secret only on rotate (caller just set it).
+        return 200, {
+            "endpoint": webhook_endpoint_to_dict(ep, include_secret=True)
+        }
 
     def _pause_schedule(
         self, path: str, body: dict[str, Any]
@@ -1548,7 +1554,12 @@ class Coordinator:
             rows = self.queue.list_webhooks(tenant_id=str(tenant_id))
         except ValueError as exc:
             return 400, {"error": str(exc)}
-        return 200, {"endpoints": [webhook_endpoint_to_dict(e) for e in rows]}
+        # Never return plaintext secrets on list.
+        return 200, {
+            "endpoints": [
+                webhook_endpoint_to_dict(e, include_secret=False) for e in rows
+            ]
+        }
 
     def _set_webhook_enabled(
         self, path: str, body: dict[str, Any]
@@ -1572,7 +1583,10 @@ class Coordinator:
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
-        return 200, {"endpoint": webhook_endpoint_to_dict(ep)}
+        # Status-only mutation — do not leak secret.
+        return 200, {
+            "endpoint": webhook_endpoint_to_dict(ep, include_secret=False)
+        }
 
     def _delete_webhook(
         self, path: str, body: dict[str, Any]

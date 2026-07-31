@@ -274,12 +274,21 @@ def schedule_to_dict(sched: Schedule) -> dict[str, Any]:
     }
 
 
-def webhook_endpoint_to_dict(ep: WebhookEndpoint) -> dict[str, Any]:
-    return {
+def webhook_endpoint_to_dict(
+    ep: WebhookEndpoint,
+    *,
+    include_secret: bool = False,
+) -> dict[str, Any]:
+    """Serialize a webhook endpoint for HTTP.
+
+    Plaintext ``secret`` is **never** included by default (list / status
+    responses). Pass ``include_secret=True`` only for create/rotate responses
+    where the caller just supplied the secret and needs the echo.
+    """
+    out: dict[str, Any] = {
         "id": str(ep.id),
         "tenant_id": ep.tenant_id,
         "url": ep.url,
-        "secret": ep.secret,
         "events": list(ep.events),
         "enabled": ep.enabled,
         "max_attempts": ep.max_attempts,
@@ -287,7 +296,14 @@ def webhook_endpoint_to_dict(ep: WebhookEndpoint) -> dict[str, Any]:
         "backoff_max_seconds": ep.backoff_max_seconds,
         "created_at": _dt(ep.created_at),
         "updated_at": _dt(ep.updated_at),
+        "has_secret": bool(ep.secret),
     }
+    if include_secret:
+        out["secret"] = ep.secret
+    else:
+        # Explicit null so clients never treat a missing key as "unknown".
+        out["secret"] = None
+    return out
 
 
 def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
