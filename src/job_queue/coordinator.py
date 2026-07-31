@@ -21,6 +21,7 @@ from job_queue.codec import (
     bulk_cancel_result_to_dict,
     claimed_webhook_to_dict,
     job_to_dict,
+    job_progress_event_to_dict,
     job_retention_to_dict,
     retention_purge_to_dict,
     schedule_to_dict,
@@ -1822,6 +1823,104 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _stream_job_events(self, path: str, query: dict[str, list[str]]) -> None:
+            """SSE stream of live job progress (no client polling)."""
+            # /v1/jobs/{id}/events?tenant_id=
+            # /v1/stream/job-events?tenant_id=&tenant_id=&job_id=&label=
+            try:
+                tenants = list(query.get("tenant_id") or [])
+                job_ids: list[UUID] = []
+                labels = list(query.get("label") or query.get("labels") or [])
+                idle_raw = (query.get("idle_timeout_seconds") or [None])[0]
+                idle = float(idle_raw) if idle_raw not in (None, "") else None
+                include_snap = (query.get("snapshot") or ["1"])[0] not in (
+                    "0",
+                    "false",
+                    "no",
+                )
+
+                if path.endswith("/events") and path.startswith("/v1/jobs/"):
+                    parts = path.strip("/").split("/")
+                    # v1 jobs {id} events
+                    if len(parts) != 4 or not _UUID_RE.match(parts[2]):
+                        self._send(400, {"error": "invalid job events path"})
+                        return
+                    if not tenants or not tenants[0]:
+                        self._send(400, {"error": "tenant_id query param required"})
+                        return
+                    job_ids = [UUID(parts[2])]
+                    tenants = [tenants[0]]
+                elif path == "/v1/stream/job-events":
+                    if not tenants:
+                        self._send(
+                            400,
+                            {"error": "tenant_id query param required (repeat for multi-tenant)"},
+                        )
+                        return
+                    for jid in query.get("job_id") or []:
+                        if not _UUID_RE.match(jid):
+                            self._send(400, {"error": f"invalid job_id {jid}"})
+                            return
+                        job_ids.append(UUID(jid))
+                else:
+                    self._send(404, {"error": "not found"})
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+
+                def _write(ev_name: str, data: dict[str, Any]) -> None:
+                    raw = json.dumps(data, default=str, separators=(",", ":"))
+                    chunk = f"event: {ev_name}\ndata: {raw}\n\n".encode("utf-8")
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+                _write(
+                    "ready",
+                    {
+                        "tenants": tenants,
+                        "job_ids": [str(j) for j in job_ids],
+                        "labels": labels,
+                    },
+                )
+                for ev in coordinator.queue.iter_job_events(
+                    tenant_ids=tenants,
+                    job_ids=job_ids or None,
+                    labels=labels or None,
+                    include_snapshot=include_snap,
+                    idle_timeout_seconds=idle,
+                    heartbeat_seconds=15.0,
+                ):
+                    if ev.event == "ping":
+                        # SSE comment keepalive
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        continue
+                    name = "snapshot" if ev.snapshot else "progress"
+                    _write(name, job_progress_event_to_dict(ev))
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except ValueError as exc:
+                try:
+                    self._send(400, {"error": str(exc)})
+                except Exception:  # noqa: BLE001
+                    return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("sse stream error: %s", exc)
+                try:
+                    if not self.wfile.closed:
+                        err = json.dumps({"error": str(exc)})
+                        self.wfile.write(
+                            f"event: error\ndata: {err}\n\n".encode("utf-8")
+                        )
+                        self.wfile.flush()
+                except Exception:  # noqa: BLE001
+                    return
+
         def _dispatch(self, method: str) -> None:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
@@ -1830,6 +1929,16 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 path = self.path.split("?", 1)[0].rstrip("/")
             query = parse_qs(parsed.query)
             try:
+                # Live progress streams (SSE) — not JSON response bodies.
+                if method == "GET" and (
+                    path == "/v1/stream/job-events"
+                    or (
+                        path.startswith("/v1/jobs/")
+                        and path.endswith("/events")
+                    )
+                ):
+                    self._stream_job_events(path, query)
+                    return
                 body = self._read_json() if method in ("POST", "PUT", "PATCH") else None
                 status, payload = coordinator.handle(method, path, body, query)
                 self._send(status, payload)

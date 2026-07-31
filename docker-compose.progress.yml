@@ -1,0 +1,71 @@
+# Live multi-tenant job progress SSE load (no GET polling).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.progress.yml \
+#     up --build --abort-on-container-exit --exit-code-from progress-soak progress-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  worker-1: &w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+  worker-2:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+  worker-3:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+  worker-4:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      BATCH_SIZE: "2"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "60"
+      LOG_LEVEL: INFO
+
+  progress-soak:
+    build: .
+    command: ["python", "scripts/progress_stream_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "4"
+      JOBS_PER_TENANT: "40"
+      STEPS: "5"
+      STEP_MS: "60"
+      MAX_WALL_SECONDS: "120"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

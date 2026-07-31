@@ -428,3 +428,26 @@ class ClaimedWebhook:
     url: str | None
     secret: str | None
     endpoint_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class JobProgressEvent:
+    """Live job progress event (SSE / LISTEN payload).
+
+    Emitted on status transitions and checkpoints so clients need not poll
+    ``GET /v1/jobs/{id}``. Multi-tenant: filter by ``tenant_id`` / ``job_id``.
+    """
+
+    event: str
+    tenant_id: str
+    job_id: UUID
+    status: str
+    from_status: str | None
+    attempts: int
+    labels: tuple[str, ...]
+    checkpoint: Any
+    result: Any
+    last_error: str | None
+    actor: str | None
+    ts: datetime
+    snapshot: bool = False  # True for initial snapshot on subscribe

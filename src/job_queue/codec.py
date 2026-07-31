@@ -12,6 +12,7 @@ from job_queue.models import (
     ClaimedWebhook,
     Job,
     JobAuditEvent,
+    JobProgressEvent,
     JobSideEffect,
     JobStatus,
     PreemptResult,
@@ -168,6 +169,24 @@ def bulk_cancel_result_to_dict(result: BulkCancelResult) -> dict[str, Any]:
         "complete": result.complete,
         "remaining_estimate": result.remaining_estimate,
         "batches": result.batches,
+    }
+
+
+def job_progress_event_to_dict(ev: JobProgressEvent) -> dict[str, Any]:
+    return {
+        "event": ev.event,
+        "tenant_id": ev.tenant_id,
+        "job_id": str(ev.job_id),
+        "status": ev.status,
+        "from_status": ev.from_status,
+        "attempts": ev.attempts,
+        "labels": list(ev.labels),
+        "checkpoint": ev.checkpoint,
+        "result": ev.result,
+        "last_error": ev.last_error,
+        "actor": ev.actor,
+        "ts": _dt(ev.ts),
+        "snapshot": ev.snapshot,
     }
 
 

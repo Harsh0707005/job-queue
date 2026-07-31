@@ -7411,3 +7411,109 @@ def test_webhook_process_posts_valid_signature_after_rotation(queue: JobQueue):
             )
     finally:
         capture.stop()
+
+
+def test_job_progress_stream_multi_tenant(queue: JobQueue):
+    """Live iter_job_events receives status + checkpoint across tenants."""
+    from job_queue.models import JobProgressEvent
+
+    stop = threading.Event()
+    seen: list[JobProgressEvent] = []
+    lock = threading.Lock()
+
+    def _listen() -> None:
+        for ev in queue.iter_job_events(
+            tenant_ids=["ta", "tb"],
+            include_snapshot=False,
+            idle_timeout_seconds=8.0,
+            heartbeat_seconds=30.0,
+            stop_when=stop.is_set,
+        ):
+            if ev.event == "ping":
+                continue
+            with lock:
+                seen.append(ev)
+            # Stop after we see both tenants complete-ish activity.
+            with lock:
+                tenants = {e.tenant_id for e in seen if e.event != "ping"}
+                statuses = {e.status for e in seen}
+            if "ta" in tenants and "tb" in tenants and (
+                "completed" in statuses or "leased" in statuses
+            ):
+                if any(e.event == "checkpointed" for e in seen) or any(
+                    e.status == "completed" for e in seen
+                ):
+                    # Need enough events
+                    if len(seen) >= 4:
+                        stop.set()
+                        return
+
+    th = threading.Thread(target=_listen, daemon=True)
+    th.start()
+    time.sleep(0.3)  # allow LISTEN to start
+
+    # Tenant A: stepped job with checkpoint
+    ja = queue.enqueue(
+        tenant_id="ta",
+        payload={"kind": "steps", "steps": 2},
+        labels=["stream:a"],
+    )
+    la = queue.lease(
+        tenant_id="ta", worker_id="wa", visibility_timeout_seconds=30
+    )
+    assert la is not None
+    queue.checkpoint(
+        la.id,
+        tenant_id="ta",
+        worker_id="wa",
+        lease_token=la.lease_token,  # type: ignore[arg-type]
+        progress={"step": 1, "total": 2},
+    )
+    _ack(queue, la, "wa", result={"ok": True})
+
+    # Tenant B: simple complete
+    jb = queue.enqueue(tenant_id="tb", payload={"x": 1}, labels=["stream:b"])
+    lb = queue.lease(
+        tenant_id="tb", worker_id="wb", visibility_timeout_seconds=30
+    )
+    assert lb is not None
+    _ack(queue, lb, "wb")
+
+    stop.wait(6)
+    stop.set()
+    th.join(timeout=3)
+
+    with lock:
+        events = list(seen)
+    tenants = {e.tenant_id for e in events}
+    assert "ta" in tenants and "tb" in tenants, events
+    assert any(e.job_id == ja.id for e in events)
+    assert any(e.job_id == jb.id for e in events)
+    assert any(e.event == "checkpointed" for e in events)
+    assert any(e.status == "completed" for e in events)
+    # Isolation: no other tenant leakage in filter
+    assert all(e.tenant_id in ("ta", "tb") for e in events)
+
+
+def test_job_progress_stream_job_filter_and_snapshot(queue: JobQueue):
+    j1 = queue.enqueue(tenant_id="t1", payload={"n": 1}, labels=["watch"])
+    j2 = queue.enqueue(tenant_id="t1", payload={"n": 2}, labels=["ignore"])
+
+    snaps = []
+    for ev in queue.iter_job_events(
+        tenant_ids=["t1"],
+        job_ids=[j1.id],
+        include_snapshot=True,
+        idle_timeout_seconds=0.5,
+        heartbeat_seconds=60.0,
+    ):
+        if ev.event == "ping":
+            continue
+        if ev.snapshot:
+            snaps.append(ev)
+        else:
+            break
+    assert any(e.job_id == j1.id and e.snapshot for e in snaps)
+    assert all(e.job_id == j1.id for e in snaps)
+    # j2 not in snapshot filter
+    assert not any(e.job_id == j2.id for e in snaps)

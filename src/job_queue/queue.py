@@ -150,6 +150,10 @@ Design notes
   (``X-Job-Queue-Signature: v1=...``). The secret is **snapshotted** onto each
   delivery at enqueue (``signing_secret``) so ``rotate_webhook_secret`` does
   not break retries of in-flight deliveries.
+* **Live progress**: job mutations ``NOTIFY`` on channel ``job_queue_events``
+  (status, checkpoint, result). Clients subscribe via
+  :meth:`iter_job_events` / SSE ``GET /v1/jobs/{id}/events`` or
+  ``GET /v1/stream/job-events`` (multi-tenant) instead of polling ``GET``.
 """
 
 from __future__ import annotations
@@ -171,6 +175,7 @@ from job_queue.models import (
     BulkCancelResult,
     Job,
     JobAuditEvent,
+    JobProgressEvent,
     JobRetentionSettings,
     JobSideEffect,
     JobStatus,
@@ -186,6 +191,11 @@ from job_queue.models import (
     WebhookEndpoint,
     WebhookEvent,
 )
+
+# Postgres LISTEN/NOTIFY channel for live job progress (SSE).
+JOB_EVENTS_CHANNEL = "job_queue_events"
+_NOTIFY_MAX_BYTES = 7000  # pg_notify limit is 8000; leave margin
+
 
 # Defaults for deadline / preemption heuristics.
 _DEFAULT_ESTIMATE_SECONDS = 60.0
@@ -565,8 +575,9 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
 class JobQueue:
     """PostgreSQL-backed multi-tenant job queue."""
 
-    def __init__(self, pool: ConnectionPool) -> None:
+    def __init__(self, pool: ConnectionPool, *, dsn: str | None = None) -> None:
         self._pool = pool
+        self._dsn = dsn
 
     @classmethod
     def connect(cls, dsn: str, *, min_size: int = 1, max_size: int = 10) -> JobQueue:
@@ -576,10 +587,20 @@ class JobQueue:
         pool = create_pool(dsn, min_size=min_size, max_size=max_size)
         with pool.connection() as conn:
             init_schema(conn)
-        return cls(pool)
+        return cls(pool, dsn=dsn)
 
     def close(self) -> None:
         self._pool.close()
+
+    @property
+    def dsn(self) -> str:
+        if self._dsn:
+            return self._dsn
+        # psycopg_pool ConnectionPool exposes conninfo
+        info = getattr(self._pool, "conninfo", None)
+        if info:
+            return str(info)
+        raise RuntimeError("JobQueue has no DSN; construct via JobQueue.connect")
 
     # ------------------------------------------------------------------
     # Tenant concurrency limits + pause / metrics
@@ -6708,7 +6729,236 @@ class JobQueue:
             ),
         ).fetchone()
         assert row is not None
+        # Live progress: same transaction as mutation so NOTIFY is ordered.
+        if job_row is not None:
+            self._notify_job_progress(
+                conn,
+                job_row=job_row,
+                event_type=event_type,
+                from_status=from_status,
+                actor=actor,
+                now=ts,
+            )
         return self._row_to_audit(row)
+
+    def _notify_job_progress(
+        self,
+        conn: Any,
+        *,
+        job_row: dict[str, Any],
+        event_type: str,
+        from_status: str | None,
+        actor: str | None,
+        now: datetime,
+    ) -> None:
+        """pg_notify compact progress payload for SSE subscribers."""
+        labs = job_row.get("labels") or []
+        if isinstance(labs, str):
+            labs = []
+        cp = job_row.get("checkpoint")
+        result = job_row.get("result")
+        # Keep payload under NOTIFY size limit.
+        payload: dict[str, Any] = {
+            "v": 1,
+            "event": event_type,
+            "tenant_id": job_row["tenant_id"],
+            "job_id": str(job_row["id"]),
+            "status": job_row["status"],
+            "from_status": from_status,
+            "attempts": int(job_row.get("attempts") or 0),
+            "labels": list(labs)[:32],
+            "checkpoint": cp,
+            "result": result if job_row["status"] == JobStatus.COMPLETED.value else None,
+            "last_error": (
+                (job_row.get("last_error") or "")[:500] or None
+            ),
+            "actor": actor,
+            "ts": now.isoformat(),
+            "snapshot": False,
+        }
+        raw = json.dumps(payload, default=str, separators=(",", ":"))
+        if len(raw.encode("utf-8")) > _NOTIFY_MAX_BYTES:
+            # Drop large fields first.
+            payload["checkpoint"] = (
+                {"_truncated": True}
+                if cp is not None
+                else None
+            )
+            payload["result"] = (
+                {"_truncated": True}
+                if payload.get("result") is not None
+                else None
+            )
+            raw = json.dumps(payload, default=str, separators=(",", ":"))
+            if len(raw.encode("utf-8")) > _NOTIFY_MAX_BYTES:
+                payload["labels"] = []
+                raw = json.dumps(payload, default=str, separators=(",", ":"))
+        try:
+            conn.execute(
+                "SELECT pg_notify(%s, %s)",
+                (JOB_EVENTS_CHANNEL, raw),
+            )
+        except Exception:  # noqa: BLE001 — never fail mutation for notify
+            logger = __import__("logging").getLogger(__name__)
+            logger.exception("pg_notify job progress failed")
+
+    def iter_job_events(
+        self,
+        *,
+        tenant_ids: Sequence[str],
+        job_ids: Sequence[UUID] | None = None,
+        labels: Sequence[str] | str | None = None,
+        include_snapshot: bool = True,
+        idle_timeout_seconds: float | None = None,
+        heartbeat_seconds: float = 15.0,
+        stop_when: Any = None,
+    ) -> Any:
+        """Yield :class:`JobProgressEvent` live for the given tenants.
+
+        Uses Postgres ``LISTEN job_queue_events`` so any coordinator/worker
+        mutation is visible to all subscribers (multi-node safe).
+
+        *tenant_ids* is required (one or more). Optional *job_ids* and
+        *labels* (AND) filter events. When *include_snapshot* is True, yields
+        current matching job rows first (``snapshot=True``).
+
+        *stop_when* is an optional zero-arg callable; when it returns True the
+        iterator ends. *idle_timeout_seconds* ends after that many seconds
+        without events (after snapshot). Yields ``None`` as a heartbeat every
+        *heartbeat_seconds* of quiet (callers may ignore).
+        """
+        import time as _time
+
+        import psycopg
+        from psycopg.rows import dict_row
+
+        if not tenant_ids:
+            raise ValueError("tenant_ids is required")
+        tenants = {str(t) for t in tenant_ids if t}
+        if not tenants:
+            raise ValueError("tenant_ids is required")
+        job_filter: set[str] | None = None
+        if job_ids is not None:
+            job_filter = {str(j) for j in job_ids}
+            if not job_filter:
+                job_filter = None
+        label_list = _normalize_labels(labels)
+
+        def _match(ev: dict[str, Any]) -> bool:
+            if ev.get("tenant_id") not in tenants:
+                return False
+            if job_filter is not None and str(ev.get("job_id")) not in job_filter:
+                return False
+            if label_list:
+                labs = ev.get("labels") or []
+                if not set(label_list).issubset(set(labs)):
+                    return False
+            return True
+
+        def _to_event(ev: dict[str, Any], *, snapshot: bool = False) -> JobProgressEvent:
+            labs = ev.get("labels") or []
+            ts_raw = ev.get("ts")
+            if isinstance(ts_raw, str):
+                try:
+                    ts = datetime.fromisoformat(ts_raw)
+                except ValueError:
+                    ts = _utcnow()
+            elif isinstance(ts_raw, datetime):
+                ts = ts_raw
+            else:
+                ts = _utcnow()
+            return JobProgressEvent(
+                event=str(ev.get("event") or "update"),
+                tenant_id=str(ev["tenant_id"]),
+                job_id=UUID(str(ev["job_id"])),
+                status=str(ev.get("status") or ""),
+                from_status=(
+                    None
+                    if ev.get("from_status") is None
+                    else str(ev.get("from_status"))
+                ),
+                attempts=int(ev.get("attempts") or 0),
+                labels=tuple(str(x) for x in labs),
+                checkpoint=ev.get("checkpoint"),
+                result=ev.get("result"),
+                last_error=ev.get("last_error"),
+                actor=ev.get("actor"),
+                ts=ts,
+                snapshot=snapshot or bool(ev.get("snapshot")),
+            )
+
+        # Initial snapshot of matching jobs.
+        if include_snapshot:
+            for tid in sorted(tenants):
+                jobs = self.list_jobs(
+                    tenant_id=tid,
+                    labels=label_list or None,
+                    limit=500,
+                )
+                for job in jobs:
+                    if job_filter is not None and str(job.id) not in job_filter:
+                        continue
+                    yield JobProgressEvent(
+                        event="snapshot",
+                        tenant_id=job.tenant_id,
+                        job_id=job.id,
+                        status=job.status.value,
+                        from_status=None,
+                        attempts=job.attempts,
+                        labels=job.labels,
+                        checkpoint=job.checkpoint,
+                        result=job.result,
+                        last_error=job.last_error,
+                        actor=None,
+                        ts=job.updated_at,
+                        snapshot=True,
+                    )
+
+        started = _time.monotonic()
+        last_event = started
+        last_hb = started
+        with psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True) as conn:
+            conn.execute(f"LISTEN {JOB_EVENTS_CHANNEL}")
+            while True:
+                if stop_when is not None and stop_when():
+                    return
+                now_m = _time.monotonic()
+                if (
+                    idle_timeout_seconds is not None
+                    and (now_m - last_event) >= float(idle_timeout_seconds)
+                ):
+                    return
+                # Wait up to 1s for notifies.
+                for notify in conn.notifies(timeout=1.0):
+                    try:
+                        data = json.loads(notify.payload)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(data, dict) or not _match(data):
+                        continue
+                    last_event = _time.monotonic()
+                    last_hb = last_event
+                    yield _to_event(data)
+                now_m = _time.monotonic()
+                if heartbeat_seconds > 0 and (now_m - last_hb) >= float(
+                    heartbeat_seconds
+                ):
+                    last_hb = now_m
+                    yield JobProgressEvent(
+                        event="ping",
+                        tenant_id=next(iter(tenants)),
+                        job_id=UUID("00000000-0000-0000-0000-000000000000"),
+                        status="",
+                        from_status=None,
+                        attempts=0,
+                        labels=(),
+                        checkpoint=None,
+                        result=None,
+                        last_error=None,
+                        actor=None,
+                        ts=_utcnow(),
+                        snapshot=False,
+                    )
 
     @staticmethod
     def _row_to_audit(row: dict[str, Any]) -> JobAuditEvent:
