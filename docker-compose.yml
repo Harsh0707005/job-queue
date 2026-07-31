@@ -41,6 +41,8 @@ services:
       JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
       COORDINATOR_NODE: coordinator-1
       LOG_LEVEL: INFO
+      # Fleet soak posts to in-network sinks (docker private DNS).
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,6 +68,7 @@ services:
       JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
       COORDINATOR_NODE: coordinator-2
       LOG_LEVEL: INFO
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
     depends_on:
       postgres:
         condition: service_healthy
@@ -148,6 +151,7 @@ services:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       POLL_INTERVAL: "0.4"
       LOG_LEVEL: INFO
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
     depends_on:
       coordinator-1:
         condition: service_healthy
@@ -163,6 +167,7 @@ services:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       POLL_INTERVAL: "0.4"
       LOG_LEVEL: INFO
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
     depends_on:
       coordinator-1:
         condition: service_healthy

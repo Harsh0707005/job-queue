@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
+import os
+import socket
 import threading
 import time
 import urllib.error
@@ -28,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 from job_queue.models import WebhookDelivery
@@ -37,6 +41,91 @@ logger = logging.getLogger(__name__)
 
 SIGNATURE_HEADER = "X-Job-Queue-Signature"
 SIGNATURE_VERSION_PREFIX = "v1="
+
+# Env escape hatch for local soak tests that POST to 127.0.0.1 sinks.
+_ALLOW_PRIVATE_WEBHOOKS_ENV = "JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS"
+
+
+def _private_webhooks_allowed() -> bool:
+    return os.environ.get(_ALLOW_PRIVATE_WEBHOOKS_ENV, "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
+    """Validate *url* for outbound webhook delivery (SSRF hardening).
+
+    Requires ``http``/``https``, rejects credentials in the URL, and blocks
+    loopback / link-local / private / reserved destinations unless
+    ``JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS=1``.
+
+    When *resolve_dns* is True (default), also resolves the hostname and
+    rejects private A/AAAA records (DNS rebinding to internal IPs).
+
+    Returns the stripped URL on success; raises ``ValueError`` otherwise.
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("url must be a non-empty string")
+    cleaned = url.strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("url must be an http(s) URL")
+    if not parsed.hostname:
+        raise ValueError("url must include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("url must not contain credentials")
+    if _private_webhooks_allowed():
+        return cleaned
+
+    host = parsed.hostname.lower().rstrip(".")
+    blocked_hosts = {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+        "metadata",
+        "kubernetes.default",
+        "kubernetes.default.svc",
+    }
+    if host in blocked_hosts:
+        raise ValueError(f"webhook URL host {host!r} is not allowed")
+
+    # Literal IP in the URL.
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if not ip.is_global:
+            raise ValueError(
+                f"webhook URL host resolves to non-public address {ip}"
+            )
+        return cleaned
+
+    # Hostname path: optional DNS check against private A/AAAA records.
+    if resolve_dns:
+        try:
+            infos = socket.getaddrinfo(
+                host,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as dns_exc:
+            raise ValueError(
+                f"webhook URL host could not be resolved: {host}"
+            ) from dns_exc
+        for info in infos:
+            addr = info[4][0]
+            try:
+                resolved = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if not resolved.is_global:
+                raise ValueError(
+                    f"webhook URL host resolves to non-public address {resolved}"
+                )
+    return cleaned
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +199,13 @@ def post_webhook(
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
         headers["X-Job-Queue-Delivery-Id"] = idempotency_key
+
+    # Defense in depth: refuse private destinations at POST time too
+    # (registration should already have checked; DNS may have changed).
+    try:
+        validate_webhook_url(url, resolve_dns=True)
+    except ValueError as exc:
+        return 0, f"ssrf_blocked: {exc}"
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:

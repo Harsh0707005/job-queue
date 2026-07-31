@@ -34,7 +34,18 @@ def _uuid(value: UUID | None) -> str | None:
     return str(value) if value is not None else None
 
 
-def job_to_dict(job: Job) -> dict[str, Any]:
+def job_to_dict(
+    job: Job,
+    *,
+    include_lease_token: bool = False,
+) -> dict[str, Any]:
+    """Serialize a job for HTTP.
+
+    ``lease_token`` is a fencing secret: anyone who holds it can ack/nack/
+    heartbeat as the worker. Default is **redacted** (``null``) so list/get
+    cannot hijack in-flight leases. Pass ``include_lease_token=True`` only on
+    lease (and similar) responses that mint a token for the caller.
+    """
     return {
         "id": str(job.id),
         "tenant_id": job.tenant_id,
@@ -56,7 +67,9 @@ def job_to_dict(job: Job) -> dict[str, Any]:
         "waiting_on": [str(x) for x in job.waiting_on],
         "labels": list(job.labels),
         "leased_by": job.leased_by,
-        "lease_token": _uuid(job.lease_token),
+        "lease_token": (
+            _uuid(job.lease_token) if include_lease_token else None
+        ),
         "lease_tenant_id": job.lease_tenant_id,
         "lease_expires_at": _dt(job.lease_expires_at),
         "lease_started_at": _dt(job.lease_started_at),
@@ -378,8 +391,18 @@ def tenant_merge_result_to_dict(result: TenantMergeResult) -> dict[str, Any]:
     }
 
 
-def webhook_delivery_to_dict(d: WebhookDelivery) -> dict[str, Any]:
-    return {
+def webhook_delivery_to_dict(
+    d: WebhookDelivery,
+    *,
+    include_signing_secret: bool = False,
+) -> dict[str, Any]:
+    """Serialize a webhook delivery.
+
+    ``signing_secret`` is redacted by default. Claim responses expose the
+    secret once at the top level of :func:`claimed_webhook_to_dict` for the
+    agent that must sign the POST — not nested on every delivery echo.
+    """
+    out: dict[str, Any] = {
         "id": str(d.id),
         "endpoint_id": str(d.endpoint_id),
         "tenant_id": d.tenant_id,
@@ -398,14 +421,21 @@ def webhook_delivery_to_dict(d: WebhookDelivery) -> dict[str, Any]:
         "created_at": _dt(d.created_at),
         "updated_at": _dt(d.updated_at),
         "completed_at": _dt(d.completed_at),
-        # Present so agents can sign retries after secret rotation.
-        "signing_secret": d.signing_secret,
+        "has_signing_secret": bool(d.signing_secret),
+        "signing_secret": (
+            d.signing_secret if include_signing_secret else None
+        ),
     }
+    return out
 
 
 def claimed_webhook_to_dict(c: ClaimedWebhook) -> dict[str, Any]:
+    # Nested delivery is redacted; top-level secret is the claim handoff
+    # for the agent that will POST and sign.
     return {
-        "delivery": webhook_delivery_to_dict(c.delivery),
+        "delivery": webhook_delivery_to_dict(
+            c.delivery, include_signing_secret=False
+        ),
         "url": c.url,
         "secret": c.secret,
         "endpoint_enabled": c.endpoint_enabled,

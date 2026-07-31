@@ -388,13 +388,17 @@ class Coordinator:
             return 400, {"error": str(exc)}
         if not jobs:
             return 204, {}
+        # Lease responses are the only place that must return fencing tokens.
+        jobs_out = [
+            job_to_dict(j, include_lease_token=True) for j in jobs
+        ]
         payload: dict[str, Any] = {
-            "jobs": [job_to_dict(j) for j in jobs],
-            "count": len(jobs),
+            "jobs": jobs_out,
+            "count": len(jobs_out),
         }
         # Backward-compatible single-job field when limit==1 / one result.
-        if len(jobs) == 1:
-            payload["job"] = payload["jobs"][0]
+        if len(jobs_out) == 1:
+            payload["job"] = jobs_out[0]
         return 200, payload
 
     def _cancel_job(
@@ -2277,10 +2281,14 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
             provided = _extract_request_token(self.headers)
             if provided is None:
                 return False
-            # Constant-time compare for shared secret.
+            # Constant-time compare for shared secret. Length mismatch must
+            # never raise (would turn auth failure into a 500).
             import hmac as _hmac
 
-            return _hmac.compare_digest(provided, token)
+            try:
+                return bool(_hmac.compare_digest(provided, token))
+            except (TypeError, ValueError):
+                return False
 
         def _dispatch(self, method: str) -> None:
             parsed = urlparse(self.path)
@@ -2312,13 +2320,19 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 self._send(400, {"error": str(exc)})
             except Exception as exc:  # noqa: BLE001
                 logger.exception("coordinator error: %s", exc)
-                self._send(
-                    500,
-                    {
-                        "error": str(exc),
-                        "trace": traceback.format_exc().splitlines()[-5:],
-                    },
-                )
+                # Never leak stack frames to clients unless explicitly debugging.
+                payload: dict[str, Any] = {
+                    "error": "internal server error",
+                    "code": "internal_error",
+                }
+                if os.environ.get("JOB_QUEUE_DEBUG", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    payload["error"] = str(exc)
+                    payload["trace"] = traceback.format_exc().splitlines()[-5:]
+                self._send(500, payload)
 
         def do_GET(self) -> None:  # noqa: N802
             self._dispatch("GET")

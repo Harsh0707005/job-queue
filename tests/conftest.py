@@ -13,6 +13,9 @@ import pytest
 
 # We clean up containers ourselves in fixture teardown — no need for Ryuk.
 os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
+# Unit/soak tests deliver webhooks to local HTTP sinks (127.0.0.1). Production
+# defaults block private destinations; tests opt in explicitly.
+os.environ.setdefault("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
 
 from testcontainers.postgres import PostgresContainer  # noqa: E402
 

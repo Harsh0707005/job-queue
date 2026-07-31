@@ -5308,8 +5308,10 @@ class JobQueue:
         """Register an HTTP webhook endpoint for terminal job events."""
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        if not url or not url.startswith(("http://", "https://")):
-            raise ValueError("url must be an http(s) URL")
+        # SSRF harden: scheme + block private/link-local/metadata destinations.
+        from job_queue.webhooks import validate_webhook_url
+
+        url = validate_webhook_url(url, resolve_dns=True)
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if backoff_base_seconds < 0 or backoff_max_seconds < 0:
