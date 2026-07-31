@@ -7148,3 +7148,113 @@ def test_schedule_fire_copies_labels(queue: JobQueue):
     res = queue.cancel_matching(tenant_id="t1", labels=["sched:nightly"])
     assert res.cancelled >= 1
     assert res.complete is True
+
+
+def test_cancel_matching_skip_locked_empty_not_complete(queue: JobQueue):
+    """Empty SKIP LOCKED page must not report complete while matches remain locked."""
+    from job_queue.db import transaction
+
+    jobs = [
+        queue.enqueue(tenant_id="t1", payload={"i": i}, labels=["lock:race"])
+        for i in range(3)
+    ]
+    ids = [j.id for j in jobs]
+
+    # Hold FOR UPDATE on all matching rows in a concurrent transaction.
+    hold_ready = threading.Event()
+    release = threading.Event()
+    hold_err: list[str] = []
+
+    def _hold_locks() -> None:
+        try:
+            with transaction(queue._pool) as conn:  # type: ignore[attr-defined]
+                rows = conn.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE tenant_id = %s AND labels @> %s::text[]
+                    FOR UPDATE
+                    """,
+                    ("t1", ["lock:race"]),
+                ).fetchall()
+                if len(rows) != 3:
+                    hold_err.append(f"locked {len(rows)} want 3")
+                hold_ready.set()
+                if not release.wait(10):
+                    hold_err.append("release timeout")
+        except Exception as exc:  # noqa: BLE001
+            hold_err.append(str(exc))
+            hold_ready.set()
+
+    th = threading.Thread(target=_hold_locks, daemon=True)
+    th.start()
+    assert hold_ready.wait(5), hold_err
+
+    # While locked, cancel cannot claim rows — must not claim complete.
+    partial = queue.cancel_matching(
+        tenant_id="t1",
+        labels=["lock:race"],
+        batch_size=10,
+        lock_wait_seconds=0.15,
+        lock_retry_interval=0.05,
+    )
+    assert partial.cancelled == 0
+    assert partial.complete is False
+    assert partial.remaining_estimate == 3
+
+    # Release locks; full cancel should now drain everything.
+    release.set()
+    th.join(timeout=5)
+    assert not hold_err, hold_err
+
+    done = queue.cancel_matching(
+        tenant_id="t1",
+        labels=["lock:race"],
+        batch_size=10,
+        lock_wait_seconds=2.0,
+    )
+    assert done.complete is True
+    assert done.cancelled == 3
+    assert done.remaining_estimate == 0
+    for jid in ids:
+        row = queue.get(jid, tenant_id="t1")
+        assert row is not None and row.status == JobStatus.CANCELLED
+
+
+def test_cancel_matching_waits_for_lock_release(queue: JobQueue):
+    """Sweep retries until concurrent locks release (within wait window)."""
+    from job_queue.db import transaction
+
+    j = queue.enqueue(tenant_id="t1", payload={"x": 1}, labels=["lock:wait"])
+    hold_ready = threading.Event()
+    release = threading.Event()
+
+    def _hold() -> None:
+        with transaction(queue._pool) as conn:  # type: ignore[attr-defined]
+            conn.execute(
+                "SELECT id FROM jobs WHERE id = %s FOR UPDATE",
+                (j.id,),
+            )
+            hold_ready.set()
+            release.wait(5)
+
+    th = threading.Thread(target=_hold, daemon=True)
+    th.start()
+    assert hold_ready.wait(3)
+
+    def _release_soon() -> None:
+        time.sleep(0.2)
+        release.set()
+
+    threading.Thread(target=_release_soon, daemon=True).start()
+
+    result = queue.cancel_matching(
+        tenant_id="t1",
+        labels=["lock:wait"],
+        lock_wait_seconds=3.0,
+        lock_retry_interval=0.05,
+    )
+    th.join(timeout=3)
+    assert result.complete is True
+    assert result.cancelled == 1
+    after = queue.get(j.id, tenant_id="t1")
+    assert after is not None and after.status == JobStatus.CANCELLED

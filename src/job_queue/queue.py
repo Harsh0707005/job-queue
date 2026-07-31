@@ -2910,6 +2910,8 @@ class JobQueue:
         batch_size: int = _CANCEL_MATCHING_BATCH_DEFAULT,
         max_jobs: int | None = None,
         limit: int | None = None,
+        lock_wait_seconds: float = 5.0,
+        lock_retry_interval: float = 0.05,
     ) -> BulkCancelResult:
         """Cancel **all** cancelable jobs matching tenant + optional filters.
 
@@ -2917,8 +2919,13 @@ class JobQueue:
         remain (or *max_jobs* total cancellations if set). Does **not**
         silently stop after one batch.
 
-        *limit* is accepted as a deprecated alias for *max_jobs* (same meaning:
-        absolute cap, not “page size”). Prefer *max_jobs*.
+        Rows are locked with ``FOR UPDATE SKIP LOCKED``. An empty SKIP LOCKED
+        page is **not** treated as success by itself: remaining matches are
+        counted without locking. If matches still exist (held by other
+        transactions), the sweep waits and retries until *lock_wait_seconds*
+        elapses, then returns ``complete=False`` with ``remaining_estimate``.
+
+        *limit* is a deprecated alias for *max_jobs*. Prefer *max_jobs*.
 
         Filters:
           * *labels*: job must include all listed labels
@@ -2929,14 +2936,17 @@ class JobQueue:
         (pending, leased, awaiting_approval, awaiting_children). Terminal
         jobs are never cancelled. Cascades dependents / join children like
         :meth:`cancel`.
-
-        ``BulkCancelResult.complete`` is False if *max_jobs* stopped the sweep
-        while matches remain; ``remaining_estimate`` reports how many.
         """
+        import time as _time
+
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
+        if lock_wait_seconds < 0:
+            raise ValueError("lock_wait_seconds must be >= 0")
+        if lock_retry_interval <= 0:
+            raise ValueError("lock_retry_interval must be > 0")
         # Backward compat: old callers used limit= as a hard page size that
         # silently truncated. Treat limit as max_jobs (absolute cap).
         if max_jobs is None and limit is not None:
@@ -2961,10 +2971,20 @@ class JobQueue:
         total = 0
         batches = 0
         complete = False
+        remaining = 0
+        lock_wait_deadline = _time.monotonic() + float(lock_wait_seconds)
 
         while True:
             if max_jobs is not None and total >= max_jobs:
+                remaining = self._count_matching_cancelable(
+                    tenant_id=tenant_id,
+                    labels=label_list,
+                    statuses=target_statuses,
+                    queue_name=queue_name,
+                )
+                complete = remaining == 0
                 break
+
             take = batch_size
             if max_jobs is not None:
                 take = min(take, max_jobs - total)
@@ -2996,13 +3016,6 @@ class JobQueue:
                     tuple(params),
                 ).fetchall()
 
-                if not rows:
-                    complete = True
-                    self._maybe_finalize_offboard(
-                        conn, tenant_id=tenant_id, now=now
-                    )
-                    break
-
                 for row in rows:
                     job = self._cancel_locked_row(
                         conn,
@@ -3022,31 +3035,36 @@ class JobQueue:
                 )
 
             batches += 1
-            # Empty page or short page means we're done (unless SKIP LOCKED
-            # raced; re-check on next loop). Short page → likely drained.
-            if batch_n == 0:
-                complete = True
-                break
-            if batch_n < take and (max_jobs is None or total < max_jobs):
-                # Likely exhausted; one more loop will confirm with empty page.
+
+            if batch_n > 0:
+                # Progress made; keep sweeping (short page still may have
+                # locked leftovers — next iteration will COUNT if empty).
                 continue
 
-        remaining = 0
-        if not complete:
+            # Empty SKIP LOCKED page: either truly drained, or every remaining
+            # match is locked by another transaction. Never assume success.
             remaining = self._count_matching_cancelable(
                 tenant_id=tenant_id,
                 labels=label_list,
                 statuses=target_statuses,
                 queue_name=queue_name,
             )
-            complete = remaining == 0
+            if remaining == 0:
+                complete = True
+                break
+
+            # Matches exist but are locked — wait and retry until deadline.
+            if _time.monotonic() >= lock_wait_deadline:
+                complete = False
+                break
+            _time.sleep(float(lock_retry_interval))
 
         return BulkCancelResult(
             tenant_id=tenant_id,
             cancelled=total,
             jobs=tuple(sample),
             complete=complete,
-            remaining_estimate=remaining,
+            remaining_estimate=remaining if not complete else 0,
             batches=batches,
         )
 
