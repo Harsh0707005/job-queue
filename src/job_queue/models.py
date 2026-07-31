@@ -138,11 +138,22 @@ class SpawnChildrenResult:
 
 @dataclass(frozen=True, slots=True)
 class BulkCancelResult:
-    """Result of :meth:`~job_queue.queue.JobQueue.cancel_matching`."""
+    """Result of :meth:`~job_queue.queue.JobQueue.cancel_matching`.
+
+    ``cancelled`` is the total number cancelled across all batches.
+    ``jobs`` is a sample of cancelled rows (capped) so large sweeps stay
+    memory-safe; use ``cancelled`` for the full count.
+    ``complete`` is True when no matching cancelable jobs remain.
+    ``remaining_estimate`` is how many matching cancelable rows were still
+    present after a *max_jobs* cap stopped the sweep (0 when complete).
+    """
 
     tenant_id: str
     cancelled: int
     jobs: tuple[Job, ...]
+    complete: bool = True
+    remaining_estimate: int = 0
+    batches: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +163,7 @@ class Schedule:
     Prefer ``cron_expr`` (standard 5-field or 6-field with seconds), e.g.
     ``\"0 9 * * 1-5\"`` (weekdays 09:00) or ``\"0 0 1 * *\"`` (1st of month).
     ``interval_seconds`` remains for simple fixed delays.
+    ``labels`` are copied onto every job this schedule enqueues.
     """
 
     id: UUID
@@ -170,6 +182,7 @@ class Schedule:
     last_enqueued_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -465,6 +465,12 @@ ALTER TABLE schedules ADD CONSTRAINT schedules_spec_check CHECK (
     OR (interval_seconds IS NOT NULL AND interval_seconds >= 1)
 );
 
+-- Labels stamped onto every job fired by this schedule.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS labels TEXT[];
+UPDATE schedules SET labels = '{}' WHERE labels IS NULL;
+ALTER TABLE schedules ALTER COLUMN labels SET DEFAULT '{}';
+ALTER TABLE schedules ALTER COLUMN labels SET NOT NULL;
+
 -- HTTP webhooks: endpoints + durable delivery outbox.
 CREATE TABLE IF NOT EXISTS webhook_endpoints (
     id                          UUID PRIMARY KEY,

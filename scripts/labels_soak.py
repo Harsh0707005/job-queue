@@ -36,6 +36,8 @@ COORDS = [
 TENANTS = int(os.environ.get("TENANTS", "4") or "4")
 JOBS_PER_TENANT = int(os.environ.get("JOBS_PER_TENANT", "6") or "6")
 LONG_MS = int(os.environ.get("LONG_MS", "8000") or "8000")
+# Force multi-batch cancel sweeps (default cancel batch is 500).
+CANCEL_BATCH = int(os.environ.get("CANCEL_BATCH", "75") or "75")
 MAX_WALL = int(os.environ.get("MAX_WALL_SECONDS", "90") or "90")
 _rr = 0
 
@@ -95,18 +97,34 @@ def backlog() -> dict[str, int]:
 
 
 def list_jobs(tenant_id: str, **filters: Any) -> list[dict[str, Any]]:
-    q: list[tuple[str, str]] = [("tenant_id", tenant_id), ("limit", "200")]
-    for lab in filters.get("labels") or []:
-        q.append(("label", lab))
-    status = filters.get("status")
-    if status:
-        if isinstance(status, str):
-            q.append(("status", status))
-        else:
-            for s in status:
-                q.append(("status", s))
-    payload = http_json("GET", f"/v1/jobs?{urlencode(q)}")
-    return list(payload.get("jobs") or [])
+    # Page through results so stress runs > default list limit still verify.
+    page_size = int(filters.get("page_size") or 500)
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        q: list[tuple[str, str]] = [
+            ("tenant_id", tenant_id),
+            ("limit", str(page_size)),
+            ("offset", str(offset)),
+        ]
+        for lab in filters.get("labels") or []:
+            q.append(("label", lab))
+        status = filters.get("status")
+        if status:
+            if isinstance(status, str):
+                q.append(("status", status))
+            else:
+                for s in status:
+                    q.append(("status", s))
+        payload = http_json("GET", f"/v1/jobs?{urlencode(q)}")
+        batch = list(payload.get("jobs") or [])
+        out.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+        if offset > 50_000:
+            break
+    return out
 
 
 def main() -> int:
@@ -202,6 +220,7 @@ def main() -> int:
         return 1
 
     # Bulk cancel wave:canary per tenant (includes leased).
+    # Small batch_size stresses multi-batch drain (must cancel ALL, not one page).
     cancelled_total = 0
     for i in range(TENANTS):
         tid = f"lbl-{i:02d}"
@@ -211,18 +230,40 @@ def main() -> int:
             {
                 "tenant_id": tid,
                 "labels": ["wave:canary"],
-                "limit": 500,
+                "batch_size": CANCEL_BATCH,
+                # No max_jobs — must fully drain even when > batch_size.
             },
         )
         n = int(res.get("cancelled") or 0)
+        complete = bool(res.get("complete", False))
+        batches = int(res.get("batches") or 0)
+        remaining = int(res.get("remaining_estimate") or 0)
         cancelled_total += n
-        logger.info("cancel-matching tenant=%s cancelled=%d", tid, n)
-        if n != JOBS_PER_TENANT:
+        logger.info(
+            "cancel-matching tenant=%s cancelled=%d complete=%s batches=%d remaining=%d",
+            tid,
+            n,
+            complete,
+            batches,
+            remaining,
+        )
+        if n != JOBS_PER_TENANT or not complete or remaining != 0:
             logger.error(
-                "expected %d cancelled for %s got %d",
-                JOBS_PER_TENANT,
+                "expected full drain for %s: cancelled=%d want=%d complete=%s remaining=%d",
                 tid,
                 n,
+                JOBS_PER_TENANT,
+                complete,
+                remaining,
+            )
+            return 1
+        if JOBS_PER_TENANT > CANCEL_BATCH and batches < 2:
+            logger.error(
+                "expected multi-batch cancel for %s (jobs=%d batch=%d batches=%d)",
+                tid,
+                JOBS_PER_TENANT,
+                CANCEL_BATCH,
+                batches,
             )
             return 1
 

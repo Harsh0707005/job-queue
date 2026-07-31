@@ -51,9 +51,11 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       TENANTS: "4"
-      JOBS_PER_TENANT: "6"
-      LONG_MS: "10000"
-      MAX_WALL_SECONDS: "90"
+      # Stress: well above cancel batch size so multi-batch drain is required.
+      JOBS_PER_TENANT: "350"
+      CANCEL_BATCH: "80"
+      LONG_MS: "15000"
+      MAX_WALL_SECONDS: "120"
       LOG_LEVEL: INFO
     depends_on:
       coordinator-1:

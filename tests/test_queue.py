@@ -7046,3 +7046,105 @@ def test_cancel_matching_with_workers_mid_flight(queue: JobQueue):
         w.stop()
     for th in threads:
         th.join(timeout=3)
+
+
+def test_cancel_matching_loops_past_batch_size(queue: JobQueue):
+    """Must drain all matches, not silently stop after one batch."""
+    n = 1200
+    for i in range(n):
+        queue.enqueue(
+            tenant_id="t1",
+            payload={"i": i},
+            labels=["sweep:big"],
+        )
+    # Small batch_size forces multiple loops.
+    result = queue.cancel_matching(
+        tenant_id="t1",
+        labels=["sweep:big"],
+        batch_size=100,
+    )
+    assert result.complete is True
+    assert result.remaining_estimate == 0
+    assert result.cancelled == n
+    assert result.batches >= 12
+    # Sample is capped; full count is in cancelled.
+    assert len(result.jobs) <= 200
+    leftover = queue.list_jobs(
+        tenant_id="t1", labels=["sweep:big"], status="pending", limit=10
+    )
+    assert leftover == []
+    cancelled = queue.list_jobs(
+        tenant_id="t1", labels=["sweep:big"], status="cancelled", limit=50
+    )
+    assert len(cancelled) == 50  # limit on list
+
+
+def test_cancel_matching_max_jobs_reports_incomplete(queue: JobQueue):
+    for i in range(50):
+        queue.enqueue(tenant_id="t1", payload={"i": i}, labels=["cap:x"])
+    result = queue.cancel_matching(
+        tenant_id="t1",
+        labels=["cap:x"],
+        batch_size=10,
+        max_jobs=25,
+    )
+    assert result.cancelled == 25
+    assert result.complete is False
+    assert result.remaining_estimate == 25
+    # Drain the rest.
+    rest = queue.cancel_matching(tenant_id="t1", labels=["cap:x"], batch_size=20)
+    assert rest.cancelled == 25
+    assert rest.complete is True
+
+
+def test_spawn_children_inherit_parent_labels(queue: JobQueue):
+    parent = queue.enqueue(
+        tenant_id="t1",
+        payload={"role": "parent"},
+        labels=["wave:spawn", "env:test"],
+    )
+    job = queue.lease(
+        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
+    )
+    assert job is not None
+    result = queue.spawn_children(
+        parent.id,
+        tenant_id="t1",
+        worker_id="p1",
+        lease_token=job.lease_token,  # type: ignore[arg-type]
+        children=[
+            {"payload": {"c": 1}},
+            {"payload": {"c": 2}, "labels": ["child:extra"]},
+        ],
+        wait=False,
+    )
+    kids = list(result.children)
+    assert len(kids) == 2
+    assert set(kids[0].labels) == {"env:test", "wave:spawn"}
+    assert set(kids[1].labels) == {"child:extra", "env:test", "wave:spawn"}
+    listed = queue.list_jobs(tenant_id="t1", labels=["wave:spawn"])
+    # parent + 2 children
+    assert len(listed) >= 3
+
+
+def test_schedule_fire_copies_labels(queue: JobQueue):
+    from datetime import datetime, timezone
+
+    past = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        payload={"from": "schedule"},
+        interval_seconds=60,
+        start_at=past,
+        labels=["sched:nightly", "env:prod"],
+    )
+    fires = queue.process_due_schedules(tenant_id="t1", limit=5)
+    assert len(fires) >= 1
+    job = fires[0].job
+    assert set(job.labels) == {"env:prod", "sched:nightly"}
+    found = queue.list_jobs(tenant_id="t1", labels=["sched:nightly"])
+    assert any(j.id == job.id for j in found)
+    # Bulk cancel schedule-fired jobs by label.
+    res = queue.cancel_matching(tenant_id="t1", labels=["sched:nightly"])
+    assert res.cancelled >= 1
+    assert res.complete is True

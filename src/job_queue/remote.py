@@ -602,11 +602,13 @@ class CoordinatorClient:
         labels: list[str] | None = None,
         status: str | list[str] | None = None,
         queue_name: str | None = None,
-        limit: int = 1000,
+        batch_size: int = 500,
+        max_jobs: int | None = None,
+        limit: int | None = None,
     ) -> BulkCancelResult:
         body: dict[str, Any] = {
             "tenant_id": tenant_id,
-            "limit": limit,
+            "batch_size": batch_size,
         }
         if labels is not None:
             body["labels"] = labels
@@ -614,6 +616,9 @@ class CoordinatorClient:
             body["status"] = status
         if queue_name is not None:
             body["queue_name"] = queue_name
+        cap = max_jobs if max_jobs is not None else limit
+        if cap is not None:
+            body["max_jobs"] = cap
         payload = self._request("POST", "/v1/jobs/cancel-matching", body)
         assert payload is not None
         jobs = tuple(job_from_dict(j) for j in (payload.get("jobs") or []))
@@ -621,6 +626,9 @@ class CoordinatorClient:
             tenant_id=str(payload.get("tenant_id") or tenant_id),
             cancelled=int(payload.get("cancelled") or len(jobs)),
             jobs=jobs,
+            complete=bool(payload.get("complete", True)),
+            remaining_estimate=int(payload.get("remaining_estimate") or 0),
+            batches=int(payload.get("batches") or 1),
         )
 
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:

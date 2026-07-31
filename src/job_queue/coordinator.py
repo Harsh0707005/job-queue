@@ -650,6 +650,7 @@ class Coordinator:
         if not tenant_id:
             return 400, {"error": "tenant_id required"}
         try:
+            max_jobs = body.get("max_jobs", body.get("limit"))
             result = self.queue.cancel_matching(
                 tenant_id=str(tenant_id),
                 labels=body.get("labels"),
@@ -659,7 +660,12 @@ class Coordinator:
                     if body.get("queue_name") is not None
                     else None
                 ),
-                limit=int(body.get("limit") or 1000),
+                batch_size=int(
+                    body.get("batch_size") or 500
+                ),
+                max_jobs=(
+                    None if max_jobs is None else int(max_jobs)
+                ),
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
@@ -1309,6 +1315,7 @@ class Coordinator:
                     body.get("visibility_timeout_seconds") or 30
                 ),
                 enabled=bool(body.get("enabled", True)),
+                labels=body.get("labels"),
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}

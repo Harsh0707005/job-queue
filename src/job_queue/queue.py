@@ -61,6 +61,10 @@ Design notes
   alongside approval timeouts (and via ``process_await_children_timeouts``).
 * **Labels**: jobs may carry free-form string tags (``labels``). List and bulk
   cancel filter by tenant + optional label set (all must match) + status.
+  Labels apply on ``enqueue``, schedule fires (from ``create_schedule`` labels),
+  and ``spawn_children`` (inherited from the parent, mergeable per child).
+  ``cancel_matching`` loops in batches until **all** matches are cancelled
+  (optional ``max_jobs`` cap reports ``complete=False`` when truncated).
 * **Immutable audit**: every job state change appends a
   ``job_audit_events`` row in the **same transaction** (ordered ``seq`` per
   job) with a full ``detail.job`` snapshot. Event rows keep the tenant at
@@ -515,8 +519,13 @@ class ScheduleError(Exception):
 _SCHEDULE_COLUMNS = """
     id, tenant_id, name, queue_name, payload, interval_seconds, cron_expr,
     timezone, priority, max_attempts, visibility_timeout_seconds, enabled,
-    next_run_at, last_enqueued_at, created_at, updated_at
+    next_run_at, last_enqueued_at, created_at, updated_at, labels
 """
+
+# Internal page size for cancel_matching sweeps (not a silent total cap).
+_CANCEL_MATCHING_BATCH_DEFAULT = 500
+# Max cancelled Job rows retained in BulkCancelResult.jobs (count is full).
+_CANCEL_MATCHING_RETURN_CAP = 200
 
 
 def _row_to_schedule(row: dict[str, Any]) -> Schedule:
@@ -526,6 +535,9 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
     interval = row.get("interval_seconds")
     cron = row.get("cron_expr")
     tz = row.get("timezone") or "UTC"
+    labs = row.get("labels") or []
+    if isinstance(labs, str):
+        labs = []
     return Schedule(
         id=row["id"],
         tenant_id=row["tenant_id"],
@@ -543,6 +555,7 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
         last_enqueued_at=row["last_enqueued_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        labels=tuple(labs),
     )
 
 
@@ -2894,9 +2907,18 @@ class JobQueue:
         labels: Sequence[str] | str | None = None,
         status: JobStatus | str | Sequence[JobStatus | str] | None = None,
         queue_name: str | None = None,
-        limit: int = 1000,
+        batch_size: int = _CANCEL_MATCHING_BATCH_DEFAULT,
+        max_jobs: int | None = None,
+        limit: int | None = None,
     ) -> BulkCancelResult:
-        """Cancel all cancelable jobs matching tenant + optional filters.
+        """Cancel **all** cancelable jobs matching tenant + optional filters.
+
+        Loops in batches of *batch_size* until no matching cancelable rows
+        remain (or *max_jobs* total cancellations if set). Does **not**
+        silently stop after one batch.
+
+        *limit* is accepted as a deprecated alias for *max_jobs* (same meaning:
+        absolute cap, not “page size”). Prefer *max_jobs*.
 
         Filters:
           * *labels*: job must include all listed labels
@@ -2907,11 +2929,21 @@ class JobQueue:
         (pending, leased, awaiting_approval, awaiting_children). Terminal
         jobs are never cancelled. Cascades dependents / join children like
         :meth:`cancel`.
+
+        ``BulkCancelResult.complete`` is False if *max_jobs* stopped the sweep
+        while matches remain; ``remaining_estimate`` reports how many.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        if limit < 1:
-            raise ValueError("limit must be >= 1")
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        # Backward compat: old callers used limit= as a hard page size that
+        # silently truncated. Treat limit as max_jobs (absolute cap).
+        if max_jobs is None and limit is not None:
+            max_jobs = int(limit)
+        if max_jobs is not None and max_jobs < 1:
+            raise ValueError("max_jobs must be >= 1 when set")
+
         label_list = _normalize_labels(labels)
         status_list = _normalize_status_filter(status)
         cancelable_values = {s.value for s in _CANCELABLE_STATUSES}
@@ -2925,52 +2957,122 @@ class JobQueue:
                     f"(cancelable={sorted(cancelable_values)})"
                 )
 
-        now = _utcnow()
-        cancelled: list[Job] = []
-        with transaction(self._pool) as conn:
-            clauses = [
-                "tenant_id = %s",
-                "status = ANY(%s)",
-            ]
-            params: list[Any] = [tenant_id, target_statuses]
-            if queue_name is not None:
-                clauses.append("queue_name = %s")
-                params.append(queue_name)
-            if label_list:
-                clauses.append("labels @> %s::text[]")
-                params.append(label_list)
-            params.append(limit)
-            where = " AND ".join(clauses)
-            rows = conn.execute(
-                f"""
-                SELECT {_JOB_COLUMNS}
-                FROM jobs
-                WHERE {where}
-                ORDER BY created_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-                """,
-                tuple(params),
-            ).fetchall()
+        sample: list[Job] = []
+        total = 0
+        batches = 0
+        complete = False
 
-            for row in rows:
-                job = self._cancel_locked_row(
-                    conn,
-                    row=row,
-                    tenant_id=tenant_id,
-                    now=now,
-                    reason="bulk cancel matching filter",
+        while True:
+            if max_jobs is not None and total >= max_jobs:
+                break
+            take = batch_size
+            if max_jobs is not None:
+                take = min(take, max_jobs - total)
+            now = _utcnow()
+            batch_n = 0
+            with transaction(self._pool) as conn:
+                clauses = [
+                    "tenant_id = %s",
+                    "status = ANY(%s)",
+                ]
+                params: list[Any] = [tenant_id, target_statuses]
+                if queue_name is not None:
+                    clauses.append("queue_name = %s")
+                    params.append(queue_name)
+                if label_list:
+                    clauses.append("labels @> %s::text[]")
+                    params.append(label_list)
+                params.append(take)
+                where = " AND ".join(clauses)
+                rows = conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM jobs
+                    WHERE {where}
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    tuple(params),
+                ).fetchall()
+
+                if not rows:
+                    complete = True
+                    self._maybe_finalize_offboard(
+                        conn, tenant_id=tenant_id, now=now
+                    )
+                    break
+
+                for row in rows:
+                    job = self._cancel_locked_row(
+                        conn,
+                        row=row,
+                        tenant_id=tenant_id,
+                        now=now,
+                        reason="bulk cancel matching filter",
+                    )
+                    if job is not None:
+                        batch_n += 1
+                        total += 1
+                        if len(sample) < _CANCEL_MATCHING_RETURN_CAP:
+                            sample.append(job)
+
+                self._maybe_finalize_offboard(
+                    conn, tenant_id=tenant_id, now=now
                 )
-                if job is not None:
-                    cancelled.append(job)
 
-            self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
+            batches += 1
+            # Empty page or short page means we're done (unless SKIP LOCKED
+            # raced; re-check on next loop). Short page → likely drained.
+            if batch_n == 0:
+                complete = True
+                break
+            if batch_n < take and (max_jobs is None or total < max_jobs):
+                # Likely exhausted; one more loop will confirm with empty page.
+                continue
+
+        remaining = 0
+        if not complete:
+            remaining = self._count_matching_cancelable(
+                tenant_id=tenant_id,
+                labels=label_list,
+                statuses=target_statuses,
+                queue_name=queue_name,
+            )
+            complete = remaining == 0
 
         return BulkCancelResult(
             tenant_id=tenant_id,
-            cancelled=len(cancelled),
-            jobs=tuple(cancelled),
+            cancelled=total,
+            jobs=tuple(sample),
+            complete=complete,
+            remaining_estimate=remaining,
+            batches=batches,
         )
+
+    def _count_matching_cancelable(
+        self,
+        *,
+        tenant_id: str,
+        labels: list[str],
+        statuses: list[str],
+        queue_name: str | None,
+    ) -> int:
+        clauses = ["tenant_id = %s", "status = ANY(%s)"]
+        params: list[Any] = [tenant_id, statuses]
+        if queue_name is not None:
+            clauses.append("queue_name = %s")
+            params.append(queue_name)
+        if labels:
+            clauses.append("labels @> %s::text[]")
+            params.append(labels)
+        where = " AND ".join(clauses)
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM jobs WHERE {where}",
+                tuple(params),
+            ).fetchone()
+            return int(row["n"] if row else 0)
 
     def _cancel_locked_row(
         self,
@@ -4415,6 +4517,7 @@ class JobQueue:
             self._assert_active_lease(row, worker_id, lease_token, now)
 
             parent_queue = row["queue_name"]
+            parent_labels = list(row.get("labels") or [])
             child_jobs: list[Job] = []
             child_ids: list[UUID] = []
 
@@ -4463,6 +4566,13 @@ class JobQueue:
                     if "preemptible" in spec
                     else True
                 )
+                # Labels: inherit parent, then merge any child-specific labels.
+                if "labels" in spec:
+                    child_labels = _normalize_labels(
+                        list(parent_labels) + list(spec.get("labels") or [])
+                    )
+                else:
+                    child_labels = list(parent_labels)
                 cid = uuid4()
                 if dedupe_key is not None:
                     self._lock_dedupe_key(
@@ -4491,7 +4601,7 @@ class JobQueue:
                         max_runtime_seconds,
                         retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
-                        parent_job_id, waiting_on,
+                        parent_job_id, waiting_on, labels,
                         deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at
                     ) VALUES (
@@ -4500,7 +4610,7 @@ class JobQueue:
                         %s,
                         %s, %s,
                         %s, %s, NULL, '{{}}'::uuid[],
-                        %s, '{{}}'::uuid[],
+                        %s, '{{}}'::uuid[], %s,
                         NULL, %s, %s,
                         %s, %s
                     )
@@ -4521,6 +4631,7 @@ class JobQueue:
                         now,
                         dedupe_key,
                         job_id,
+                        child_labels,
                         est,
                         preemptible,
                         now,
@@ -5908,6 +6019,7 @@ class JobQueue:
         start_at: datetime | None = None,
         enabled: bool = True,
         schedule_id: UUID | None = None,
+        labels: Sequence[str] | str | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -5952,6 +6064,7 @@ class JobQueue:
 
         cron_expr = validate_cron(cron) if cron is not None else None
         tz_name = validate_timezone(timezone)
+        label_list = _normalize_labels(labels)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -5977,13 +6090,13 @@ class JobQueue:
                         interval_seconds, cron_expr, timezone,
                         priority, max_attempts,
                         visibility_timeout_seconds, enabled, next_run_at,
-                        created_at, updated_at
+                        labels, created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s
+                        %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -6001,6 +6114,7 @@ class JobQueue:
                         visibility_timeout_seconds,
                         enabled,
                         first_run,
+                        label_list,
                         now,
                         now,
                     ),
@@ -6237,6 +6351,7 @@ class JobQueue:
                     with conn.transaction():
                         # Intentionally no pending-cap / enqueue-rate checks:
                         # schedule materialization is system-timed work.
+                        sched_labels = list(sched_row.get("labels") or [])
                         job_row = conn.execute(
                             f"""
                             INSERT INTO jobs (
@@ -6245,6 +6360,7 @@ class JobQueue:
                                 max_runtime_seconds,
                                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
+                                labels,
                                 created_at, updated_at
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
@@ -6252,6 +6368,7 @@ class JobQueue:
                                 3600,
                                 1, 300,
                                 %s, NULL, %s, %s,
+                                %s,
                                 %s, %s
                             )
                             RETURNING {_JOB_COLUMNS}
@@ -6268,6 +6385,7 @@ class JobQueue:
                                 now,
                                 sched_row["id"],
                                 [],
+                                sched_labels,
                                 now,
                                 now,
                             ),

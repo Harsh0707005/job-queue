@@ -165,6 +165,9 @@ def bulk_cancel_result_to_dict(result: BulkCancelResult) -> dict[str, Any]:
         "cancelled": result.cancelled,
         "jobs": [job_to_dict(j) for j in result.jobs],
         "count": result.cancelled,
+        "complete": result.complete,
+        "remaining_estimate": result.remaining_estimate,
+        "batches": result.batches,
     }
 
 
@@ -248,6 +251,7 @@ def schedule_to_dict(sched: Schedule) -> dict[str, Any]:
         "last_enqueued_at": _dt(sched.last_enqueued_at),
         "created_at": _dt(sched.created_at),
         "updated_at": _dt(sched.updated_at),
+        "labels": list(sched.labels),
     }
 
 
