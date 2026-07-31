@@ -429,13 +429,27 @@ class Worker:
             try:
                 self._process(job)
             except LeaseError:
+                # Propagate so run_once / callers can detect cancel, reclaim,
+                # or max-runtime. Release any not-yet-processed batch mates.
                 logger.warning("lease lost for job %s", job.id)
+                self._release_held_except_active(reason="batch_abort_lease")
+                raise
             except Exception:
+                # Handler already nacked inside _process; still surface the
+                # original error (tests and operators rely on this).
                 logger.exception("processing failed for job %s", job.id)
+                self._release_held_except_active(reason="batch_abort_error")
+                raise
         return jobs
 
     def run(self, *, max_jobs: int | None = None, stop_when_idle: bool = False) -> int:
-        """Run the worker loop. Returns the number of jobs processed."""
+        """Run the worker loop. Returns the number of jobs processed.
+
+        Handler failures and lease losses are logged and the loop continues
+        (so a single bad job cannot kill a long-running worker). Call
+        :meth:`run_once` / :meth:`run_batch_once` when you want errors to
+        propagate to the caller.
+        """
         processed = 0
         while not self._stop.is_set() and not self._draining.is_set():
             remaining = None
@@ -444,7 +458,24 @@ class Worker:
                 if remaining <= 0:
                     break
             take = self.batch_size if remaining is None else min(self.batch_size, remaining)
-            jobs = self.run_batch_once(limit=take)
+            try:
+                jobs = self.run_batch_once(limit=take)
+            except LeaseError:
+                logger.warning(
+                    "worker %s lease error in run loop; continuing",
+                    self.worker_id,
+                )
+                if self._draining.is_set() or self._stop.is_set():
+                    break
+                continue
+            except Exception:
+                logger.exception(
+                    "worker %s job error in run loop; continuing",
+                    self.worker_id,
+                )
+                if self._draining.is_set() or self._stop.is_set():
+                    break
+                continue
             if not jobs:
                 if stop_when_idle or self._draining.is_set() or self._stop.is_set():
                     break
