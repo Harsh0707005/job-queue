@@ -4935,7 +4935,7 @@ def test_non_preemptible_not_victim(queue: JobQueue):
 
 def test_preempt_count_caps_thrashing(queue: JobQueue):
     from datetime import timedelta
-    from job_queue.queue import _MAX_PREEMPTS_PER_JOB
+    from job_queue.queue._common import _MAX_PREEMPTS_PER_JOB
 
     queue.set_concurrency_limit("t1", 1)
     victim = queue.enqueue(
