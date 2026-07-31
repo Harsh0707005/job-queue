@@ -249,6 +249,12 @@ def audit_consistency_report_to_dict(
 
 
 def job_side_effect_to_dict(eff: JobSideEffect) -> dict[str, Any]:
+    """Serialize a side-effect row for HTTP.
+
+    ``lease_token`` is always redacted: it is a fencing secret stored for
+    audit/idempotency correlation server-side, never needed by readers of
+    get/list/begin/complete responses (callers already hold the live lease).
+    """
     return {
         "job_id": str(eff.job_id),
         "effect_key": eff.effect_key,
@@ -259,7 +265,7 @@ def job_side_effect_to_dict(eff: JobSideEffect) -> dict[str, Any]:
         "started_by": eff.started_by,
         "started_at": _dt(eff.started_at),
         "completed_by": eff.completed_by,
-        "lease_token": _uuid(eff.lease_token),
+        "lease_token": None,
         "created_at": _dt(eff.created_at),
         "completed_at": _dt(eff.completed_at),
     }

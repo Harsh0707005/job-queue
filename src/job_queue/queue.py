@@ -3609,13 +3609,30 @@ class JobQueue:
 
         After ``merge_tenant``, *tenant_id* may be the pre-merge claim tenant
         (``lease_tenant_id``); an unrelated tenant is still rejected.
+
+        If ``max_runtime_seconds`` has elapsed, force-releases the lease (same
+        as :meth:`heartbeat`) so cooperative handlers cannot keep a stuck
+        lease alive by only calling ``ensure_held`` without heartbeating.
         """
         now = _utcnow()
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_lease_tenant(row, tenant_id)
-            self._assert_active_lease(row, worker_id, lease_token, now)
-            return _row_to_job(row)
+            self._assert_lease_holder(row, worker_id, lease_token)
+            hard = self._hard_deadline(row)
+            if hard is not None and now >= hard:
+                self._release_max_runtime_exceeded(conn, row, now=now)
+                runtime_exceeded = True
+            else:
+                runtime_exceeded = False
+                self._assert_lease_not_expired(row, now)
+                return _row_to_job(row)
+        if runtime_exceeded:
+            raise LeaseError(
+                f"job {job_id} max runtime exceeded "
+                f"(limit={row.get('max_runtime_seconds')}s)"
+            )
+        raise LeaseError(f"job {job_id} lease lost during ensure_lease")
 
     def checkpoint(
         self,

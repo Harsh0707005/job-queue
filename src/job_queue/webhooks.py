@@ -54,15 +54,46 @@ def _private_webhooks_allowed() -> bool:
     )
 
 
+def _ip_forbidden_for_webhook(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Return a rejection reason if *ip* must never be a webhook target.
+
+    ``JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS=1`` permits loopback and RFC1918-style
+    private addresses (docker / local sinks) but **never** link-local or
+    cloud-metadata ranges (e.g. ``169.254.169.254``).
+    """
+    # Always blocked — even when private webhooks are allowed.
+    if ip.is_unspecified:
+        return f"unspecified address {ip}"
+    if ip.is_multicast:
+        return f"multicast address {ip}"
+    if ip.is_link_local:
+        return f"link-local address {ip}"
+    # IPv4 link-local / APIPA is is_link_local; also catch documented metadata.
+    if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network(
+        "169.254.0.0/16"
+    ):
+        return f"link-local address {ip}"
+
+    if _private_webhooks_allowed():
+        # Loopback + private OK for local sinks / docker networks.
+        return None
+
+    if not ip.is_global:
+        return f"non-public address {ip}"
+    return None
+
+
 def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
     """Validate *url* for outbound webhook delivery (SSRF hardening).
 
     Requires ``http``/``https``, rejects credentials in the URL, and blocks
-    loopback / link-local / private / reserved destinations unless
-    ``JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS=1``.
+    non-public destinations. With ``JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS=1``,
+    loopback and private (RFC1918 / ULA) hosts are allowed for local sinks,
+    but **link-local / metadata** ranges stay blocked.
 
     When *resolve_dns* is True (default), also resolves the hostname and
-    rejects private A/AAAA records (DNS rebinding to internal IPs).
+    rejects forbidden A/AAAA records (DNS rebinding). Callers that follow
+    HTTP redirects must re-invoke this for every hop.
 
     Returns the stripped URL on success; raises ``ValueError`` otherwise.
     """
@@ -76,8 +107,6 @@ def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
         raise ValueError("url must include a hostname")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("url must not contain credentials")
-    if _private_webhooks_allowed():
-        return cleaned
 
     host = parsed.hostname.lower().rstrip(".")
     blocked_hosts = {
@@ -88,8 +117,12 @@ def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
         "kubernetes.default",
         "kubernetes.default.svc",
     }
+    # localhost hostnames: only when private webhooks are not allowed.
     if host in blocked_hosts:
-        raise ValueError(f"webhook URL host {host!r} is not allowed")
+        if host.startswith("metadata") or host.startswith("kubernetes"):
+            raise ValueError(f"webhook URL host {host!r} is not allowed")
+        if not _private_webhooks_allowed():
+            raise ValueError(f"webhook URL host {host!r} is not allowed")
 
     # Literal IP in the URL.
     try:
@@ -97,13 +130,12 @@ def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
     except ValueError:
         ip = None
     if ip is not None:
-        if not ip.is_global:
-            raise ValueError(
-                f"webhook URL host resolves to non-public address {ip}"
-            )
+        reason = _ip_forbidden_for_webhook(ip)
+        if reason is not None:
+            raise ValueError(f"webhook URL host resolves to {reason}")
         return cleaned
 
-    # Hostname path: optional DNS check against private A/AAAA records.
+    # Hostname path: optional DNS check against forbidden A/AAAA records.
     if resolve_dns:
         try:
             infos = socket.getaddrinfo(
@@ -112,6 +144,11 @@ def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
                 type=socket.SOCK_STREAM,
             )
         except socket.gaierror as dns_exc:
+            # Unresolvable hosts cannot be proven public. In strict mode reject;
+            # with private webhooks allowed (tests / docker) permit registration
+            # of placeholder sinks like ``http://example.test/hook``.
+            if _private_webhooks_allowed():
+                return cleaned
             raise ValueError(
                 f"webhook URL host could not be resolved: {host}"
             ) from dns_exc
@@ -121,9 +158,10 @@ def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
                 resolved = ipaddress.ip_address(addr)
             except ValueError:
                 continue
-            if not resolved.is_global:
+            reason = _ip_forbidden_for_webhook(resolved)
+            if reason is not None:
                 raise ValueError(
-                    f"webhook URL host resolves to non-public address {resolved}"
+                    f"webhook URL host resolves to {reason}"
                 )
     return cleaned
 
@@ -175,6 +213,34 @@ def verify_webhook_signature(
         return False
 
 
+class _SsrfSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only when each hop passes :func:`validate_webhook_url`.
+
+    Without this, a public host can 302 to ``http://169.254.169.254/`` (or any
+    private IP) and urllib's default redirect following would complete the
+    SSRF. Validation runs on every ``Location`` before the hop is taken.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        try:
+            validate_webhook_url(newurl, resolve_dns=True)
+        except ValueError as exc:
+            # Raise URLError so post_webhook surfaces a clear ssrf_blocked
+            # error instead of silently following into the private network.
+            raise urllib.error.URLError(
+                f"ssrf_blocked_redirect: {exc}"
+            ) from exc
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def post_webhook(
     url: str,
     payload: dict[str, Any],
@@ -188,6 +254,10 @@ def post_webhook(
     When *secret* is set, signs the body with :func:`sign_payload` and sets
     ``X-Job-Queue-Signature``. *idempotency_key* is sent as ``Idempotency-Key``
     and ``X-Job-Queue-Delivery-Id`` so receivers can treat retries as one event.
+
+    SSRF: the initial URL and **every redirect hop** are checked with
+    :func:`validate_webhook_url` (private / link-local / metadata blocked
+    unless ``JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS=1``).
     """
     body = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
     headers = {
@@ -208,8 +278,10 @@ def post_webhook(
         return 0, f"ssrf_blocked: {exc}"
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    # Custom opener: default urlopen follows redirects without re-validating.
+    opener = urllib.request.build_opener(_SsrfSafeRedirectHandler)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        with opener.open(req, timeout=timeout_seconds) as resp:
             code = int(resp.getcode())
             raw = resp.read(512)
             text = raw.decode("utf-8", errors="replace")
@@ -218,6 +290,11 @@ def post_webhook(
         raw = exc.read(512) if exc.fp else b""
         text = raw.decode("utf-8", errors="replace")
         return int(exc.code), text or str(exc)
+    except urllib.error.URLError as exc:
+        reason = str(getattr(exc, "reason", exc) or exc)
+        if "ssrf_blocked" in reason:
+            return 0, reason
+        return 0, reason
     except Exception as exc:  # noqa: BLE001 — network errors become retryable failures
         return 0, str(exc)
 
