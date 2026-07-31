@@ -7258,3 +7258,156 @@ def test_cancel_matching_waits_for_lock_release(queue: JobQueue):
     assert result.cancelled == 1
     after = queue.get(j.id, tenant_id="t1")
     assert after is not None and after.status == JobStatus.CANCELLED
+
+
+def test_webhook_signature_verify_helper():
+    from job_queue.webhooks import sign_payload, verify_webhook_signature
+
+    body = b'{"event":"job.completed","ok":true}'
+    sig = sign_payload("super-secret", body)
+    assert sig.startswith("v1=")
+    assert verify_webhook_signature("super-secret", body, sig) is True
+    assert verify_webhook_signature("wrong", body, sig) is False
+    assert verify_webhook_signature("super-secret", body, None) is False
+    # Bare hex (legacy) still verifies.
+    bare = sig.removeprefix("v1=")
+    assert verify_webhook_signature("super-secret", body, bare) is True
+    assert verify_webhook_signature("super-secret", body, f"sha256={bare}") is True
+
+
+def test_webhook_signed_delivery_and_secret_rotation_mid_flight(queue: JobQueue):
+    """In-flight retries must keep verifying under the pre-rotation secret."""
+    import json
+
+    from job_queue.webhooks import sign_payload, verify_webhook_signature
+
+    capture = _WebhookCapture(fail_times=1)
+    try:
+        ep = queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            secret="secret-v1",
+            max_attempts=5,
+            backoff_base_seconds=0,
+            backoff_max_seconds=1,
+        )
+        queue.enqueue(tenant_id="t1", payload={"n": 1})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1", result={"done": True})
+
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending) == 1
+        assert pending[0].signing_secret == "secret-v1"
+
+        # First attempt fails (capture fails once).
+        results = queue.process_webhook_deliveries(limit=5)
+        assert len(results) == 1
+        assert results[0].success is False
+        assert len(capture.received) == 1
+        first_sig = capture.received[0]["signature"]
+        first_body = json.dumps(
+            capture.received[0]["body"], default=str, separators=(",", ":")
+        ).encode("utf-8")
+        # Note: process re-serializes payload; verify using the exact POST body
+        # is not available here — check header format + claim path instead.
+        assert first_sig is not None and first_sig.startswith("v1=")
+
+        # Rotate while delivery is pending retry.
+        rotated = queue.rotate_webhook_secret(
+            ep.id, tenant_id="t1", secret="secret-v2"
+        )
+        assert rotated.secret == "secret-v2"
+        still = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(still) == 1
+        assert still[0].signing_secret == "secret-v1"
+
+        # Claim must hand out frozen secret, not the rotated one.
+        claimed, _ = queue.claim_webhook_deliveries(limit=5, claim_seconds=30.0)
+        assert len(claimed) == 1
+        assert claimed[0].secret == "secret-v1"
+        assert claimed[0].delivery.signing_secret == "secret-v1"
+
+        # Manually verify HMAC with frozen secret over a re-encoded payload
+        # matching post_webhook separators.
+        body = json.dumps(
+            claimed[0].delivery.payload, default=str, separators=(",", ":")
+        ).encode("utf-8")
+        sig = sign_payload("secret-v1", body)
+        assert verify_webhook_signature("secret-v1", body, sig)
+        assert not verify_webhook_signature("secret-v2", body, sig)
+
+        # Finalize success; new job after rotate uses v2.
+        queue.finalize_webhook_delivery(claimed[0].delivery.id, status_code=200)
+
+        queue.enqueue(tenant_id="t1", payload={"n": 2})
+        job2 = queue.lease(tenant_id="t1", worker_id="w2")
+        assert job2 is not None
+        _ack(queue, job2, "w2")
+        pending2 = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending2) == 1
+        assert pending2[0].signing_secret == "secret-v2"
+        claimed2, _ = queue.claim_webhook_deliveries(limit=5)
+        assert len(claimed2) == 1
+        assert claimed2[0].secret == "secret-v2"
+        queue.finalize_webhook_delivery(claimed2[0].delivery.id, status_code=200)
+    finally:
+        capture.stop()
+
+
+def test_webhook_process_posts_valid_signature_after_rotation(queue: JobQueue):
+    """End-to-end: rotate mid-retry; second POST still verifies with old secret."""
+    import json
+
+    from job_queue.webhooks import verify_webhook_signature
+
+    bodies: list[tuple[bytes, str | None]] = []
+    capture = _WebhookCapture(fail_times=1)
+    # Patch capture to record raw body+sig for verify.
+    orig_handler = capture.received
+
+    try:
+        ep = queue.register_webhook(
+            tenant_id="t1",
+            url=capture.url,
+            events=["job.completed"],
+            secret="alpha",
+            max_attempts=5,
+            backoff_base_seconds=0,
+            backoff_max_seconds=1,
+        )
+        queue.enqueue(tenant_id="t1", payload={"x": 1})
+        job = queue.lease(tenant_id="t1", worker_id="w1")
+        assert job is not None
+        _ack(queue, job, "w1")
+
+        r1 = queue.process_webhook_deliveries(limit=5)
+        assert r1[0].success is False
+        assert capture.received[0]["signature"]
+
+        queue.rotate_webhook_secret(ep.id, tenant_id="t1", secret="beta")
+
+        # Force due for retry.
+        pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(pending) == 1
+        # process again — should succeed with signature under alpha
+        r2 = queue.process_webhook_deliveries(limit=5)
+        assert r2[0].success is True
+        assert len(capture.received) == 2
+        # Both attempts should carry a signature header.
+        for rec in capture.received:
+            assert rec["signature"] and rec["signature"].startswith("v1=")
+            # Re-serialize as post_webhook does and check alpha still works
+            # for both (frozen secret).
+            body = json.dumps(
+                rec["body"], default=str, separators=(",", ":")
+            ).encode("utf-8")
+            assert verify_webhook_signature(
+                "alpha", body, rec["signature"]
+            ), "retry must verify under pre-rotation secret"
+            assert not verify_webhook_signature(
+                "beta", body, rec["signature"]
+            )
+    finally:
+        capture.stop()

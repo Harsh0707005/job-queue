@@ -386,6 +386,10 @@ class WebhookDelivery:
     Status lifecycle: pending → delivering → succeeded | pending (retry) | dead.
     Claim (delivering) is committed *before* HTTP so a crash after a successful
     POST cannot leave the row as pending and cause an automatic resend.
+
+    ``signing_secret`` is a snapshot of the endpoint secret taken when the
+    delivery was enqueued. Agents must HMAC with this value (not the live
+    endpoint secret) so in-flight retries still verify after rotation.
     """
 
     id: UUID
@@ -406,6 +410,7 @@ class WebhookDelivery:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    signing_secret: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +419,9 @@ class ClaimedWebhook:
 
     The claim is committed in Postgres (status=delivering) before this is
     returned. The agent POSTs, then calls finalize. Coordinators never POST.
+
+    ``secret`` is the delivery's frozen ``signing_secret`` (fallback: current
+    endpoint secret for legacy rows without a snapshot).
     """
 
     delivery: WebhookDelivery

@@ -1,0 +1,49 @@
+# Signed webhooks + mid-flight secret rotation fleet soak.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.webhook-sign.yml \
+#     up --build --abort-on-container-exit --exit-code-from webhook-sign-soak webhook-sign-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  webhook-sink:
+    environment:
+      LOG_LEVEL: INFO
+      SLOW_MS: "20"
+      # Accept both secrets so posts signed before/after rotate verify.
+      WEBHOOK_VERIFY_SECRETS: "fleet-secret-v1,fleet-secret-v2"
+
+  webhook-sign-soak:
+    build: .
+    command: ["python", "scripts/webhook_sign_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WEBHOOK_SINK_URL: http://webhook-sink:8090
+      TENANTS: "4"
+      JOBS_PER_TENANT: "25"
+      SECRET_V1: fleet-secret-v1
+      SECRET_V2: fleet-secret-v2
+      MAX_WALL_SECONDS: "120"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      webhook-1:
+        condition: service_started
+      webhook-2:
+        condition: service_started
+      webhook-sink:
+        condition: service_healthy

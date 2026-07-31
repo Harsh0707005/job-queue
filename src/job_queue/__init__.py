@@ -40,7 +40,13 @@ from job_queue.queue import (
 )
 from job_queue.cleaner import RetentionCleaner
 from job_queue.scheduler import ScheduleRunner
-from job_queue.webhooks import WebhookDeliveryResult, WebhookDispatcher
+from job_queue.webhooks import (
+    SIGNATURE_HEADER,
+    WebhookDeliveryResult,
+    WebhookDispatcher,
+    sign_payload,
+    verify_webhook_signature,
+)
 from job_queue.worker import LeaseContext, Worker
 
 from job_queue.coordinator import Coordinator
@@ -85,6 +91,7 @@ __all__ = [
     "ScheduleError",
     "ScheduleFire",
     "ScheduleNode",
+    "SIGNATURE_HEADER",
     "ScheduleRunner",
     "SpawnChildrenResult",
     "SpawnError",
@@ -99,5 +106,7 @@ __all__ = [
     "WebhookNode",
     "Worker",
     "compute_retry_backoff_seconds",
+    "sign_payload",
+    "verify_webhook_signature",
 ]
 __version__ = "0.1.0"

@@ -526,6 +526,10 @@ ALTER TABLE webhook_deliveries ADD CONSTRAINT webhook_deliveries_status_check CH
 
 ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS delivering_until TIMESTAMPTZ;
 
+-- Snapshot of endpoint.secret at delivery enqueue time. Retries / reclaims
+-- must sign with this value so secret rotation mid-flight still verifies.
+ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS signing_secret TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
     ON webhook_deliveries (next_attempt_at ASC)
     WHERE status = 'pending';

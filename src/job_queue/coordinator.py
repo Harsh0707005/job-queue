@@ -155,6 +155,10 @@ class Coordinator:
             return self._create_schedule(body)
         if method == "POST" and path == "/v1/webhooks":
             return self._register_webhook(body)
+        if method == "POST" and path.startswith("/v1/webhooks/") and path.endswith(
+            "/rotate-secret"
+        ):
+            return self._rotate_webhook_secret(path, body)
         if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/pause"):
             return self._pause_schedule(path, body)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/pause"):
@@ -1336,6 +1340,32 @@ class Coordinator:
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 201, {"endpoint": webhook_endpoint_to_dict(ep)}
+
+    def _rotate_webhook_secret(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        # /v1/webhooks/{id}/rotate-secret
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid webhook path"}
+        eid = parts[2]
+        if not _UUID_RE.match(eid):
+            return 400, {"error": "invalid webhook id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        # secret may be explicitly null to clear
+        if "secret" not in body:
+            return 400, {"error": "secret is required (use null to clear)"}
+        try:
+            ep = self.queue.rotate_webhook_secret(
+                UUID(eid),
+                tenant_id=str(tenant_id),
+                secret=body.get("secret"),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"endpoint": webhook_endpoint_to_dict(ep)}
 
     def _pause_schedule(
         self, path: str, body: dict[str, Any]

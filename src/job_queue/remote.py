@@ -671,6 +671,21 @@ class CoordinatorClient:
         assert payload is not None
         return payload["schedule"]
 
+    def rotate_webhook_secret(
+        self,
+        endpoint_id: str | UUID,
+        *,
+        tenant_id: str,
+        secret: str | None,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/webhooks/{endpoint_id}/rotate-secret",
+            {"tenant_id": tenant_id, "secret": secret},
+        )
+        assert payload is not None
+        return payload
+
     def register_webhook(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/webhooks", kwargs)
         assert payload is not None

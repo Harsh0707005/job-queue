@@ -363,6 +363,8 @@ def webhook_delivery_to_dict(d: WebhookDelivery) -> dict[str, Any]:
         "created_at": _dt(d.created_at),
         "updated_at": _dt(d.updated_at),
         "completed_at": _dt(d.completed_at),
+        # Present so agents can sign retries after secret rotation.
+        "signing_secret": d.signing_secret,
     }
 
 

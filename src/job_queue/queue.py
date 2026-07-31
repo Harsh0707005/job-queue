@@ -146,7 +146,10 @@ Design notes
   ``webhook_deliveries`` first; ``process_webhook_deliveries`` POSTs with
   exponential backoff and dead-letters failed deliveries. Paused tenants do
   not enqueue new deliveries and their pending rows are not claimed until
-  resume.
+  resume. When an endpoint has a ``secret``, POSTs are HMAC-SHA256 signed
+  (``X-Job-Queue-Signature: v1=...``). The secret is **snapshotted** onto each
+  delivery at enqueue (``signing_secret``) so ``rotate_webhook_secret`` does
+  not break retries of in-flight deliveries.
 """
 
 from __future__ import annotations
@@ -5265,7 +5268,7 @@ class JobQueue:
         id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,
         max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,
         delivering_until, last_error, last_status_code, created_at, updated_at,
-        completed_at
+        completed_at, signing_secret
     """
 
     def register_webhook(
@@ -5383,6 +5386,44 @@ class JobQueue:
                 RETURNING {self._WEBHOOK_ENDPOINT_COLUMNS}
                 """,
                 (enabled, now, endpoint_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"webhook {endpoint_id} not found for tenant {tenant_id!r}"
+                )
+            return self._row_to_webhook_endpoint(row)
+
+    def rotate_webhook_secret(
+        self,
+        endpoint_id: UUID,
+        *,
+        tenant_id: str,
+        secret: str | None,
+    ) -> WebhookEndpoint:
+        """Update the endpoint signing secret without touching in-flight deliveries.
+
+        New deliveries snapshot the new secret. Pending/retrying deliveries keep
+        their original ``signing_secret`` so receivers can still verify them.
+        Pass ``secret=None`` to disable signing for future deliveries only.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if secret is not None:
+            secret = str(secret)
+            if secret == "":
+                raise ValueError("secret must be non-empty when provided")
+            if len(secret) > 512:
+                raise ValueError("secret must be at most 512 characters")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                UPDATE webhook_endpoints
+                SET secret = %s, updated_at = %s
+                WHERE id = %s AND tenant_id = %s
+                RETURNING {self._WEBHOOK_ENDPOINT_COLUMNS}
+                """,
+                (secret, now, endpoint_id, tenant_id),
             ).fetchone()
             if row is None:
                 raise ValueError(
@@ -5613,12 +5654,13 @@ class JobQueue:
                         d.backoff_base_seconds, d.backoff_max_seconds,
                         d.next_attempt_at, d.delivering_until, d.last_error,
                         d.last_status_code, d.created_at, d.updated_at,
-                        d.completed_at
+                        d.completed_at, d.signing_secret
                 )
                 SELECT
                     u.*,
                     e.url AS _ep_url,
-                    e.secret AS _ep_secret,
+                    -- Prefer frozen delivery secret; fall back for legacy rows.
+                    COALESCE(u.signing_secret, e.secret) AS _sign_secret,
                     e.enabled AS _ep_enabled
                 FROM updated u
                 LEFT JOIN webhook_endpoints e ON e.id = u.endpoint_id
@@ -5639,7 +5681,7 @@ class JobQueue:
                     continue
                 delivery = self._row_to_webhook_delivery(row)
                 url = row.get("_ep_url")
-                secret = row.get("_ep_secret")
+                secret = row.get("_sign_secret")
                 enabled = row.get("_ep_enabled")
                 if url is None:
                     claimed.append(
@@ -5947,16 +5989,20 @@ class JobQueue:
                 ),
                 "timestamp": now.isoformat(),
             }
+            # Freeze signing secret at enqueue so rotation mid-retry is safe.
+            signing_secret = ep.get("secret")
             conn.execute(
                 f"""
                 INSERT INTO webhook_deliveries (
                     id, endpoint_id, tenant_id, job_id, event, payload,
                     status, attempts, max_attempts, backoff_base_seconds,
-                    backoff_max_seconds, next_attempt_at, created_at, updated_at
+                    backoff_max_seconds, next_attempt_at, signing_secret,
+                    created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     'pending', 0, %s, %s,
-                    %s, %s, %s, %s
+                    %s, %s, %s,
+                    %s, %s
                 )
                 """,
                 (
@@ -5970,6 +6016,7 @@ class JobQueue:
                     ep["backoff_base_seconds"],
                     ep["backoff_max_seconds"],
                     now,
+                    signing_secret,
                     now,
                     now,
                 ),
@@ -6016,6 +6063,7 @@ class JobQueue:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
+            signing_secret=row.get("signing_secret"),
         )
     # ------------------------------------------------------------------
     # Recurring schedules

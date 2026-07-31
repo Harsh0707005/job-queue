@@ -1,4 +1,18 @@
-"""HTTP webhook delivery with durable Postgres outbox semantics."""
+"""HTTP webhook delivery with durable Postgres outbox semantics.
+
+Signing
+-------
+When an endpoint has a ``secret``, each delivery is HMAC-SHA256 signed over
+the exact JSON body bytes. Header::
+
+    X-Job-Queue-Signature: v1=<hex>
+
+Receivers should call :func:`verify_webhook_signature` with the secret they
+were given. The secret used for a delivery is **snapshotted** onto the
+outbox row at enqueue time (``signing_secret``), so if the endpoint secret
+is rotated mid-flight, retries of in-progress deliveries still verify under
+the original secret.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +35,9 @@ from job_queue.queue import JobQueue, compute_retry_backoff_seconds
 
 logger = logging.getLogger(__name__)
 
+SIGNATURE_HEADER = "X-Job-Queue-Signature"
+SIGNATURE_VERSION_PREFIX = "v1="
+
 
 @dataclass(frozen=True, slots=True)
 class WebhookDeliveryResult:
@@ -31,8 +48,42 @@ class WebhookDeliveryResult:
 
 
 def sign_payload(secret: str, body: bytes) -> str:
-    """HMAC-SHA256 hex digest for webhook body."""
-    return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    """Return ``v1=<hmac-sha256-hex>`` over *body* with *secret*."""
+    digest = hmac.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    return f"{SIGNATURE_VERSION_PREFIX}{digest}"
+
+
+def verify_webhook_signature(
+    secret: str,
+    body: bytes,
+    signature_header: str | None,
+) -> bool:
+    """Constant-time check that *signature_header* matches *body* under *secret*.
+
+    Accepts ``v1=<hex>`` (preferred) and bare hex (legacy deliveries).
+    """
+    if not secret or not signature_header:
+        return False
+    header = signature_header.strip()
+    if not header:
+        return False
+    expected_digest = hmac.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    if header.startswith(SIGNATURE_VERSION_PREFIX):
+        provided = header[len(SIGNATURE_VERSION_PREFIX) :].strip()
+    elif header.startswith("sha256="):
+        provided = header[len("sha256=") :].strip()
+    else:
+        provided = header
+    if len(provided) != len(expected_digest):
+        return False
+    try:
+        return hmac.compare_digest(provided.lower(), expected_digest.lower())
+    except (TypeError, ValueError):
+        return False
 
 
 def post_webhook(
@@ -45,8 +96,9 @@ def post_webhook(
 ) -> tuple[int, str]:
     """POST JSON payload. Returns (status_code, response_snippet_or_error).
 
-    *idempotency_key* is sent as ``Idempotency-Key`` and
-    ``X-Job-Queue-Delivery-Id`` so receivers can treat retries as one event.
+    When *secret* is set, signs the body with :func:`sign_payload` and sets
+    ``X-Job-Queue-Signature``. *idempotency_key* is sent as ``Idempotency-Key``
+    and ``X-Job-Queue-Delivery-Id`` so receivers can treat retries as one event.
     """
     body = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
     headers = {
@@ -54,7 +106,7 @@ def post_webhook(
         "User-Agent": "job-queue-webhook/0.1",
     }
     if secret:
-        headers["X-Job-Queue-Signature"] = sign_payload(secret, body)
+        headers[SIGNATURE_HEADER] = sign_payload(secret, body)
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
         headers["X-Job-Queue-Delivery-Id"] = idempotency_key

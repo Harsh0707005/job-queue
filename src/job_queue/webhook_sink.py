@@ -25,8 +25,25 @@ class WebhookSinkState:
         self.by_tenant: dict[str, int] = {}
         self.by_job: dict[str, int] = {}
         self.duplicate_posts = 0
+        self.signed_posts = 0
+        self.unsigned_posts = 0
+        self.sig_ok = 0
+        self.sig_bad = 0
+        self.verify_secrets: list[str] = []
 
-    def record(self, payload: dict[str, Any], headers: Any) -> None:
+    def set_verify_secrets(self, secrets: list[str]) -> None:
+        with self._lock:
+            self.verify_secrets = list(secrets)
+
+    def record(
+        self,
+        payload: dict[str, Any],
+        headers: Any,
+        *,
+        raw_body: bytes | None = None,
+    ) -> None:
+        from job_queue.webhooks import verify_webhook_signature
+
         delivery_id = str(
             payload.get("delivery_id")
             or headers.get("Idempotency-Key")
@@ -35,6 +52,7 @@ class WebhookSinkState:
         )
         tenant = str(payload.get("tenant_id") or "?")
         job_id = str(payload.get("job_id") or "?")
+        sig = headers.get("X-Job-Queue-Signature")
         with self._lock:
             self.total_posts += 1
             prev = self.by_delivery.get(delivery_id, 0)
@@ -43,6 +61,23 @@ class WebhookSinkState:
                 self.duplicate_posts += 1
             self.by_tenant[tenant] = self.by_tenant.get(tenant, 0) + 1
             self.by_job[job_id] = self.by_job.get(job_id, 0) + 1
+            if sig:
+                self.signed_posts += 1
+            else:
+                self.unsigned_posts += 1
+            secrets = list(self.verify_secrets)
+            if not secrets:
+                env = os.environ.get("WEBHOOK_VERIFY_SECRET")
+                if env:
+                    secrets = [env]
+            if secrets and raw_body is not None:
+                ok = any(
+                    verify_webhook_signature(s, raw_body, sig) for s in secrets
+                )
+                if ok:
+                    self.sig_ok += 1
+                else:
+                    self.sig_bad += 1
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -59,6 +94,10 @@ class WebhookSinkState:
                 "multi_post_sample": dict(list(multi.items())[:20]),
                 "by_tenant": dict(self.by_tenant),
                 "unique_jobs": len(self.by_job),
+                "signed_posts": self.signed_posts,
+                "unsigned_posts": self.unsigned_posts,
+                "sig_ok": self.sig_ok,
+                "sig_bad": self.sig_bad,
             }
 
 
@@ -67,6 +106,11 @@ def serve_sink(*, host: str = "0.0.0.0", port: int = 8090) -> None:
     # Optional artificial delay so fleet soaks can offboard while deliveries
     # are still status=delivering (agent has claimed and is mid-POST).
     slow_ms = int(os.environ.get("SLOW_MS", "0") or "0")
+    # Comma-separated secrets accepted for verification (rotation support).
+    multi = os.environ.get("WEBHOOK_VERIFY_SECRETS") or ""
+    secrets = [s.strip() for s in multi.split(",") if s.strip()]
+    if secrets:
+        state.set_verify_secrets(secrets)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
@@ -81,7 +125,7 @@ def serve_sink(*, host: str = "0.0.0.0", port: int = 8090) -> None:
                 payload = {}
             if not isinstance(payload, dict):
                 payload = {}
-            state.record(payload, self.headers)
+            state.record(payload, self.headers, raw_body=raw)
             if slow_ms > 0:
                 time.sleep(slow_ms / 1000.0)
             body = b"ok"
