@@ -50,6 +50,14 @@ _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+# Cap request bodies so a forged Content-Length cannot pin a worker thread
+# reading multi-GB payloads. Enqueue payloads are JSON; 2 MiB is generous.
+_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+
+
+class _BodyTooLarge(ValueError):
+    """Request body exceeds :data:`_MAX_REQUEST_BODY_BYTES`."""
+
 
 class Coordinator:
     """Thin HTTP façade over :class:`JobQueue`."""
@@ -1795,9 +1803,19 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
             logger.debug("http: " + format, *args)
 
         def _read_json(self) -> dict[str, Any] | None:
-            length = int(self.headers.get("Content-Length") or "0")
+            raw_len = self.headers.get("Content-Length") or "0"
+            try:
+                length = int(raw_len)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if length < 0:
+                raise ValueError("invalid Content-Length")
             if length <= 0:
                 return None
+            if length > _MAX_REQUEST_BODY_BYTES:
+                raise _BodyTooLarge(
+                    f"body too large ({length} > {_MAX_REQUEST_BODY_BYTES})"
+                )
             raw = self.rfile.read(length)
             if not raw:
                 return None
@@ -1942,6 +1960,8 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json() if method in ("POST", "PUT", "PATCH") else None
                 status, payload = coordinator.handle(method, path, body, query)
                 self._send(status, payload)
+            except _BodyTooLarge as exc:
+                self._send(413, {"error": str(exc)})
             except ValueError as exc:
                 self._send(400, {"error": str(exc)})
             except Exception as exc:  # noqa: BLE001

@@ -230,3 +230,56 @@ def test_offboard_via_coordinator_http(queue, coordinator_url):
     assert ack.status.value == "completed" or str(ack.status) == "completed"
 
     assert queue.tenant_is_empty("http-gone") is True
+
+
+def test_coordinator_rejects_oversized_body(coordinator_url):
+    """Forged Content-Length must not pin the server reading multi-GB bodies."""
+    import http.client
+    import json
+    from urllib.parse import urlparse
+
+    from job_queue.coordinator import _MAX_REQUEST_BODY_BYTES
+
+    # Claim a body just over the cap without actually sending multi-MB of data:
+    # the server rejects based on Content-Length before reading the full body.
+    oversized = _MAX_REQUEST_BODY_BYTES + 1
+    parsed = urlparse(coordinator_url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        conn.putrequest("POST", "/v1/jobs")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(oversized))
+        conn.putheader("Accept", "application/json")
+        conn.endheaders()
+        conn.send(b"{}")
+        resp = conn.getresponse()
+        body = resp.read()
+        assert resp.status == 413, body
+        payload = json.loads(body.decode("utf-8"))
+        assert "too large" in payload.get("error", "").lower()
+    finally:
+        conn.close()
+
+
+def test_coordinator_rejects_invalid_content_length(coordinator_url):
+    import http.client
+    import json
+    from urllib.parse import urlparse
+
+    parsed = urlparse(coordinator_url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        payload = b'{"tenant_id":"t1","payload":{}}'
+        conn.putrequest("POST", "/v1/jobs")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "not-a-number")
+        conn.putheader("Accept", "application/json")
+        conn.endheaders()
+        conn.send(payload)
+        resp = conn.getresponse()
+        body = resp.read()
+        assert resp.status == 400, body
+        data = json.loads(body.decode("utf-8"))
+        assert "content-length" in data.get("error", "").lower()
+    finally:
+        conn.close()
