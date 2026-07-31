@@ -7627,6 +7627,7 @@ def test_job_progress_stream_snapshot_paginates_beyond_500(queue: JobQueue):
         include_snapshot=True,
         idle_timeout_seconds=0.3,
         heartbeat_seconds=60.0,
+        max_snapshot_jobs=10_000,
     ):
         if ev.event == "ping":
             continue
@@ -7634,6 +7635,25 @@ def test_job_progress_stream_snapshot_paginates_beyond_500(queue: JobQueue):
             snaps.append(ev.job_id)
     assert len(snaps) == 520
     assert set(snaps) == set(ids)
+
+
+def test_job_progress_stream_snapshot_respects_max_snapshot_jobs(queue: JobQueue):
+    """Memory guard: tenant-wide snapshots stop after max_snapshot_jobs."""
+    for i in range(30):
+        queue.enqueue(tenant_id="t1", payload={"i": i})
+    snaps: list = []
+    for ev in queue.iter_job_events(
+        tenant_ids=["t1"],
+        include_snapshot=True,
+        idle_timeout_seconds=0.3,
+        heartbeat_seconds=60.0,
+        max_snapshot_jobs=12,
+    ):
+        if ev.event == "ping":
+            continue
+        if ev.snapshot:
+            snaps.append(ev.job_id)
+    assert len(snaps) == 12
 
 
 # ---------------------------------------------------------------------------

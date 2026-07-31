@@ -283,3 +283,123 @@ def test_coordinator_rejects_invalid_content_length(coordinator_url):
         assert "content-length" in data.get("error", "").lower()
     finally:
         conn.close()
+
+
+def test_schedule_webhook_dlq_management_via_http(queue, coordinator_url):
+    """Stage 4: list/resume/delete schedules, enable/delete webhooks, DLQ replay."""
+    client = CoordinatorClient(coordinator_url)
+
+    sched = client.create_schedule(
+        tenant_id="ops",
+        interval_seconds=3600,
+        payload={"k": 1},
+        name="ops-sched",
+    )
+    sid = sched["id"]
+    listed = client.list_schedules(tenant_id="ops")
+    assert any(s["id"] == sid for s in listed)
+    got = client.get_schedule(sid, tenant_id="ops")
+    assert got is not None and got["name"] == "ops-sched"
+
+    paused = client.pause_schedule(sid, tenant_id="ops")
+    assert paused["enabled"] is False
+    resumed = client.resume_schedule(sid, tenant_id="ops")
+    assert resumed["enabled"] is True
+    assert client.delete_schedule(sid, tenant_id="ops") is True
+    assert client.get_schedule(sid, tenant_id="ops") is None
+
+    ep = client.register_webhook(
+        tenant_id="ops",
+        url="http://127.0.0.1:9/hook",
+        events=["job.completed"],
+        secret="sec",
+    )
+    eid = ep["id"]
+    endpoints = client.list_webhooks(tenant_id="ops")
+    assert any(e["id"] == eid for e in endpoints)
+    disabled = client.set_webhook_enabled(eid, tenant_id="ops", enabled=False)
+    assert disabled["enabled"] is False
+    assert client.delete_webhook(eid, tenant_id="ops") is True
+    assert client.list_webhooks(tenant_id="ops") == []
+
+    # Dead-letter + replay
+    job = queue.enqueue(tenant_id="ops", payload={"x": 1}, max_attempts=1)
+    leased = queue.lease(tenant_id="ops", worker_id="w")
+    assert leased is not None
+    queue.nack(
+        leased.id,
+        tenant_id="ops",
+        worker_id="w",
+        lease_token=leased.lease_token,
+        error="boom",
+        requeue=True,
+    )
+    assert queue.get(job.id, tenant_id="ops").status.value == "dead"
+
+    dead = client.list_dead_letters(tenant_id="ops")
+    assert any(j.id == job.id for j in dead)
+    from job_queue import JobStatus
+
+    replayed = client.replay_dead_letter(job.id, tenant_id="ops")
+    assert replayed.status == JobStatus.PENDING
+    assert queue.count(tenant_id="ops", status=JobStatus.PENDING) == 1
+
+
+def test_coordinator_api_token_auth(queue, postgres_url, monkeypatch):
+    """Stage 5: when api_token is set, unauthenticated calls get 401; health is open."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    from job_queue.coordinator import Coordinator, _make_handler
+    from http.server import ThreadingHTTPServer
+
+    monkeypatch.delenv("JOB_QUEUE_API_TOKEN", raising=False)
+    monkeypatch.delenv("COORDINATOR_TOKEN", raising=False)
+
+    coord = Coordinator(queue, api_token="secret-token")
+    handler = _make_handler(coord)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{port}"
+    try:
+        # Health stays open.
+        with urllib.request.urlopen(f"{url}/health", timeout=5) as resp:
+            assert json.loads(resp.read())["ok"] is True
+
+        # Missing token → 401
+        req = urllib.request.Request(
+            f"{url}/v1/jobs",
+            data=json.dumps({"tenant_id": "t", "payload": {}}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            urllib.request.urlopen(req, timeout=5)
+        assert ei.value.code == 401
+
+        # Bearer works.
+        authed = CoordinatorClient(url, api_token="secret-token")
+        assert authed.health()["ok"] is True
+        # enqueue via client
+        # CoordinatorClient has no enqueue helper — use raw _request
+        payload = authed._request(
+            "POST",
+            "/v1/jobs",
+            {"tenant_id": "auth-t", "payload": {"n": 1}},
+        )
+        assert payload is not None and "job" in payload
+
+        # Wrong token
+        bad = CoordinatorClient(url, api_token="wrong")
+        with pytest.raises(RuntimeError, match="unauthorized"):
+            bad._request(
+                "POST",
+                "/v1/jobs",
+                {"tenant_id": "auth-t", "payload": {"n": 2}},
+            )
+    finally:
+        server.shutdown()
+        t.join(timeout=5)

@@ -43,6 +43,7 @@ class CoordinatorClient:
         base_url: str | list[str],
         *,
         timeout: float = 30.0,
+        api_token: str | None = None,
     ) -> None:
         if isinstance(base_url, str):
             urls = [u.strip() for u in base_url.split(",") if u.strip()]
@@ -52,6 +53,17 @@ class CoordinatorClient:
             raise ValueError("at least one coordinator URL is required")
         self.base_urls = [u.rstrip("/") for u in urls]
         self.timeout = timeout
+        # Prefer explicit token; else env (same keys as the coordinator).
+        if api_token is not None:
+            self.api_token = api_token or None
+        else:
+            import os
+
+            self.api_token = (
+                os.environ.get("JOB_QUEUE_API_TOKEN")
+                or os.environ.get("COORDINATOR_TOKEN")
+                or None
+            )
         self._rr = 0
         self._lock = threading.Lock()
 
@@ -79,6 +91,8 @@ class CoordinatorClient:
         if body is not None:
             data = json.dumps(body, default=str).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
 
         last_err: Exception | None = None
         for base in self._next_order():
@@ -99,6 +113,10 @@ class CoordinatorClient:
                     payload = json.loads(raw.decode("utf-8") or "{}")
                 except json.JSONDecodeError:
                     payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
+                if exc.code == 401:
+                    raise RuntimeError(
+                        f"coordinator unauthorized for {method} {path}: {payload}"
+                    ) from exc
                 if exc.code == 409 and payload.get("code") == "lease_error":
                     raise LeaseError(payload.get("error") or "lease error") from exc
                 if exc.code == 409 and payload.get("code") == "approval_error":
@@ -112,6 +130,12 @@ class CoordinatorClient:
 
                     raise CancelError(
                         payload.get("error") or "cancel error"
+                    ) from exc
+                if exc.code == 409 and payload.get("code") == "replay_error":
+                    from job_queue.queue import ReplayError
+
+                    raise ReplayError(
+                        payload.get("error") or "replay error"
                     ) from exc
                 if int(exc.code) == 404:
                     return {"error": payload.get("error") or "not found", "_http": 404}
@@ -184,13 +208,16 @@ class CoordinatorClient:
         for base in self._next_order():
             url = f"{base}/v1/lease"
             data = json.dumps(body).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            if self.api_token:
+                headers["Authorization"] = f"Bearer {self.api_token}"
             req = urllib.request.Request(
                 url,
                 data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
+                headers=headers,
                 method="POST",
             )
             try:
@@ -699,6 +726,170 @@ class CoordinatorClient:
         )
         assert payload is not None
         return payload["schedule"]
+
+    def resume_schedule(self, schedule_id: str, *, tenant_id: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/resume",
+            {"tenant_id": tenant_id},
+        )
+        assert payload is not None
+        return payload["schedule"]
+
+    def delete_schedule(self, schedule_id: str, *, tenant_id: str) -> bool:
+        payload = self._request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/delete",
+            {"tenant_id": tenant_id},
+        )
+        if payload is None:
+            return False
+        if payload.get("_http") == 404:
+            return False
+        return bool(payload.get("deleted"))
+
+    def list_schedules(
+        self,
+        *,
+        tenant_id: str,
+        enabled_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        from urllib.parse import urlencode
+
+        q = urlencode(
+            {
+                "tenant_id": tenant_id,
+                "enabled_only": "1" if enabled_only else "0",
+                "limit": str(limit),
+                "offset": str(offset),
+            }
+        )
+        payload = self._request("GET", f"/v1/schedules?{q}")
+        assert payload is not None
+        return list(payload.get("schedules") or [])
+
+    def get_schedule(
+        self, schedule_id: str | UUID, *, tenant_id: str
+    ) -> dict[str, Any] | None:
+        from urllib.parse import urlencode
+
+        q = urlencode({"tenant_id": tenant_id})
+        payload = self._request("GET", f"/v1/schedules/{schedule_id}?{q}")
+        if payload is None or payload.get("_http") == 404:
+            return None
+        return payload.get("schedule")
+
+    def list_webhooks(self, *, tenant_id: str) -> list[dict[str, Any]]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"tenant_id": tenant_id})
+        payload = self._request("GET", f"/v1/webhooks?{q}")
+        assert payload is not None
+        return list(payload.get("endpoints") or [])
+
+    def set_webhook_enabled(
+        self,
+        endpoint_id: str | UUID,
+        *,
+        tenant_id: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/webhooks/{endpoint_id}/set-enabled",
+            {"tenant_id": tenant_id, "enabled": enabled},
+        )
+        assert payload is not None
+        return payload["endpoint"]
+
+    def delete_webhook(self, endpoint_id: str | UUID, *, tenant_id: str) -> bool:
+        payload = self._request(
+            "POST",
+            f"/v1/webhooks/{endpoint_id}/delete",
+            {"tenant_id": tenant_id},
+        )
+        if payload is None or payload.get("_http") == 404:
+            return False
+        return bool(payload.get("deleted"))
+
+    def list_dead_letters(
+        self,
+        *,
+        tenant_id: str,
+        queue_name: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Job]:
+        from urllib.parse import urlencode
+
+        q: list[tuple[str, str]] = [
+            ("tenant_id", tenant_id),
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if queue_name is not None:
+            q.append(("queue_name", queue_name))
+        payload = self._request("GET", f"/v1/dead-letters?{urlencode(q)}")
+        assert payload is not None
+        return [job_from_dict(j) for j in (payload.get("jobs") or [])]
+
+    def replay_dead_letter(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        reset_attempts: bool = True,
+        max_attempts: int | None = None,
+        delay_seconds: float | int | None = None,
+        clear_error: bool = False,
+    ) -> Job:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "reset_attempts": reset_attempts,
+            "clear_error": clear_error,
+        }
+        if max_attempts is not None:
+            body["max_attempts"] = max_attempts
+        if delay_seconds is not None:
+            body["delay_seconds"] = delay_seconds
+        payload = self._request(
+            "POST", f"/v1/dead-letters/{job_id}/replay", body
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def replay_dead_letters(
+        self,
+        *,
+        tenant_id: str,
+        job_ids: list[str | UUID] | None = None,
+        queue_name: str | None = None,
+        limit: int | None = None,
+        reset_attempts: bool = True,
+        max_attempts: int | None = None,
+        delay_seconds: float | int | None = None,
+        clear_error: bool = False,
+    ) -> list[Job]:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "reset_attempts": reset_attempts,
+            "clear_error": clear_error,
+        }
+        if job_ids is not None:
+            body["job_ids"] = [str(j) for j in job_ids]
+        if queue_name is not None:
+            body["queue_name"] = queue_name
+        if limit is not None:
+            body["limit"] = limit
+        if max_attempts is not None:
+            body["max_attempts"] = max_attempts
+        if delay_seconds is not None:
+            body["delay_seconds"] = delay_seconds
+        payload = self._request("POST", "/v1/dead-letters/replay", body)
+        assert payload is not None
+        return [job_from_dict(j) for j in (payload.get("jobs") or [])]
 
     def set_retention(
         self,

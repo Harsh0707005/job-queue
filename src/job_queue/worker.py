@@ -635,10 +635,14 @@ class Worker:
             actives = list(self._active.values())
         released = 0
         for active in actives:
-            active.lease_lost.set()
+            # Stop heartbeat and free the lease *before* signalling lease_lost.
+            # If we flip lease_lost first, the handler can race into
+            # ``lease_lost_cleanup`` and release the row, making this path
+            # return False and under-count ``DrainResult.released``.
             active.stop_hb.set()
             if self._release_job(active.job, reason=reason):
                 released += 1
+            active.lease_lost.set()
             with self._lease_lock:
                 self._held.pop(active.job.id, None)
                 self._active.pop(active.job.id, None)

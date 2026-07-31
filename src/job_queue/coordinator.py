@@ -41,6 +41,7 @@ from job_queue.queue import (
     JobQueue,
     LeaseError,
     RateLimitError,
+    ReplayError,
     ScheduleError,
 )
 
@@ -54,16 +55,53 @@ _UUID_RE = re.compile(
 # reading multi-GB payloads. Enqueue payloads are JSON; 2 MiB is generous.
 _MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 
+# Optional shared secret. When set (env ``JOB_QUEUE_API_TOKEN`` or
+# ``COORDINATOR_TOKEN``), all routes except ``GET /health`` require
+# ``Authorization: Bearer <token>`` or ``X-API-Key: <token>``.
+_API_TOKEN_ENV_KEYS = ("JOB_QUEUE_API_TOKEN", "COORDINATOR_TOKEN")
+
 
 class _BodyTooLarge(ValueError):
     """Request body exceeds :data:`_MAX_REQUEST_BODY_BYTES`."""
 
 
+def _configured_api_token() -> str | None:
+    for key in _API_TOKEN_ENV_KEYS:
+        val = os.environ.get(key)
+        if val:
+            return val
+    return None
+
+
+def _extract_request_token(headers: Any) -> str | None:
+    """Pull bearer / API key from request headers (case-insensitive mapping)."""
+    if headers is None:
+        return None
+    # BaseHTTPRequestHandler headers are case-insensitive.
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if isinstance(auth, str) and auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    key = headers.get("X-API-Key") or headers.get("x-api-key")
+    if key:
+        return str(key).strip() or None
+    return None
+
+
 class Coordinator:
     """Thin HTTP façade over :class:`JobQueue`."""
 
-    def __init__(self, queue: JobQueue) -> None:
+    def __init__(
+        self,
+        queue: JobQueue,
+        *,
+        api_token: str | None = None,
+    ) -> None:
         self.queue = queue
+        # Explicit token wins; else env; None means auth disabled.
+        if api_token is not None:
+            self.api_token = api_token or None
+        else:
+            self.api_token = _configured_api_token()
 
     # ------------------------------------------------------------------
     # Routing
@@ -162,14 +200,40 @@ class Coordinator:
 
         if method == "POST" and path == "/v1/schedules":
             return self._create_schedule(body)
+        if method == "GET" and path == "/v1/schedules":
+            return self._list_schedules(query)
+        if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/pause"):
+            return self._pause_schedule(path, body)
+        if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/resume"):
+            return self._resume_schedule(path, body)
+        if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/delete"):
+            return self._delete_schedule(path, body)
+        if method == "GET" and path.startswith("/v1/schedules/"):
+            return self._get_schedule(path, query)
+
         if method == "POST" and path == "/v1/webhooks":
             return self._register_webhook(body)
+        if method == "GET" and path == "/v1/webhooks":
+            return self._list_webhooks(query)
         if method == "POST" and path.startswith("/v1/webhooks/") and path.endswith(
             "/rotate-secret"
         ):
             return self._rotate_webhook_secret(path, body)
-        if method == "POST" and path.startswith("/v1/schedules/") and path.endswith("/pause"):
-            return self._pause_schedule(path, body)
+        if method == "POST" and path.startswith("/v1/webhooks/") and path.endswith(
+            "/set-enabled"
+        ):
+            return self._set_webhook_enabled(path, body)
+        if method == "POST" and path.startswith("/v1/webhooks/") and path.endswith("/delete"):
+            return self._delete_webhook(path, body)
+
+        if method == "GET" and path == "/v1/dead-letters":
+            return self._list_dead_letters(query)
+        if method == "POST" and path == "/v1/dead-letters/replay":
+            return self._replay_dead_letters(body)
+        if method == "POST" and path.startswith("/v1/dead-letters/") and path.endswith(
+            "/replay"
+        ):
+            return self._replay_dead_letter(path, body)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/pause"):
             return self._pause_tenant(path)
         if method == "POST" and path.startswith("/v1/tenants/") and path.endswith("/resume"):
@@ -1395,6 +1459,242 @@ class Coordinator:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}
 
+    def _resume_schedule(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            sched = self.queue.resume_schedule(UUID(sid), tenant_id=str(tenant_id))
+        except ScheduleError as exc:
+            return 404, {"error": str(exc)}
+        return 200, {"schedule": schedule_to_dict(sched)}
+
+    def _delete_schedule(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        deleted = self.queue.delete_schedule(UUID(sid), tenant_id=str(tenant_id))
+        if not deleted:
+            return 404, {"error": f"schedule {sid} not found for tenant"}
+        return 200, {"deleted": True, "schedule_id": sid}
+
+    def _list_schedules(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = (query.get("tenant_id") or [None])[0]
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        enabled_only = (query.get("enabled_only") or ["0"])[0] in (
+            "1",
+            "true",
+            "yes",
+        )
+        try:
+            limit = int((query.get("limit") or ["100"])[0])
+            offset = int((query.get("offset") or ["0"])[0])
+        except ValueError:
+            return 400, {"error": "limit/offset must be integers"}
+        try:
+            rows = self.queue.list_schedules(
+                tenant_id=str(tenant_id),
+                enabled_only=enabled_only,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"schedules": [schedule_to_dict(s) for s in rows]}
+
+    def _get_schedule(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 3:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = (query.get("tenant_id") or [None])[0]
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        sched = self.queue.get_schedule(UUID(sid), tenant_id=str(tenant_id))
+        if sched is None:
+            return 404, {"error": "schedule not found"}
+        return 200, {"schedule": schedule_to_dict(sched)}
+
+    def _list_webhooks(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = (query.get("tenant_id") or [None])[0]
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            rows = self.queue.list_webhooks(tenant_id=str(tenant_id))
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"endpoints": [webhook_endpoint_to_dict(e) for e in rows]}
+
+    def _set_webhook_enabled(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid webhook path"}
+        eid = parts[2]
+        if not _UUID_RE.match(eid):
+            return 400, {"error": "invalid webhook id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        if "enabled" not in body:
+            return 400, {"error": "enabled is required"}
+        try:
+            ep = self.queue.set_webhook_enabled(
+                UUID(eid),
+                tenant_id=str(tenant_id),
+                enabled=bool(body.get("enabled")),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"endpoint": webhook_endpoint_to_dict(ep)}
+
+    def _delete_webhook(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid webhook path"}
+        eid = parts[2]
+        if not _UUID_RE.match(eid):
+            return 400, {"error": "invalid webhook id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        deleted = self.queue.delete_webhook(UUID(eid), tenant_id=str(tenant_id))
+        if not deleted:
+            return 404, {"error": f"webhook {eid} not found for tenant"}
+        return 200, {"deleted": True, "endpoint_id": eid}
+
+    def _list_dead_letters(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = (query.get("tenant_id") or [None])[0]
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        queue_name = (query.get("queue_name") or [None])[0]
+        try:
+            limit = int((query.get("limit") or ["100"])[0])
+            offset = int((query.get("offset") or ["0"])[0])
+        except ValueError:
+            return 400, {"error": "limit/offset must be integers"}
+        try:
+            jobs = self.queue.list_dead_letters(
+                tenant_id=str(tenant_id),
+                queue_name=str(queue_name) if queue_name else None,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"jobs": [job_to_dict(j) for j in jobs]}
+
+    def _replay_dead_letter(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / dead-letters / {id} / replay
+        if len(parts) != 4:
+            return 400, {"error": "invalid dead-letter path"}
+        jid = parts[2]
+        if not _UUID_RE.match(jid):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            job = self.queue.replay_dead_letter(
+                UUID(jid),
+                tenant_id=str(tenant_id),
+                reset_attempts=bool(body.get("reset_attempts", True)),
+                max_attempts=(
+                    None
+                    if body.get("max_attempts") is None
+                    else int(body["max_attempts"])
+                ),
+                delay_seconds=(
+                    None
+                    if body.get("delay_seconds") is None
+                    else float(body["delay_seconds"])
+                ),
+                clear_error=bool(body.get("clear_error", False)),
+            )
+        except (ValueError, TypeError) as exc:
+            return 400, {"error": str(exc)}
+        except ReplayError as exc:
+            return 409, {"error": str(exc), "code": "replay_error"}
+        return 200, {"job": job_to_dict(job)}
+
+    def _replay_dead_letters(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        raw_ids = body.get("job_ids")
+        job_ids: list[UUID] | None = None
+        if raw_ids is not None:
+            try:
+                job_ids = [UUID(str(x)) for x in raw_ids]
+            except (TypeError, ValueError) as exc:
+                return 400, {"error": f"invalid job_ids: {exc}"}
+        try:
+            jobs = self.queue.replay_dead_letters(
+                tenant_id=str(tenant_id),
+                job_ids=job_ids,
+                queue_name=(
+                    None
+                    if body.get("queue_name") is None
+                    else str(body["queue_name"])
+                ),
+                limit=(
+                    None if body.get("limit") is None else int(body["limit"])
+                ),
+                reset_attempts=bool(body.get("reset_attempts", True)),
+                max_attempts=(
+                    None
+                    if body.get("max_attempts") is None
+                    else int(body["max_attempts"])
+                ),
+                delay_seconds=(
+                    None
+                    if body.get("delay_seconds") is None
+                    else float(body["delay_seconds"])
+                ),
+                clear_error=bool(body.get("clear_error", False)),
+            )
+        except (ValueError, TypeError) as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "jobs": [job_to_dict(j) for j in jobs],
+            "replayed": len(jobs),
+        }
+
     def _set_retention(
         self, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -1856,6 +2156,12 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                     "false",
                     "no",
                 )
+                max_snap_raw = (query.get("max_snapshot_jobs") or [None])[0]
+                max_snapshot_jobs: int | None
+                if max_snap_raw in (None, ""):
+                    max_snapshot_jobs = None  # use iter_job_events default
+                else:
+                    max_snapshot_jobs = int(max_snap_raw)
 
                 if path.endswith("/events") and path.startswith("/v1/jobs/"):
                     parts = path.strip("/").split("/")
@@ -1912,6 +2218,11 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                     include_snapshot=include_snap,
                     idle_timeout_seconds=idle,
                     heartbeat_seconds=15.0,
+                    **(
+                        {"max_snapshot_jobs": max_snapshot_jobs}
+                        if max_snapshot_jobs is not None
+                        else {}
+                    ),
                 ):
                     if ev.event == "ping":
                         # SSE comment keepalive
@@ -1939,6 +2250,24 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 except Exception:  # noqa: BLE001
                     return
 
+        def _authorized(self, path: str) -> bool:
+            """When ``coordinator.api_token`` is set, require matching credential.
+
+            ``GET /health`` stays open for load balancers / probes.
+            """
+            token = coordinator.api_token
+            if not token:
+                return True
+            if path == "/health":
+                return True
+            provided = _extract_request_token(self.headers)
+            if provided is None:
+                return False
+            # Constant-time compare for shared secret.
+            import hmac as _hmac
+
+            return _hmac.compare_digest(provided, token)
+
         def _dispatch(self, method: str) -> None:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
@@ -1947,6 +2276,9 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 path = self.path.split("?", 1)[0].rstrip("/")
             query = parse_qs(parsed.query)
             try:
+                if not self._authorized(path):
+                    self._send(401, {"error": "unauthorized", "code": "auth_required"})
+                    return
                 # Live progress streams (SSE) — not JSON response bodies.
                 if method == "GET" and (
                     path == "/v1/stream/job-events"

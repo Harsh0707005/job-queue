@@ -6812,6 +6812,7 @@ class JobQueue:
         idle_timeout_seconds: float | None = None,
         heartbeat_seconds: float = 15.0,
         stop_when: Any = None,
+        max_snapshot_jobs: int = 10_000,
     ) -> Any:
         """Yield :class:`JobProgressEvent` live for the given tenants.
 
@@ -6825,6 +6826,11 @@ class JobQueue:
         *tenant_ids* is required (one or more). Optional *job_ids* and
         *labels* (AND) filter events. When *include_snapshot* is True, yields
         current matching job rows first (``snapshot=True``).
+
+        *max_snapshot_jobs* caps how many snapshot rows are loaded for a
+        tenant-wide stream (default 10_000) so a huge backlog cannot blow
+        memory. Filtered *job_ids* ignore this cap (bounded by the filter).
+        Pass a larger value or rely on job_ids for full history.
 
         *stop_when* is an optional zero-arg callable; when it returns True the
         iterator ends. *idle_timeout_seconds* ends after that many seconds
@@ -6840,6 +6846,8 @@ class JobQueue:
         tenants = {str(t) for t in tenant_ids if t}
         if not tenants:
             raise ValueError("tenant_ids is required")
+        if max_snapshot_jobs < 1:
+            raise ValueError("max_snapshot_jobs must be >= 1")
         job_filter: set[str] | None = None
         if job_ids is not None:
             job_filter = {str(j) for j in job_ids}
@@ -6942,21 +6950,26 @@ class JobQueue:
                 return jobs_out
 
             page_size = 500
+            remaining = int(max_snapshot_jobs)
             for tid in sorted(tenants):
+                if remaining <= 0:
+                    break
                 offset = 0
-                while True:
+                while remaining > 0:
+                    take = min(page_size, remaining)
                     page = self.list_jobs(
                         tenant_id=tid,
                         labels=label_list or None,
-                        limit=page_size,
+                        limit=take,
                         offset=offset,
                     )
                     if not page:
                         break
                     jobs_out.extend(page)
-                    if len(page) < page_size:
+                    remaining -= len(page)
+                    if len(page) < take:
                         break
-                    offset += page_size
+                    offset += len(page)
             return jobs_out
 
         started = _time.monotonic()
