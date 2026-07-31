@@ -7517,3 +7517,102 @@ def test_job_progress_stream_job_filter_and_snapshot(queue: JobQueue):
     assert all(e.job_id == j1.id for e in snaps)
     # j2 not in snapshot filter
     assert not any(e.job_id == j2.id for e in snaps)
+
+
+def test_job_progress_stream_no_missed_completion_race(queue: JobQueue):
+    """LISTEN before snapshot: completion between snapshot and listen is not lost.
+
+    Runs many iterations to stress the race window that previously left clients
+    stuck on a pre-completion snapshot.
+    """
+    for i in range(25):
+        j = queue.enqueue(
+            tenant_id="t1",
+            payload={"race": i},
+            labels=["race:stream"],
+        )
+        leased = queue.lease(
+            tenant_id="t1",
+            worker_id=f"race-w-{i}",
+            visibility_timeout_seconds=30,
+        )
+        assert leased is not None and leased.id == j.id
+
+        stop = threading.Event()
+        events: list = []
+        lock = threading.Lock()
+
+        def _listen(job_id=j.id, ev_list=events, st=stop) -> None:
+            for ev in queue.iter_job_events(
+                tenant_ids=["t1"],
+                job_ids=[job_id],
+                include_snapshot=True,
+                idle_timeout_seconds=4.0,
+                heartbeat_seconds=60.0,
+                stop_when=st.is_set,
+            ):
+                if ev.event == "ping":
+                    continue
+                with lock:
+                    ev_list.append(ev)
+                    if any(e.status == "completed" for e in ev_list):
+                        st.set()
+                        return
+
+        th = threading.Thread(target=_listen, daemon=True)
+        th.start()
+        # Complete as soon as possible while subscribe is snapshotting / listening.
+        time.sleep(0.005)
+        _ack(queue, leased, f"race-w-{i}", result={"i": i})
+        assert stop.wait(4.0), (
+            f"iter {i}: never saw completed; events="
+            f"{[(e.event, e.status, e.snapshot) for e in events]}"
+        )
+        stop.set()
+        th.join(timeout=2)
+        with lock:
+            assert any(e.status == "completed" for e in events)
+
+
+def test_job_progress_stream_completion_during_snapshot_buffered(queue: JobQueue):
+    """If job finishes while snapshot is loading, buffered NOTIFY still delivers."""
+    j = queue.enqueue(tenant_id="t1", payload={"x": 1})
+    leased = queue.lease(
+        tenant_id="t1", worker_id="buf-w", visibility_timeout_seconds=30
+    )
+    assert leased is not None
+
+    # Flood list_jobs work by enqueueing many siblings so snapshot takes longer.
+    for n in range(80):
+        queue.enqueue(tenant_id="t1", payload={"pad": n}, labels=["pad"])
+
+    stop = threading.Event()
+    seen_completed = threading.Event()
+    events: list = []
+
+    def _listen() -> None:
+        for ev in queue.iter_job_events(
+            tenant_ids=["t1"],
+            job_ids=[j.id],
+            include_snapshot=True,
+            idle_timeout_seconds=5.0,
+            heartbeat_seconds=60.0,
+            stop_when=stop.is_set,
+        ):
+            if ev.event == "ping":
+                continue
+            events.append(ev)
+            if ev.job_id == j.id and ev.status == "completed":
+                seen_completed.set()
+                stop.set()
+                return
+
+    th = threading.Thread(target=_listen, daemon=True)
+    th.start()
+    time.sleep(0.02)
+    _ack(queue, leased, "buf-w", result={"done": True})
+    assert seen_completed.wait(5.0), [
+        (e.event, e.status, e.snapshot) for e in events
+    ]
+    stop.set()
+    th.join(timeout=2)

@@ -6818,14 +6818,17 @@ class JobQueue:
         Uses Postgres ``LISTEN job_queue_events`` so any coordinator/worker
         mutation is visible to all subscribers (multi-node safe).
 
+        Subscribe order is **LISTEN → snapshot → drain buffered notifies →
+        live loop**. Listening first ensures a completion that races the
+        snapshot is not lost (it sits in the notify buffer until drained).
+
         *tenant_ids* is required (one or more). Optional *job_ids* and
         *labels* (AND) filter events. When *include_snapshot* is True, yields
         current matching job rows first (``snapshot=True``).
 
         *stop_when* is an optional zero-arg callable; when it returns True the
         iterator ends. *idle_timeout_seconds* ends after that many seconds
-        without events (after snapshot). Yields ``None`` as a heartbeat every
-        *heartbeat_seconds* of quiet (callers may ignore).
+        without events (after snapshot). Heartbeat events use ``event=ping``.
         """
         import time as _time
 
@@ -6887,8 +6890,36 @@ class JobQueue:
                 snapshot=snapshot or bool(ev.get("snapshot")),
             )
 
-        # Initial snapshot of matching jobs.
-        if include_snapshot:
+        def _job_to_snapshot_event(job: Job) -> JobProgressEvent:
+            return JobProgressEvent(
+                event="snapshot",
+                tenant_id=job.tenant_id,
+                job_id=job.id,
+                status=job.status.value,
+                from_status=None,
+                attempts=job.attempts,
+                labels=job.labels,
+                checkpoint=job.checkpoint,
+                result=job.result,
+                last_error=job.last_error,
+                actor=None,
+                ts=job.updated_at,
+                snapshot=True,
+            )
+
+        def _drain_notifies(conn: Any, *, timeout: float) -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            for notify in conn.notifies(timeout=timeout):
+                try:
+                    data = json.loads(notify.payload)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(data, dict) and _match(data):
+                    out.append(data)
+            return out
+
+        def _load_snapshot_jobs() -> list[Job]:
+            jobs_out: list[Job] = []
             for tid in sorted(tenants):
                 jobs = self.list_jobs(
                     tenant_id=tid,
@@ -6898,27 +6929,77 @@ class JobQueue:
                 for job in jobs:
                     if job_filter is not None and str(job.id) not in job_filter:
                         continue
-                    yield JobProgressEvent(
-                        event="snapshot",
-                        tenant_id=job.tenant_id,
-                        job_id=job.id,
-                        status=job.status.value,
-                        from_status=None,
-                        attempts=job.attempts,
-                        labels=job.labels,
-                        checkpoint=job.checkpoint,
-                        result=job.result,
-                        last_error=job.last_error,
-                        actor=None,
-                        ts=job.updated_at,
-                        snapshot=True,
-                    )
+                    jobs_out.append(job)
+            # Explicit get for filtered job_ids that may have finished (still
+            # visible) or been missed by list limit.
+            if job_filter is not None:
+                have = {str(j.id) for j in jobs_out}
+                for jid_s in job_filter:
+                    if jid_s in have:
+                        continue
+                    for tid in tenants:
+                        got = self.get(UUID(jid_s), tenant_id=tid)
+                        if got is not None:
+                            if label_list and not set(label_list).issubset(
+                                set(got.labels)
+                            ):
+                                break
+                            jobs_out.append(got)
+                            break
+            return jobs_out
 
         started = _time.monotonic()
         last_event = started
         last_hb = started
+        # last known status per job after snapshot (for reconcile)
+        last_status: dict[str, str] = {}
+
         with psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True) as conn:
+            # 1) LISTEN first so completions during snapshot are buffered.
             conn.execute(f"LISTEN {JOB_EVENTS_CHANNEL}")
+
+            # 2) Snapshot while listening (notifies queue on this connection).
+            snap_jobs: list[Job] = []
+            if include_snapshot:
+                snap_jobs = _load_snapshot_jobs()
+
+            # 3) Drain anything that arrived during snapshot (non-blocking).
+            buffered = _drain_notifies(conn, timeout=0.0)
+
+            # 4) Emit snapshot, then buffered live events (may include
+            #    completions that raced the snapshot read).
+            for job in snap_jobs:
+                last_status[str(job.id)] = job.status.value
+                last_event = _time.monotonic()
+                last_hb = last_event
+                yield _job_to_snapshot_event(job)
+
+            for data in buffered:
+                jid = str(data.get("job_id") or "")
+                if jid:
+                    last_status[jid] = str(data.get("status") or "")
+                last_event = _time.monotonic()
+                last_hb = last_event
+                yield _to_event(data)
+
+            # 5) Reconcile: for watched jobs, re-GET once. If status advanced
+            #    past what we last emitted (notify lost / truncated), emit
+            #    a synthetic snapshot of current state so clients are not stuck.
+            if include_snapshot and job_filter is not None:
+                for jid_s in job_filter:
+                    for tid in tenants:
+                        got = self.get(UUID(jid_s), tenant_id=tid)
+                        if got is None:
+                            continue
+                        prev = last_status.get(jid_s)
+                        if prev != got.status.value:
+                            last_status[jid_s] = got.status.value
+                            last_event = _time.monotonic()
+                            last_hb = last_event
+                            yield _job_to_snapshot_event(got)
+                        break
+
+            # 6) Live loop.
             while True:
                 if stop_when is not None and stop_when():
                     return
@@ -6928,14 +7009,10 @@ class JobQueue:
                     and (now_m - last_event) >= float(idle_timeout_seconds)
                 ):
                     return
-                # Wait up to 1s for notifies.
-                for notify in conn.notifies(timeout=1.0):
-                    try:
-                        data = json.loads(notify.payload)
-                    except (TypeError, json.JSONDecodeError):
-                        continue
-                    if not isinstance(data, dict) or not _match(data):
-                        continue
+                for data in _drain_notifies(conn, timeout=1.0):
+                    jid = str(data.get("job_id") or "")
+                    if jid:
+                        last_status[jid] = str(data.get("status") or "")
                     last_event = _time.monotonic()
                     last_hb = last_event
                     yield _to_event(data)
