@@ -410,6 +410,7 @@ class LeaseMixin:
         # high-priority noisy tenant cannot burn the skip budget.
         rate_limited_tenants: set[str] = set()
 
+        # Maintenance in its own short transaction (not held across claims).
         with transaction(self._pool) as conn:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=None)
             self._reap_offboarding_expired_leases(conn, now=now, tenant_id=None)
@@ -420,29 +421,31 @@ class LeaseMixin:
                 conn, queue_name=queue_name, now=now, limit=max(4, limit)
             )
 
-            while len(claimed) < limit and skips < max_skips:
-                try:
-                    # Savepoint so a rejected candidate releases its row lock.
-                    with conn.transaction():
-                        job = self._try_claim_fair_candidate(
-                            conn,
-                            worker_id=worker_id,
-                            queue_name=queue_name,
-                            visibility_timeout_seconds=visibility_timeout_seconds,
-                            now=now,
-                            exclude_tenants=rate_limited_tenants,
-                        )
-                        if job is None:
-                            break
-                        claimed.append(job)
-                except _SkipLeaseCandidate as skip:
-                    skips += 1
-                    if (
-                        skip.tenant_id
-                        and skip.reason == "tenant lease rate limited"
-                    ):
-                        rate_limited_tenants.add(skip.tenant_id)
-                    continue
+        # One transaction per claim so per-tenant advisory locks cannot invert
+        # across tenants inside a multi-claim batch (was a multi-worker deadlock
+        # under fair lease: txn A holds tenant1 wants tenant2, B the reverse).
+        while len(claimed) < limit and skips < max_skips:
+            try:
+                with transaction(self._pool) as conn:
+                    job = self._try_claim_fair_candidate(
+                        conn,
+                        worker_id=worker_id,
+                        queue_name=queue_name,
+                        visibility_timeout_seconds=visibility_timeout_seconds,
+                        now=now,
+                        exclude_tenants=rate_limited_tenants,
+                    )
+                    if job is None:
+                        break
+                    claimed.append(job)
+            except _SkipLeaseCandidate as skip:
+                skips += 1
+                if (
+                    skip.tenant_id
+                    and skip.reason == "tenant lease rate limited"
+                ):
+                    rate_limited_tenants.add(skip.tenant_id)
+                continue
         return claimed
 
 
