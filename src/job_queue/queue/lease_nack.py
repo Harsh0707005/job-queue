@@ -127,6 +127,17 @@ class LeaseNackMixin:
                 detail={"error": error, "requeue": requeue},
                 now=now,
             )
+            metric_increments = {"nack": 1}
+            if new_status == JobStatus.DEAD.value:
+                metric_increments["dead"] = 1
+            elif new_status == JobStatus.FAILED.value:
+                metric_increments["failed"] = 1
+            self._record_metrics_batch(
+                conn,
+                tenant_id=str(owner_tenant),
+                increments=metric_increments,
+                now=now,
+            )
 
             if new_status in (JobStatus.DEAD.value, JobStatus.FAILED.value):
                 self._cascade_cancel_dependents(

@@ -1,0 +1,84 @@
+{
+  "ok": true,
+  "label": "metrics-fleet",
+  "tenants": 10,
+  "jobs_per_tenant": 100,
+  "expected": 1000,
+  "completed": 1000,
+  "enqueue_seconds": 2.087161064147949,
+  "drain_seconds": 4.016802787780762,
+  "jobs_per_sec": 248.95421877370504,
+  "metrics": {
+    "lease_count": 1000,
+    "ack_count": 1000,
+    "nack_count": 0,
+    "ack_matches_completed": true,
+    "lease_sane": true,
+    "noisy_tenant_count": 10
+  },
+  "snapshot_gauges": {
+    "tenant_id": "__overall__",
+    "pending": 0,
+    "leased": 0,
+    "claimable": 0,
+    "failed": 0,
+    "dead": 0,
+    "completed": 1000,
+    "cancelled": 0,
+    "awaiting_approval": 0,
+    "awaiting_children": 0,
+    "queue_lag_seconds": null,
+    "avg_pending_age_seconds": null,
+    "max_pending_age_seconds": null,
+    "webhook_pending": 0,
+    "webhook_delivering": 0,
+    "webhook_succeeded": 0,
+    "webhook_dead": 0,
+    "schedules_enabled": 0,
+    "schedules_due": 0
+  },
+  "throughput": {
+    "lease": {
+      "count": 1000,
+      "rate_per_sec": 0.2777777777777778
+    },
+    "ack": {
+      "count": 1000,
+      "rate_per_sec": 0.2777777777777778
+    },
+    "nack": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "dead": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "failed": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "webhook_success": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "webhook_fail": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "schedule_fire": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "schedule_skip": {
+      "count": 0,
+      "rate_per_sec": 0.0
+    },
+    "wait_before_claim": {
+      "count": 1000,
+      "rate_per_sec": 0.2777777777777778,
+      "avg_ms": 1052.5449749999998,
+      "sum_ms": 1052544.9749999999
+    }
+  }
+}

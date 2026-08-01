@@ -325,3 +325,81 @@ class ClientAdminMixin:
         payload = self._request("GET", "/v1/admin/webhook-stats")
         assert payload is not None
         return payload
+
+    def metrics_snapshot(
+        self,
+        *,
+        tenant_id: str | None = None,
+        window_seconds: int = 300,
+        format: str = "json",
+    ) -> dict[str, Any] | tuple[str, bytes]:
+        """Live gauges + throughput. JSON dict, or ``(content_type, body)`` for csv/parquet."""
+        from urllib.parse import urlencode
+
+        q: dict[str, Any] = {
+            "window_seconds": window_seconds,
+            "format": format,
+        }
+        if tenant_id is not None:
+            q["tenant_id"] = tenant_id
+        path = f"/v1/metrics/snapshot?{urlencode(q)}"
+        if format == "json":
+            payload = self._request("GET", path)
+            assert payload is not None
+            return payload
+        return self._request_bytes("GET", path)
+
+    def metrics_history(
+        self,
+        *,
+        tenant_id: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        format: str = "json",
+    ) -> dict[str, Any] | tuple[str, bytes]:
+        from urllib.parse import urlencode
+
+        q: dict[str, Any] = {"format": format}
+        if tenant_id is not None:
+            q["tenant_id"] = tenant_id
+        if start is not None:
+            q["start"] = start
+        if end is not None:
+            q["end"] = end
+        path = f"/v1/metrics/history?{urlencode(q)}"
+        if format == "json":
+            payload = self._request("GET", path)
+            assert payload is not None
+            return payload
+        return self._request_bytes("GET", path)
+
+    def metrics_noisy(
+        self,
+        *,
+        window_seconds: int = 300,
+        min_rate: float = 0.5,
+        limit: int = 50,
+        format: str = "json",
+    ) -> dict[str, Any] | tuple[str, bytes]:
+        from urllib.parse import urlencode
+
+        q: dict[str, Any] = {
+            "window_seconds": window_seconds,
+            "min_rate": min_rate,
+            "limit": limit,
+            "format": format,
+        }
+        path = f"/v1/metrics/noisy?{urlencode(q)}"
+        if format == "json":
+            payload = self._request("GET", path)
+            assert payload is not None
+            return payload
+        return self._request_bytes("GET", path)
+
+    def metrics_sample(self, *, tenant_id: str | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/metrics/sample", body)
+        assert payload is not None
+        return payload

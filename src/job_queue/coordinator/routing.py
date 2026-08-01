@@ -329,4 +329,14 @@ class RoutingMixin:
         if method == "GET" and path == "/v1/admin/tenant-residue":
             return self._tenant_residue(query)
 
+        # Operational monitoring (per-tenant + overall, multi-format).
+        if method == "GET" and path == "/v1/metrics/snapshot":
+            return self._metrics_snapshot(query)
+        if method == "GET" and path == "/v1/metrics/history":
+            return self._metrics_history(query)
+        if method == "GET" and path == "/v1/metrics/noisy":
+            return self._metrics_noisy(query)
+        if method == "POST" and path == "/v1/metrics/sample":
+            return self._metrics_sample(body)
+
         return 404, {"error": f"unknown route {method} {path}"}

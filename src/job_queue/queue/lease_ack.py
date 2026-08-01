@@ -91,6 +91,13 @@ class LeaseAckMixin:
                     detail={"has_result": result is not None},
                     now=now,
                 )
+                self._record_metric(
+                    conn,
+                    tenant_id=str(updated["tenant_id"]),
+                    metric="ack",
+                    count=1,
+                    now=now,
+                )
                 self._record_job_duration(conn, job=job, now=now)
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now

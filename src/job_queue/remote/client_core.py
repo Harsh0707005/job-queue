@@ -141,6 +141,48 @@ class ClientCoreMixin:
                 continue
         raise RuntimeError(f"all coordinators failed for {method} {path}: {last_err}")
 
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[str, bytes]:
+        """Like ``_request`` but return ``(content_type, raw_body)`` for CSV/Parquet."""
+        data = None
+        headers = {"Accept": "*/*"}
+        if body is not None:
+            data = json.dumps(body, default=str).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
+
+        last_err: Exception | None = None
+        for base in self._next_order():
+            url = f"{base}{path}"
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+                    return ctype, resp.read()
+            except urllib.error.HTTPError as exc:
+                raw = exc.read() if exc.fp else b""
+                try:
+                    payload = json.loads(raw.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
+                if 500 <= int(exc.code) < 600:
+                    last_err = RuntimeError(
+                        f"coordinator {method} {path} -> {exc.code}: {payload}"
+                    )
+                    continue
+                raise RuntimeError(
+                    f"coordinator {method} {path} -> {exc.code}: {payload}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                last_err = RuntimeError(f"coordinator {base} unreachable: {exc}")
+                continue
+        raise RuntimeError(f"all coordinators failed for {method} {path}: {last_err}")
+
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health") or {}
 

@@ -57,6 +57,8 @@ def queue(postgres_url: str):
         conn.execute("TRUNCATE schedules")
         conn.execute("TRUNCATE webhook_deliveries")
         conn.execute("TRUNCATE webhook_endpoints CASCADE")
+        conn.execute("TRUNCATE queue_metric_buckets")
+        conn.execute("TRUNCATE queue_metric_snapshots")
         conn.commit()
     yield q
     q.close()

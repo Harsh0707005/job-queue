@@ -1,0 +1,50 @@
+# Metrics integrity under fleet load (dual coordinators + workers).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.metrics.yml down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.metrics.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.metrics.yml \
+#     up --abort-on-container-exit --exit-code-from metrics-soak metrics-soak
+
+services:
+  load-soak:
+    profiles: ["disabled"]
+
+  metrics-soak:
+    build: .
+    command: ["python", "scripts/load_metrics_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "10"
+      JOBS_PER_TENANT: "100"
+      ENQUEUE_WORKERS: "16"
+      MAX_WALL_SECONDS: "480"
+      POLL_SECONDS: "1"
+      LOAD_LABEL: metrics-fleet
+      RESULTS_PATH: /results/metrics-fleet.json
+      LOG_LEVEL: INFO
+    volumes:
+      - ./deploy/load-results:/results
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      worker-7:
+        condition: service_started
+      worker-8:
+        condition: service_started

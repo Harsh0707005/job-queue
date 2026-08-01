@@ -223,6 +223,26 @@ class LeaseClaimTenantMixin:
             },
             now=now,
         )
+        # Durable throughput counter (same txn as claim).
+        wait_ms = 0.0
+        wait_count = 0
+        if from_status == JobStatus.PENDING.value:
+            avail = candidate.get("available_at") or candidate.get("created_at")
+            if avail is not None:
+                if getattr(avail, "tzinfo", None) is None:
+                    from datetime import timezone
+
+                    avail = avail.replace(tzinfo=timezone.utc)
+                wait_ms = max(0.0, (now - avail).total_seconds() * 1000.0)
+                wait_count = 1
+        self._record_metrics_batch(
+            conn,
+            tenant_id=str(candidate["tenant_id"]),
+            increments={"lease": 1},
+            wait_sum_ms=wait_ms,
+            wait_count=wait_count,
+            now=now,
+        )
         return job
 
     def _lock_job_for_tenant(

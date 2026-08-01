@@ -59,6 +59,13 @@ class WebhooksFinalizeMixin:
                 ).fetchone()
                 if updated is None:
                     return None
+                self._record_metric(
+                    conn,
+                    tenant_id=str(updated["tenant_id"]),
+                    metric="webhook_fail",
+                    count=1,
+                    now=now,
+                )
                 self._maybe_finalize_offboard(
                     conn, tenant_id=updated["tenant_id"], now=now
                 )
@@ -112,6 +119,13 @@ class WebhooksFinalizeMixin:
                 ).fetchone()
                 if updated is None:
                     return None
+                self._record_metric(
+                    conn,
+                    tenant_id=str(tenant_id),
+                    metric="webhook_success",
+                    count=1,
+                    now=now,
+                )
                 self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
                 return WebhookDeliveryResult(
                     delivery=self._row_to_webhook_delivery(updated),
@@ -149,6 +163,13 @@ class WebhooksFinalizeMixin:
                 ).fetchone()
                 if updated is None:
                     return None
+                self._record_metric(
+                    conn,
+                    tenant_id=str(tenant_id),
+                    metric="webhook_fail",
+                    count=1,
+                    now=now,
+                )
                 self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
                 return WebhookDeliveryResult(
                     delivery=self._row_to_webhook_delivery(updated),
@@ -186,6 +207,13 @@ class WebhooksFinalizeMixin:
             ).fetchone()
             if updated is None:
                 return None
+            self._record_metric(
+                conn,
+                tenant_id=str(tenant_id),
+                metric="webhook_fail",
+                count=1,
+                now=now,
+            )
             return WebhookDeliveryResult(
                 delivery=self._row_to_webhook_delivery(updated),
                 success=False,

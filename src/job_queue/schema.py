@@ -632,4 +632,52 @@ ALTER TABLE job_side_effects DROP CONSTRAINT IF EXISTS job_side_effects_idem_che
 ALTER TABLE job_side_effects ADD CONSTRAINT job_side_effects_idem_check CHECK (
     idempotency_key IS NOT NULL AND idempotency_key <> ''
 );
+
+-- Time-bucketed operational counters (durable throughput history).
+-- Incremented in the same transaction as lease/ack/nack/webhook/schedule events
+-- so high-load fleets cannot lose metric increments when a coordinator crashes.
+CREATE TABLE IF NOT EXISTS queue_metric_buckets (
+    bucket_start    TIMESTAMPTZ NOT NULL,
+    tenant_id       TEXT NOT NULL,
+    metric          TEXT NOT NULL,
+    count           BIGINT NOT NULL DEFAULT 0,
+    sum_ms          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_start, tenant_id, metric),
+    CONSTRAINT queue_metric_buckets_count_check CHECK (count >= 0),
+    CONSTRAINT queue_metric_buckets_sum_ms_check CHECK (sum_ms >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_metric_buckets_tenant_metric_time
+    ON queue_metric_buckets (tenant_id, metric, bucket_start DESC);
+
+CREATE INDEX IF NOT EXISTS idx_queue_metric_buckets_metric_time
+    ON queue_metric_buckets (metric, bucket_start DESC);
+
+-- Point-in-time gauge snapshots (lag, in-flight, backlog) for trend charts.
+CREATE TABLE IF NOT EXISTS queue_metric_snapshots (
+    sampled_at              TIMESTAMPTZ NOT NULL,
+    tenant_id               TEXT NOT NULL,
+    pending                 INTEGER NOT NULL DEFAULT 0,
+    leased                  INTEGER NOT NULL DEFAULT 0,
+    claimable               INTEGER NOT NULL DEFAULT 0,
+    failed                  INTEGER NOT NULL DEFAULT 0,
+    dead                    INTEGER NOT NULL DEFAULT 0,
+    completed               INTEGER NOT NULL DEFAULT 0,
+    cancelled               INTEGER NOT NULL DEFAULT 0,
+    awaiting_approval       INTEGER NOT NULL DEFAULT 0,
+    awaiting_children       INTEGER NOT NULL DEFAULT 0,
+    queue_lag_seconds       DOUBLE PRECISION,
+    avg_pending_age_seconds DOUBLE PRECISION,
+    max_pending_age_seconds DOUBLE PRECISION,
+    webhook_pending         INTEGER NOT NULL DEFAULT 0,
+    webhook_delivering      INTEGER NOT NULL DEFAULT 0,
+    webhook_succeeded       INTEGER NOT NULL DEFAULT 0,
+    webhook_dead            INTEGER NOT NULL DEFAULT 0,
+    schedules_enabled       INTEGER NOT NULL DEFAULT 0,
+    schedules_due           INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (sampled_at, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_metric_snapshots_tenant_time
+    ON queue_metric_snapshots (tenant_id, sampled_at DESC);
 """

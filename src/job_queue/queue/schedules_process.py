@@ -104,6 +104,13 @@ class SchedulesProcessMixin:
             for sched_row in due:
                 # Race: tenant paused after SELECT.
                 if self._is_tenant_paused(conn, sched_row["tenant_id"]):
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        metric="schedule_skip",
+                        count=1,
+                        now=now,
+                    )
                     continue
 
                 # Skip if a prior run is still in flight (incl. park waits).
@@ -124,6 +131,13 @@ class SchedulesProcessMixin:
                     ),
                 ).fetchone()
                 if active is not None:
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        metric="schedule_skip",
+                        count=1,
+                        now=now,
+                    )
                     continue
 
                 try:
@@ -135,6 +149,13 @@ class SchedulesProcessMixin:
                     _logging.getLogger(__name__).exception(
                         "schedule %s invalid cron; skipping fire",
                         sched_row["id"],
+                    )
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        metric="schedule_skip",
+                        count=1,
+                        now=now,
                     )
                     continue
                 job_id = uuid4()
@@ -221,6 +242,13 @@ class SchedulesProcessMixin:
                         schedule=_row_to_schedule(updated),
                         job=_row_to_job(job_row),
                     )
+                )
+                self._record_metric(
+                    conn,
+                    tenant_id=str(sched_row["tenant_id"]),
+                    metric="schedule_fire",
+                    count=1,
+                    now=now,
                 )
 
         return fires

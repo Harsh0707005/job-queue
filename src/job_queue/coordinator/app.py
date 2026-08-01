@@ -32,6 +32,7 @@ from job_queue.coordinator.tenants import TenantsApiMixin
 from job_queue.coordinator.audit import AuditApiMixin
 from job_queue.coordinator.admin import AdminApiMixin
 from job_queue.coordinator.workflow import WorkflowApiMixin
+from job_queue.coordinator.metrics_api import MetricsApiMixin
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class Coordinator(
     AuditApiMixin,
     AdminApiMixin,
     WorkflowApiMixin,
+    MetricsApiMixin,
 ):
     """Thin HTTP façade over JobQueue (handlers split by domain)."""
 
@@ -88,6 +90,39 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 self.send_response(204)
                 self.end_headers()
                 return
+            # Metrics multi-format export: raw CSV / Parquet body.
+            if (
+                isinstance(payload, dict)
+                and payload.get("format") in ("csv", "parquet")
+                and isinstance(payload.get("body"), (bytes, bytearray))
+            ):
+                raw = bytes(payload["body"])
+                ctype = str(
+                    payload.get("content_type")
+                    or (
+                        "text/csv; charset=utf-8"
+                        if payload["format"] == "csv"
+                        else "application/vnd.apache.parquet"
+                    )
+                )
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="metrics.{payload["format"]}"',
+                )
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            # JSON metrics export wraps data under {"format","data",...}
+            if (
+                isinstance(payload, dict)
+                and payload.get("format") == "json"
+                and "data" in payload
+                and "body" not in payload
+            ):
+                payload = payload["data"]
             body = json.dumps(payload, default=str).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
