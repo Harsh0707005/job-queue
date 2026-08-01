@@ -1,54 +1,24 @@
 """Coordinator API handlers."""
+
 from __future__ import annotations
 
 from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
 )
 
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
     bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
     job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
     schedule_to_dict,
-    audit_consistency_report_to_dict,
-    job_audit_event_to_dict,
-    job_side_effect_to_dict,
     preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
 )
-from job_queue.models import JobStatus
 from job_queue.queue import (
     CancelError,
-    JobQueue,
     LeaseError,
     RateLimitError,
-    ReplayError,
-    ScheduleError,
 )
 
 
@@ -89,9 +59,7 @@ class JobsApiMixin:
                 max_runtime_seconds=int(body.get("max_runtime_seconds") or 3600),
                 depends_on=dep_ids,
                 deadline_at=deadline_at,
-                estimated_duration_seconds=(
-                    None if est is None else int(est)
-                ),
+                estimated_duration_seconds=(None if est is None else int(est)),
                 preemptible=bool(body.get("preemptible", True)),
                 labels=labels,
             )
@@ -109,13 +77,10 @@ class JobsApiMixin:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job)}
 
-
     def _process_deadlines(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
             results = self.queue.process_deadlines(
-                tenant_id=(
-                    str(body["tenant_id"]) if body.get("tenant_id") else None
-                ),
+                tenant_id=(str(body["tenant_id"]) if body.get("tenant_id") else None),
                 queue_name=str(body.get("queue_name") or "default"),
                 limit=int(body.get("limit") or 20),
             )
@@ -125,7 +90,6 @@ class JobsApiMixin:
             "count": len(results),
             "preemptions": [preempt_result_to_dict(r) for r in results],
         }
-
 
     def _lease(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         worker_id = body.get("worker_id")
@@ -150,9 +114,7 @@ class JobsApiMixin:
         if not jobs:
             return 204, {}
         # Lease responses are the only place that must return fencing tokens.
-        jobs_out = [
-            job_to_dict(j, include_lease_token=True) for j in jobs
-        ]
+        jobs_out = [job_to_dict(j, include_lease_token=True) for j in jobs]
         payload: dict[str, Any] = {
             "jobs": jobs_out,
             "count": len(jobs_out),
@@ -161,7 +123,6 @@ class JobsApiMixin:
         if len(jobs_out) == 1:
             payload["job"] = jobs_out[0]
         return 200, payload
-
 
     def _cancel_job(
         self, path: str, body: dict[str, Any]
@@ -187,7 +148,6 @@ class JobsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"job": job_to_dict(job)}
-
 
     def _job_action(
         self, path: str, body: dict[str, Any], action: str
@@ -266,9 +226,7 @@ class JobsApiMixin:
                         worker_id=str(worker_id),
                         lease_token=token,
                         message=body.get("message"),
-                        timeout_seconds=float(
-                            body.get("timeout_seconds") or 3600
-                        ),
+                        timeout_seconds=float(body.get("timeout_seconds") or 3600),
                         progress=body.get("progress"),
                     )
                 except ApprovalError as exc:
@@ -282,10 +240,7 @@ class JobsApiMixin:
 
         return 200, {"job": job_to_dict(job)}
 
-
-    def _list_jobs(
-        self, query: dict[str, list[str]]
-    ) -> tuple[int, dict[str, Any]]:
+    def _list_jobs(self, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         tenants = query.get("tenant_id") or []
         if not tenants or not tenants[0]:
             return 400, {"error": "tenant_id query param required"}
@@ -312,10 +267,7 @@ class JobsApiMixin:
             "count": len(jobs),
         }
 
-
-    def _cancel_matching(
-        self, body: dict[str, Any]
-    ) -> tuple[int, dict[str, Any]]:
+    def _cancel_matching(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         tenant_id = body.get("tenant_id")
         if not tenant_id:
             return 400, {"error": "tenant_id required"}
@@ -330,17 +282,12 @@ class JobsApiMixin:
                     if body.get("queue_name") is not None
                     else None
                 ),
-                batch_size=int(
-                    body.get("batch_size") or 500
-                ),
-                max_jobs=(
-                    None if max_jobs is None else int(max_jobs)
-                ),
+                batch_size=int(body.get("batch_size") or 500),
+                max_jobs=(None if max_jobs is None else int(max_jobs)),
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, bulk_cancel_result_to_dict(result)
-
 
     def _get_job(
         self, path: str, query: dict[str, list[str]]
@@ -360,7 +307,6 @@ class JobsApiMixin:
             return 404, {"error": "job not found"}
         return 200, {"job": job_to_dict(job)}
 
-
     def _process_due(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         limit = int(body.get("limit") or 100)
         tenant_id = body.get("tenant_id")
@@ -378,5 +324,3 @@ class JobsApiMixin:
                 for f in fires
             ],
         }
-
-

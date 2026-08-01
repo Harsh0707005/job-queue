@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 # ---------------------------------------------------------------------------
 # Rebuild job from audit after row loss
 # ---------------------------------------------------------------------------
+
 
 def test_rebuild_job_from_audit_after_delete(queue: JobQueue):
     from job_queue import RebuildError
@@ -57,6 +53,7 @@ def test_rebuild_job_from_audit_after_delete(queue: JobQueue):
     with pytest.raises(RebuildError, match="already exists"):
         queue.rebuild_job_from_audit(jid, tenant_id="t1")
 
+
 def test_rebuild_after_merge_uses_target_tenant(queue: JobQueue):
     job = queue.enqueue(tenant_id="alpha", payload={"x": 1})
     leased = queue.lease(tenant_id="alpha", worker_id="w1")
@@ -88,6 +85,7 @@ def test_rebuild_after_merge_uses_target_tenant(queue: JobQueue):
     assert events[-1].event_type == "rebuilt"
     assert queue.verify_job_audit(jid, tenant_id="beta").ok
 
+
 def test_rebuild_rejects_corrupt_audit(queue: JobQueue):
     from job_queue import RebuildError
 
@@ -107,6 +105,7 @@ def test_rebuild_rejects_corrupt_audit(queue: JobQueue):
         conn.commit()
     with pytest.raises(RebuildError, match="missing detail.job"):
         queue.rebuild_job_from_audit(jid)
+
 
 def test_rebuild_rejects_seq_gap(queue: JobQueue):
     from job_queue import RebuildError
@@ -130,4 +129,3 @@ def test_rebuild_rejects_seq_gap(queue: JobQueue):
         conn.commit()
     with pytest.raises(RebuildError, match="seq gap"):
         queue.rebuild_job_from_audit(jid)
-

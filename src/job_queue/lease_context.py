@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 import threading
-import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any  # noqa: I001 — keep Any with callables
+from typing import Any
 
-from job_queue.models import DrainResult, Job, JobSideEffect, SpawnChildrenResult
+from job_queue.models import Job, JobSideEffect, SpawnChildrenResult
 from job_queue.queue import (
     ApprovalRequested,
     ChildrenAwaited,
@@ -18,15 +15,13 @@ from job_queue.queue import (
     LeaseError,
 )
 
-logger = logging.getLogger(__name__)
-
-Handler = Callable[..., Any]
 
 @dataclass(slots=True)
 class _ActiveJob:
     job: Job
     lease_lost: threading.Event
     stop_hb: threading.Event
+
 
 @dataclass(slots=True)
 class LeaseContext:
@@ -131,9 +126,7 @@ class LeaseContext:
 
     def list_children(self) -> list[Job]:
         """List subtasks spawned by the current job."""
-        return self.queue.list_children(
-            self.job.id, tenant_id=self.job.tenant_id
-        )
+        return self.queue.list_children(self.job.id, tenant_id=self.job.tenant_id)
 
     def side_effect_done(self, effect_key: str) -> bool:
         """True if this effect already completed (skip re-run after reclaim)."""

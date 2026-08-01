@@ -1,77 +1,20 @@
 """JobQueue nack."""
+
 from __future__ import annotations
 
-import json
+from datetime import timedelta
+from uuid import UUID
 
-from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
-from typing import Any
-from uuid import UUID, uuid4
-
-from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
-
-from job_queue.db import init_schema, transaction
+from job_queue.db import transaction
 from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
     Job,
-    JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
     JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
     WebhookEvent,
 )
 from job_queue.queue._common import (
-    JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
-    _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
     _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
-    _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
     LeaseError,
-    MergeError,
-    RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
-    SpawnError,
-    _SkipLeaseCandidate,
-    _as_utc,
-    _normalize_labels,
-    _normalize_status_filter,
     _row_to_job,
-    _row_to_schedule,
     _utcnow,
     compute_retry_backoff_seconds,
 )
@@ -172,9 +115,7 @@ class LeaseNackMixin:
                 "requeued"
                 if new_status == JobStatus.PENDING.value
                 else (
-                    "dead_lettered"
-                    if new_status == JobStatus.DEAD.value
-                    else "failed"
+                    "dead_lettered" if new_status == JobStatus.DEAD.value else "failed"
                 )
             )
             self._append_job_audit(
@@ -208,13 +149,9 @@ class LeaseNackMixin:
                     conn, job=job, event=WebhookEvent.JOB_FAILED, now=now
                 )
             # Child terminal fail must wake/fail a parked parent join.
-            if (
-                updated.get("parent_job_id") is not None
-                and new_status
-                in (
-                    JobStatus.DEAD.value,
-                    JobStatus.FAILED.value,
-                )
+            if updated.get("parent_job_id") is not None and new_status in (
+                JobStatus.DEAD.value,
+                JobStatus.FAILED.value,
             ):
                 self._maybe_wake_parent_on_join_locked(
                     conn,
@@ -224,7 +161,5 @@ class LeaseNackMixin:
                 )
             # Offboarding: requeued pending is purged when no leases remain;
             # terminal nacks also trigger purge when this was the last holder.
-            self._maybe_finalize_offboard(
-                conn, tenant_id=job.tenant_id, now=now
-            )
+            self._maybe_finalize_offboard(conn, tenant_id=job.tenant_id, now=now)
             return job

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +15,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Cancel pending jobs
 # ---------------------------------------------------------------------------
+
 
 def test_cancel_pending_job(queue: JobQueue):
     from job_queue import CancelError  # noqa: F401 — import path check
@@ -30,11 +28,12 @@ def test_cancel_pending_job(queue: JobQueue):
     assert got is not None
     assert got.status == JobStatus.CANCELLED
 
+
 def test_cancel_leased_job_stops_worker_finish(queue: JobQueue):
     """Cancelling a running job invalidates the fence; old worker cannot ack."""
-    from job_queue import CancelError, LeaseError
+    from job_queue import LeaseError
 
-    job = queue.enqueue(tenant_id="t1", payload={})
+    queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None
     assert leased.lease_token is not None
@@ -75,6 +74,7 @@ def test_cancel_leased_job_stops_worker_finish(queue: JobQueue):
     # Must not become completed.
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
 
+
 def test_cancel_completed_job_rejected(queue: JobQueue):
     from job_queue import CancelError
 
@@ -86,6 +86,7 @@ def test_cancel_completed_job_rejected(queue: JobQueue):
     with pytest.raises(CancelError):
         queue.cancel(leased.id, tenant_id="t1")
 
+
 def test_cancel_cross_tenant_rejected(queue: JobQueue):
     from job_queue import CancelError
 
@@ -94,11 +95,13 @@ def test_cancel_cross_tenant_rejected(queue: JobQueue):
         queue.cancel(job.id, tenant_id="beta")
     assert queue.get(job.id, tenant_id="alpha").status == JobStatus.PENDING
 
+
 def test_cancel_unknown_job(queue: JobQueue):
     from job_queue import CancelError
 
     with pytest.raises(CancelError, match="not found"):
         queue.cancel(uuid4(), tenant_id="t1")
+
 
 def test_cancel_frees_dedupe_key(queue: JobQueue):
     first = queue.enqueue(tenant_id="t1", payload={"v": 1}, dedupe_key="k")
@@ -106,4 +109,3 @@ def test_cancel_frees_dedupe_key(queue: JobQueue):
     second = queue.enqueue(tenant_id="t1", payload={"v": 2}, dedupe_key="k")
     assert second.id != first.id
     assert second.payload == {"v": 2}
-

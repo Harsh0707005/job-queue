@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, Worker
 
 from tests.helpers_queue import (
     _ack,
@@ -20,6 +16,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Exponential retry backoff
 # ---------------------------------------------------------------------------
+
 
 def test_nack_applies_exponential_backoff_before_reclaimable(queue: JobQueue):
     from datetime import datetime, timezone
@@ -52,16 +49,19 @@ def test_nack_applies_exponential_backoff_before_reclaimable(queue: JobQueue):
     assert again.id == job.id
     assert again.attempts == 2
 
+
 def test_backoff_grows_exponentially_and_caps(queue: JobQueue):
     from job_queue import compute_retry_backoff_seconds
 
     assert compute_retry_backoff_seconds(1, base_seconds=2, max_seconds=10) == 2
     assert compute_retry_backoff_seconds(2, base_seconds=2, max_seconds=10) == 4
     assert compute_retry_backoff_seconds(3, base_seconds=2, max_seconds=10) == 8
-    assert compute_retry_backoff_seconds(4, base_seconds=2, max_seconds=10) == 10  # capped
+    assert (
+        compute_retry_backoff_seconds(4, base_seconds=2, max_seconds=10) == 10
+    )  # capped
     assert compute_retry_backoff_seconds(5, base_seconds=2, max_seconds=10) == 10
 
-    job = queue.enqueue(
+    queue.enqueue(
         tenant_id="t1",
         payload={},
         max_attempts=4,
@@ -94,6 +94,7 @@ def test_backoff_grows_exponentially_and_caps(queue: JobQueue):
     d3 = (n3.available_at - n3.updated_at).total_seconds()
     assert 1.9 <= d3 <= 2.5
 
+
 def test_backoff_then_dead_letter_after_max_attempts(queue: JobQueue):
     queue.enqueue(
         tenant_id="t1",
@@ -116,6 +117,7 @@ def test_backoff_then_dead_letter_after_max_attempts(queue: JobQueue):
     assert n2.status == JobStatus.DEAD
     assert queue.lease(tenant_id="t1", worker_id="w3") is None
     assert queue.count(tenant_id="t1", status=JobStatus.DEAD) == 1
+
 
 def test_fair_lease_skips_jobs_in_backoff(queue: JobQueue):
     """A nacked job in backoff must not be claimed by fair lease either."""
@@ -148,6 +150,7 @@ def test_fair_lease_skips_jobs_in_backoff(queue: JobQueue):
         _nack(queue, j2, "fw", error="nope", requeue=True)
         assert queue.lease(worker_id="fw") is None
 
+
 def test_worker_nack_uses_backoff(queue: JobQueue):
     enq = queue.enqueue(
         tenant_id="t1",
@@ -176,4 +179,3 @@ def test_worker_nack_uses_backoff(queue: JobQueue):
     assert again is not None
     assert again.id == enq.id
     assert again.attempts == 2
-

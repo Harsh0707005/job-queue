@@ -20,24 +20,18 @@ import hashlib
 import hmac
 import ipaddress
 import json
-import logging
 import os
 import socket
 import threading
-import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
-from uuid import UUID
 
 from job_queue.models import WebhookDelivery
-from job_queue.queue import JobQueue, compute_retry_backoff_seconds
-
-logger = logging.getLogger(__name__)
+from job_queue.queue import JobQueue
 
 SIGNATURE_HEADER = "X-Job-Queue-Signature"
 SIGNATURE_VERSION_PREFIX = "v1="
@@ -54,7 +48,9 @@ def _private_webhooks_allowed() -> bool:
     )
 
 
-def _ip_forbidden_for_webhook(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+def _ip_forbidden_for_webhook(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> str | None:
     """Return a rejection reason if *ip* must never be a webhook target.
 
     ``JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS=1`` permits loopback and RFC1918-style
@@ -160,9 +156,7 @@ def validate_webhook_url(url: str, *, resolve_dns: bool = True) -> str:
                 continue
             reason = _ip_forbidden_for_webhook(resolved)
             if reason is not None:
-                raise ValueError(
-                    f"webhook URL host resolves to {reason}"
-                )
+                raise ValueError(f"webhook URL host resolves to {reason}")
     return cleaned
 
 
@@ -176,9 +170,7 @@ class WebhookDeliveryResult:
 
 def sign_payload(secret: str, body: bytes) -> str:
     """Return ``v1=<hmac-sha256-hex>`` over *body* with *secret*."""
-    digest = hmac.new(
-        secret.encode("utf-8"), body, hashlib.sha256
-    ).hexdigest()
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return f"{SIGNATURE_VERSION_PREFIX}{digest}"
 
 
@@ -196,9 +188,7 @@ def verify_webhook_signature(
     header = signature_header.strip()
     if not header:
         return False
-    expected_digest = hmac.new(
-        secret.encode("utf-8"), body, hashlib.sha256
-    ).hexdigest()
+    expected_digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     if header.startswith(SIGNATURE_VERSION_PREFIX):
         provided = header[len(SIGNATURE_VERSION_PREFIX) :].strip()
     elif header.startswith("sha256="):
@@ -235,9 +225,7 @@ class _SsrfSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         except ValueError as exc:
             # Raise URLError so post_webhook surfaces a clear ssrf_blocked
             # error instead of silently following into the private network.
-            raise urllib.error.URLError(
-                f"ssrf_blocked_redirect: {exc}"
-            ) from exc
+            raise urllib.error.URLError(f"ssrf_blocked_redirect: {exc}") from exc
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 

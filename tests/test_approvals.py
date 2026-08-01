@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseError
 
 # ---------------------------------------------------------------------------
 # Approvals (park without lease, tenant-scoped, timeout, resume)
 # ---------------------------------------------------------------------------
 
+
 def test_request_approval_releases_lease_and_slot(queue: JobQueue):
     queue.set_concurrency_limit("t1", 1)
-    job = queue.enqueue(tenant_id="t1", payload={"steps": 4})
+    queue.enqueue(tenant_id="t1", payload={"steps": 4})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None and leased.lease_token is not None
     queue.checkpoint(
@@ -54,6 +52,7 @@ def test_request_approval_releases_lease_and_slot(queue: JobQueue):
             worker_id="w1",
             lease_token=leased.lease_token,
         )
+
 
 def test_approve_resumes_from_checkpoint(queue: JobQueue):
     from job_queue import ApprovalError
@@ -96,6 +95,7 @@ def test_approve_resumes_from_checkpoint(queue: JobQueue):
     done = queue.get(job.id, tenant_id="t1")
     assert done is not None and done.status == JobStatus.COMPLETED
 
+
 def test_reject_idempotent_and_tenant_scoped(queue: JobQueue):
     from job_queue import ApprovalError
 
@@ -123,6 +123,7 @@ def test_reject_idempotent_and_tenant_scoped(queue: JobQueue):
     with pytest.raises(ApprovalError):
         queue.approve(job.id, tenant_id="t1")
 
+
 def test_approval_timeout_auto_rejects(queue: JobQueue):
     job = queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
@@ -147,6 +148,7 @@ def test_approval_timeout_auto_rejects(queue: JobQueue):
     # Second process is empty.
     assert queue.process_approval_timeouts(tenant_id="t1") == []
 
+
 def test_list_awaiting_approvals(queue: JobQueue):
     a = queue.enqueue(tenant_id="t1", payload={"a": 1})
     b = queue.enqueue(tenant_id="t1", payload={"b": 1})
@@ -163,6 +165,7 @@ def test_list_awaiting_approvals(queue: JobQueue):
     waiting = queue.list_awaiting_approvals(tenant_id="t1")
     assert len(waiting) == 2
     assert {j.id for j in waiting} == {a.id, b.id}
+
 
 def test_request_approval_idempotent_when_already_parked(queue: JobQueue):
     job = queue.enqueue(tenant_id="t1", payload={})
@@ -185,4 +188,3 @@ def test_request_approval_idempotent_when_already_parked(queue: JobQueue):
     )
     assert p1.status == p2.status == JobStatus.AWAITING_APPROVAL
     assert p1.id == p2.id == job.id
-

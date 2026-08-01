@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +15,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Delayed jobs
 # ---------------------------------------------------------------------------
+
 
 def test_delayed_job_not_claimable_until_available_at(queue: JobQueue):
     from datetime import datetime, timedelta, timezone
@@ -49,6 +46,7 @@ def test_delayed_job_not_claimable_until_available_at(queue: JobQueue):
     assert later.id == delayed.id
     _ack(queue, later, "w1")
 
+
 def test_delay_seconds_helper(queue: JobQueue):
     job = queue.enqueue(
         tenant_id="t1",
@@ -61,6 +59,7 @@ def test_delay_seconds_helper(queue: JobQueue):
     assert leased is not None
     assert leased.id == job.id
 
+
 def test_available_at_and_delay_seconds_mutually_exclusive(queue: JobQueue):
     from datetime import datetime, timezone
 
@@ -71,6 +70,7 @@ def test_available_at_and_delay_seconds_mutually_exclusive(queue: JobQueue):
             available_at=datetime.now(timezone.utc),
             delay_seconds=5,
         )
+
 
 def test_delayed_job_does_not_block_ready_jobs(queue: JobQueue):
     """A future high-priority delayed job must not starve ready work."""
@@ -90,4 +90,3 @@ def test_delayed_job_does_not_block_ready_jobs(queue: JobQueue):
     claimed = queue.lease(tenant_id="t1", worker_id="w1")
     assert claimed is not None
     assert claimed.id == ready.id
-

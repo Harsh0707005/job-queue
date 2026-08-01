@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _WebhookCapture,
@@ -21,6 +15,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # HTTP webhooks (durable outbox)
 # ---------------------------------------------------------------------------
+
 
 def test_webhook_on_complete_persisted_then_delivered(queue: JobQueue):
     from job_queue import WebhookEvent
@@ -57,9 +52,12 @@ def test_webhook_on_complete_persisted_then_delivered(queue: JobQueue):
         assert capture.received[0]["signature"] is not None
 
         assert queue.list_webhook_deliveries(tenant_id="t1", status="pending") == []
-        assert len(queue.list_webhook_deliveries(tenant_id="t1", status="succeeded")) == 1
+        assert (
+            len(queue.list_webhook_deliveries(tenant_id="t1", status="succeeded")) == 1
+        )
     finally:
         capture.stop()
+
 
 def test_webhook_retry_backoff_then_succeed(queue: JobQueue):
     capture = _WebhookCapture(fail_times=2)
@@ -103,6 +101,7 @@ def test_webhook_retry_backoff_then_succeed(queue: JobQueue):
     finally:
         capture.stop()
 
+
 def test_webhook_dead_letters_after_max_attempts(queue: JobQueue):
     capture = _WebhookCapture(fail_times=100)
     try:
@@ -127,6 +126,7 @@ def test_webhook_dead_letters_after_max_attempts(queue: JobQueue):
         assert queue.list_webhook_deliveries(tenant_id="t1", status="dead")
     finally:
         capture.stop()
+
 
 def test_webhook_on_failed_and_dead_events(queue: JobQueue):
     capture = _WebhookCapture()
@@ -173,6 +173,7 @@ def test_webhook_on_failed_and_dead_events(queue: JobQueue):
     finally:
         capture.stop()
 
+
 def test_webhook_only_matching_tenant_and_events(queue: JobQueue):
     capture = _WebhookCapture()
     try:
@@ -202,12 +203,15 @@ def test_webhook_only_matching_tenant_and_events(queue: JobQueue):
     finally:
         capture.stop()
 
+
 def test_webhook_dispatcher_run_once(queue: JobQueue):
     from job_queue import WebhookDispatcher
 
     capture = _WebhookCapture()
     try:
-        queue.register_webhook(tenant_id="t1", url=capture.url, events=["job.completed"])
+        queue.register_webhook(
+            tenant_id="t1", url=capture.url, events=["job.completed"]
+        )
         queue.enqueue(tenant_id="t1", payload={})
         job = queue.lease(tenant_id="t1", worker_id="w1")
         assert job is not None
@@ -219,6 +223,7 @@ def test_webhook_dispatcher_run_once(queue: JobQueue):
         assert results[0].success
     finally:
         capture.stop()
+
 
 def test_webhook_no_double_send_after_success_before_db_finalize(queue: JobQueue):
     """Simulate crash after HTTP 200 but before status=succeeded.
@@ -304,6 +309,7 @@ def test_webhook_no_double_send_after_success_before_db_finalize(queue: JobQueue
     finally:
         capture.stop()
 
+
 def test_webhook_claim_before_post_not_pending_until_done(queue: JobQueue):
     """After claim, row is delivering so concurrent process won't double-claim."""
     capture = _WebhookCapture()
@@ -320,9 +326,7 @@ def test_webhook_claim_before_post_not_pending_until_done(queue: JobQueue):
         _ack(queue, job, "w1")
 
         # Manually claim like phase1
-        now = __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        )
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
         pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
         assert len(pending) == 1
         did = pending[0].id
@@ -347,6 +351,7 @@ def test_webhook_claim_before_post_not_pending_until_done(queue: JobQueue):
         assert len(capture.received) == 0
     finally:
         capture.stop()
+
 
 def test_paused_tenant_does_not_enqueue_webhooks(queue: JobQueue):
     capture = _WebhookCapture()
@@ -389,6 +394,7 @@ def test_paused_tenant_does_not_enqueue_webhooks(queue: JobQueue):
         assert queue.list_webhook_deliveries(tenant_id="t1") == []
     finally:
         capture.stop()
+
 
 def test_paused_tenant_does_not_claim_pending_webhook_deliveries(queue: JobQueue):
     capture = _WebhookCapture()
@@ -439,4 +445,3 @@ def test_paused_tenant_does_not_claim_pending_webhook_deliveries(queue: JobQueue
         assert any(x["body"]["tenant_id"] == "t1" for x in capture.received)
     finally:
         capture.stop()
-

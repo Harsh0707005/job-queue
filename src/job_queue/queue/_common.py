@@ -1,66 +1,35 @@
 """Shared constants, helpers, and exceptions for JobQueue."""
-from __future__ import annotations
 
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
-from psycopg_pool import ConnectionPool
-
-from job_queue.db import init_schema, transaction
 from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
     Job,
     JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
     JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
     Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
 )
-
 
 JOB_EVENTS_CHANNEL = "job_queue_events"
 
-
 _NOTIFY_MAX_BYTES = 7000  # pg_notify limit is 8000; leave margin
-
 
 _DEFAULT_ESTIMATE_SECONDS = 60.0
 
-
 _EWMA_ALPHA = 0.3
-
 
 _MAX_PREEMPTS_PER_JOB = 8
 
-
 _DEDUPE_LOCK_CLASS = 884_422_01
-
 
 _TENANT_RETENTION_FOREVER = -1
 
-
 _UNSET = object()
-
 
 _JOB_COLUMNS = """
     id, tenant_id, queue_name, payload, status, priority, attempts,
@@ -77,12 +46,9 @@ _JOB_COLUMNS = """
     await_children_resolved_at, last_error
 """
 
-
 _MAX_LABELS = 32
 
-
 _MAX_LABEL_LEN = 128
-
 
 _CANCELABLE_STATUSES = (
     JobStatus.PENDING,
@@ -90,15 +56,6 @@ _CANCELABLE_STATUSES = (
     JobStatus.AWAITING_APPROVAL,
     JobStatus.AWAITING_CHILDREN,
 )
-
-
-_ACTIVE_JOB_STATUSES = (
-    JobStatus.PENDING.value,
-    JobStatus.LEASED.value,
-    JobStatus.AWAITING_APPROVAL.value,
-    JobStatus.AWAITING_CHILDREN.value,
-)
-
 
 _DEPS_SATISFIED_SQL = """
 (
@@ -117,16 +74,13 @@ _DEPS_SATISFIED_SQL = """
 )
 """
 
-
 _SCHEDULE_COLUMNS = """
     id, tenant_id, name, queue_name, payload, interval_seconds, cron_expr,
     timezone, priority, max_attempts, visibility_timeout_seconds, enabled,
     next_run_at, last_enqueued_at, created_at, updated_at, labels
 """
 
-
 _CANCEL_MATCHING_BATCH_DEFAULT = 500
-
 
 _CANCEL_MATCHING_RETURN_CAP = 200
 
@@ -242,7 +196,9 @@ def _row_to_job(row: dict[str, Any]) -> Job:
             if row.get("estimated_duration_seconds") is None
             else int(row["estimated_duration_seconds"])
         ),
-        preemptible=bool(row["preemptible"]) if row.get("preemptible") is not None else True,
+        preemptible=bool(row["preemptible"])
+        if row.get("preemptible") is not None
+        else True,
         preempt_count=int(row["preempt_count"] or 0),
         last_preempted_at=row.get("last_preempted_at"),
         approval_requested_at=row.get("approval_requested_at"),
@@ -429,9 +385,8 @@ class ScheduleError(Exception):
         self.schedule = schedule
 
 
-_SIDE_EFFECT_SELECT = '\n        job_id, effect_key, tenant_id, status, idempotency_key, result,\n        started_by, started_at, completed_by, lease_token,\n        created_at, completed_at\n    '
+_SIDE_EFFECT_SELECT = "\n        job_id, effect_key, tenant_id, status, idempotency_key, result,\n        started_by, started_at, completed_by, lease_token,\n        created_at, completed_at\n    "
 
-_WEBHOOK_ENDPOINT_COLUMNS = '\n        id, tenant_id, url, secret, events, enabled, max_attempts,\n        backoff_base_seconds, backoff_max_seconds, created_at, updated_at\n    '
+_WEBHOOK_ENDPOINT_COLUMNS = "\n        id, tenant_id, url, secret, events, enabled, max_attempts,\n        backoff_base_seconds, backoff_max_seconds, created_at, updated_at\n    "
 
-_WEBHOOK_DELIVERY_COLUMNS = '\n        id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,\n        max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,\n        delivering_until, last_error, last_status_code, created_at, updated_at,\n        completed_at, signing_secret\n    '
-
+_WEBHOOK_DELIVERY_COLUMNS = "\n        id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,\n        max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,\n        delivering_until, last_error, last_status_code, created_at, updated_at,\n        completed_at, signing_secret\n    "

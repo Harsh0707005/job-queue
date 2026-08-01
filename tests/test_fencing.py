@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
@@ -19,6 +18,7 @@ from tests.helpers_queue import (
 # No double-processing / fencing
 # ---------------------------------------------------------------------------
 
+
 def test_two_workers_cannot_lease_same_job(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"n": 1})
 
@@ -27,6 +27,7 @@ def test_two_workers_cannot_lease_same_job(queue: JobQueue):
 
     assert first is not None
     assert second is None
+
 
 def test_concurrent_lease_at_most_once(queue: JobQueue):
     n_jobs = 40
@@ -54,6 +55,7 @@ def test_concurrent_lease_at_most_once(queue: JobQueue):
 
     assert len(claimed) == n_jobs
     assert len(set(claimed)) == n_jobs
+
 
 def test_stale_worker_cannot_ack_after_reclaim(queue: JobQueue):
     """Zombie worker with an expired/reclaimed lease cannot complete the job.
@@ -113,6 +115,7 @@ def test_stale_worker_cannot_ack_after_reclaim(queue: JobQueue):
     final = queue.get(live.id, tenant_id="t1")
     assert final is not None
     assert final.status == JobStatus.COMPLETED
+
 
 def test_worker_aborts_when_lease_reclaimed_mid_process(queue: JobQueue):
     """If the lease is lost mid-handler, Worker refuses to ack/nack-as-success.
@@ -186,4 +189,3 @@ def test_worker_aborts_when_lease_reclaimed_mid_process(queue: JobQueue):
 
     _ack(queue, reclaimed, "rescuer")
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
-

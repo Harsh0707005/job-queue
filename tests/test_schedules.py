@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +16,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Recurring schedules
 # ---------------------------------------------------------------------------
+
 
 def test_create_list_get_schedule(queue: JobQueue):
     from job_queue import Schedule
@@ -51,6 +49,7 @@ def test_create_list_get_schedule(queue: JobQueue):
     assert len(listed) == 1
     assert listed[0].id == sched.id
 
+
 def test_create_cron_schedule_weekdays_and_dom(queue: JobQueue):
     from datetime import datetime, timezone
 
@@ -79,6 +78,7 @@ def test_create_cron_schedule_weekdays_and_dom(queue: JobQueue):
     )
     assert monthly.next_run_at == datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
 
+
 def test_cron_schedule_fires_and_advances(queue: JobQueue):
     # Every second (6-field) so tests stay short.
     sched = queue.create_schedule(
@@ -105,6 +105,7 @@ def test_cron_schedule_fires_and_advances(queue: JobQueue):
     time.sleep(1.2)
     second = queue.process_due_schedules(tenant_id="t1")
     assert len(second) == 1
+
 
 def test_schedule_fire_bypasses_pending_cap_and_enqueue_rate(queue: JobQueue):
     """System timers still materialize under tenant throttles."""
@@ -161,6 +162,7 @@ def test_schedule_fire_bypasses_pending_cap_and_enqueue_rate(queue: JobQueue):
             time.sleep(0.15)
     assert len(rate_fires) >= 1
 
+
 def test_process_due_schedules_enqueues_job_with_metadata(queue: JobQueue):
     sched = queue.create_schedule(
         tenant_id="t1",
@@ -190,6 +192,7 @@ def test_process_due_schedules_enqueues_job_with_metadata(queue: JobQueue):
     assert leased.id == fire.job.id
     _ack(queue, leased, "w1")
 
+
 def test_schedule_does_not_double_fire_until_interval_elapses(queue: JobQueue):
     queue.create_schedule(
         tenant_id="t1",
@@ -210,6 +213,7 @@ def test_schedule_does_not_double_fire_until_interval_elapses(queue: JobQueue):
     third = queue.process_due_schedules(tenant_id="t1")
     assert len(third) == 1
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+
 
 def test_pause_and_resume_schedule(queue: JobQueue):
     sched = queue.create_schedule(
@@ -233,6 +237,7 @@ def test_pause_and_resume_schedule(queue: JobQueue):
     fires = queue.process_due_schedules(tenant_id="t1")
     assert len(fires) == 1
 
+
 def test_delete_schedule_stops_future_fires(queue: JobQueue):
     from job_queue import ScheduleError
 
@@ -251,6 +256,7 @@ def test_delete_schedule_stops_future_fires(queue: JobQueue):
 
     with pytest.raises(ScheduleError):
         queue.pause_schedule(sched.id, tenant_id="t1")
+
 
 def test_schedule_name_unique_per_tenant(queue: JobQueue):
     from job_queue import ScheduleError
@@ -277,6 +283,7 @@ def test_schedule_name_unique_per_tenant(queue: JobQueue):
     )
     assert other.tenant_id == "t2"
 
+
 def test_schedule_tenant_isolation_on_process(queue: JobQueue):
     queue.create_schedule(tenant_id="alpha", interval_seconds=60, payload={"t": "a"})
     queue.create_schedule(tenant_id="beta", interval_seconds=60, payload={"t": "b"})
@@ -288,6 +295,7 @@ def test_schedule_tenant_isolation_on_process(queue: JobQueue):
 
     beta_fires = queue.process_due_schedules(tenant_id="beta")
     assert len(beta_fires) == 1
+
 
 def test_concurrent_process_due_schedules_single_fire(queue: JobQueue):
     """Many tickers race; each due schedule fires exactly once per window."""
@@ -331,6 +339,7 @@ def test_concurrent_process_due_schedules_single_fire(queue: JobQueue):
     # Not due again immediately.
     assert queue.process_due_schedules(tenant_id="t1") == []
 
+
 def test_schedule_runner_fires_and_stop(queue: JobQueue):
     from job_queue import ScheduleRunner
 
@@ -357,6 +366,7 @@ def test_schedule_runner_fires_and_stop(queue: JobQueue):
     assert len(seen) >= 1
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) >= 1
 
+
 def test_schedule_start_at_future_not_due_yet(queue: JobQueue):
     from datetime import datetime, timedelta, timezone
 
@@ -371,6 +381,7 @@ def test_schedule_start_at_future_not_due_yet(queue: JobQueue):
     time.sleep(3.2)
     fires = queue.process_due_schedules(tenant_id="t1")
     assert len(fires) == 1
+
 
 def test_schedule_skips_tick_while_previous_job_pending(queue: JobQueue):
     """Slow work: interval elapses but prior job still pending → no overlap."""
@@ -398,6 +409,7 @@ def test_schedule_skips_tick_while_previous_job_pending(queue: JobQueue):
     assert pending is not None
     assert pending.id == first_job.id
 
+
 def test_schedule_skips_tick_while_previous_job_leased(queue: JobQueue):
     """Worker holds lease longer than interval → no second enqueue."""
     queue.create_schedule(
@@ -424,6 +436,7 @@ def test_schedule_skips_tick_while_previous_job_leased(queue: JobQueue):
     assert fires[0].job.id != leased.id
     assert fires[0].job.schedule_id == first[0].schedule.id
 
+
 def test_schedule_fires_again_only_after_prior_completes(queue: JobQueue):
     queue.create_schedule(
         tenant_id="t1",
@@ -444,6 +457,7 @@ def test_schedule_fires_again_only_after_prior_completes(queue: JobQueue):
     assert len(f2) == 1
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+
 
 def test_concurrent_schedule_ticks_no_overlap_under_load(queue: JobQueue):
     """Many tickers + uncompleted first job: never more than one active job."""
@@ -492,4 +506,3 @@ def test_concurrent_schedule_ticks_no_overlap_under_load(queue: JobQueue):
         ).fetchone()
     assert row is not None
     assert int(row["n"]) == 1
-

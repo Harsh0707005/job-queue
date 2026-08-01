@@ -1,21 +1,13 @@
 """CoordinatorClient jobs: get, list, cancel."""
+
 from __future__ import annotations
 
-import json
-import logging
-import os
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Any
 from uuid import UUID
 
 from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
+from job_queue.models import BulkCancelResult, Job
+
 
 class ClientJobsMixin:
     def get_job(self, job_id: UUID | str, *, tenant_id: str) -> Job | None:

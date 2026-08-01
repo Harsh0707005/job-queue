@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, Worker
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +14,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Job dependencies
 # ---------------------------------------------------------------------------
+
 
 def test_dependent_job_not_claimable_until_parent_completes(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"step": 1})
@@ -42,6 +38,7 @@ def test_dependent_job_not_claimable_until_parent_completes(queue: JobQueue):
     assert second.id == child.id
     _ack(queue, second, "w2")
 
+
 def test_dependent_does_not_block_unrelated_jobs(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"p": 1}, priority=1)
     queue.enqueue(
@@ -63,6 +60,7 @@ def test_dependent_does_not_block_unrelated_jobs(queue: JobQueue):
     assert leased2.payload.get("child") is True or leased2.id == ready.id
     # After parent done, child (100) should beat ready (0)
     assert leased2.payload.get("child") is True
+
 
 def test_multi_parent_requires_all_completed(queue: JobQueue):
     a = queue.enqueue(tenant_id="t1", payload={"a": 1})
@@ -87,6 +85,7 @@ def test_multi_parent_requires_all_completed(queue: JobQueue):
     lc = queue.lease(tenant_id="t1", worker_id="w1")
     assert lc is not None
     assert lc.id == child.id
+
 
 def test_parent_failure_cancels_pending_children(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={}, max_attempts=1)
@@ -113,6 +112,7 @@ def test_parent_failure_cancels_pending_children(queue: JobQueue):
     # Nothing left to claim.
     assert queue.lease(tenant_id="t1", worker_id="w2") is None
 
+
 def test_parent_cancel_cascades_to_children(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={})
     child = queue.enqueue(tenant_id="t1", payload={}, depends_on=parent.id)
@@ -122,6 +122,7 @@ def test_parent_cancel_cascades_to_children(queue: JobQueue):
     child_after = queue.get(child.id, tenant_id="t1")
     assert child_after is not None
     assert child_after.status == JobStatus.CANCELLED
+
 
 def test_enqueue_rejects_missing_or_failed_dependency(queue: JobQueue):
     from job_queue import DependencyError
@@ -139,6 +140,7 @@ def test_enqueue_rejects_missing_or_failed_dependency(queue: JobQueue):
     with pytest.raises(DependencyError, match="already dead"):
         queue.enqueue(tenant_id="t1", payload={}, depends_on=parent.id)
 
+
 def test_dependent_after_parent_success_e2e_worker(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"n": 1})
     queue.enqueue(tenant_id="t1", payload={"n": 2}, depends_on=parent.id)
@@ -152,4 +154,3 @@ def test_dependent_after_parent_success_e2e_worker(queue: JobQueue):
 
     assert worker.run(max_jobs=2, stop_when_idle=True) == 2
     assert seen == [1, 2]
-

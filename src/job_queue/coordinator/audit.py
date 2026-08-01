@@ -1,54 +1,18 @@
 """Coordinator API handlers."""
+
 from __future__ import annotations
 
 from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
 )
 
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
     job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
-    schedule_to_dict,
     audit_consistency_report_to_dict,
     job_audit_event_to_dict,
-    job_side_effect_to_dict,
-    preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
-)
-from job_queue.models import JobStatus
-from job_queue.queue import (
-    CancelError,
-    JobQueue,
-    LeaseError,
-    RateLimitError,
-    ReplayError,
-    ScheduleError,
 )
 
 
@@ -82,7 +46,6 @@ class AuditApiMixin:
             "count": len(events),
         }
 
-
     def _job_audit_verify(
         self, path: str, query: dict[str, list[str]]
     ) -> tuple[int, dict[str, Any]]:
@@ -96,11 +59,8 @@ class AuditApiMixin:
         tenants = query.get("tenant_id") or []
         if not tenants or not tenants[0]:
             return 400, {"error": "tenant_id query param required"}
-        report = self.queue.verify_job_audit(
-            UUID(job_id_s), tenant_id=str(tenants[0])
-        )
+        report = self.queue.verify_job_audit(UUID(job_id_s), tenant_id=str(tenants[0]))
         return 200, {"report": audit_consistency_report_to_dict(report)}
-
 
     def _rebuild_job(
         self, path: str, body: dict[str, Any]
@@ -126,10 +86,7 @@ class AuditApiMixin:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job)}
 
-
-    def _rebuild_jobs_batch(
-        self, body: dict[str, Any]
-    ) -> tuple[int, dict[str, Any]]:
+    def _rebuild_jobs_batch(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         from job_queue.queue import RebuildError
 
         raw_ids = body.get("job_ids") or []
@@ -155,7 +112,6 @@ class AuditApiMixin:
             "count": len(jobs),
         }
 
-
     def _list_audit_orphans(
         self, query: dict[str, list[str]]
     ) -> tuple[int, dict[str, Any]]:
@@ -172,5 +128,3 @@ class AuditApiMixin:
             "job_ids": [str(i) for i in ids],
             "count": len(ids),
         }
-
-

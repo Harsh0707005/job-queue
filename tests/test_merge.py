@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseError
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +13,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Tenant merge (ownership transfer A → B)
 # ---------------------------------------------------------------------------
+
 
 def test_merge_moves_pending_jobs_and_empties_source(queue: JobQueue):
     from job_queue import TenantMergeResult
@@ -42,9 +38,10 @@ def test_merge_moves_pending_jobs_and_empties_source(queue: JobQueue):
     assert queue.get(a2.id, tenant_id="beta") is not None
     assert queue.get(b1.id, tenant_id="beta") is not None
 
+
 def test_merge_moves_running_job_without_stopping_worker(queue: JobQueue):
     """Worker still heartbeats/acks with pre-merge tenant via lease_tenant_id."""
-    job = queue.enqueue(tenant_id="alpha", payload={"run": True})
+    queue.enqueue(tenant_id="alpha", payload={"run": True})
     leased = queue.lease(tenant_id="alpha", worker_id="w1")
     assert leased is not None
     assert leased.tenant_id == "alpha"
@@ -114,6 +111,7 @@ def test_merge_moves_running_job_without_stopping_worker(queue: JobQueue):
     assert acked.lease_tenant_id is None
     assert queue.get_result(acked.id, tenant_id="beta") == {"ok": True}
 
+
 def test_merge_moves_schedules_and_webhooks(queue: JobQueue):
     sched = queue.create_schedule(
         tenant_id="alpha",
@@ -153,6 +151,7 @@ def test_merge_moves_schedules_and_webhooks(queue: JobQueue):
     beta_dels = queue.list_webhook_deliveries(tenant_id="beta")
     assert any(d.job_id == job.id for d in beta_dels)
 
+
 def test_merge_renames_conflicting_schedule_names(queue: JobQueue):
     queue.create_schedule(
         tenant_id="alpha",
@@ -172,6 +171,7 @@ def test_merge_renames_conflicting_schedule_names(queue: JobQueue):
     assert "shared" in names
     assert "shared__from_alpha" in names
 
+
 def test_merge_clears_conflicting_active_dedupe_keys(queue: JobQueue):
     ja = queue.enqueue(tenant_id="alpha", payload={"a": 1}, dedupe_key="k")
     jb = queue.enqueue(tenant_id="beta", payload={"b": 1}, dedupe_key="k")
@@ -184,6 +184,7 @@ def test_merge_clears_conflicting_active_dedupe_keys(queue: JobQueue):
     assert mb.dedupe_key == "k"
     assert ma.dedupe_key is None
 
+
 def test_merge_rejects_same_tenant_and_offboarding_target(queue: JobQueue):
     from job_queue import MergeError
 
@@ -191,7 +192,9 @@ def test_merge_rejects_same_tenant_and_offboarding_target(queue: JobQueue):
         queue.merge_tenant("a", "a")
 
     queue.enqueue(tenant_id="src", payload={"x": 1})
-    queue.offboard_tenant("tgt")  # empty offboard still marks? empty becomes empty without settings
+    queue.offboard_tenant(
+        "tgt"
+    )  # empty offboard still marks? empty becomes empty without settings
     # Force target into offboarding with residual leased work.
     queue.enqueue(tenant_id="tgt", payload={"y": 1})
     leased = queue.lease(tenant_id="tgt", worker_id="w1")
@@ -201,6 +204,7 @@ def test_merge_rejects_same_tenant_and_offboarding_target(queue: JobQueue):
 
     with pytest.raises(MergeError, match="offboarding"):
         queue.merge_tenant("src", "tgt")
+
 
 def test_merge_rejects_when_target_pending_cap_would_exceed(queue: JobQueue):
     from job_queue import MergeError
@@ -217,6 +221,7 @@ def test_merge_rejects_when_target_pending_cap_would_exceed(queue: JobQueue):
     assert queue.count(tenant_id="alpha", status=JobStatus.PENDING) == 2
     assert queue.count(tenant_id="beta", status=JobStatus.PENDING) == 1
 
+
 def test_merge_blocks_source_enqueue_after(queue: JobQueue):
     queue.enqueue(tenant_id="alpha", payload={"a": 1})
     queue.merge_tenant("alpha", "beta")
@@ -224,6 +229,7 @@ def test_merge_blocks_source_enqueue_after(queue: JobQueue):
     j = queue.enqueue(tenant_id="alpha", payload={"fresh": True})
     assert j.tenant_id == "alpha"
     assert queue.count(tenant_id="alpha") == 1
+
 
 def test_merge_claimed_webhook_finalize_after_transfer(queue: JobQueue):
     queue.register_webhook(
@@ -251,9 +257,9 @@ def test_merge_claimed_webhook_finalize_after_transfer(queue: JobQueue):
     assert d.status == "succeeded"
     assert d.job_id == job.id
 
+
 def test_merge_idempotent_empty_source(queue: JobQueue):
     result = queue.merge_tenant("never-had-work", "beta")
     assert result.jobs_moved == 0
     assert result.source_empty is True
     assert queue.tenant_is_empty("never-had-work") is True
-

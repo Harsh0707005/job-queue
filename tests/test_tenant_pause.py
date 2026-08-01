@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -20,6 +15,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Tenant pause / resume / metrics
 # ---------------------------------------------------------------------------
+
 
 def test_pause_tenant_blocks_new_leases_scoped_and_fair(queue: JobQueue):
     queue.enqueue(tenant_id="bad", payload={"n": 1})
@@ -42,6 +38,7 @@ def test_pause_tenant_blocks_new_leases_scoped_and_fair(queue: JobQueue):
     # Pending work for bad still exists.
     assert queue.count(tenant_id="bad", status=JobStatus.PENDING) == 1
 
+
 def test_pause_allows_in_flight_heartbeat_ack_nack(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"x": 1}, max_attempts=3)
     leased = queue.lease(tenant_id="t1", worker_id="w1")
@@ -60,7 +57,7 @@ def test_pause_allows_in_flight_heartbeat_ack_nack(queue: JobQueue):
     assert queue.get_result(done.id, tenant_id="t1") == {"ok": True}
 
     # Nack path on another in-flight job.
-    j2 = queue.enqueue(
+    queue.enqueue(
         tenant_id="t1",
         payload={"x": 3},
         max_attempts=2,
@@ -78,6 +75,7 @@ def test_pause_allows_in_flight_heartbeat_ack_nack(queue: JobQueue):
     nacked = _nack(queue, leased2, "w1", error="boom", requeue=True)
     assert nacked.status == JobStatus.PENDING
 
+
 def test_resume_tenant_restores_leasing(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"a": 1})
     queue.pause_tenant("t1")
@@ -88,6 +86,7 @@ def test_resume_tenant_restores_leasing(queue: JobQueue):
     assert job is not None
     assert job.payload == {"a": 1}
     _ack(queue, job, "w1")
+
 
 def test_get_tenant_stats_counts_and_flags(queue: JobQueue):
     from job_queue import TenantStats
@@ -152,6 +151,7 @@ def test_get_tenant_stats_counts_and_flags(queue: JobQueue):
     assert stats2.paused is False
     assert stats2.claimable >= 1
 
+
 def test_list_tenant_stats_multiple_tenants(queue: JobQueue):
     queue.enqueue(tenant_id="a", payload={})
     queue.enqueue(tenant_id="b", payload={})
@@ -165,6 +165,7 @@ def test_list_tenant_stats_multiple_tenants(queue: JobQueue):
     assert by_id["a"].pending == 1
     assert by_id["b"].pending == 1
 
+
 def test_pause_preserves_concurrency_limit(queue: JobQueue):
     queue.set_concurrency_limit("t1", 3)
     queue.pause_tenant("t1")
@@ -173,6 +174,7 @@ def test_pause_preserves_concurrency_limit(queue: JobQueue):
     queue.resume_tenant("t1")
     assert queue.get_concurrency_limit("t1") == 3
     assert queue.is_tenant_paused("t1") is False
+
 
 def test_fair_lease_skips_paused_prefers_others(queue: JobQueue):
     for i in range(5):
@@ -203,9 +205,10 @@ def test_fair_lease_skips_paused_prefers_others(queue: JobQueue):
         claimed += 1
     assert claimed == 5
 
+
 def test_paused_tenant_schedules_do_not_enqueue(queue: JobQueue):
     """While paused, process_due must not pile schedule jobs."""
-    sched = queue.create_schedule(
+    queue.create_schedule(
         tenant_id="paused-sched",
         interval_seconds=1,
         payload={"tick": True},
@@ -229,6 +232,7 @@ def test_paused_tenant_schedules_do_not_enqueue(queue: JobQueue):
     )
     ok_fires = queue.process_due_schedules(tenant_id="ok-sched")
     assert len(ok_fires) == 1
+
 
 def test_resume_tenant_schedule_fires_once_not_tick_backlog(queue: JobQueue):
     """After a long pause, resume + process_due enqueues one job per schedule."""
@@ -257,6 +261,7 @@ def test_resume_tenant_schedule_fires_once_not_tick_backlog(queue: JobQueue):
     # Second process immediately should not fire again (interval advanced).
     assert queue.process_due_schedules(tenant_id="t1") == []
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+
 
 def test_paused_tenant_expired_lease_not_reclaimed(queue: JobQueue):
     """Expired leases for a paused tenant must not be reclaimed until resume."""
@@ -298,6 +303,7 @@ def test_paused_tenant_expired_lease_not_reclaimed(queue: JobQueue):
     assert reclaimed.leased_by == "rescuer"
     _ack(queue, reclaimed, "rescuer")
 
+
 def test_paused_tenant_fair_lease_no_reclaim_among_mixed_tenants(queue: JobQueue):
     queue.enqueue(
         tenant_id="paused",
@@ -334,4 +340,3 @@ def test_paused_tenant_fair_lease_no_reclaim_among_mixed_tenants(queue: JobQueue
     assert still is not None
     assert still.status == JobStatus.LEASED
     assert still.leased_by == "w1"
-

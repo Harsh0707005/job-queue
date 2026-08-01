@@ -1,54 +1,22 @@
 """Coordinator API handlers."""
+
 from __future__ import annotations
 
 from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
 )
 
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
     claimed_webhook_to_dict,
     job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
-    schedule_to_dict,
-    audit_consistency_report_to_dict,
-    job_audit_event_to_dict,
-    job_side_effect_to_dict,
-    preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
     webhook_delivery_to_dict,
     webhook_endpoint_to_dict,
 )
-from job_queue.models import JobStatus
 from job_queue.queue import (
-    CancelError,
-    JobQueue,
-    LeaseError,
-    RateLimitError,
     ReplayError,
-    ScheduleError,
 )
 
 
@@ -82,7 +50,6 @@ class WebhooksApiMixin:
             "auto_finalized": auto_out,
         }
 
-
     def _finalize_webhook(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -111,7 +78,6 @@ class WebhooksApiMixin:
             "error": result.error,
         }
 
-
     def _register_webhook(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
             ep = self.queue.register_webhook(
@@ -127,10 +93,7 @@ class WebhooksApiMixin:
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         # Echo secret only on create (caller just set it).
-        return 201, {
-            "endpoint": webhook_endpoint_to_dict(ep, include_secret=True)
-        }
-
+        return 201, {"endpoint": webhook_endpoint_to_dict(ep, include_secret=True)}
 
     def _rotate_webhook_secret(
         self, path: str, body: dict[str, Any]
@@ -157,14 +120,9 @@ class WebhooksApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         # Echo secret only on rotate (caller just set it).
-        return 200, {
-            "endpoint": webhook_endpoint_to_dict(ep, include_secret=True)
-        }
+        return 200, {"endpoint": webhook_endpoint_to_dict(ep, include_secret=True)}
 
-
-    def _list_webhooks(
-        self, query: dict[str, list[str]]
-    ) -> tuple[int, dict[str, Any]]:
+    def _list_webhooks(self, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         tenant_id = (query.get("tenant_id") or [None])[0]
         if not tenant_id:
             return 400, {"error": "tenant_id is required"}
@@ -178,7 +136,6 @@ class WebhooksApiMixin:
                 webhook_endpoint_to_dict(e, include_secret=False) for e in rows
             ]
         }
-
 
     def _set_webhook_enabled(
         self, path: str, body: dict[str, Any]
@@ -203,10 +160,7 @@ class WebhooksApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         # Status-only mutation — do not leak secret.
-        return 200, {
-            "endpoint": webhook_endpoint_to_dict(ep, include_secret=False)
-        }
-
+        return 200, {"endpoint": webhook_endpoint_to_dict(ep, include_secret=False)}
 
     def _delete_webhook(
         self, path: str, body: dict[str, Any]
@@ -224,7 +178,6 @@ class WebhooksApiMixin:
         if not deleted:
             return 404, {"error": f"webhook {eid} not found for tenant"}
         return 200, {"deleted": True, "endpoint_id": eid}
-
 
     def _list_dead_letters(
         self, query: dict[str, list[str]]
@@ -248,7 +201,6 @@ class WebhooksApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"jobs": [job_to_dict(j) for j in jobs]}
-
 
     def _replay_dead_letter(
         self, path: str, body: dict[str, Any]
@@ -286,10 +238,7 @@ class WebhooksApiMixin:
             return 409, {"error": str(exc), "code": "replay_error"}
         return 200, {"job": job_to_dict(job)}
 
-
-    def _replay_dead_letters(
-        self, body: dict[str, Any]
-    ) -> tuple[int, dict[str, Any]]:
+    def _replay_dead_letters(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         tenant_id = body.get("tenant_id")
         if not tenant_id:
             return 400, {"error": "tenant_id is required"}
@@ -305,13 +254,9 @@ class WebhooksApiMixin:
                 tenant_id=str(tenant_id),
                 job_ids=job_ids,
                 queue_name=(
-                    None
-                    if body.get("queue_name") is None
-                    else str(body["queue_name"])
+                    None if body.get("queue_name") is None else str(body["queue_name"])
                 ),
-                limit=(
-                    None if body.get("limit") is None else int(body["limit"])
-                ),
+                limit=(None if body.get("limit") is None else int(body["limit"])),
                 reset_attempts=bool(body.get("reset_attempts", True)),
                 max_attempts=(
                     None
@@ -331,7 +276,6 @@ class WebhooksApiMixin:
             "jobs": [job_to_dict(j) for j in jobs],
             "replayed": len(jobs),
         }
-
 
     def _webhook_stats(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:
@@ -356,5 +300,3 @@ class WebhooksApiMixin:
             "by_status": {r["status"]: int(r["n"]) for r in rows},
             "duplicate_succeeded_job_events": [dict(r) for r in dups],
         }
-
-

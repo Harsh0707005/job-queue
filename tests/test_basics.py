@@ -2,14 +2,7 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +11,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Basic enqueue / lease / ack
 # ---------------------------------------------------------------------------
+
 
 def test_enqueue_and_lease(queue: JobQueue):
     job = queue.enqueue(tenant_id="t1", payload={"task": "hello"})
@@ -34,6 +28,7 @@ def test_enqueue_and_lease(queue: JobQueue):
     assert leased.attempts == 1
     assert leased.lease_expires_at is not None
 
+
 def test_ack_completes_job(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"n": 1})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
@@ -47,6 +42,6 @@ def test_ack_completes_job(queue: JobQueue):
 
     assert queue.lease(tenant_id="t1", worker_id="w2") is None
 
+
 def test_empty_queue_returns_none(queue: JobQueue):
     assert queue.lease(tenant_id="t1", worker_id="w1") is None
-

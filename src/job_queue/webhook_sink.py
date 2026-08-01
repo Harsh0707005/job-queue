@@ -71,9 +71,7 @@ class WebhookSinkState:
                 if env:
                     secrets = [env]
             if secrets and raw_body is not None:
-                ok = any(
-                    verify_webhook_signature(s, raw_body, sig) for s in secrets
-                )
+                ok = any(verify_webhook_signature(s, raw_body, sig) for s in secrets)
                 if ok:
                     self.sig_ok += 1
                 else:
@@ -81,9 +79,7 @@ class WebhookSinkState:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            multi = {
-                k: v for k, v in self.by_delivery.items() if v > 1
-            }
+            multi = {k: v for k, v in self.by_delivery.items() if v > 1}
             return {
                 "total_posts": self.total_posts,
                 "unique_deliveries": len(self.by_delivery),

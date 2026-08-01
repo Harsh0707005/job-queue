@@ -1,77 +1,27 @@
 """JobQueue spawn_children."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from job_queue.db import init_schema, transaction
+from job_queue.db import transaction
 from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
     Job,
-    JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
     JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
     SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
 )
 from job_queue.queue._common import (
-    JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
-    _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
     _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
-    _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
     LeaseError,
-    MergeError,
-    RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
     SpawnError,
-    _SkipLeaseCandidate,
-    _as_utc,
     _normalize_labels,
-    _normalize_status_filter,
     _row_to_job,
-    _row_to_schedule,
     _utcnow,
-    compute_retry_backoff_seconds,
 )
 
 
@@ -141,9 +91,7 @@ class SpawnChildrenMixin:
             # Idempotent re-entry if already parked for children.
             if row["status"] == JobStatus.AWAITING_CHILDREN.value:
                 if row["tenant_id"] != tenant_id:
-                    raise SpawnError(
-                        f"job {job_id} not found for tenant {tenant_id!r}"
-                    )
+                    raise SpawnError(f"job {job_id} not found for tenant {tenant_id!r}")
                 parent = _row_to_job(row)
                 kids = self._list_children_locked(
                     conn, parent_id=job_id, tenant_id=tenant_id
@@ -199,9 +147,7 @@ class SpawnChildrenMixin:
                             f"children[{i}].estimated_duration_seconds must be >= 1"
                         )
                 preemptible = (
-                    bool(spec["preemptible"])
-                    if "preemptible" in spec
-                    else True
+                    bool(spec["preemptible"]) if "preemptible" in spec else True
                 )
                 # Labels: inherit parent, then merge any child-specific labels.
                 if "labels" in spec:
@@ -376,9 +322,7 @@ class SpawnChildrenMixin:
                 detail={
                     "child_ids": [str(x) for x in child_ids],
                     "timeout_seconds": (
-                        float(timeout_seconds)
-                        if timeout_seconds is not None
-                        else None
+                        float(timeout_seconds) if timeout_seconds is not None else None
                     ),
                 },
                 now=now,

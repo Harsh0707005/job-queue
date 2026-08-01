@@ -1,4 +1,5 @@
 """Multi-tenant job queue package (domain-split for maintainability)."""
+
 from __future__ import annotations
 
 from job_queue.queue._common import (

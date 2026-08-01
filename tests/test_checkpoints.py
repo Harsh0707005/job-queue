@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseContext, LeaseError
 
 # ---------------------------------------------------------------------------
 # Checkpoints (resume after reclaim)
 # ---------------------------------------------------------------------------
+
 
 def test_checkpoint_requires_live_lease(queue: JobQueue):
     job = queue.enqueue(tenant_id="t1", payload={"steps": 3})
@@ -56,6 +56,7 @@ def test_checkpoint_requires_live_lease(queue: JobQueue):
             lease_token=leased.lease_token,
             progress={"step": 3},
         )
+
 
 def test_checkpoint_survives_reclaim_and_resume(queue: JobQueue):
     """Simulate worker death: expire lease, reclaim, resume from checkpoint."""
@@ -129,6 +130,7 @@ def test_checkpoint_survives_reclaim_and_resume(queue: JobQueue):
     assert done.checkpoint == {"step": 5}
     assert done.result == {"started_step": 3, "resumed": True}
 
+
 def test_checkpoint_survives_nack_requeue(queue: JobQueue):
     job = queue.enqueue(
         tenant_id="t1",
@@ -158,8 +160,9 @@ def test_checkpoint_survives_nack_requeue(queue: JobQueue):
     assert pending.status == JobStatus.PENDING
     assert pending.checkpoint == {"cursor": 42}
 
+
 def test_checkpoint_cleared_on_cancel(queue: JobQueue):
-    job = queue.enqueue(tenant_id="t1", payload={})
+    queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None and leased.lease_token is not None
     queue.checkpoint(
@@ -174,10 +177,11 @@ def test_checkpoint_cleared_on_cancel(queue: JobQueue):
     assert cancelled.checkpoint is None
     assert cancelled.checkpointed_at is None
 
+
 def test_lease_context_checkpoint(queue: JobQueue):
     from job_queue.worker import LeaseContext, Worker
 
-    job = queue.enqueue(tenant_id="t1", payload={"steps": 2})
+    queue.enqueue(tenant_id="t1", payload={"steps": 2})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None
     ctx = LeaseContext(
@@ -214,4 +218,3 @@ def test_lease_context_checkpoint(queue: JobQueue):
         result=r,
     )
     _ = Worker  # imported for symmetry with real usage
-

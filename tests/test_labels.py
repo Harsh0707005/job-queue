@@ -4,14 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, LeaseContext
 
 from tests.helpers_queue import (
     _WebhookCapture,
@@ -21,6 +15,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Labels: list + bulk cancel
 # ---------------------------------------------------------------------------
+
 
 def test_enqueue_labels_normalized(queue: JobQueue):
     j = queue.enqueue(
@@ -33,6 +28,7 @@ def test_enqueue_labels_normalized(queue: JobQueue):
     assert got is not None
     assert got.labels == j.labels
 
+
 def test_list_jobs_filter_tenant_label_status(queue: JobQueue):
     a1 = queue.enqueue(
         tenant_id="ta", payload={"n": 1}, labels=["campaign:x", "tier:gold"]
@@ -40,9 +36,7 @@ def test_list_jobs_filter_tenant_label_status(queue: JobQueue):
     a2 = queue.enqueue(
         tenant_id="ta", payload={"n": 2}, labels=["campaign:x", "tier:silver"]
     )
-    a3 = queue.enqueue(
-        tenant_id="ta", payload={"n": 3}, labels=["campaign:y"]
-    )
+    a3 = queue.enqueue(tenant_id="ta", payload={"n": 3}, labels=["campaign:y"])
     queue.enqueue(tenant_id="tb", payload={"n": 9}, labels=["campaign:x"])
 
     # Label filter (AND): both campaign:x and tier:gold
@@ -70,6 +64,7 @@ def test_list_jobs_filter_tenant_label_status(queue: JobQueue):
     assert tb[0].tenant_id == "tb"
     assert a3.id not in {j.id for j in cx}
 
+
 def test_cancel_matching_by_label_and_status(queue: JobQueue):
     ids = []
     for i in range(5):
@@ -80,13 +75,9 @@ def test_cancel_matching_by_label_and_status(queue: JobQueue):
         )
         ids.append(j.id)
     # One other label should survive
-    keep = queue.enqueue(
-        tenant_id="t1", payload={"keep": True}, labels=["run:other"]
-    )
+    keep = queue.enqueue(tenant_id="t1", payload={"keep": True}, labels=["run:other"])
     # Lease one so bulk cancel covers leased too
-    leased = queue.lease(
-        tenant_id="t1", worker_id="w1", visibility_timeout_seconds=30
-    )
+    leased = queue.lease(tenant_id="t1", worker_id="w1", visibility_timeout_seconds=30)
     assert leased is not None
 
     result = queue.cancel_matching(
@@ -105,6 +96,7 @@ def test_cancel_matching_by_label_and_status(queue: JobQueue):
     assert keep_after is not None
     assert keep_after.status in (JobStatus.PENDING, JobStatus.LEASED)
 
+
 def test_cancel_matching_multi_tenant_isolation(queue: JobQueue):
     for tid in ("t-a", "t-b"):
         for i in range(3):
@@ -119,6 +111,7 @@ def test_cancel_matching_multi_tenant_isolation(queue: JobQueue):
     remaining = queue.list_jobs(tenant_id="t-b", labels=["batch:shared-name"])
     assert len(remaining) == 3
     assert all(j.status == JobStatus.PENDING for j in remaining)
+
 
 def test_cancel_matching_with_workers_mid_flight(queue: JobQueue):
     """Bulk cancel frees leases; multi-tenant workers cannot complete them."""
@@ -177,6 +170,7 @@ def test_cancel_matching_with_workers_mid_flight(queue: JobQueue):
     for th in threads:
         th.join(timeout=3)
 
+
 def test_cancel_matching_loops_past_batch_size(queue: JobQueue):
     """Must drain all matches, not silently stop after one batch."""
     n = 1200
@@ -207,6 +201,7 @@ def test_cancel_matching_loops_past_batch_size(queue: JobQueue):
     )
     assert len(cancelled) == 50  # limit on list
 
+
 def test_cancel_matching_max_jobs_reports_incomplete(queue: JobQueue):
     for i in range(50):
         queue.enqueue(tenant_id="t1", payload={"i": i}, labels=["cap:x"])
@@ -224,15 +219,14 @@ def test_cancel_matching_max_jobs_reports_incomplete(queue: JobQueue):
     assert rest.cancelled == 25
     assert rest.complete is True
 
+
 def test_spawn_children_inherit_parent_labels(queue: JobQueue):
     parent = queue.enqueue(
         tenant_id="t1",
         payload={"role": "parent"},
         labels=["wave:spawn", "env:test"],
     )
-    job = queue.lease(
-        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
-    )
+    job = queue.lease(tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30)
     assert job is not None
     result = queue.spawn_children(
         parent.id,
@@ -253,11 +247,12 @@ def test_spawn_children_inherit_parent_labels(queue: JobQueue):
     # parent + 2 children
     assert len(listed) >= 3
 
+
 def test_schedule_fire_copies_labels(queue: JobQueue):
     from datetime import datetime, timezone
 
     past = datetime(2020, 1, 1, tzinfo=timezone.utc)
-    sched = queue.create_schedule(
+    queue.create_schedule(
         tenant_id="t1",
         payload={"from": "schedule"},
         interval_seconds=60,
@@ -274,6 +269,7 @@ def test_schedule_fire_copies_labels(queue: JobQueue):
     res = queue.cancel_matching(tenant_id="t1", labels=["sched:nightly"])
     assert res.cancelled >= 1
     assert res.complete is True
+
 
 def test_cancel_matching_skip_locked_empty_not_complete(queue: JobQueue):
     """Empty SKIP LOCKED page must not report complete while matches remain locked."""
@@ -344,6 +340,7 @@ def test_cancel_matching_skip_locked_empty_not_complete(queue: JobQueue):
         row = queue.get(jid, tenant_id="t1")
         assert row is not None and row.status == JobStatus.CANCELLED
 
+
 def test_cancel_matching_waits_for_lock_release(queue: JobQueue):
     """Sweep retries until concurrent locks release (within wait window)."""
     from job_queue.db import transaction
@@ -383,6 +380,7 @@ def test_cancel_matching_waits_for_lock_release(queue: JobQueue):
     after = queue.get(j.id, tenant_id="t1")
     assert after is not None and after.status == JobStatus.CANCELLED
 
+
 def test_webhook_signature_verify_helper():
     from job_queue.webhooks import sign_payload, verify_webhook_signature
 
@@ -396,6 +394,7 @@ def test_webhook_signature_verify_helper():
     bare = sig.removeprefix("v1=")
     assert verify_webhook_signature("super-secret", body, bare) is True
     assert verify_webhook_signature("super-secret", body, f"sha256={bare}") is True
+
 
 def test_webhook_signed_delivery_and_secret_rotation_mid_flight(queue: JobQueue):
     """In-flight retries must keep verifying under the pre-rotation secret."""
@@ -429,7 +428,7 @@ def test_webhook_signed_delivery_and_secret_rotation_mid_flight(queue: JobQueue)
         assert results[0].success is False
         assert len(capture.received) == 1
         first_sig = capture.received[0]["signature"]
-        first_body = json.dumps(
+        json.dumps(
             capture.received[0]["body"], default=str, separators=(",", ":")
         ).encode("utf-8")
         # Note: process re-serializes payload; verify using the exact POST body
@@ -437,9 +436,7 @@ def test_webhook_signed_delivery_and_secret_rotation_mid_flight(queue: JobQueue)
         assert first_sig is not None and first_sig.startswith("v1=")
 
         # Rotate while delivery is pending retry.
-        rotated = queue.rotate_webhook_secret(
-            ep.id, tenant_id="t1", secret="secret-v2"
-        )
+        rotated = queue.rotate_webhook_secret(ep.id, tenant_id="t1", secret="secret-v2")
         assert rotated.secret == "secret-v2"
         still = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
         assert len(still) == 1
@@ -477,16 +474,15 @@ def test_webhook_signed_delivery_and_secret_rotation_mid_flight(queue: JobQueue)
     finally:
         capture.stop()
 
+
 def test_webhook_process_posts_valid_signature_after_rotation(queue: JobQueue):
     """End-to-end: rotate mid-retry; second POST still verifies with old secret."""
     import json
 
     from job_queue.webhooks import verify_webhook_signature
 
-    bodies: list[tuple[bytes, str | None]] = []
     capture = _WebhookCapture(fail_times=1)
     # Patch capture to record raw body+sig for verify.
-    orig_handler = capture.received
 
     try:
         ep = queue.register_webhook(
@@ -521,17 +517,16 @@ def test_webhook_process_posts_valid_signature_after_rotation(queue: JobQueue):
             assert rec["signature"] and rec["signature"].startswith("v1=")
             # Re-serialize as post_webhook does and check alpha still works
             # for both (frozen secret).
-            body = json.dumps(
-                rec["body"], default=str, separators=(",", ":")
-            ).encode("utf-8")
-            assert verify_webhook_signature(
-                "alpha", body, rec["signature"]
-            ), "retry must verify under pre-rotation secret"
-            assert not verify_webhook_signature(
-                "beta", body, rec["signature"]
+            body = json.dumps(rec["body"], default=str, separators=(",", ":")).encode(
+                "utf-8"
             )
+            assert verify_webhook_signature("alpha", body, rec["signature"]), (
+                "retry must verify under pre-rotation secret"
+            )
+            assert not verify_webhook_signature("beta", body, rec["signature"])
     finally:
         capture.stop()
+
 
 def test_job_progress_stream_multi_tenant(queue: JobQueue):
     """Live iter_job_events receives status + checkpoint across tenants."""
@@ -557,8 +552,10 @@ def test_job_progress_stream_multi_tenant(queue: JobQueue):
             with lock:
                 tenants = {e.tenant_id for e in seen if e.event != "ping"}
                 statuses = {e.status for e in seen}
-            if "ta" in tenants and "tb" in tenants and (
-                "completed" in statuses or "leased" in statuses
+            if (
+                "ta" in tenants
+                and "tb" in tenants
+                and ("completed" in statuses or "leased" in statuses)
             ):
                 if any(e.event == "checkpointed" for e in seen) or any(
                     e.status == "completed" for e in seen
@@ -578,9 +575,7 @@ def test_job_progress_stream_multi_tenant(queue: JobQueue):
         payload={"kind": "steps", "steps": 2},
         labels=["stream:a"],
     )
-    la = queue.lease(
-        tenant_id="ta", worker_id="wa", visibility_timeout_seconds=30
-    )
+    la = queue.lease(tenant_id="ta", worker_id="wa", visibility_timeout_seconds=30)
     assert la is not None
     queue.checkpoint(
         la.id,
@@ -593,9 +588,7 @@ def test_job_progress_stream_multi_tenant(queue: JobQueue):
 
     # Tenant B: simple complete
     jb = queue.enqueue(tenant_id="tb", payload={"x": 1}, labels=["stream:b"])
-    lb = queue.lease(
-        tenant_id="tb", worker_id="wb", visibility_timeout_seconds=30
-    )
+    lb = queue.lease(tenant_id="tb", worker_id="wb", visibility_timeout_seconds=30)
     assert lb is not None
     _ack(queue, lb, "wb")
 
@@ -613,6 +606,7 @@ def test_job_progress_stream_multi_tenant(queue: JobQueue):
     assert any(e.status == "completed" for e in events)
     # Isolation: no other tenant leakage in filter
     assert all(e.tenant_id in ("ta", "tb") for e in events)
+
 
 def test_job_progress_stream_job_filter_and_snapshot(queue: JobQueue):
     j1 = queue.enqueue(tenant_id="t1", payload={"n": 1}, labels=["watch"])
@@ -636,6 +630,7 @@ def test_job_progress_stream_job_filter_and_snapshot(queue: JobQueue):
     assert all(e.job_id == j1.id for e in snaps)
     # j2 not in snapshot filter
     assert not any(e.job_id == j2.id for e in snaps)
+
 
 def test_job_progress_stream_no_missed_completion_race(queue: JobQueue):
     """LISTEN before snapshot: completion between snapshot and listen is not lost.
@@ -691,6 +686,7 @@ def test_job_progress_stream_no_missed_completion_race(queue: JobQueue):
         with lock:
             assert any(e.status == "completed" for e in events)
 
+
 def test_job_progress_stream_completion_during_snapshot_buffered(queue: JobQueue):
     """If job finishes while snapshot is loading, buffered NOTIFY still delivers."""
     j = queue.enqueue(tenant_id="t1", payload={"x": 1})
@@ -728,11 +724,10 @@ def test_job_progress_stream_completion_during_snapshot_buffered(queue: JobQueue
     th.start()
     time.sleep(0.02)
     _ack(queue, leased, "buf-w", result={"done": True})
-    assert seen_completed.wait(5.0), [
-        (e.event, e.status, e.snapshot) for e in events
-    ]
+    assert seen_completed.wait(5.0), [(e.event, e.status, e.snapshot) for e in events]
     stop.set()
     th.join(timeout=2)
+
 
 def test_job_progress_stream_snapshot_paginates_beyond_500(queue: JobQueue):
     """Tenant-wide subscribe must not silently drop jobs past the first list page."""
@@ -752,6 +747,7 @@ def test_job_progress_stream_snapshot_paginates_beyond_500(queue: JobQueue):
     assert len(snaps) == 520
     assert set(snaps) == set(ids)
 
+
 def test_job_progress_stream_snapshot_respects_max_snapshot_jobs(queue: JobQueue):
     """Memory guard: tenant-wide snapshots stop after max_snapshot_jobs."""
     for i in range(30):
@@ -769,4 +765,3 @@ def test_job_progress_stream_snapshot_respects_max_snapshot_jobs(queue: JobQueue
         if ev.snapshot:
             snaps.append(ev.job_id)
     assert len(snaps) == 12
-

@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, Worker
 
 from tests.helpers_queue import (
     _ack,
@@ -20,8 +19,10 @@ from tests.helpers_queue import (
 # Dead letter inspect + replay
 # ---------------------------------------------------------------------------
 
+
 def test_list_dead_letters_empty(queue: JobQueue):
     assert queue.list_dead_letters(tenant_id="t1") == []
+
 
 def test_list_dead_letters_returns_dead_jobs(queue: JobQueue):
     d1 = _drive_to_dead(queue, tenant_id="t1", payload={"n": 1})
@@ -36,6 +37,7 @@ def test_list_dead_letters_returns_dead_jobs(queue: JobQueue):
     assert all(j.status == JobStatus.DEAD for j in dead)
     assert all(j.last_error is not None for j in dead)
 
+
 def test_list_dead_letters_tenant_isolation(queue: JobQueue):
     a = _drive_to_dead(queue, tenant_id="alpha", payload={"t": "a"})
     b = _drive_to_dead(queue, tenant_id="beta", payload={"t": "b"})
@@ -44,6 +46,7 @@ def test_list_dead_letters_tenant_isolation(queue: JobQueue):
     only_b = queue.list_dead_letters(tenant_id="beta")
     assert [j.id for j in only_a] == [a.id]
     assert [j.id for j in only_b] == [b.id]
+
 
 def test_list_dead_letters_filter_queue_name_and_paging(queue: JobQueue):
     email = _drive_to_dead(
@@ -66,6 +69,7 @@ def test_list_dead_letters_filter_queue_name_and_paging(queue: JobQueue):
     assert len(page3) == 1
     all_ids = [j.id for j in page1 + page2 + page3]
     assert len(all_ids) == len(set(all_ids)) == 5
+
 
 def test_replay_dead_letter_makes_job_claimable(queue: JobQueue):
     from job_queue import ReplayError  # noqa: F401
@@ -91,6 +95,7 @@ def test_replay_dead_letter_makes_job_claimable(queue: JobQueue):
     _ack(queue, leased, "rescuer")
     assert queue.get(dead.id, tenant_id="t1").status == JobStatus.COMPLETED
 
+
 def test_replay_dead_letter_clear_error_and_custom_max_attempts(queue: JobQueue):
     dead = _drive_to_dead(queue, tenant_id="t1", payload={}, max_attempts=1)
     replayed = queue.replay_dead_letter(
@@ -103,11 +108,10 @@ def test_replay_dead_letter_clear_error_and_custom_max_attempts(queue: JobQueue)
     assert replayed.max_attempts == 5
     assert replayed.attempts == 0
 
+
 def test_replay_dead_letter_with_delay(queue: JobQueue):
     dead = _drive_to_dead(queue, tenant_id="t1", payload={"later": True})
-    replayed = queue.replay_dead_letter(
-        dead.id, tenant_id="t1", delay_seconds=2
-    )
+    replayed = queue.replay_dead_letter(dead.id, tenant_id="t1", delay_seconds=2)
     assert replayed.status == JobStatus.PENDING
     assert queue.lease(tenant_id="t1", worker_id="w1") is None
 
@@ -115,6 +119,7 @@ def test_replay_dead_letter_with_delay(queue: JobQueue):
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None
     assert leased.id == dead.id
+
 
 def test_replay_rejects_non_dead_and_cross_tenant(queue: JobQueue):
     from job_queue import ReplayError
@@ -135,16 +140,13 @@ def test_replay_rejects_non_dead_and_cross_tenant(queue: JobQueue):
     with pytest.raises(ReplayError, match="not found"):
         queue.replay_dead_letter(uuid4(), tenant_id="t1")
 
+
 def test_replay_dedupe_conflict(queue: JobQueue):
     from job_queue import ReplayError
 
-    dead = _drive_to_dead(
-        queue, tenant_id="t1", payload={"v": 1}, dedupe_key="shared"
-    )
+    dead = _drive_to_dead(queue, tenant_id="t1", payload={"v": 1}, dedupe_key="shared")
     # Active job holds the same dedupe key.
-    live = queue.enqueue(
-        tenant_id="t1", payload={"v": 2}, dedupe_key="shared"
-    )
+    live = queue.enqueue(tenant_id="t1", payload={"v": 2}, dedupe_key="shared")
     assert live.status == JobStatus.PENDING
 
     with pytest.raises(ReplayError, match="dedupe_key"):
@@ -157,6 +159,7 @@ def test_replay_dedupe_conflict(queue: JobQueue):
 
     replayed = queue.replay_dead_letter(dead.id, tenant_id="t1")
     assert replayed.status == JobStatus.PENDING
+
 
 def test_replay_dead_letters_bulk_by_ids_and_filter(queue: JobQueue):
     d1 = _drive_to_dead(queue, tenant_id="t1", payload={"i": 1}, queue_name="a")
@@ -180,6 +183,7 @@ def test_replay_dead_letters_bulk_by_ids_and_filter(queue: JobQueue):
     assert queue.count(tenant_id="t1", status=JobStatus.DEAD) == 0
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) >= 3
 
+
 def test_replay_dead_letters_limit(queue: JobQueue):
     for i in range(4):
         _drive_to_dead(queue, tenant_id="t1", payload={"i": i})
@@ -192,11 +196,10 @@ def test_replay_dead_letters_limit(queue: JobQueue):
     assert len(second_batch) == 2
     assert queue.count(tenant_id="t1", status=JobStatus.DEAD) == 0
 
+
 def test_worker_processes_replayed_dead_letter(queue: JobQueue):
     """End-to-end: dead → list → replay → worker completes."""
-    dead = _drive_to_dead(
-        queue, tenant_id="t1", payload={"x": 99}, max_attempts=1
-    )
+    dead = _drive_to_dead(queue, tenant_id="t1", payload={"x": 99}, max_attempts=1)
     listed = queue.list_dead_letters(tenant_id="t1")
     assert len(listed) == 1
     assert listed[0].id == dead.id
@@ -214,6 +217,7 @@ def test_worker_processes_replayed_dead_letter(queue: JobQueue):
     assert seen == [99]
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
     assert queue.list_dead_letters(tenant_id="t1") == []
+
 
 def test_replay_dedupe_race_with_concurrent_enqueue(queue: JobQueue):
     """Replay vs enqueue on the same dedupe key must not leak unique_violation.
@@ -272,9 +276,7 @@ def test_replay_dedupe_race_with_concurrent_enqueue(queue: JobQueue):
             record_error(exc)
 
     threads = [threading.Thread(target=replayer) for _ in range(n_replay)]
-    threads += [
-        threading.Thread(target=enqueuer, args=(i,)) for i in range(n_enqueue)
-    ]
+    threads += [threading.Thread(target=enqueuer, args=(i,)) for i in range(n_enqueue)]
     for t in threads:
         t.start()
     for t in threads:
@@ -322,4 +324,3 @@ def test_replay_dedupe_race_with_concurrent_enqueue(queue: JobQueue):
         assert still is not None
         # Either still dead, or if somehow replayed only one active exists above.
         assert still.status in (JobStatus.DEAD, JobStatus.PENDING, JobStatus.LEASED)
-

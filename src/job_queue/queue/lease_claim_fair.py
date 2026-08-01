@@ -1,79 +1,21 @@
 """JobQueue fair multi-tenant lease claim."""
+
 from __future__ import annotations
 
-import json
-
-from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
-from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
-
-from job_queue.db import init_schema, transaction
+from job_queue.db import transaction
 from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
     Job,
-    JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
     JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
 )
 from job_queue.queue._common import (
-    JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
     _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
     _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
-    _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
-    LeaseError,
-    MergeError,
-    RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
-    SpawnError,
     _SkipLeaseCandidate,
-    _as_utc,
-    _normalize_labels,
-    _normalize_status_filter,
-    _row_to_job,
-    _row_to_schedule,
     _utcnow,
-    compute_retry_backoff_seconds,
 )
 
 
@@ -131,10 +73,7 @@ class LeaseClaimFairMixin:
                     claimed.append(job)
             except _SkipLeaseCandidate as skip:
                 skips += 1
-                if (
-                    skip.tenant_id
-                    and skip.reason == "tenant lease rate limited"
-                ):
+                if skip.tenant_id and skip.reason == "tenant lease rate limited":
                     rate_limited_tenants.add(skip.tenant_id)
                 continue
         return claimed
@@ -243,9 +182,7 @@ class LeaseClaimFairMixin:
             (candidate["tenant_id"],),
         )
         if self._is_tenant_paused(conn, candidate["tenant_id"]):
-            raise _SkipLeaseCandidate(
-                "tenant paused", tenant_id=candidate["tenant_id"]
-            )
+            raise _SkipLeaseCandidate("tenant paused", tenant_id=candidate["tenant_id"])
         if candidate["status"] == JobStatus.PENDING.value:
             limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
             leased_count = self._count_leased(conn, candidate["tenant_id"])
@@ -258,9 +195,7 @@ class LeaseClaimFairMixin:
                     now=now,
                     urgent_hint=candidate,
                 ):
-                    leased_count = self._count_leased(
-                        conn, candidate["tenant_id"]
-                    )
+                    leased_count = self._count_leased(conn, candidate["tenant_id"])
                 if leased_count >= limit:
                     raise _SkipLeaseCandidate(
                         "tenant at concurrency limit",
@@ -268,9 +203,7 @@ class LeaseClaimFairMixin:
                     )
             # Token-bucket lease rate: skip + rotate LRS so other tenants
             # keep getting work while this tenant waits for tokens.
-            if not self._try_consume_lease_rate(
-                conn, candidate["tenant_id"], now=now
-            ):
+            if not self._try_consume_lease_rate(conn, candidate["tenant_id"], now=now):
                 conn.execute(
                     """
                     INSERT INTO tenant_fairness (tenant_id, last_lease_at)

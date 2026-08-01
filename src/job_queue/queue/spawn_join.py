@@ -1,77 +1,20 @@
 """JobQueue spawn join internals: wake/resume/fail parent, expire await-children."""
+
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from job_queue.db import init_schema, transaction
 from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
     Job,
-    JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
     JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
 )
 from job_queue.queue._common import (
-    JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
-    _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
     _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
-    _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
-    LeaseError,
-    MergeError,
-    RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
-    SpawnError,
-    _SkipLeaseCandidate,
-    _as_utc,
-    _normalize_labels,
-    _normalize_status_filter,
     _row_to_job,
-    _row_to_schedule,
-    _utcnow,
-    compute_retry_backoff_seconds,
 )
 
 
@@ -108,9 +51,7 @@ class SpawnJoinMixin:
         waiting = list(parent.get("waiting_on") or [])
         if not waiting:
             # Nothing to wait on — treat as joined so parent is not stuck.
-            self._resume_parent_join_locked(
-                conn, parent=parent, now=now, child_ids=[]
-            )
+            self._resume_parent_join_locked(conn, parent=parent, now=now, child_ids=[])
             return
 
         rows = conn.execute(
@@ -164,13 +105,8 @@ class SpawnJoinMixin:
 
         if failed:
             first = failed[0]
-            err = (
-                f"child job {first['id']} ended as {first['status']}"
-                + (
-                    f": {first['last_error']}"
-                    if first.get("last_error")
-                    else ""
-                )
+            err = f"child job {first['id']} ended as {first['status']}" + (
+                f": {first['last_error']}" if first.get("last_error") else ""
             )
             self._fail_parent_join_locked(
                 conn,
@@ -185,9 +121,7 @@ class SpawnJoinMixin:
             return
 
         # All children completed.
-        self._resume_parent_join_locked(
-            conn, parent=parent, now=now, child_ids=waiting
-        )
+        self._resume_parent_join_locked(conn, parent=parent, now=now, child_ids=waiting)
 
     def _resume_parent_join_locked(
         self,

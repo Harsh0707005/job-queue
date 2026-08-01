@@ -1,79 +1,13 @@
 """JobQueue lease rate-limit domain: set/get/consume claim rate limits."""
+
 from __future__ import annotations
 
-import json
-
-from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
-from uuid import UUID, uuid4
 
-from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
-
-from job_queue.db import init_schema, transaction
-from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
-    Job,
-    JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
-    JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
-)
+from job_queue.db import transaction
 from job_queue.queue._common import (
-    JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
-    _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
-    _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
-    _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
-    LeaseError,
-    MergeError,
-    RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
-    SpawnError,
-    _SkipLeaseCandidate,
-    _as_utc,
-    _normalize_labels,
-    _normalize_status_filter,
-    _row_to_job,
-    _row_to_schedule,
     _utcnow,
-    compute_retry_backoff_seconds,
 )
 
 
@@ -140,9 +74,7 @@ class LeaseRateMixin:
                 (tenant_id, rate, burst_n, float(burst_n), now, now),
             )
 
-    def get_lease_rate_limit(
-        self, tenant_id: str
-    ) -> tuple[float | None, int | None]:
+    def get_lease_rate_limit(self, tenant_id: str) -> tuple[float | None, int | None]:
         """Return ``(per_second, burst)`` or ``(None, None)`` if unlimited."""
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -158,9 +90,7 @@ class LeaseRateMixin:
             if row is None or row["lease_rate_per_sec"] is None:
                 return None, None
             return float(row["lease_rate_per_sec"]), (
-                int(row["lease_burst"])
-                if row["lease_burst"] is not None
-                else None
+                int(row["lease_burst"]) if row["lease_burst"] is not None else None
             )
 
     def _try_consume_lease_rate(

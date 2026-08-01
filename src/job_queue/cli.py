@@ -17,9 +17,8 @@ def _resolve_dsn(explicit: str | None) -> str:
             "database DSN required: pass --dsn or set JOB_QUEUE_DSN / DATABASE_URL"
         )
     # Accept SQLAlchemy-style driver URLs if present.
-    return (
-        dsn.replace("postgresql+psycopg://", "postgresql://", 1)
-        .replace("postgresql+psycopg2://", "postgresql://", 1)
+    return dsn.replace("postgresql+psycopg://", "postgresql://", 1).replace(
+        "postgresql+psycopg2://", "postgresql://", 1
     )
 
 
@@ -81,9 +80,7 @@ def _format_table(rows: Sequence[TenantStats]) -> str:
     table_rows: list[tuple[str, ...]] = [headers]
     for s in rows:
         limit = (
-            str(s.max_concurrent_leases)
-            if s.max_concurrent_leases is not None
-            else "-"
+            str(s.max_concurrent_leases) if s.max_concurrent_leases is not None else "-"
         )
         table_rows.append(
             (
@@ -101,9 +98,7 @@ def _format_table(rows: Sequence[TenantStats]) -> str:
             )
         )
 
-    widths = [
-        max(len(row[i]) for row in table_rows) for i in range(len(headers))
-    ]
+    widths = [max(len(row[i]) for row in table_rows) for i in range(len(headers))]
     lines: list[str] = []
     for idx, row in enumerate(table_rows):
         line = "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
@@ -126,9 +121,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
                 if not all_stats:
                     print("(no tenants)")
                 else:
-                    print(
-                        "\n\n".join(_format_stats(s) for s in all_stats)
-                    )
+                    print("\n\n".join(_format_stats(s) for s in all_stats))
             else:
                 print(_format_table(all_stats))
     finally:

@@ -369,7 +369,6 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_dead_ret_check CHECK 
     dead_retention_seconds IS NULL OR dead_retention_seconds >= -1
 );
 
-
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_rate_per_sec DOUBLE PRECISION;
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_burst INTEGER;
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_tokens DOUBLE PRECISION;

@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseError
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +13,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Multi-tenant isolation
 # ---------------------------------------------------------------------------
+
 
 def test_tenants_are_isolated(queue: JobQueue):
     a = queue.enqueue(tenant_id="alpha", payload={"who": "a"})
@@ -30,10 +26,12 @@ def test_tenants_are_isolated(queue: JobQueue):
     assert leased_b is not None and leased_b.id == b.id
     assert queue.lease(tenant_id="alpha", worker_id="w2") is None
 
+
 def test_cross_tenant_get_returns_none(queue: JobQueue):
     job = queue.enqueue(tenant_id="alpha", payload={"secret": True})
     assert queue.get(job.id, tenant_id="alpha") is not None
     assert queue.get(job.id, tenant_id="beta") is None
+
 
 def test_cross_tenant_ack_heartbeat_nack_rejected(queue: JobQueue):
     """Unrelated tenant cannot heartbeat/ack/nack even with a valid lease token."""
@@ -92,6 +90,7 @@ def test_cross_tenant_ack_heartbeat_nack_rejected(queue: JobQueue):
     assert final is not None
     assert final.status == JobStatus.COMPLETED
 
+
 def test_queue_name_isolation(queue: JobQueue):
     queue.enqueue(tenant_id="t1", queue_name="email", payload={"t": "e"})
     queue.enqueue(tenant_id="t1", queue_name="sms", payload={"t": "s"})
@@ -103,4 +102,3 @@ def test_queue_name_isolation(queue: JobQueue):
     sms = queue.lease(tenant_id="t1", worker_id="w1", queue_name="sms")
     assert sms is not None
     assert sms.payload["t"] == "s"
-

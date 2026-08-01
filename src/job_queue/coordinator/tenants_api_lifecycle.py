@@ -1,54 +1,14 @@
 """Coordinator tenant pause/offboard/merge/residue API handlers."""
+
 from __future__ import annotations
 
-from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
-    _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
-)
-
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
-from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
-    job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
-    schedule_to_dict,
     audit_consistency_report_to_dict,
     job_audit_event_to_dict,
-    job_side_effect_to_dict,
-    preempt_result_to_dict,
     tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
-)
-from job_queue.models import JobStatus
-from job_queue.queue import (
-    CancelError,
-    JobQueue,
-    LeaseError,
-    RateLimitError,
-    ReplayError,
-    ScheduleError,
 )
 
 
@@ -140,9 +100,7 @@ class TenantsApiLifecycleMixin:
         if not target_tenant_id:
             return 400, {"error": "target_tenant_id required"}
         try:
-            result = self.queue.merge_tenant(
-                source_tenant_id, str(target_tenant_id)
-            )
+            result = self.queue.merge_tenant(source_tenant_id, str(target_tenant_id))
         except ValueError as exc:
             return 400, {"error": str(exc)}
         except Exception as exc:

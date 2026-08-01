@@ -1,24 +1,11 @@
 """nodes."""
-from __future__ import annotations
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import socket
 import threading
-import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Any
-from uuid import UUID
-
-from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
-
 
 from job_queue.remote.client import CoordinatorClient
 from job_queue.remote.worker_agent import RemoteWorkerAgent
@@ -51,9 +38,7 @@ class CleanerNode:
             try:
                 # Drain while work remains so large terminal backlogs catch up.
                 while not self._stop.is_set():
-                    result = self.client.purge_expired_jobs(
-                        limit=self.batch_limit
-                    )
+                    result = self.client.purge_expired_jobs(limit=self.batch_limit)
                     n = int(result.get("total_deleted") or 0)
                     if n:
                         self.deleted += n
@@ -241,7 +226,9 @@ def worker_main(argv: list[str] | None = None) -> int:
     p.add_argument("--coordinator", default=_coord_url())
     p.add_argument("--worker-id", default=_env("WORKER_ID"))
     p.add_argument("--tenant-id", default=_env("TENANT_ID"))  # empty => fair
-    p.add_argument("--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5"))
+    p.add_argument(
+        "--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5")
+    )
     p.add_argument(
         "--visibility-timeout",
         type=int,
@@ -317,7 +304,9 @@ def scheduler_main(argv: list[str] | None = None) -> int:
     )
     p = argparse.ArgumentParser(prog="job-queue-scheduler-node")
     p.add_argument("--coordinator", default=_coord_url())
-    p.add_argument("--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5"))
+    p.add_argument(
+        "--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5")
+    )
     args = p.parse_args(argv)
     client = CoordinatorClient(args.coordinator)
     client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
@@ -374,7 +363,9 @@ def webhook_main(argv: list[str] | None = None) -> int:
     )
     p = argparse.ArgumentParser(prog="job-queue-webhook-node")
     p.add_argument("--coordinator", default=_coord_url())
-    p.add_argument("--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5"))
+    p.add_argument(
+        "--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5")
+    )
     p.add_argument(
         "--batch-limit",
         type=int,
@@ -400,5 +391,3 @@ def webhook_main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         node.stop()
     return 0
-
-

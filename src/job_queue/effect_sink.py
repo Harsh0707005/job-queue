@@ -55,9 +55,7 @@ class EffectSinkState:
         with self._lock:
             multi = {k: v for k, v in self.by_key.items() if v > 1}
             multi_workers = {
-                k: sorted(v)
-                for k, v in self.workers_seen.items()
-                if len(v) > 1
+                k: sorted(v) for k, v in self.workers_seen.items() if len(v) > 1
             }
             return {
                 "total_posts": self.total_posts,
@@ -107,7 +105,9 @@ def serve_sink(*, host: str = "0.0.0.0", port: int = 8091) -> None:
             if self.path.split("?", 1)[0] not in ("/effect", "/v1/effect", "/"):
                 self._send(404, {"error": "not found"})
                 return
-            out = state.record(payload if isinstance(payload, dict) else {}, self.headers)
+            out = state.record(
+                payload if isinstance(payload, dict) else {}, self.headers
+            )
             # Always 200 so retries are safe; accepted=false means duplicate key.
             self._send(200, out)
 

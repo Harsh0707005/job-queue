@@ -1,79 +1,24 @@
 """JobQueue audit append: snapshots, append, progress notify."""
+
 from __future__ import annotations
 
 import json
 
-from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from job_queue.db import init_schema, transaction
 from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
-    Job,
     JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
     JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
 )
 from job_queue.queue._common import (
     JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
-    _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
-    _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
     _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
-    LeaseError,
-    MergeError,
-    RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
-    SpawnError,
-    _SkipLeaseCandidate,
     _as_utc,
-    _normalize_labels,
-    _normalize_status_filter,
-    _row_to_job,
-    _row_to_schedule,
     _utcnow,
-    compute_retry_backoff_seconds,
 )
 
 
@@ -131,12 +76,8 @@ class AuditAppendMixin:
             "priority": int(row["priority"] or 0),
             "attempts": int(row["attempts"] or 0),
             "max_attempts": int(row["max_attempts"] or 3),
-            "visibility_timeout_seconds": int(
-                row["visibility_timeout_seconds"] or 30
-            ),
-            "max_runtime_seconds": int(
-                row.get("max_runtime_seconds") or 3600
-            ),
+            "visibility_timeout_seconds": int(row["visibility_timeout_seconds"] or 30),
+            "max_runtime_seconds": int(row.get("max_runtime_seconds") or 3600),
             "retry_backoff_base_seconds": int(
                 row.get("retry_backoff_base_seconds") or 1
             ),
@@ -165,9 +106,7 @@ class AuditAppendMixin:
                 else int(row["estimated_duration_seconds"])
             ),
             "preemptible": (
-                True
-                if row.get("preemptible") is None
-                else bool(row["preemptible"])
+                True if row.get("preemptible") is None else bool(row["preemptible"])
             ),
             "preempt_count": int(row.get("preempt_count") or 0),
             "last_preempted_at": _dt(row.get("last_preempted_at")),
@@ -280,10 +219,10 @@ class AuditAppendMixin:
             "attempts": int(job_row.get("attempts") or 0),
             "labels": list(labs)[:32],
             "checkpoint": cp,
-            "result": result if job_row["status"] == JobStatus.COMPLETED.value else None,
-            "last_error": (
-                (job_row.get("last_error") or "")[:500] or None
-            ),
+            "result": result
+            if job_row["status"] == JobStatus.COMPLETED.value
+            else None,
+            "last_error": ((job_row.get("last_error") or "")[:500] or None),
             "actor": actor,
             "ts": now.isoformat(),
             "snapshot": False,
@@ -291,15 +230,9 @@ class AuditAppendMixin:
         raw = json.dumps(payload, default=str, separators=(",", ":"))
         if len(raw.encode("utf-8")) > _NOTIFY_MAX_BYTES:
             # Drop large fields first.
-            payload["checkpoint"] = (
-                {"_truncated": True}
-                if cp is not None
-                else None
-            )
+            payload["checkpoint"] = {"_truncated": True} if cp is not None else None
             payload["result"] = (
-                {"_truncated": True}
-                if payload.get("result") is not None
-                else None
+                {"_truncated": True} if payload.get("result") is not None else None
             )
             raw = json.dumps(payload, default=str, separators=(",", ":"))
             if len(raw.encode("utf-8")) > _NOTIFY_MAX_BYTES:

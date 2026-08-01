@@ -1,24 +1,15 @@
 """RemoteWorkerAgent._do_work."""
+
 from __future__ import annotations
 
-import json
 import logging
-import os
 import socket
 import threading
 import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Any
-from uuid import UUID
 
-from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
-
-
-from job_queue.remote.client import CoordinatorClient, _ActiveRemoteJob
+from job_queue.models import Job
+from job_queue.queue import ApprovalRequested, LeaseError
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +44,7 @@ class RemoteWorkerDoWorkMixin:
                 ms = 20
             if ms > 0:
                 time.sleep(min(ms, 5000) / 1000.0)
-            raise RuntimeError(
-                str(payload.get("error") or "forced failure")
-            )
+            raise RuntimeError(str(payload.get("error") or "forced failure"))
 
         steps_raw = payload.get("steps")
         use_steps = steps_raw is not None or kind == "steps"
@@ -178,20 +167,14 @@ class RemoteWorkerDoWorkMixin:
         # Optional payload sleep for cancel/long-job soaks; cooperative cancel.
         sleep_ms = 0
         try:
-            sleep_ms = int(
-                payload.get("sleep_ms")
-                or payload.get("ms")
-                or 0
-            )
+            sleep_ms = int(payload.get("sleep_ms") or payload.get("ms") or 0)
         except (TypeError, ValueError):
             sleep_ms = 0
         if sleep_ms > 0:
             deadline = time.time() + (sleep_ms / 1000.0)
             while time.time() < deadline:
                 if lease_lost.is_set():
-                    raise LeaseError(
-                        f"job {job.id} cancelled/lease lost during work"
-                    )
+                    raise LeaseError(f"job {job.id} cancelled/lease lost during work")
                 time.sleep(min(0.1, max(0.01, deadline - time.time())))
         else:
             time.sleep(0.02)

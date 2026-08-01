@@ -1,22 +1,16 @@
 """RemoteWorkerAgent loop: init, drain, run, process, release helpers."""
+
 from __future__ import annotations
 
-import json
 import logging
-import os
 import socket
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from typing import Any
-from uuid import UUID
 
-from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
+from job_queue.models import DrainResult, Job
 from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
-
 
 from job_queue.remote.client import CoordinatorClient, _ActiveRemoteJob
 
@@ -37,7 +31,9 @@ class RemoteWorkerLoopMixin:
         drain_timeout_seconds: float = 60.0,
     ) -> None:
         self.client = client
-        self.worker_id = worker_id or f"remote-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+        self.worker_id = (
+            worker_id or f"remote-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+        )
         self.tenant_id = tenant_id  # None => fair multi-tenant
         self.poll_interval_seconds = poll_interval_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
@@ -151,9 +147,7 @@ class RemoteWorkerLoopMixin:
                 self._stop.wait(self.poll_interval_seconds)
                 continue
 
-            logger.debug(
-                "worker %s leased batch of %d", self.worker_id, len(jobs)
-            )
+            logger.debug("worker %s leased batch of %d", self.worker_id, len(jobs))
             with self._lease_lock:
                 for job in jobs:
                     self._held[job.id] = job

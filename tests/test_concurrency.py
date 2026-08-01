@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +16,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Per-tenant concurrency limits
 # ---------------------------------------------------------------------------
+
 
 def test_concurrency_limit_caps_leased_jobs(queue: JobQueue):
     queue.set_concurrency_limit("t1", 2)
@@ -39,6 +38,7 @@ def test_concurrency_limit_caps_leased_jobs(queue: JobQueue):
     assert j4 is not None
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 2
 
+
 def test_concurrency_limit_is_per_tenant(queue: JobQueue):
     queue.set_concurrency_limit("alpha", 1)
     queue.set_concurrency_limit("beta", 1)
@@ -55,6 +55,7 @@ def test_concurrency_limit_is_per_tenant(queue: JobQueue):
     assert a2 is None  # alpha at cap
     assert b1 is not None  # beta independent
 
+
 def test_concurrency_limit_tenant_wide_across_queues(queue: JobQueue):
     queue.set_concurrency_limit("t1", 1)
     queue.enqueue(tenant_id="t1", queue_name="email", payload={"q": "e"})
@@ -64,6 +65,7 @@ def test_concurrency_limit_tenant_wide_across_queues(queue: JobQueue):
     s = queue.lease(tenant_id="t1", worker_id="w2", queue_name="sms")
     assert e is not None
     assert s is None  # shared tenant cap
+
 
 def test_clear_concurrency_limit(queue: JobQueue):
     queue.set_concurrency_limit("t1", 1)
@@ -75,6 +77,7 @@ def test_clear_concurrency_limit(queue: JobQueue):
     queue.set_concurrency_limit("t1", None)
     assert queue.get_concurrency_limit("t1") is None
     assert queue.lease(tenant_id="t1", worker_id="w2") is not None
+
 
 def test_concurrent_lease_respects_tenant_cap(queue: JobQueue):
     """Many workers race; leased count never exceeds the tenant cap."""
@@ -103,6 +106,7 @@ def test_concurrent_lease_respects_tenant_cap(queue: JobQueue):
     assert len(set(leased_ids)) == 3
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 3
 
+
 def test_pending_limit_rejects_enqueue_at_cap(queue: JobQueue):
     queue.set_pending_limit("t1", 2)
     assert queue.get_pending_limit("t1") == 2
@@ -120,6 +124,7 @@ def test_pending_limit_rejects_enqueue_at_cap(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"i": 4})
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 2
 
+
 def test_pending_limit_is_per_tenant(queue: JobQueue):
     queue.set_pending_limit("alpha", 1)
     queue.set_pending_limit("beta", 1)
@@ -129,6 +134,7 @@ def test_pending_limit_is_per_tenant(queue: JobQueue):
         queue.enqueue(tenant_id="alpha", payload={"a": 2})
     with pytest.raises(ValueError, match="pending job cap"):
         queue.enqueue(tenant_id="beta", payload={"b": 2})
+
 
 def test_pending_limit_clear(queue: JobQueue):
     queue.set_pending_limit("t1", 1)
@@ -140,6 +146,7 @@ def test_pending_limit_clear(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"i": 2})
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 2
 
+
 def test_pending_limit_dedupe_existing_does_not_fail(queue: JobQueue):
     queue.set_pending_limit("t1", 1)
     j1 = queue.enqueue(tenant_id="t1", payload={"i": 1}, dedupe_key="k1")
@@ -149,6 +156,7 @@ def test_pending_limit_dedupe_existing_does_not_fail(queue: JobQueue):
     with pytest.raises(ValueError, match="pending job cap"):
         queue.enqueue(tenant_id="t1", payload={"i": 2}, dedupe_key="k2")
 
+
 def test_pending_limit_tenant_stats(queue: JobQueue):
     queue.set_pending_limit("t1", 5)
     queue.set_concurrency_limit("t1", 2)
@@ -157,6 +165,7 @@ def test_pending_limit_tenant_stats(queue: JobQueue):
     assert stats.max_concurrent_leases == 2
     assert stats.enqueue_rate_per_sec is None
     assert stats.lease_rate_per_sec is None
+
 
 def test_enqueue_rate_limit_rejects_burst_flood(queue: JobQueue):
     from job_queue import RateLimitError
@@ -178,6 +187,7 @@ def test_enqueue_rate_limit_rejects_burst_flood(queue: JobQueue):
     time.sleep(0.6)
     queue.enqueue(tenant_id="noisy", payload={"i": 4})
 
+
 def test_enqueue_rate_limit_clear(queue: JobQueue):
     from job_queue import RateLimitError
 
@@ -188,6 +198,7 @@ def test_enqueue_rate_limit_clear(queue: JobQueue):
     queue.set_enqueue_rate_limit("t1", None)
     assert queue.get_enqueue_rate_limit("t1") == (None, None)
     queue.enqueue(tenant_id="t1", payload={"i": 2})
+
 
 def test_lease_rate_limit_scoped_partial_batch(queue: JobQueue):
     queue.set_lease_rate_limit("t1", 1.0, burst=1)
@@ -201,6 +212,7 @@ def test_lease_rate_limit_scoped_partial_batch(queue: JobQueue):
     time.sleep(1.1)
     third = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=5)
     assert len(third) == 1
+
 
 def test_lease_rate_limit_fair_rotates_to_other_tenants(queue: JobQueue):
     """Noisy tenant at lease rate cap does not starve fair multi-tenant lease."""
@@ -219,6 +231,7 @@ def test_lease_rate_limit_fair_rotates_to_other_tenants(queue: JobQueue):
     assert noisy_n <= 1
     assert quiet_n >= 1
     assert "quiet" in tenants
+
 
 def test_lease_rate_limit_does_not_block_reclaim(queue: JobQueue):
     queue.set_lease_rate_limit("t1", 1.0, burst=1)
@@ -241,6 +254,7 @@ def test_lease_rate_limit_does_not_block_reclaim(queue: JobQueue):
     assert reclaimed is not None
     assert reclaimed.id == job.id
 
+
 def test_rate_limit_tenant_stats(queue: JobQueue):
     queue.set_enqueue_rate_limit("t1", 5.0, burst=10)
     queue.set_lease_rate_limit("t1", 3.0, burst=3)
@@ -249,6 +263,7 @@ def test_rate_limit_tenant_stats(queue: JobQueue):
     assert stats.enqueue_burst == 10
     assert stats.lease_rate_per_sec == 3.0
     assert stats.lease_burst == 3
+
 
 def test_concurrent_enqueue_respects_pending_cap(queue: JobQueue):
     queue.set_pending_limit("t1", 10)
@@ -278,6 +293,7 @@ def test_concurrent_enqueue_respects_pending_cap(queue: JobQueue):
     assert rejected == 10
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 10
 
+
 def test_at_limit_can_still_reclaim_expired_lease(queue: JobQueue):
     queue.set_concurrency_limit("t1", 1)
     queue.enqueue(
@@ -303,4 +319,3 @@ def test_at_limit_can_still_reclaim_expired_lease(queue: JobQueue):
     assert reclaimed.id == first.id
     assert reclaimed.leased_by == "rescuer"
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 1
-

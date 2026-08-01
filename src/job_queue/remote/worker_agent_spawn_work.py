@@ -1,26 +1,15 @@
 """RemoteWorkerAgent._do_spawn_work."""
+
 from __future__ import annotations
 
-import json
-import logging
-import os
 import socket
 import threading
 import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Any
 from uuid import UUID
 
-from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
-
-
-from job_queue.remote.client import CoordinatorClient, _ActiveRemoteJob
-
-logger = logging.getLogger(__name__)
+from job_queue.models import Job
+from job_queue.queue import ChildrenAwaited, LeaseError
 
 
 class RemoteWorkerSpawnWorkMixin:
@@ -45,12 +34,9 @@ class RemoteWorkerSpawnWorkMixin:
         ``await_children_outcome=joined`` / checkpoint phase children_joined;
         this path finishes ``after_ms`` work and acks.
         """
-        already_joined = (
-            job.await_children_outcome == "joined"
-            or (
-                isinstance(job.checkpoint, dict)
-                and job.checkpoint.get("phase") == "children_joined"
-            )
+        already_joined = job.await_children_outcome == "joined" or (
+            isinstance(job.checkpoint, dict)
+            and job.checkpoint.get("phase") == "children_joined"
         )
         if already_joined:
             after_ms = 0

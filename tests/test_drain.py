@@ -4,12 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +14,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Graceful worker drain
 # ---------------------------------------------------------------------------
+
 
 def test_release_returns_job_pending_immediately(queue: JobQueue):
     job = queue.enqueue(
@@ -48,6 +45,7 @@ def test_release_returns_job_pending_immediately(queue: JobQueue):
     assert j2 is not None and j2.id == job.id
     assert j2.leased_by == "w2"
 
+
 def test_worker_drain_finishes_in_flight(queue: JobQueue):
     from job_queue import Worker
 
@@ -77,6 +75,7 @@ def test_worker_drain_finishes_in_flight(queue: JobQueue):
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
     assert started.wait(5)
+
     # Drain while job is running; allow handler to finish.
     def _finish_soon() -> None:
         time.sleep(0.2)
@@ -90,6 +89,7 @@ def test_worker_drain_finishes_in_flight(queue: JobQueue):
     assert result.released == 0
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 0
+
 
 def test_worker_drain_timeout_releases_for_reclaim(queue: JobQueue):
     from job_queue import Worker
@@ -132,6 +132,7 @@ def test_worker_drain_timeout_releases_for_reclaim(queue: JobQueue):
     assert j2.leased_by == "other"
     _ack(queue, j2, "other")
 
+
 def test_worker_drain_stops_new_leases(queue: JobQueue):
     from job_queue import Worker
 
@@ -151,6 +152,7 @@ def test_worker_drain_stops_new_leases(queue: JobQueue):
     jobs = worker.run_batch_once()
     assert jobs == []
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+
 
 def test_worker_drain_releases_entire_batch_not_only_active(queue: JobQueue):
     """Bug: only the running job was released; rest of batch stayed leased."""
@@ -234,6 +236,7 @@ def test_worker_drain_releases_entire_batch_not_only_active(queue: JobQueue):
         _ack(queue, j, "other")
     assert claimed >= 3
 
+
 def test_worker_drain_timeout_releases_active_and_batch(queue: JobQueue):
     from job_queue import Worker
 
@@ -269,6 +272,7 @@ def test_worker_drain_timeout_releases_active_and_batch(queue: JobQueue):
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 0
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 3
 
+
 def test_worker_drain_idle_is_noop(queue: JobQueue):
     """Drain with nothing leased completes immediately."""
     from job_queue import Worker
@@ -285,6 +289,7 @@ def test_worker_drain_idle_is_noop(queue: JobQueue):
     assert result.in_flight_at_start == 0
     assert result.released == 0
     assert result.wait_seconds < 1.0
+
 
 def test_worker_drain_before_any_job_starts_releases_full_batch(queue: JobQueue):
     """If drain wins before the first handler starts, free the entire batch."""
@@ -337,6 +342,7 @@ def test_worker_drain_before_any_job_starts_releases_full_batch(queue: JobQueue)
         )
         assert j is not None
         _ack(queue, j, "other")
+
 
 def test_worker_stop_releases_queued_batch_not_active(queue: JobQueue):
     """stop() also frees leased-but-not-running batch members immediately."""
@@ -399,6 +405,7 @@ def test_worker_stop_releases_queued_batch_not_active(queue: JobQueue):
         worker._active.clear()  # type: ignore[attr-defined]
     t.join(timeout=5)
 
+
 def test_worker_drain_mid_batch_does_not_start_next_job(queue: JobQueue):
     """After releasing leftovers, the run loop must not start another batch job."""
     from job_queue import Worker
@@ -448,4 +455,3 @@ def test_worker_drain_mid_batch_does_not_start_next_job(queue: JobQueue):
     t.join(timeout=5)
     with lock:
         assert len(started_ids) == 1
-

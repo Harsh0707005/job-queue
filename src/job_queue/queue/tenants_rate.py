@@ -1,79 +1,17 @@
 """JobQueue tenant enqueue rate limits (token bucket)."""
+
 from __future__ import annotations
 
 import math
 
-from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
-from uuid import UUID, uuid4
 
-from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
-
-from job_queue.db import init_schema, transaction
-from job_queue.models import (
-    AuditConsistencyReport,
-    BulkCancelResult,
-    Job,
-    JobAuditEvent,
-    JobProgressEvent,
-    JobRetentionSettings,
-    JobSideEffect,
-    JobStatus,
-    PreemptResult,
-    RetentionPurgeResult,
-    Schedule,
-    ScheduleFire,
-    SpawnChildrenResult,
-    TenantMergeResult,
-    TenantOffboardResult,
-    TenantStats,
-    WebhookDelivery,
-    WebhookEndpoint,
-    WebhookEvent,
-)
+from job_queue.db import transaction
 from job_queue.queue._common import (
-    JOB_EVENTS_CHANNEL,
-    _ACTIVE_JOB_STATUSES,
-    _CANCELABLE_STATUSES,
-    _CANCEL_MATCHING_BATCH_DEFAULT,
-    _CANCEL_MATCHING_RETURN_CAP,
-    _DEDUPE_LOCK_CLASS,
-    _DEFAULT_ESTIMATE_SECONDS,
-    _DEPS_SATISFIED_SQL,
-    _EWMA_ALPHA,
-    _JOB_COLUMNS,
-    _MAX_LABELS,
-    _MAX_LABEL_LEN,
-    _MAX_PREEMPTS_PER_JOB,
-    _NOTIFY_MAX_BYTES,
-    _SCHEDULE_COLUMNS,
-    _SIDE_EFFECT_SELECT,
-    _TENANT_RETENTION_FOREVER,
-    _UNSET,
-    _WEBHOOK_DELIVERY_COLUMNS,
-    _WEBHOOK_ENDPOINT_COLUMNS,
-    ApprovalError,
-    ApprovalRequested,
-    CancelError,
-    ChildrenAwaited,
-    DependencyError,
-    LeaseError,
-    MergeError,
     RateLimitError,
-    RebuildError,
-    ReplayError,
-    ScheduleError,
-    SpawnError,
-    _SkipLeaseCandidate,
     _as_utc,
-    _normalize_labels,
-    _normalize_status_filter,
-    _row_to_job,
-    _row_to_schedule,
     _utcnow,
-    compute_retry_backoff_seconds,
 )
 
 
@@ -139,9 +77,7 @@ class TenantsRateMixin:
                 (tenant_id, rate, burst_n, float(burst_n), now, now),
             )
 
-    def get_enqueue_rate_limit(
-        self, tenant_id: str
-    ) -> tuple[float | None, int | None]:
+    def get_enqueue_rate_limit(self, tenant_id: str) -> tuple[float | None, int | None]:
         """Return ``(per_second, burst)`` or ``(None, None)`` if unlimited."""
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -157,9 +93,7 @@ class TenantsRateMixin:
             if row is None or row["enqueue_rate_per_sec"] is None:
                 return None, None
             return float(row["enqueue_rate_per_sec"]), (
-                int(row["enqueue_burst"])
-                if row["enqueue_burst"] is not None
-                else None
+                int(row["enqueue_burst"]) if row["enqueue_burst"] is not None else None
             )
 
     @staticmethod
@@ -201,11 +135,7 @@ class TenantsRateMixin:
             return
         raise RateLimitError(
             f"tenant {tenant_id!r} enqueue rate limit exceeded"
-            + (
-                f"; retry after ~{retry_after:.3f}s"
-                if retry_after is not None
-                else ""
-            ),
+            + (f"; retry after ~{retry_after:.3f}s" if retry_after is not None else ""),
             tenant_id=tenant_id,
             kind="enqueue",
             retry_after_seconds=retry_after,

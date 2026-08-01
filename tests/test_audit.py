@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 # ---------------------------------------------------------------------------
 # Immutable job audit stream
 # ---------------------------------------------------------------------------
+
 
 def test_audit_enqueued_leased_completed(queue: JobQueue):
     job = queue.enqueue(tenant_id="t1", payload={"a": 1})
@@ -45,6 +39,7 @@ def test_audit_enqueued_leased_completed(queue: JobQueue):
     assert report.event_count == 3
     assert report.job_status == "completed"
     assert report.audit_final_status == "completed"
+
 
 def test_audit_matches_after_nack_cancel_checkpoint(queue: JobQueue):
     job = queue.enqueue(
@@ -83,6 +78,7 @@ def test_audit_matches_after_nack_cancel_checkpoint(queue: JobQueue):
     assert final.event_type == "cancelled"
     assert final.to_status == "cancelled"
 
+
 def test_audit_tenant_scoped_and_after_seq(queue: JobQueue):
     j = queue.enqueue(tenant_id="alpha", payload={})
     queue.enqueue(tenant_id="beta", payload={})
@@ -93,6 +89,7 @@ def test_audit_tenant_scoped_and_after_seq(queue: JobQueue):
     assert more == []
     stream = queue.list_tenant_audit("alpha")
     assert any(e.job_id == j.id for e in stream)
+
 
 def test_verify_tenant_audit_all_ok(queue: JobQueue):
     ids = []
@@ -110,6 +107,7 @@ def test_verify_tenant_audit_all_ok(queue: JobQueue):
     reports = queue.verify_tenant_audit("t1")
     assert len(reports) == 5
     assert all(r.ok for r in reports)
+
 
 def test_audit_history_survives_tenant_merge(queue: JobQueue):
     """After merge, target owner sees full seq including pre-merge events."""
@@ -176,4 +174,3 @@ def test_audit_history_survives_tenant_merge(queue: JobQueue):
     assert final[-1].event_type == "completed"
     assert final[-1].seq == len(final)
     assert queue.verify_job_audit(job.id, tenant_id="beta").ok
-

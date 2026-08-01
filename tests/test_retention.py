@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +14,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Terminal job retention + cleaner
 # ---------------------------------------------------------------------------
+
 
 def test_retention_default_keeps_forever(queue: JobQueue):
     settings = queue.get_job_retention()
@@ -31,6 +27,7 @@ def test_retention_default_keeps_forever(queue: JobQueue):
     purged = queue.purge_expired_jobs(limit=100)
     assert purged.total_deleted == 0
     assert queue.get(job.id, tenant_id="t1") is not None
+
 
 def test_purge_completed_after_retention(queue: JobQueue):
     queue.set_job_retention(completed_seconds=1, dead_seconds=None)
@@ -46,6 +43,7 @@ def test_purge_completed_after_retention(queue: JobQueue):
     assert result.completed_deleted == 1
     assert result.dead_deleted == 0
     assert queue.get(job.id, tenant_id="t1") is None
+
 
 def test_purge_dead_after_retention(queue: JobQueue):
     queue.set_job_retention(completed_seconds=None, dead_seconds=1)
@@ -64,6 +62,7 @@ def test_purge_dead_after_retention(queue: JobQueue):
     assert result.dead_deleted == 1
     assert queue.get(job.id, tenant_id="t1") is None
 
+
 def test_tenant_retention_override(queue: JobQueue):
     queue.set_job_retention(completed_seconds=3600, dead_seconds=3600)
     queue.set_tenant_job_retention("fast", completed_seconds=1, dead_seconds=1)
@@ -79,6 +78,7 @@ def test_tenant_retention_override(queue: JobQueue):
     assert result.completed_deleted == 1
     assert queue.get(a.id, tenant_id="fast") is None
     assert queue.get(b.id, tenant_id="slow") is not None
+
 
 def test_tenant_retention_none_means_forever_not_global(queue: JobQueue):
     """Bugfix: tenant None must not COALESCE into short global retention."""
@@ -106,20 +106,17 @@ def test_tenant_retention_none_means_forever_not_global(queue: JobQueue):
     assert result.dead_deleted == 0
     assert queue.get(job.id, tenant_id="keep") is not None
 
+
 def test_tenant_retention_none_dead_forever_not_global(queue: JobQueue):
     queue.set_job_retention(completed_seconds=1, dead_seconds=1)
-    queue.set_tenant_job_retention(
-        "keep-dead", completed_seconds=1, dead_seconds=None
-    )
+    queue.set_tenant_job_retention("keep-dead", completed_seconds=1, dead_seconds=None)
     ov = queue.get_tenant_job_retention("keep-dead")
     assert ov.completed_inherits is False
     assert ov.completed_retention_seconds == 1
     assert ov.dead_inherits is False
     assert ov.dead_retention_seconds is None  # forever
 
-    job = queue.enqueue(
-        tenant_id="keep-dead", payload={}, max_attempts=1
-    )
+    job = queue.enqueue(tenant_id="keep-dead", payload={}, max_attempts=1)
     leased = queue.lease(tenant_id="keep-dead", worker_id="w1")
     assert leased is not None
     dead = _nack(queue, leased, "w1", error="boom", requeue=True)
@@ -130,11 +127,10 @@ def test_tenant_retention_none_dead_forever_not_global(queue: JobQueue):
     assert result.dead_deleted == 0
     assert queue.get(job.id, tenant_id="keep-dead") is not None
 
+
 def test_tenant_retention_clear_inherits_global(queue: JobQueue):
     queue.set_job_retention(completed_seconds=1, dead_seconds=1)
-    queue.set_tenant_job_retention(
-        "t1", completed_seconds=None, dead_seconds=None
-    )
+    queue.set_tenant_job_retention("t1", completed_seconds=None, dead_seconds=None)
     queue.set_tenant_job_retention("t1", clear=True)
     cleared = queue.get_tenant_job_retention("t1")
     assert cleared.completed_inherits is True
@@ -148,6 +144,7 @@ def test_tenant_retention_clear_inherits_global(queue: JobQueue):
     result = queue.purge_expired_jobs()
     assert result.completed_deleted == 1
     assert queue.get(job.id, tenant_id="t1") is None
+
 
 def test_purge_completed_and_dead_independently(queue: JobQueue):
     queue.set_job_retention(completed_seconds=1, dead_seconds=3600)
@@ -165,6 +162,7 @@ def test_purge_completed_and_dead_independently(queue: JobQueue):
     assert result.dead_deleted == 0
     assert queue.get(c.id, tenant_id="t1") is None
     assert queue.get(d.id, tenant_id="t1") is not None
+
 
 def test_purge_deletes_side_effects(queue: JobQueue):
     queue.set_job_retention(completed_seconds=1, dead_seconds=1)
@@ -186,12 +184,13 @@ def test_purge_deletes_side_effects(queue: JobQueue):
     assert result.side_effects_deleted >= 1
     assert queue.list_side_effects(job.id, tenant_id="t1") == []
 
+
 def test_retention_cleaner_run_once(queue: JobQueue):
     from job_queue import RetentionCleaner
 
     queue.set_job_retention(completed_seconds=0, dead_seconds=0)
     for i in range(5):
-        j = queue.enqueue(tenant_id="t1", payload={"i": i})
+        queue.enqueue(tenant_id="t1", payload={"i": i})
         leased = queue.lease(tenant_id="t1", worker_id="w1")
         assert leased is not None
         _ack(queue, leased, "w1")
@@ -204,4 +203,3 @@ def test_retention_cleaner_run_once(queue: JobQueue):
             break
     assert total == 5
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
-

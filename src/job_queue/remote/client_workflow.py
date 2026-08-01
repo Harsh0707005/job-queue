@@ -1,21 +1,13 @@
 """CoordinatorClient workflow: side effects, approvals, spawn/join."""
+
 from __future__ import annotations
 
-import json
-import logging
-import os
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Any
 from uuid import UUID
 
 from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
+from job_queue.models import Job, SpawnChildrenResult
+
 
 class ClientWorkflowMixin:
     def begin_side_effect(
@@ -36,9 +28,7 @@ class ClientWorkflowMixin:
         }
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
-        payload = self._request(
-            "POST", f"/v1/jobs/{job_id}/side-effects/begin", body
-        )
+        payload = self._request("POST", f"/v1/jobs/{job_id}/side-effects/begin", body)
         assert payload is not None
         return payload.get("effect") or {}
 
@@ -60,9 +50,7 @@ class ClientWorkflowMixin:
         }
         if result is not None:
             body["result"] = result
-        payload = self._request(
-            "POST", f"/v1/jobs/{job_id}/side-effects", body
-        )
+        payload = self._request("POST", f"/v1/jobs/{job_id}/side-effects", body)
         assert payload is not None
         return payload.get("effect") or {}
 
@@ -112,9 +100,7 @@ class ClientWorkflowMixin:
             body["message"] = message
         if progress is not None:
             body["progress"] = progress
-        payload = self._request(
-            "POST", f"/v1/jobs/{job_id}/request-approval", body
-        )
+        payload = self._request("POST", f"/v1/jobs/{job_id}/request-approval", body)
         assert payload is not None
         return job_from_dict(payload["job"])
 
@@ -174,17 +160,13 @@ class ClientWorkflowMixin:
             body["timeout_seconds"] = timeout_seconds
         if progress is not None:
             body["progress"] = progress
-        payload = self._request(
-            "POST", f"/v1/jobs/{job_id}/spawn-children", body
-        )
+        payload = self._request("POST", f"/v1/jobs/{job_id}/spawn-children", body)
         assert payload is not None
         parent = job_from_dict(payload["parent"])
         kids = tuple(job_from_dict(c) for c in (payload.get("children") or []))
         return SpawnChildrenResult(parent=parent, children=kids)
 
-    def list_children(
-        self, job_id: UUID | str, *, tenant_id: str
-    ) -> list[Job]:
+    def list_children(self, job_id: UUID | str, *, tenant_id: str) -> list[Job]:
         payload = self._request(
             "GET", f"/v1/jobs/{job_id}/children?tenant_id={tenant_id}"
         )
@@ -197,8 +179,6 @@ class ClientWorkflowMixin:
         body: dict[str, Any] = {"limit": limit}
         if tenant_id is not None:
             body["tenant_id"] = tenant_id
-        payload = self._request(
-            "POST", "/v1/await-children/process-timeouts", body
-        )
+        payload = self._request("POST", "/v1/await-children/process-timeouts", body)
         assert payload is not None
         return [job_from_dict(j) for j in (payload.get("jobs") or [])]

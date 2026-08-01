@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
@@ -20,8 +17,9 @@ from tests.helpers_queue import (
 # Max runtime hard stop (stuck heartbeat cannot hold forever)
 # ---------------------------------------------------------------------------
 
+
 def test_heartbeat_cannot_extend_past_max_runtime(queue: JobQueue):
-    job = queue.enqueue(
+    queue.enqueue(
         tenant_id="t1",
         payload={},
         visibility_timeout_seconds=30,
@@ -64,6 +62,7 @@ def test_heartbeat_cannot_extend_past_max_runtime(queue: JobQueue):
     assert got.last_error == "max runtime exceeded"
     assert got.lease_token is None
 
+
 def test_max_runtime_dead_letters_after_max_attempts(queue: JobQueue):
     job = queue.enqueue(
         tenant_id="t1",
@@ -88,6 +87,7 @@ def test_max_runtime_dead_letters_after_max_attempts(queue: JobQueue):
     assert got.status == JobStatus.DEAD
     assert got.last_error == "max runtime exceeded"
 
+
 def test_ack_rejected_after_max_runtime(queue: JobQueue):
     queue.enqueue(
         tenant_id="t1",
@@ -108,6 +108,7 @@ def test_ack_rejected_after_max_runtime(queue: JobQueue):
             result={"late": True},
         )
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 0
+
 
 def test_worker_stopped_by_max_runtime(queue: JobQueue):
     """Worker heartbeating a long job hits max_runtime and cannot complete."""
@@ -158,9 +159,9 @@ def test_worker_stopped_by_max_runtime(queue: JobQueue):
         or queue.count(tenant_id="t1", status=JobStatus.DEAD) == 1
     )
 
+
 def test_parent_dead_cancels_running_child_and_pending_grandchild(queue: JobQueue):
     """When a mid-chain job dies, leased children are fenced and descendants cancelled."""
-    from job_queue import LeaseError
 
     root = queue.enqueue(tenant_id="t1", payload={"n": "root"})
     mid = queue.enqueue(tenant_id="t1", payload={"n": "mid"}, depends_on=root.id)
@@ -188,6 +189,7 @@ def test_parent_dead_cancels_running_child_and_pending_grandchild(queue: JobQueu
     leaf_after = queue.get(leaf.id, tenant_id="t1")
     assert leaf_after is not None
     assert leaf_after.status == JobStatus.CANCELLED
+
 
 def test_cancel_running_parent_kills_running_dependent_chain(queue: JobQueue):
     """Cancel leased mid-job: its leased child cannot finish (fence cleared)."""
@@ -222,4 +224,3 @@ def test_cancel_running_parent_kills_running_dependent_chain(queue: JobQueue):
     assert lc is not None
     assert lc.status == JobStatus.CANCELLED
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1  # only a
-

@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, LeaseError
 
 # ---------------------------------------------------------------------------
 # Once-only side effects across reclaim
 # ---------------------------------------------------------------------------
+
 
 def test_side_effect_survives_reclaim_and_skips_second_run(queue: JobQueue):
     job = queue.enqueue(
@@ -91,6 +90,7 @@ def test_side_effect_survives_reclaim_and_skips_second_run(queue: JobQueue):
             effect_key="refund",
         )
 
+
 def test_side_effect_crash_after_call_before_complete_reuses_idempotency_key(
     queue: JobQueue,
 ):
@@ -134,7 +134,9 @@ def test_side_effect_crash_after_call_before_complete_reuses_idempotency_key(
 
     first = apply_charge(idem)
     assert first["charge_id"] == "ch_1"
-    assert queue.side_effect_done(j1.id, tenant_id="t1", effect_key="charge_card") is False
+    assert (
+        queue.side_effect_done(j1.id, tenant_id="t1", effect_key="charge_card") is False
+    )
     mid = queue.get_side_effect(j1.id, tenant_id="t1", effect_key="charge_card")
     assert mid is not None and mid.status == "started"
 
@@ -169,12 +171,15 @@ def test_side_effect_crash_after_call_before_complete_reuses_idempotency_key(
     )
     assert done.status == "completed"
     assert done.result == first
-    assert queue.side_effect_done(j2.id, tenant_id="t1", effect_key="charge_card") is True
+    assert (
+        queue.side_effect_done(j2.id, tenant_id="t1", effect_key="charge_card") is True
+    )
+
 
 def test_lease_context_run_side_effect_once(queue: JobQueue):
     from job_queue.worker import LeaseContext
 
-    job = queue.enqueue(tenant_id="t1", payload={})
+    queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
     assert leased is not None
     ctx = LeaseContext(
@@ -199,6 +204,7 @@ def test_lease_context_run_side_effect_once(queue: JobQueue):
     assert len(keys) == 1
     assert keys[0] == f"{leased.id}:charge_card"
 
+
 def test_side_effect_cross_tenant_rejected(queue: JobQueue):
     job = queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w1")
@@ -212,7 +218,9 @@ def test_side_effect_cross_tenant_rejected(queue: JobQueue):
         result={"ok": True},
     )
     assert queue.side_effect_done(job.id, tenant_id="t1", effect_key="charge") is True
-    assert queue.side_effect_done(job.id, tenant_id="other", effect_key="charge") is False
+    assert (
+        queue.side_effect_done(job.id, tenant_id="other", effect_key="charge") is False
+    )
     assert queue.get_side_effect(job.id, tenant_id="other", effect_key="charge") is None
     assert queue.list_side_effects(job.id, tenant_id="other") == []
     with pytest.raises(LeaseError, match="not found for tenant"):
@@ -223,6 +231,7 @@ def test_side_effect_cross_tenant_rejected(queue: JobQueue):
             lease_token=leased.lease_token,
             effect_key="email",
         )
+
 
 def test_side_effect_merge_tenant_preserves_markers(queue: JobQueue):
     job = queue.enqueue(tenant_id="src", payload={})
@@ -250,4 +259,3 @@ def test_side_effect_merge_tenant_preserves_markers(queue: JobQueue):
     assert eff.result == {"cents": 100}
     keys = {e.effect_key for e in queue.list_side_effects(job.id, tenant_id="dst")}
     assert keys == {"charge"}
-

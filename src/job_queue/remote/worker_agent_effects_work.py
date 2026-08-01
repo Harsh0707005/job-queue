@@ -1,4 +1,5 @@
 """RemoteWorkerAgent._do_side_effects."""
+
 from __future__ import annotations
 
 import json
@@ -9,16 +10,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from typing import Any
-from uuid import UUID
 
-from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
-
-
-from job_queue.remote.client import CoordinatorClient, _ActiveRemoteJob
+from job_queue.models import Job
+from job_queue.queue import LeaseError
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +96,7 @@ class RemoteWorkerEffectsWorkMixin:
             deadline = time.time() + (max(0, effect_ms) / 1000.0)
             while time.time() < deadline:
                 if lease_lost.is_set():
-                    raise LeaseError(
-                        f"job {job.id} lease lost during effect {key}"
-                    )
+                    raise LeaseError(f"job {job.id} lease lost during effect {key}")
                 time.sleep(min(0.05, max(0.005, deadline - time.time())))
 
             idem = str(begun.get("idempotency_key") or f"{job.id}:{key}")
@@ -129,9 +122,7 @@ class RemoteWorkerEffectsWorkMixin:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     _ = resp.read()
             except Exception:
-                logger.exception(
-                    "effect sink POST failed job=%s key=%s", job.id, key
-                )
+                logger.exception("effect sink POST failed job=%s key=%s", job.id, key)
                 raise
 
             try:

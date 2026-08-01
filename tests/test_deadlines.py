@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseError
 
 from tests.helpers_queue import (
     _utcnow,
@@ -19,6 +13,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Deadlines + preemption
 # ---------------------------------------------------------------------------
+
 
 def test_deadline_preempts_low_priority_at_concurrency_cap(queue: JobQueue):
     """At cap, urgent deadline job preempts long low-urgency leased work."""
@@ -94,6 +89,7 @@ def test_deadline_preempts_low_priority_at_concurrency_cap(queue: JobQueue):
     assert resumed is not None and resumed.id == long.id
     assert resumed.checkpoint == {"step": 4, "total": 50}
 
+
 def test_process_deadlines_preempts_proactively(queue: JobQueue):
     from datetime import timedelta
     from job_queue import PreemptResult
@@ -120,6 +116,7 @@ def test_process_deadlines_preempts_proactively(queue: JobQueue):
     assert results[0].victim_job_id == low.id
     assert queue.get(low.id, tenant_id="t1").status == JobStatus.PENDING
     assert queue.count(tenant_id="t1", status=JobStatus.LEASED) == 0
+
 
 def test_no_preempt_when_can_wait_for_holder(queue: JobQueue):
     """If less-urgent work finishes before slack runs out, do not preempt."""
@@ -148,6 +145,7 @@ def test_no_preempt_when_can_wait_for_holder(queue: JobQueue):
     assert queue.lease(tenant_id="t1", worker_id="w2") is None
     assert queue.get(far.id, tenant_id="t1").status == JobStatus.PENDING
 
+
 def test_non_preemptible_not_victim(queue: JobQueue):
     from datetime import timedelta
 
@@ -168,6 +166,7 @@ def test_non_preemptible_not_victim(queue: JobQueue):
     )
     assert queue.process_deadlines(tenant_id="t1") == []
     assert queue.get(protected.id, tenant_id="t1").status == JobStatus.LEASED
+
 
 def test_preempt_count_caps_thrashing(queue: JobQueue):
     from datetime import timedelta
@@ -212,6 +211,7 @@ def test_preempt_count_caps_thrashing(queue: JobQueue):
     )
     assert queue.process_deadlines(tenant_id="t1") == []
 
+
 def test_deadline_ordering_among_pending(queue: JobQueue):
     from datetime import timedelta
 
@@ -234,4 +234,3 @@ def test_deadline_ordering_among_pending(queue: JobQueue):
     assert first is not None and first.id == soon.id
     second = queue.lease(tenant_id="t1", worker_id="w1")
     assert second is not None and second.id == late.id
-

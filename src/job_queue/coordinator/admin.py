@@ -1,72 +1,25 @@
 """Coordinator API handlers."""
+
 from __future__ import annotations
 
-from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
-    _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
-)
-
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
-from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
-    job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
     retention_purge_to_dict,
-    schedule_to_dict,
-    audit_consistency_report_to_dict,
-    job_audit_event_to_dict,
-    job_side_effect_to_dict,
-    preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
     tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
-)
-from job_queue.models import JobStatus
-from job_queue.queue import (
-    CancelError,
-    JobQueue,
-    LeaseError,
-    RateLimitError,
-    ReplayError,
-    ScheduleError,
 )
 
 
 class AdminApiMixin:
-    def _purge_expired_jobs(
-        self, body: dict[str, Any]
-    ) -> tuple[int, dict[str, Any]]:
+    def _purge_expired_jobs(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
             result = self.queue.purge_expired_jobs(
                 limit=int(body.get("limit") or 500),
-                tenant_id=(
-                    str(body["tenant_id"]) if body.get("tenant_id") else None
-                ),
+                tenant_id=(str(body["tenant_id"]) if body.get("tenant_id") else None),
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, retention_purge_to_dict(result)
-
 
     def _backlog(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:
@@ -98,17 +51,13 @@ class AdminApiMixin:
             "webhooks": dict(wh_row),
         }
 
-
-    def _list_stats(
-        self, query: dict[str, list[str]]
-    ) -> tuple[int, dict[str, Any]]:
+    def _list_stats(self, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         tenant = (query.get("tenant") or [None])[0]
         if tenant:
             stats = self.queue.get_tenant_stats(tenant)
             return 200, {"stats": [tenant_stats_to_dict(stats)]}
         all_stats = self.queue.list_tenant_stats()
         return 200, {"stats": [tenant_stats_to_dict(s) for s in all_stats]}
-
 
     def _fairness_check(self) -> tuple[int, dict[str, Any]]:
         """Schedule overlap + paused claimable + completed-by-tenant for soak."""
@@ -144,20 +93,15 @@ class AdminApiMixin:
                 """
             ).fetchall()
         return 200, {
-            "active_jobs_by_schedule": {
-                r["schedule_id"]: int(r["n"]) for r in active
-            },
+            "active_jobs_by_schedule": {r["schedule_id"]: int(r["n"]) for r in active},
             "paused_tenant_claimable": {
                 r["tenant_id"]: int(r["n"]) for r in paused_claimable
             },
             "completed_by_tenant": {
                 r["tenant_id"]: int(r["completed"]) for r in by_tenant
             },
-            "max_active_per_schedule": max(
-                (int(r["n"]) for r in active), default=0
-            ),
+            "max_active_per_schedule": max((int(r["n"]) for r in active), default=0),
         }
-
 
     def _completion_order(
         self, query: dict[str, list[str]]
@@ -190,7 +134,6 @@ class AdminApiMixin:
                 for r in rows
             ]
         }
-
 
     def _priority_stats(
         self, query: dict[str, list[str]]
@@ -248,5 +191,3 @@ class AdminApiMixin:
                 r["tenant_id"]: int(r["n"]) for r in by_tenant
             },
         }
-
-

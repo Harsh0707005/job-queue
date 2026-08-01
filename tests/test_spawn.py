@@ -4,12 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +14,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Spawn children / join
 # ---------------------------------------------------------------------------
+
 
 def test_spawn_children_parks_parent_and_frees_lease(queue: JobQueue):
     """Parent releases concurrency while children run."""
@@ -97,9 +94,7 @@ def test_spawn_children_parks_parent_and_frees_lease(queue: JobQueue):
             except LeaseError:
                 pass
     # High priority so the free slot claims filler before pending children.
-    filler = queue.enqueue(
-        tenant_id="t1", payload={"role": "filler"}, priority=100
-    )
+    filler = queue.enqueue(tenant_id="t1", payload={"role": "filler"}, priority=100)
     leased_filler = queue.lease(
         tenant_id="t1", worker_id="other", visibility_timeout_seconds=30
     )
@@ -124,9 +119,7 @@ def test_spawn_children_parks_parent_and_frees_lease(queue: JobQueue):
                 return {
                     "joined": True,
                     "children": len(kids),
-                    "all_done": all(
-                        k.status == JobStatus.COMPLETED for k in kids
-                    ),
+                    "all_done": all(k.status == JobStatus.COMPLETED for k in kids),
                 }
             lease.spawn_children(
                 [
@@ -154,14 +147,12 @@ def test_spawn_children_parks_parent_and_frees_lease(queue: JobQueue):
     worker2.stop()
     t2.join(timeout=5)
 
+
 def test_spawn_child_failure_cancels_parent(queue: JobQueue):
     """If a child dies, parent must not wait forever — it is terminalized."""
-    from job_queue import Worker
 
     parent = queue.enqueue(tenant_id="t1", payload={"role": "parent"})
-    job = queue.lease(
-        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
-    )
+    job = queue.lease(tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30)
     assert job is not None and job.id == parent.id
     result = queue.spawn_children(
         parent.id,
@@ -212,11 +203,10 @@ def test_spawn_child_failure_cancels_parent(queue: JobQueue):
     assert parent_after.last_error is not None
     assert "child" in parent_after.last_error
 
+
 def test_spawn_child_cancel_fails_parent(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"p": True})
-    job = queue.lease(
-        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
-    )
+    job = queue.lease(tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30)
     assert job is not None
     result = queue.spawn_children(
         parent.id,
@@ -236,11 +226,10 @@ def test_spawn_child_cancel_fails_parent(queue: JobQueue):
     assert sib is not None
     assert sib.status == JobStatus.CANCELLED
 
+
 def test_spawn_join_timeout_fails_parent(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"p": True})
-    job = queue.lease(
-        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
-    )
+    job = queue.lease(tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30)
     assert job is not None
     queue.spawn_children(
         parent.id,
@@ -260,12 +249,11 @@ def test_spawn_join_timeout_fails_parent(queue: JobQueue):
     kids = queue.list_children(parent.id, tenant_id="t1")
     assert all(k.status == JobStatus.CANCELLED for k in kids)
 
+
 def test_spawn_join_timeout_expires_on_lease_path(queue: JobQueue):
     """Join deadlines must be reaped by normal lease(), not only the endpoint."""
     parent = queue.enqueue(tenant_id="t1", payload={"p": True})
-    job = queue.lease(
-        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
-    )
+    job = queue.lease(tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30)
     assert job is not None
     queue.spawn_children(
         parent.id,
@@ -301,6 +289,7 @@ def test_spawn_join_timeout_expires_on_lease_path(queue: JobQueue):
             )
         except LeaseError:
             pass
+
 
 def test_spawn_join_timeout_expires_on_fair_lease_multi_tenant(queue: JobQueue):
     """Fair multi-tenant lease reaps join timeouts across tenants."""
@@ -352,10 +341,7 @@ def test_spawn_join_timeout_expires_on_fair_lease_multi_tenant(queue: JobQueue):
 
     deadline = time.time() + 8
     while time.time() < deadline:
-        statuses = [
-            queue.get(pid, tenant_id=tid)
-            for tid, pid in parents
-        ]
+        statuses = [queue.get(pid, tenant_id=tid) for tid, pid in parents]
         if all(
             s is not None
             and s.status == JobStatus.CANCELLED
@@ -380,25 +366,22 @@ def test_spawn_join_timeout_expires_on_fair_lease_multi_tenant(queue: JobQueue):
         kids = queue.list_children(pid, tenant_id=tid)
         assert all(k.status == JobStatus.CANCELLED for k in kids)
 
+
 def test_spawn_multi_tenant_isolation(queue: JobQueue):
     """Spawn/join under one tenant never touches another."""
     pa = queue.enqueue(tenant_id="ta", payload={"p": "a"})
     pb = queue.enqueue(tenant_id="tb", payload={"p": "b"})
-    la = queue.lease(
-        tenant_id="ta", worker_id="wa", visibility_timeout_seconds=30
-    )
-    lb = queue.lease(
-        tenant_id="tb", worker_id="wb", visibility_timeout_seconds=30
-    )
+    la = queue.lease(tenant_id="ta", worker_id="wa", visibility_timeout_seconds=30)
+    lb = queue.lease(tenant_id="tb", worker_id="wb", visibility_timeout_seconds=30)
     assert la is not None and lb is not None
-    ra = queue.spawn_children(
+    queue.spawn_children(
         pa.id,
         tenant_id="ta",
         worker_id="wa",
         lease_token=la.lease_token,  # type: ignore[arg-type]
         children=[{"payload": {"c": "a1"}}, {"payload": {"c": "a2"}}],
     )
-    rb = queue.spawn_children(
+    queue.spawn_children(
         pb.id,
         tenant_id="tb",
         worker_id="wb",
@@ -417,6 +400,7 @@ def test_spawn_multi_tenant_isolation(queue: JobQueue):
     pb_after = queue.get(pb.id, tenant_id="tb")
     assert pa_after is not None and pa_after.status == JobStatus.CANCELLED
     assert pb_after is not None and pb_after.status == JobStatus.AWAITING_CHILDREN
+
 
 def test_spawn_multi_worker_join(queue: JobQueue):
     """Multiple fair workers process children while parent is parked."""
@@ -440,10 +424,7 @@ def test_spawn_multi_worker_join(queue: JobQueue):
                 if job.await_children_outcome == "joined":
                     return {"joined": True, "worker": _w.worker_id}
                 lease.spawn_children(
-                    [
-                        {"payload": {"role": "child", "i": n}}
-                        for n in range(4)
-                    ]
+                    [{"payload": {"role": "child", "i": n}} for n in range(4)]
                 )
                 return {}
             with lock:
@@ -459,9 +440,7 @@ def test_spawn_multi_worker_join(queue: JobQueue):
     parents = []
     for tname in ("t-a", "t-b"):
         parents.append(
-            queue.enqueue(
-                tenant_id=tname, payload={"role": "parent", "tenant": tname}
-            )
+            queue.enqueue(tenant_id=tname, payload={"role": "parent", "tenant": tname})
         )
 
     deadline = time.time() + 15
@@ -489,11 +468,10 @@ def test_spawn_multi_worker_join(queue: JobQueue):
     for th in threads:
         th.join(timeout=3)
 
+
 def test_spawn_wait_false_keeps_lease(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"p": 1})
-    job = queue.lease(
-        tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30
-    )
+    job = queue.lease(tenant_id="t1", worker_id="p1", visibility_timeout_seconds=30)
     assert job is not None
     result = queue.spawn_children(
         parent.id,
@@ -510,4 +488,3 @@ def test_spawn_wait_false_keeps_lease(queue: JobQueue):
     assert kids[0].parent_job_id == parent.id
     # Parent can still ack.
     _ack(queue, result.parent, "p1", result={"spawned": True})
-

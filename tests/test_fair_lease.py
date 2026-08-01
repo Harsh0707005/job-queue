@@ -4,13 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, Worker
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +14,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Fair multi-tenant leasing
 # ---------------------------------------------------------------------------
+
 
 def test_fair_lease_without_tenant_id(queue: JobQueue):
     queue.enqueue(tenant_id="alpha", payload={"t": "a"})
@@ -30,6 +26,7 @@ def test_fair_lease_without_tenant_id(queue: JobQueue):
     tenants = {j1.tenant_id, j2.tenant_id}
     assert tenants == {"alpha", "beta"}
     assert queue.lease(worker_id="shared-1") is None
+
 
 def test_fair_lease_prefers_under_served_tenants(queue: JobQueue):
     """Noisy tenant with many jobs must not monopolize early leases."""
@@ -47,6 +44,7 @@ def test_fair_lease_prefers_under_served_tenants(queue: JobQueue):
     assert "quiet" in claimed_tenants
     # Not all five from noisy before quiet got a turn.
     assert claimed_tenants.count("noisy") < 5
+
 
 def test_fair_lease_ack_drain_does_not_starve_late_tenant(queue: JobQueue):
     """Real starvation case: noisy backlog enqueued first, workers lease+ack.
@@ -80,6 +78,7 @@ def test_fair_lease_ack_drain_does_not_starve_late_tenant(queue: JobQueue):
     assert order.count("noisy") == noisy_n
     assert queue.lease(worker_id="drain-w") is None
 
+
 def test_fair_lease_round_robin_three_tenants_with_backlog(queue: JobQueue):
     """Each tenant with a backlog gets a turn before any gets a second job."""
     for t in ("a", "b", "c"):
@@ -103,6 +102,7 @@ def test_fair_lease_round_robin_three_tenants_with_backlog(queue: JobQueue):
         _ack(queue, job, "rr-w")
 
     assert set(second_round) == {"a", "b", "c"}
+
 
 def test_fair_lease_ack_drain_multi_worker_no_starvation(queue: JobQueue):
     """Several workers race lease+ack against a noisy backlog + quiet jobs."""
@@ -149,6 +149,7 @@ def test_fair_lease_ack_drain_multi_worker_no_starvation(queue: JobQueue):
     assert queue.count(tenant_id="noisy", status=JobStatus.COMPLETED) == 40
     assert queue.count(tenant_id="quiet", status=JobStatus.COMPLETED) == 5
 
+
 def test_fair_lease_priority_lane_before_low(queue: JobQueue):
     """High-priority work of any tenant runs before low-priority noise."""
     for i in range(20):
@@ -159,6 +160,7 @@ def test_fair_lease_priority_lane_before_low(queue: JobQueue):
     assert first is not None
     assert first.id == high.id
     _ack(queue, first, "pri-w")
+
 
 def test_fair_lease_high_priority_lane_fair_across_tenants(queue: JobQueue):
     """Within the high lane, tenants rotate — one tenant cannot monopolize."""
@@ -196,11 +198,12 @@ def test_fair_lease_high_priority_lane_fair_across_tenants(queue: JobQueue):
     assert low.priority == 0
     assert low.tenant_id == "c"
 
+
 def test_fair_lease_high_of_quiet_beats_low_of_noisy(queue: JobQueue):
     """Noisy tenant flooding low priority cannot block quiet high priority."""
     for i in range(40):
         queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=1)
-    quiet_high = queue.enqueue(tenant_id="quiet", payload={"t": "q"}, priority=100)
+    queue.enqueue(tenant_id="quiet", payload={"t": "q"}, priority=100)
 
     order: list[tuple[str, int]] = []
     for _ in range(5):
@@ -212,6 +215,7 @@ def test_fair_lease_high_of_quiet_beats_low_of_noisy(queue: JobQueue):
     assert order[0] == ("quiet", 100)
     # Remaining early leases are noisy low only after high is done.
     assert all(t == "noisy" and p == 1 for t, p in order[1:])
+
 
 def test_fair_lease_respects_tenant_concurrency_limit(queue: JobQueue):
     queue.set_concurrency_limit("capped", 1)
@@ -236,6 +240,7 @@ def test_fair_lease_respects_tenant_concurrency_limit(queue: JobQueue):
         assert second.tenant_id == "capped"
         third = queue.lease(worker_id="w3")
         assert third is None  # capped at limit, other done
+
 
 def test_fair_lease_respects_delay_and_dependencies(queue: JobQueue):
     from datetime import datetime, timedelta, timezone
@@ -265,6 +270,7 @@ def test_fair_lease_respects_delay_and_dependencies(queue: JobQueue):
     else:
         assert first.id == ready.id
 
+
 def test_fair_lease_queue_name_isolation(queue: JobQueue):
     queue.enqueue(tenant_id="a", queue_name="email", payload={"q": "e"})
     queue.enqueue(tenant_id="b", queue_name="sms", payload={"q": "s"})
@@ -275,6 +281,7 @@ def test_fair_lease_queue_name_isolation(queue: JobQueue):
     assert job.tenant_id == "a"
     assert queue.lease(worker_id="w1", queue_name="email") is None
 
+
 def test_tenant_scoped_lease_still_works(queue: JobQueue):
     queue.enqueue(tenant_id="only-me", payload={"x": 1})
     queue.enqueue(tenant_id="other", payload={"x": 2})
@@ -283,6 +290,7 @@ def test_tenant_scoped_lease_still_works(queue: JobQueue):
     assert job is not None
     assert job.tenant_id == "only-me"
     assert queue.lease(tenant_id="only-me", worker_id="w1") is None
+
 
 def test_fair_worker_processes_across_tenants(queue: JobQueue):
     queue.enqueue(tenant_id="a", payload={"n": 1})
@@ -298,4 +306,3 @@ def test_fair_worker_processes_across_tenants(queue: JobQueue):
     n = worker.run(max_jobs=2, stop_when_idle=True)
     assert n == 2
     assert set(seen) == {"a", "b"}
-

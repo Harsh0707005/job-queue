@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import threading
 import time
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseError
 
 from tests.helpers_queue import (
     _ack,
@@ -22,6 +17,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Tenant offboard
 # ---------------------------------------------------------------------------
+
 
 def test_offboard_cancels_pending_deletes_schedules_webhooks(queue: JobQueue):
     from job_queue import TenantOffboardResult
@@ -69,6 +65,7 @@ def test_offboard_cancels_pending_deletes_schedules_webhooks(queue: JobQueue):
     assert job is not None
     _ack(queue, job, "w1")
 
+
 def test_offboard_allows_in_flight_ack_then_empties(queue: JobQueue):
     queue.enqueue(tenant_id="gone", payload={"run": 1})
     queue.enqueue(tenant_id="gone", payload={"wait": 1})  # pending, will cancel
@@ -76,9 +73,7 @@ def test_offboard_allows_in_flight_ack_then_empties(queue: JobQueue):
     assert leased is not None
     assert leased.payload == {"run": 1}
 
-    queue.create_schedule(
-        tenant_id="gone", interval_seconds=30, payload={"s": 1}
-    )
+    queue.create_schedule(tenant_id="gone", interval_seconds=30, payload={"s": 1})
     queue.register_webhook(tenant_id="gone", url="http://example.test/h")
 
     result = queue.offboard_tenant("gone")
@@ -96,9 +91,7 @@ def test_offboard_allows_in_flight_ack_then_empties(queue: JobQueue):
     with pytest.raises(ValueError, match="offboarding"):
         queue.enqueue(tenant_id="gone", payload={"nope": 1})
     with pytest.raises(ValueError, match="offboarding"):
-        queue.create_schedule(
-            tenant_id="gone", interval_seconds=10, payload={}
-        )
+        queue.create_schedule(tenant_id="gone", interval_seconds=10, payload={})
     with pytest.raises(ValueError, match="offboarding"):
         queue.register_webhook(tenant_id="gone", url="http://example.test/x")
     with pytest.raises(ValueError, match="offboarding"):
@@ -117,6 +110,7 @@ def test_offboard_allows_in_flight_ack_then_empties(queue: JobQueue):
     assert queue.tenant_is_empty("gone") is True
     assert queue.is_tenant_offboarding("gone") is False
     assert queue.get(leased.id, tenant_id="gone") is None
+
 
 def test_offboard_in_flight_nack_then_empties(queue: JobQueue):
     j = queue.enqueue(
@@ -137,6 +131,7 @@ def test_offboard_in_flight_nack_then_empties(queue: JobQueue):
     # Either requeued-then-purged or terminalized; tenant empty either way.
     assert queue.tenant_is_empty("gone") is True
     assert queue.get(nacked.id, tenant_id="gone") is None
+
 
 def test_offboard_multiple_in_flight_empties_after_last(queue: JobQueue):
     queue.set_concurrency_limit("gone", 5)
@@ -161,6 +156,7 @@ def test_offboard_multiple_in_flight_empties_after_last(queue: JobQueue):
 
     _ack(queue, jobs[2], "w2")
     assert queue.tenant_is_empty("gone") is True
+
 
 def test_offboard_reaps_expired_abandoned_lease(queue: JobQueue):
     """Expired leases on offboarding tenants must be cancelled (not stuck)."""
@@ -187,6 +183,7 @@ def test_offboard_reaps_expired_abandoned_lease(queue: JobQueue):
     assert queue.lease(worker_id="other") is None
     assert queue.tenant_is_empty("gone") is True
 
+
 def test_offboard_idempotent_when_already_empty(queue: JobQueue):
     result = queue.offboard_tenant("never-existed")
     assert result.empty is True
@@ -197,6 +194,7 @@ def test_offboard_idempotent_when_already_empty(queue: JobQueue):
     # Second call still fine.
     result2 = queue.offboard_tenant("never-existed")
     assert result2.empty is True
+
 
 def test_offboard_cancel_running_job_can_empty(queue: JobQueue):
     queue.enqueue(tenant_id="gone", payload={"x": 1})
@@ -215,6 +213,7 @@ def test_offboard_cancel_running_job_can_empty(queue: JobQueue):
             lease_token=token,  # type: ignore[arg-type]
         )
     assert queue.tenant_is_empty("gone") is True
+
 
 def test_offboard_keeps_claimed_webhook_for_finalize(queue: JobQueue):
     """Claimed delivering webhooks survive offboard so finalize can complete."""
@@ -246,7 +245,7 @@ def test_offboard_keeps_claimed_webhook_for_finalize(queue: JobQueue):
         url=sink_url,
         events=["job.completed"],
     )
-    job = queue.enqueue(tenant_id="gone", payload={"n": 1})
+    queue.enqueue(tenant_id="gone", payload={"n": 1})
     leased = queue.lease(tenant_id="gone", worker_id="w1")
     assert leased is not None
     _ack(queue, leased, "w1", result={"ok": True})
@@ -305,6 +304,7 @@ def test_offboard_keeps_claimed_webhook_for_finalize(queue: JobQueue):
     assert queue.is_tenant_offboarding("gone") is False
     assert queue.get_webhook_delivery(delivery_id, tenant_id="gone") is None
 
+
 def test_offboard_finalize_failed_webhook_does_not_requeue(queue: JobQueue):
     queue.register_webhook(
         tenant_id="gone",
@@ -312,7 +312,7 @@ def test_offboard_finalize_failed_webhook_does_not_requeue(queue: JobQueue):
         events=["job.completed"],
         max_attempts=5,
     )
-    job = queue.enqueue(tenant_id="gone", payload={"n": 1})
+    queue.enqueue(tenant_id="gone", payload={"n": 1})
     leased = queue.lease(tenant_id="gone", worker_id="w1")
     assert leased is not None
     _ack(queue, leased, "w1")
@@ -325,13 +325,12 @@ def test_offboard_finalize_failed_webhook_does_not_requeue(queue: JobQueue):
     assert result.webhooks_delivering_remaining == 1
 
     # Failed POST finalize during offboard → dead, not pending retry.
-    fin = queue.finalize_webhook_delivery(
-        did, status_code=500, error="boom"
-    )
+    fin = queue.finalize_webhook_delivery(did, status_code=500, error="boom")
     assert fin is not None
     assert fin.success is False
     # Tenant emptied (dead delivery purged on finalize-offboard).
     assert queue.tenant_is_empty("gone") is True
+
 
 def test_offboard_reaps_expired_claimed_webhook(queue: JobQueue):
     queue.register_webhook(
@@ -339,7 +338,7 @@ def test_offboard_reaps_expired_claimed_webhook(queue: JobQueue):
         url="http://example.test/hook",
         events=["job.completed"],
     )
-    job = queue.enqueue(tenant_id="gone", payload={"n": 1})
+    queue.enqueue(tenant_id="gone", payload={"n": 1})
     leased = queue.lease(tenant_id="gone", worker_id="w1")
     assert leased is not None
     _ack(queue, leased, "w1")
@@ -355,6 +354,7 @@ def test_offboard_reaps_expired_claimed_webhook(queue: JobQueue):
     claimed2, auto = queue.claim_webhook_deliveries(limit=5)
     assert claimed2 == []
     assert queue.tenant_is_empty("gone") is True
+
 
 def test_offboard_waits_for_both_lease_and_webhook(queue: JobQueue):
     queue.register_webhook(
@@ -391,4 +391,3 @@ def test_offboard_waits_for_both_lease_and_webhook(queue: JobQueue):
     # Finish lease last — now empty.
     _ack(queue, l2, "w2")
     assert queue.tenant_is_empty("gone") is True
-

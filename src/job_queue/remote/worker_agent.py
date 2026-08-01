@@ -1,4 +1,5 @@
 """Remote worker agent (composed from loop + work mixins)."""
+
 from __future__ import annotations
 
 from job_queue.remote.worker_agent_loop import RemoteWorkerLoopMixin

@@ -1,12 +1,10 @@
 """Coordinator HTTP service."""
-from __future__ import annotations
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import re
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -14,40 +12,16 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
-    job_to_dict,
     job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
-    schedule_to_dict,
-    audit_consistency_report_to_dict,
-    job_audit_event_to_dict,
-    job_side_effect_to_dict,
-    preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
 )
-from job_queue.models import JobStatus
 from job_queue.queue import (
-    CancelError,
     JobQueue,
-    LeaseError,
-    RateLimitError,
-    ReplayError,
-    ScheduleError,
 )
-
-
 
 from job_queue.coordinator.auth import (
     _BodyTooLarge,
     _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
-    _configured_api_token,
     _extract_request_token,
 )
 from job_queue.coordinator.routing import RoutingMixin
@@ -58,7 +32,6 @@ from job_queue.coordinator.tenants import TenantsApiMixin
 from job_queue.coordinator.audit import AuditApiMixin
 from job_queue.coordinator.admin import AdminApiMixin
 from job_queue.coordinator.workflow import WorkflowApiMixin
-
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +47,9 @@ class Coordinator(
     WorkflowApiMixin,
 ):
     """Thin HTTP façade over JobQueue (handlers split by domain)."""
+
     pass
+
 
 def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -157,7 +132,9 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                     if not tenants:
                         self._send(
                             400,
-                            {"error": "tenant_id query param required (repeat for multi-tenant)"},
+                            {
+                                "error": "tenant_id query param required (repeat for multi-tenant)"
+                            },
                         )
                         return
                     for jid in query.get("job_id") or []:
@@ -265,10 +242,7 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 # Live progress streams (SSE) — not JSON response bodies.
                 if method == "GET" and (
                     path == "/v1/stream/job-events"
-                    or (
-                        path.startswith("/v1/jobs/")
-                        and path.endswith("/events")
-                    )
+                    or (path.startswith("/v1/jobs/") and path.endswith("/events"))
                 ):
                     self._stream_job_events(path, query)
                     return
@@ -348,11 +322,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dsn:
         print("JOB_QUEUE_DSN / --dsn required", file=__import__("sys").stderr)
         return 2
-    dsn = (
-        args.dsn.replace("postgresql+psycopg://", "postgresql://", 1)
-        .replace("postgresql+psycopg2://", "postgresql://", 1)
+    dsn = args.dsn.replace("postgresql+psycopg://", "postgresql://", 1).replace(
+        "postgresql+psycopg2://", "postgresql://", 1
     )
     serve_coordinator(dsn, host=args.host, port=args.port)
     return 0
-
-

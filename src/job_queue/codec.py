@@ -67,9 +67,7 @@ def job_to_dict(
         "waiting_on": [str(x) for x in job.waiting_on],
         "labels": list(job.labels),
         "leased_by": job.leased_by,
-        "lease_token": (
-            _uuid(job.lease_token) if include_lease_token else None
-        ),
+        "lease_token": (_uuid(job.lease_token) if include_lease_token else None),
         "lease_tenant_id": job.lease_tenant_id,
         "lease_expires_at": _dt(job.lease_expires_at),
         "lease_started_at": _dt(job.lease_started_at),
@@ -126,7 +124,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         max_runtime_seconds=int(data.get("max_runtime_seconds") or 3600),
         retry_backoff_base_seconds=int(data.get("retry_backoff_base_seconds") or 1),
         retry_backoff_max_seconds=int(data.get("retry_backoff_max_seconds") or 300),
-        available_at=parse_dt("available_at") or datetime.fromisoformat(data["created_at"]),
+        available_at=parse_dt("available_at")
+        or datetime.fromisoformat(data["created_at"]),
         dedupe_key=data.get("dedupe_key"),
         schedule_id=parse_uuid("schedule_id"),
         depends_on=tuple(UUID(str(x)) for x in depends),
@@ -150,7 +149,9 @@ def job_from_dict(data: dict[str, Any]) -> Job:
             if data.get("estimated_duration_seconds") is None
             else int(data["estimated_duration_seconds"])
         ),
-        preemptible=bool(data["preemptible"]) if data.get("preemptible") is not None else True,
+        preemptible=bool(data["preemptible"])
+        if data.get("preemptible") is not None
+        else True,
         preempt_count=int(data.get("preempt_count") or 0),
         last_preempted_at=parse_dt("last_preempted_at"),
         approval_requested_at=parse_dt("approval_requested_at"),
@@ -350,9 +351,7 @@ def job_retention_to_dict(settings: Any) -> dict[str, Any]:
     return {
         "completed_retention_seconds": settings.completed_retention_seconds,
         "dead_retention_seconds": settings.dead_retention_seconds,
-        "completed_inherits": bool(
-            getattr(settings, "completed_inherits", False)
-        ),
+        "completed_inherits": bool(getattr(settings, "completed_inherits", False)),
         "dead_inherits": bool(getattr(settings, "dead_inherits", False)),
     }
 
@@ -428,9 +427,7 @@ def webhook_delivery_to_dict(
         "updated_at": _dt(d.updated_at),
         "completed_at": _dt(d.completed_at),
         "has_signing_secret": bool(d.signing_secret),
-        "signing_secret": (
-            d.signing_secret if include_signing_secret else None
-        ),
+        "signing_secret": (d.signing_secret if include_signing_secret else None),
     }
     return out
 
@@ -439,9 +436,7 @@ def claimed_webhook_to_dict(c: ClaimedWebhook) -> dict[str, Any]:
     # Nested delivery is redacted; top-level secret is the claim handoff
     # for the agent that will POST and sign.
     return {
-        "delivery": webhook_delivery_to_dict(
-            c.delivery, include_signing_secret=False
-        ),
+        "delivery": webhook_delivery_to_dict(c.delivery, include_signing_secret=False),
         "url": c.url,
         "secret": c.secret,
         "endpoint_enabled": c.endpoint_enabled,

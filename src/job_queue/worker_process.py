@@ -5,23 +5,17 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import uuid
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any  # noqa: I001 — keep Any with callables
+from typing import Any
 
-from job_queue.models import DrainResult, Job, JobSideEffect, SpawnChildrenResult
+from job_queue.models import Job
 from job_queue.queue import (
     ApprovalRequested,
     ChildrenAwaited,
-    JobQueue,
     LeaseError,
 )
 from job_queue.lease_context import LeaseContext, _ActiveJob
 
 logger = logging.getLogger(__name__)
-
-Handler = Callable[..., Any]
 
 
 class WorkerProcessMixin:

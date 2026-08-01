@@ -1,4 +1,5 @@
 """JobQueue: domain mixins composed into one class."""
+
 from __future__ import annotations
 
 from job_queue.queue.base import BaseMixin
@@ -13,8 +14,9 @@ from job_queue.queue.approval_spawn import ApprovalSpawnMixin
 from job_queue.queue.dead_letters import DeadLettersMixin
 from job_queue.queue.misc import MiscMixin
 
+
 class JobQueue(
-BaseMixin,
+    BaseMixin,
     JobsMixin,
     LeaseMixin,
     TenantsMixin,

@@ -4,16 +4,13 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, LeaseContext, Worker
 
 # ---------------------------------------------------------------------------
 # Batch lease
 # ---------------------------------------------------------------------------
+
 
 def test_lease_batch_tenant_scoped_priority_order(queue: JobQueue):
     low = queue.enqueue(tenant_id="t1", payload={"p": "low"}, priority=1)
@@ -26,6 +23,7 @@ def test_lease_batch_tenant_scoped_priority_order(queue: JobQueue):
     # Distinct fencing tokens.
     assert len({j.lease_token for j in batch}) == 3
 
+
 def test_lease_batch_respects_limit_and_empty(queue: JobQueue):
     for i in range(5):
         queue.enqueue(tenant_id="t1", payload={"i": i})
@@ -34,6 +32,7 @@ def test_lease_batch_respects_limit_and_empty(queue: JobQueue):
     batch2 = queue.lease_batch(tenant_id="t1", worker_id="w1", limit=10)
     assert len(batch2) == 3
     assert queue.lease_batch(tenant_id="t1", worker_id="w1", limit=5) == []
+
 
 def test_lease_batch_fair_rotates_tenants_in_batch(queue: JobQueue):
     """A fair batch should not hand all slots to one tenant when peers are ready."""
@@ -49,6 +48,7 @@ def test_lease_batch_fair_rotates_tenants_in_batch(queue: JobQueue):
     for t in ("a", "b", "c"):
         assert tenants.count(t) <= 3
 
+
 def test_lease_batch_fair_priority_before_low(queue: JobQueue):
     for i in range(10):
         queue.enqueue(tenant_id="noisy", payload={"i": i}, priority=0)
@@ -62,6 +62,7 @@ def test_lease_batch_fair_priority_before_low(queue: JobQueue):
     assert all(j.tenant_id == "vip" for j in batch[:3])
     assert all(j.priority == 0 for j in batch[3:])
 
+
 def test_lease_batch_concurrency_cap(queue: JobQueue):
     queue.set_concurrency_limit("capped", 2)
     for i in range(5):
@@ -71,6 +72,7 @@ def test_lease_batch_concurrency_cap(queue: JobQueue):
     assert len(batch) == 2
     more = queue.lease_batch(tenant_id="capped", worker_id="w2", limit=5)
     assert more == []
+
 
 def test_worker_batch_processes_all(queue: JobQueue):
     from job_queue import Worker
@@ -88,6 +90,7 @@ def test_worker_batch_processes_all(queue: JobQueue):
     assert n == 7
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 7
 
+
 def test_lease_batch_invalid_limit(queue: JobQueue):
     import pytest
 
@@ -95,6 +98,7 @@ def test_lease_batch_invalid_limit(queue: JobQueue):
         queue.lease_batch(worker_id="w", limit=0)
     with pytest.raises(ValueError):
         queue.lease_batch(worker_id="w", limit=1000)
+
 
 def test_cancel_running_worker_aborts_mid_process(queue: JobQueue):
     """Worker holding a lease must not complete after cancel."""
@@ -169,6 +173,7 @@ def test_cancel_running_worker_aborts_mid_process(queue: JobQueue):
     assert queue.count(tenant_id="t1", status=JobStatus.CANCELLED) == 1
     assert cancelled_seen.is_set() or "run_lease_error" in outcomes
 
+
 def test_cancel_running_cascades_to_pending_children(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"p": 1})
     child = queue.enqueue(
@@ -183,4 +188,3 @@ def test_cancel_running_cascades_to_pending_children(queue: JobQueue):
     queue.cancel(parent.id, tenant_id="t1")
     assert queue.get(parent.id, tenant_id="t1").status == JobStatus.CANCELLED
     assert queue.get(child.id, tenant_id="t1").status == JobStatus.CANCELLED
-

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus, LeaseError
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +16,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Visibility timeout / worker death recovery
 # ---------------------------------------------------------------------------
+
 
 def test_expired_lease_becomes_available_again(queue: JobQueue):
     queue.enqueue(
@@ -51,6 +49,7 @@ def test_expired_lease_becomes_available_again(queue: JobQueue):
     assert final is not None
     assert final.status == JobStatus.COMPLETED
 
+
 def test_heartbeat_prevents_reclaim(queue: JobQueue):
     queue.enqueue(
         tenant_id="t1",
@@ -72,6 +71,7 @@ def test_heartbeat_prevents_reclaim(queue: JobQueue):
     assert queue.lease(tenant_id="t1", worker_id="w2") is None
     _ack(queue, job, "w1")
 
+
 def test_heartbeat_from_wrong_worker_fails(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={})
     job = queue.lease(tenant_id="t1", worker_id="w1")
@@ -86,6 +86,7 @@ def test_heartbeat_from_wrong_worker_fails(queue: JobQueue):
             lease_token=job.lease_token,
         )
 
+
 def test_ack_from_wrong_worker_fails(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={})
     job = queue.lease(tenant_id="t1", worker_id="w1")
@@ -99,6 +100,7 @@ def test_ack_from_wrong_worker_fails(queue: JobQueue):
             worker_id="impostor",
             lease_token=job.lease_token,
         )
+
 
 def test_expired_lease_rejects_ack(queue: JobQueue):
     queue.enqueue(
@@ -116,4 +118,3 @@ def test_expired_lease_rejects_ack(queue: JobQueue):
 
     with pytest.raises(LeaseError):
         _ack(queue, job, "w1")
-

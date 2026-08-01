@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlencode
-from uuid import uuid4
 
 import pytest
 
-from job_queue import JobQueue, JobStatus
+from job_queue import JobQueue
 from job_queue.codec import job_to_dict, webhook_delivery_to_dict
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
@@ -81,9 +79,7 @@ def test_cross_tenant_get_is_not_found(queue: JobQueue, coordinator_url):
     queue.lease(tenant_id="alpha", worker_id="w")
     q = urlencode({"tenant_id": "beta"})
     with pytest.raises(urllib.error.HTTPError) as ei:
-        urllib.request.urlopen(
-            f"{coordinator_url}/v1/jobs/{j.id}?{q}", timeout=5
-        )
+        urllib.request.urlopen(f"{coordinator_url}/v1/jobs/{j.id}?{q}", timeout=5)
     assert ei.value.code == 404
     # No payload leakage in error body.
     err = ei.value.read().decode()
@@ -92,7 +88,7 @@ def test_cross_tenant_get_is_not_found(queue: JobQueue, coordinator_url):
 
 
 def test_job_to_dict_default_redacts_lease_token(queue: JobQueue):
-    j = queue.enqueue(tenant_id="t1", payload={})
+    queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w")
     assert leased is not None and leased.lease_token is not None
     d = job_to_dict(leased)
@@ -113,7 +109,9 @@ def test_validate_webhook_url_blocks_private_by_default(monkeypatch):
     with pytest.raises(ValueError, match="non-public"):
         validate_webhook_url("http://10.0.0.5/hook", resolve_dns=False)
     with pytest.raises(ValueError, match="link-local"):
-        validate_webhook_url("http://169.254.169.254/latest/meta-data", resolve_dns=False)
+        validate_webhook_url(
+            "http://169.254.169.254/latest/meta-data", resolve_dns=False
+        )
     with pytest.raises(ValueError, match="credentials"):
         validate_webhook_url("https://user:pass@example.com/hook", resolve_dns=False)
 
@@ -122,7 +120,9 @@ def test_validate_webhook_url_never_allows_link_local_metadata(monkeypatch):
     """Even with private webhooks allowed, metadata / link-local stays blocked."""
     monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
     with pytest.raises(ValueError, match="link-local"):
-        validate_webhook_url("http://169.254.169.254/latest/meta-data", resolve_dns=False)
+        validate_webhook_url(
+            "http://169.254.169.254/latest/meta-data", resolve_dns=False
+        )
     with pytest.raises(ValueError, match="not allowed"):
         validate_webhook_url("http://metadata.google.internal/", resolve_dns=False)
 
@@ -194,7 +194,9 @@ def test_webhook_delivery_dict_redacts_signing_secret():
     assert full["signing_secret"] == "frozen-secret"
 
 
-def test_claim_exposes_top_level_secret_not_nested(queue: JobQueue, coordinator_url, monkeypatch):
+def test_claim_exposes_top_level_secret_not_nested(
+    queue: JobQueue, coordinator_url, monkeypatch
+):
     monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
     client = CoordinatorClient(coordinator_url)
     client.register_webhook(
@@ -203,7 +205,7 @@ def test_claim_exposes_top_level_secret_not_nested(queue: JobQueue, coordinator_
         events=["job.completed"],
         secret="claim-secret",
     )
-    j = queue.enqueue(tenant_id="t1", payload={})
+    queue.enqueue(tenant_id="t1", payload={})
     leased = queue.lease(tenant_id="t1", worker_id="w")
     assert leased is not None
     queue.ack(
@@ -271,7 +273,7 @@ def test_side_effect_get_http_redacts_lease_token(queue: JobQueue, coordinator_u
     )
     assert begun.lease_token == leased.lease_token  # stored server-side
 
-    client = CoordinatorClient(coordinator_url)
+    CoordinatorClient(coordinator_url)
     # GET single effect via HTTP
     q = urlencode({"tenant_id": "t-se"})
     key = quote("charge", safe="")

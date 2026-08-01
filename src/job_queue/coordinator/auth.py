@@ -1,12 +1,10 @@
 """Coordinator auth, limits, and path helpers."""
+
 from __future__ import annotations
 
-import logging
 import os
 import re
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -46,5 +44,3 @@ def _extract_request_token(headers: Any) -> str | None:
     if key:
         return str(key).strip() or None
     return None
-
-

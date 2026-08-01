@@ -1,54 +1,20 @@
 """Coordinator API handlers."""
+
 from __future__ import annotations
 
 from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
 )
 
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
     job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
-    schedule_to_dict,
-    audit_consistency_report_to_dict,
-    job_audit_event_to_dict,
     job_side_effect_to_dict,
-    preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
 )
-from job_queue.models import JobStatus
 from job_queue.queue import (
-    CancelError,
-    JobQueue,
     LeaseError,
-    RateLimitError,
-    ReplayError,
-    ScheduleError,
 )
 
 
@@ -74,7 +40,6 @@ class WorkflowApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"job": job_to_dict(job)}
-
 
     def _reject_job(
         self, path: str, body: dict[str, Any]
@@ -102,15 +67,12 @@ class WorkflowApiMixin:
             return 400, {"error": str(exc)}
         return 200, {"job": job_to_dict(job)}
 
-
     def _process_approval_timeouts(
         self, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         try:
             jobs = self.queue.process_approval_timeouts(
-                tenant_id=(
-                    str(body["tenant_id"]) if body.get("tenant_id") else None
-                ),
+                tenant_id=(str(body["tenant_id"]) if body.get("tenant_id") else None),
                 limit=int(body.get("limit") or 100),
             )
         except ValueError as exc:
@@ -119,7 +81,6 @@ class WorkflowApiMixin:
             "count": len(jobs),
             "jobs": [job_to_dict(j) for j in jobs],
         }
-
 
     def _list_approvals(
         self, query: dict[str, list[str]]
@@ -138,7 +99,6 @@ class WorkflowApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"jobs": [job_to_dict(j) for j in jobs], "count": len(jobs)}
-
 
     def _spawn_children(
         self, path: str, body: dict[str, Any]
@@ -172,9 +132,7 @@ class WorkflowApiMixin:
                 worker_id=str(worker_id),
                 lease_token=token,
                 children=children,
-                timeout_seconds=(
-                    float(timeout) if timeout is not None else None
-                ),
+                timeout_seconds=(float(timeout) if timeout is not None else None),
                 progress=body.get("progress"),
                 wait=bool(body.get("wait", True)),
             )
@@ -188,7 +146,6 @@ class WorkflowApiMixin:
             "parent": job_to_dict(result.parent),
             "children": [job_to_dict(c) for c in result.children],
         }
-
 
     def _list_children(
         self, path: str, query: dict[str, list[str]]
@@ -217,15 +174,12 @@ class WorkflowApiMixin:
             "count": len(kids),
         }
 
-
     def _process_await_children_timeouts(
         self, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         try:
             jobs = self.queue.process_await_children_timeouts(
-                tenant_id=(
-                    str(body["tenant_id"]) if body.get("tenant_id") else None
-                ),
+                tenant_id=(str(body["tenant_id"]) if body.get("tenant_id") else None),
                 limit=int(body.get("limit") or 100),
             )
         except ValueError as exc:
@@ -234,7 +188,6 @@ class WorkflowApiMixin:
             "count": len(jobs),
             "jobs": [job_to_dict(j) for j in jobs],
         }
-
 
     def _begin_side_effect(
         self, path: str, body: dict[str, Any]
@@ -274,7 +227,6 @@ class WorkflowApiMixin:
             return 400, {"error": str(exc)}
         return 200, {"effect": job_side_effect_to_dict(eff)}
 
-
     def _complete_side_effect(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -308,7 +260,6 @@ class WorkflowApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"effect": job_side_effect_to_dict(eff)}
-
 
     def _get_side_effect(
         self, path: str, query: dict[str, list[str]]
@@ -345,7 +296,6 @@ class WorkflowApiMixin:
             "effect": job_side_effect_to_dict(eff) if eff else None,
         }
 
-
     def _list_side_effects(
         self, path: str, query: dict[str, list[str]]
     ) -> tuple[int, dict[str, Any]]:
@@ -368,5 +318,3 @@ class WorkflowApiMixin:
             "effects": [job_side_effect_to_dict(e) for e in effects],
             "count": len(effects),
         }
-
-

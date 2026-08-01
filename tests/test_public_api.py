@@ -2,14 +2,7 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
-
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -18,6 +11,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Public API coverage (previously untested entry points)
 # ---------------------------------------------------------------------------
+
 
 def test_delete_webhook_and_set_enabled(queue: JobQueue):
     from job_queue import WebhookEvent
@@ -38,6 +32,7 @@ def test_delete_webhook_and_set_enabled(queue: JobQueue):
     assert queue.list_webhooks(tenant_id="t1") == []
     assert queue.delete_webhook(ep.id, tenant_id="t1") is False
 
+
 def test_get_lease_rate_limit_roundtrip(queue: JobQueue):
     assert queue.get_lease_rate_limit("t1") == (None, None)
     queue.set_lease_rate_limit("t1", 2.5, burst=5)
@@ -46,6 +41,7 @@ def test_get_lease_rate_limit_roundtrip(queue: JobQueue):
     assert burst == 5
     queue.set_lease_rate_limit("t1", None)
     assert queue.get_lease_rate_limit("t1") == (None, None)
+
 
 def test_list_awaiting_children(queue: JobQueue):
     parent = queue.enqueue(tenant_id="t1", payload={"p": 1})
@@ -64,6 +60,7 @@ def test_list_awaiting_children(queue: JobQueue):
     assert len(waiting) == 1
     assert waiting[0].id == parent.id
 
+
 def test_rebuild_jobs_from_audit_batch(queue: JobQueue):
     j1 = queue.enqueue(tenant_id="t1", payload={"a": 1})
     j2 = queue.enqueue(tenant_id="t1", payload={"a": 2})
@@ -77,4 +74,3 @@ def test_rebuild_jobs_from_audit_batch(queue: JobQueue):
     rebuilt = queue.rebuild_jobs_from_audit([j1.id, j2.id], tenant_id="t1")
     assert {r.id for r in rebuilt} == {j1.id, j2.id}
     assert all(r.status == JobStatus.COMPLETED for r in rebuilt)
-

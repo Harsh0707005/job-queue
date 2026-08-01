@@ -1,53 +1,19 @@
 """Coordinator API handlers."""
+
 from __future__ import annotations
 
 from job_queue.coordinator.auth import (
-    _API_TOKEN_ENV_KEYS,
-    _BodyTooLarge,
-    _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
-    _configured_api_token,
-    _extract_request_token,
 )
 
-
-
-
-import json
-import logging
-import os
-import re
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 from job_queue.codec import (
-    bulk_cancel_result_to_dict,
-    claimed_webhook_to_dict,
-    job_to_dict,
-    job_progress_event_to_dict,
-    job_retention_to_dict,
-    retention_purge_to_dict,
     schedule_to_dict,
-    audit_consistency_report_to_dict,
-    job_audit_event_to_dict,
-    job_side_effect_to_dict,
-    preempt_result_to_dict,
-    tenant_merge_result_to_dict,
-    tenant_offboard_result_to_dict,
-    tenant_stats_to_dict,
-    webhook_delivery_to_dict,
-    webhook_endpoint_to_dict,
 )
 from job_queue.models import JobStatus
 from job_queue.queue import (
-    CancelError,
-    JobQueue,
-    LeaseError,
-    RateLimitError,
-    ReplayError,
     ScheduleError,
 )
 
@@ -78,7 +44,6 @@ class SchedulesApiMixin:
             return 400, {"error": str(exc)}
         return 201, {"schedule": schedule_to_dict(sched)}
 
-
     def _pause_schedule(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -98,7 +63,6 @@ class SchedulesApiMixin:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}
 
-
     def _resume_schedule(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -117,7 +81,6 @@ class SchedulesApiMixin:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}
 
-
     def _delete_schedule(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -134,7 +97,6 @@ class SchedulesApiMixin:
         if not deleted:
             return 404, {"error": f"schedule {sid} not found for tenant"}
         return 200, {"deleted": True, "schedule_id": sid}
-
 
     def _list_schedules(
         self, query: dict[str, list[str]]
@@ -163,7 +125,6 @@ class SchedulesApiMixin:
             return 400, {"error": str(exc)}
         return 200, {"schedules": [schedule_to_dict(s) for s in rows]}
 
-
     def _get_schedule(
         self, path: str, query: dict[str, list[str]]
     ) -> tuple[int, dict[str, Any]]:
@@ -180,7 +141,6 @@ class SchedulesApiMixin:
         if sched is None:
             return 404, {"error": "schedule not found"}
         return 200, {"schedule": schedule_to_dict(sched)}
-
 
     def _completed_by_schedule(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:
@@ -208,5 +168,3 @@ class SchedulesApiMixin:
             "completed_by_schedule": by,
             "schedules": [dict(s) for s in scheds],
         }
-
-

@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
-import pytest
-
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import JobQueue, JobStatus
 
 from tests.helpers_queue import (
     _ack,
@@ -19,6 +14,7 @@ from tests.helpers_queue import (
 # ---------------------------------------------------------------------------
 # Priority, nack, dead-letter, skip-limit removal
 # ---------------------------------------------------------------------------
+
 
 def test_higher_priority_leased_first(queue: JobQueue):
     low = queue.enqueue(tenant_id="t1", payload={"p": "low"}, priority=1)
@@ -31,6 +27,7 @@ def test_higher_priority_leased_first(queue: JobQueue):
     second = queue.lease(tenant_id="t1", worker_id="w1")
     assert second is not None
     assert second.id == low.id
+
 
 def test_nack_requeues_job(queue: JobQueue):
     queue.enqueue(
@@ -50,6 +47,7 @@ def test_nack_requeues_job(queue: JobQueue):
     assert again is not None
     assert again.id == job.id
     assert again.attempts == 2
+
 
 def test_nack_dead_letters_after_max_attempts(queue: JobQueue):
     queue.enqueue(
@@ -71,6 +69,7 @@ def test_nack_dead_letters_after_max_attempts(queue: JobQueue):
 
     assert queue.lease(tenant_id="t1", worker_id="w3") is None
     assert queue.count(tenant_id="t1", status=JobStatus.DEAD) == 1
+
 
 def test_many_dead_lettered_jobs_do_not_block_claimable_work(queue: JobQueue):
     """Previously a skip-limit of 32 could return None while jobs remained.
@@ -117,4 +116,3 @@ def test_many_dead_lettered_jobs_do_not_block_claimable_work(queue: JobQueue):
     _ack(queue, claimed, "rescuer")
     assert queue.count(tenant_id="t1", status=JobStatus.DEAD) == 50
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
-

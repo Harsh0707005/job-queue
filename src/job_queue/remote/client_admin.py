@@ -1,21 +1,13 @@
 """CoordinatorClient admin: tenants, schedules, webhooks, dead letters, retention, stats."""
+
 from __future__ import annotations
 
-import json
-import logging
-import os
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
-import uuid
 from typing import Any
 from uuid import UUID
 
 from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
+from job_queue.models import Job
+
 
 class ClientAdminMixin:
     def process_due_schedules(
@@ -58,9 +50,7 @@ class ClientAdminMixin:
             body["status_code"] = status_code
         if error is not None:
             body["error"] = error
-        payload = self._request(
-            "POST", f"/v1/webhooks/{delivery_id}/finalize", body
-        )
+        payload = self._request("POST", f"/v1/webhooks/{delivery_id}/finalize", body)
         assert payload is not None
         return payload
 
@@ -251,9 +241,7 @@ class ClientAdminMixin:
             body["max_attempts"] = max_attempts
         if delay_seconds is not None:
             body["delay_seconds"] = delay_seconds
-        payload = self._request(
-            "POST", f"/v1/dead-letters/{job_id}/replay", body
-        )
+        payload = self._request("POST", f"/v1/dead-letters/{job_id}/replay", body)
         assert payload is not None
         return job_from_dict(payload["job"])
 

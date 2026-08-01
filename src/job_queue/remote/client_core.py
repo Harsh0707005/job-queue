@@ -1,21 +1,17 @@
 """CoordinatorClient core: construction, failover request, health."""
+
 from __future__ import annotations
 
 import json
-import logging
-import os
-import socket
 import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from typing import Any
-from uuid import UUID
 
-from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, DrainResult, Job, SpawnChildrenResult
-from job_queue.queue import ApprovalRequested, ChildrenAwaited, LeaseError
+from job_queue.models import Job
+from job_queue.queue import LeaseError
+
 
 class _ActiveRemoteJob:
     __slots__ = ("job", "lease_lost", "stop_hb")
@@ -29,6 +25,7 @@ class _ActiveRemoteJob:
         self.job = job
         self.lease_lost = lease_lost
         self.stop_hb = stop_hb
+
 
 class ClientCoreMixin:
     def __init__(
@@ -105,7 +102,9 @@ class ClientCoreMixin:
                 try:
                     payload = json.loads(raw.decode("utf-8") or "{}")
                 except json.JSONDecodeError:
-                    payload = {"error": raw.decode("utf-8", errors="replace") or str(exc)}
+                    payload = {
+                        "error": raw.decode("utf-8", errors="replace") or str(exc)
+                    }
                 if exc.code == 401:
                     raise RuntimeError(
                         f"coordinator unauthorized for {method} {path}: {payload}"
@@ -121,15 +120,11 @@ class ClientCoreMixin:
                 if exc.code == 409 and payload.get("code") == "cancel_error":
                     from job_queue.queue import CancelError
 
-                    raise CancelError(
-                        payload.get("error") or "cancel error"
-                    ) from exc
+                    raise CancelError(payload.get("error") or "cancel error") from exc
                 if exc.code == 409 and payload.get("code") == "replay_error":
                     from job_queue.queue import ReplayError
 
-                    raise ReplayError(
-                        payload.get("error") or "replay error"
-                    ) from exc
+                    raise ReplayError(payload.get("error") or "replay error") from exc
                 if int(exc.code) == 404:
                     return {"error": payload.get("error") or "not found", "_http": 404}
                 # 5xx → try next coordinator; 4xx is definitive.

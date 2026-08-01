@@ -7,17 +7,14 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any  # noqa: I001 — keep Any with callables
+from typing import Any
 
-from job_queue.models import DrainResult, Job, JobSideEffect, SpawnChildrenResult
+from job_queue.models import DrainResult, Job
 from job_queue.queue import (
-    ApprovalRequested,
-    ChildrenAwaited,
     JobQueue,
     LeaseError,
 )
-from job_queue.lease_context import LeaseContext, _ActiveJob
+from job_queue.lease_context import _ActiveJob
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +214,11 @@ class WorkerLoopMixin:
                 remaining = max_jobs - processed
                 if remaining <= 0:
                     break
-            take = self.batch_size if remaining is None else min(self.batch_size, remaining)
+            take = (
+                self.batch_size
+                if remaining is None
+                else min(self.batch_size, remaining)
+            )
             try:
                 jobs = self.run_batch_once(limit=take)
             except LeaseError:

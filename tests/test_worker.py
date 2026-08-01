@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 import pytest
 
-from job_queue import Job, JobQueue, JobStatus, LeaseContext, LeaseError, Worker
+from job_queue import Job, JobQueue, JobStatus, Worker
 
 # ---------------------------------------------------------------------------
 # Worker helper
 # ---------------------------------------------------------------------------
+
 
 def test_worker_processes_and_acks(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={"x": 1})
@@ -31,6 +30,7 @@ def test_worker_processes_and_acks(queue: JobQueue):
     assert sorted(seen) == [1, 2]
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 2
 
+
 def test_worker_nack_on_handler_error(queue: JobQueue):
     queue.enqueue(tenant_id="t1", payload={}, max_attempts=3)
     worker = Worker(queue, tenant_id="t1", worker_id="worker-b")
@@ -43,6 +43,7 @@ def test_worker_nack_on_handler_error(queue: JobQueue):
         worker.run_once()
 
     assert queue.count(tenant_id="t1", status=JobStatus.PENDING) == 1
+
 
 def test_worker_heartbeat_keeps_lease(queue: JobQueue):
     queue.enqueue(
@@ -66,6 +67,6 @@ def test_worker_heartbeat_keeps_lease(queue: JobQueue):
     worker.run_once()
     assert queue.count(tenant_id="t1", status=JobStatus.COMPLETED) == 1
 
+
 def test_get_unknown_job(queue: JobQueue):
     assert queue.get(uuid4(), tenant_id="t1") is None
-
