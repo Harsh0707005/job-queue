@@ -33,6 +33,18 @@ class LeaseClaimTenantMixin:
         now = _utcnow()
         claimed: list[Job] = []
 
+        # Maintenance in a short transaction so reclaim/dead-letter/timeouts
+        # do not hold the per-tenant claim lock across the whole batch (fair
+        # lease already does this — scoped path was a multi-worker bottleneck).
+        with transaction(self._pool) as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (tenant_id,),
+            )
+            self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
+            self._reap_offboarding_expired_leases(conn, now=now, tenant_id=tenant_id)
+            self._expire_parked_timeouts_locked(conn, now=now, tenant_id=tenant_id)
+
         with transaction(self._pool) as conn:
             # Serialize lease decisions for this tenant so concurrency caps
             # cannot be exceeded by racing workers.
@@ -40,12 +52,6 @@ class LeaseClaimTenantMixin:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (tenant_id,),
             )
-
-            self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
-            # Offboarding: cancel abandoned expired leases so the tenant can empty.
-            self._reap_offboarding_expired_leases(conn, now=now, tenant_id=tenant_id)
-            # Parked-job deadlines (approval + await-children join).
-            self._expire_parked_timeouts_locked(conn, now=now, tenant_id=tenant_id)
 
             # Paused: no new claims (pending or reclaim). In-flight holders
             # still use heartbeat/ack/nack outside this path.
@@ -147,16 +153,20 @@ class LeaseClaimTenantMixin:
                 if candidate["status"] == JobStatus.PENDING.value:
                     if not self._try_consume_lease_rate(conn, tenant_id, now=now):
                         break
-                claimed.append(
-                    self._claim_locked_job(
-                        conn,
-                        candidate,
-                        worker_id=worker_id,
-                        token=uuid4(),
-                        visibility_timeout_seconds=visibility_timeout_seconds,
-                        now=now,
+                try:
+                    claimed.append(
+                        self._claim_locked_job(
+                            conn,
+                            candidate,
+                            worker_id=worker_id,
+                            token=uuid4(),
+                            visibility_timeout_seconds=visibility_timeout_seconds,
+                            now=now,
+                        )
                     )
-                )
+                except LeaseError:
+                    # Row no longer claimable (e.g. concurrent max-runtime release).
+                    continue
         return claimed
 
     def _claim_locked_job(
@@ -178,6 +188,8 @@ class LeaseClaimTenantMixin:
             lease_expires = hard
 
         from_status = candidate["status"]
+        # Optimistic predicates: never claim a completed/cancelled/pending-not-ready
+        # row even if a caller held a stale snapshot (defense in depth under load).
         row = conn.execute(
             f"""
             UPDATE jobs
@@ -193,6 +205,18 @@ class LeaseClaimTenantMixin:
                 last_error = NULL
             WHERE id = %s
               AND tenant_id = %s
+              AND (
+                    (
+                        status = %s
+                        AND available_at <= %s
+                    )
+                 OR (
+                        status = %s
+                        AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at < %s
+                        AND attempts < max_attempts
+                    )
+              )
             RETURNING {_JOB_COLUMNS}
             """,
             (
@@ -207,9 +231,17 @@ class LeaseClaimTenantMixin:
                 now,
                 candidate["id"],
                 candidate["tenant_id"],
+                JobStatus.PENDING.value,
+                now,
+                JobStatus.LEASED.value,
+                now,
             ),
         ).fetchone()
-        assert row is not None
+        if row is None:
+            raise LeaseError(
+                f"job {candidate['id']} claim race "
+                f"(status changed under lock for tenant {candidate['tenant_id']!r})"
+            )
         job = _row_to_job(row)
         self._append_job_audit(
             conn,

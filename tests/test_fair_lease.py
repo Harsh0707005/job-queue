@@ -306,3 +306,42 @@ def test_fair_worker_processes_across_tenants(queue: JobQueue):
     n = worker.run(max_jobs=2, stop_when_idle=True)
     assert n == 2
     assert set(seen) == {"a", "b"}
+
+
+def test_fair_multi_worker_respects_per_tenant_cap(queue: JobQueue):
+    """High concurrency fair lease must not exceed per-tenant caps."""
+    import threading
+
+    tenants = [f"ft{i}" for i in range(5)]
+    for tid in tenants:
+        queue.set_concurrency_limit(tid, 2)
+        for j in range(20):
+            queue.enqueue(tenant_id=tid, payload={"j": j})
+
+    barrier = threading.Barrier(16)
+    held: list = []
+    lock = threading.Lock()
+
+    def worker(wid: str) -> None:
+        barrier.wait()
+        batch = queue.lease_batch(worker_id=wid, limit=4)  # fair multi-tenant
+        with lock:
+            held.extend(batch)
+
+    threads = [threading.Thread(target=worker, args=(f"fw{i}",)) for i in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # No duplicate claims.
+    ids = [j.id for j in held]
+    assert len(ids) == len(set(ids))
+    # Per-tenant leased count <= 2.
+    from collections import Counter
+
+    by_tenant = Counter(j.tenant_id for j in held)
+    for tid, n in by_tenant.items():
+        assert n <= 2, f"tenant {tid} leased {n} > cap 2"
+    for tid in tenants:
+        assert queue.count(tenant_id=tid, status=JobStatus.LEASED) <= 2

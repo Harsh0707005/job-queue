@@ -5,9 +5,9 @@
   "jobs_per_tenant": 100,
   "expected": 1000,
   "completed": 1000,
-  "enqueue_seconds": 2.087161064147949,
-  "drain_seconds": 4.016802787780762,
-  "jobs_per_sec": 248.95421877370504,
+  "enqueue_seconds": 5.793967247009277,
+  "drain_seconds": 4.034469127655029,
+  "jobs_per_sec": 247.86408530066853,
   "metrics": {
     "lease_count": 1000,
     "ack_count": 1000,
@@ -77,8 +77,8 @@
     "wait_before_claim": {
       "count": 1000,
       "rate_per_sec": 0.2777777777777778,
-      "avg_ms": 1052.5449749999998,
-      "sum_ms": 1052544.9749999999
+      "avg_ms": 1297.8842120000004,
+      "sum_ms": 1297884.2120000003
     }
   }
 }

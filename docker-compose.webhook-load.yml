@@ -80,6 +80,8 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      # Seed path calls validate_webhook_url against docker DNS (private).
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
       SINK_URL: http://webhook-sink:8090
       WEBHOOK_URL: http://webhook-sink:8090/hook
       TENANTS: "20"

@@ -303,6 +303,10 @@ def test_lease_expiry_exhausted_increments_dead_counter(queue: JobQueue):
     assert claimed is None  # nothing left claimable
     got = queue.get(job.id, tenant_id="exp")
     assert got is not None and got.status == JobStatus.DEAD
+    # Retention ages via completed_at; must be stamped on system dead-letter.
+    assert got.completed_at is not None
+    assert got.lease_started_at is None
+    assert got.lease_token is None
     snap = queue.get_metrics_snapshot(tenant_id="exp", window_seconds=600)
     assert snap["throughput"]["dead"]["count"] >= 1
 

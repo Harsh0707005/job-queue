@@ -202,10 +202,12 @@ class LeaseMaxRuntimeMixin:
                     lease_token = NULL,
                     lease_tenant_id = NULL,
                     lease_expires_at = NULL,
+                    lease_started_at = NULL,
                     last_error = COALESCE(
                         last_error,
                         'exceeded max_attempts after lease expiry'
                     ),
+                    completed_at = COALESCE(completed_at, %s),
                     updated_at = %s
                 WHERE tenant_id = %s
                   AND status = %s
@@ -215,6 +217,7 @@ class LeaseMaxRuntimeMixin:
                 """,
                 (
                     JobStatus.DEAD.value,
+                    now,
                     now,
                     tenant_id,
                     JobStatus.LEASED.value,
@@ -230,10 +233,12 @@ class LeaseMaxRuntimeMixin:
                     lease_token = NULL,
                     lease_tenant_id = NULL,
                     lease_expires_at = NULL,
+                    lease_started_at = NULL,
                     last_error = COALESCE(
                         last_error,
                         'exceeded max_attempts after lease expiry'
                     ),
+                    completed_at = COALESCE(completed_at, %s),
                     updated_at = %s
                 WHERE status = %s
                   AND lease_expires_at < %s
@@ -242,6 +247,7 @@ class LeaseMaxRuntimeMixin:
                 """,
                 (
                     JobStatus.DEAD.value,
+                    now,
                     now,
                     JobStatus.LEASED.value,
                     now,

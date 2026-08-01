@@ -14,6 +14,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
     _JOB_COLUMNS,
+    LeaseError,
     _SkipLeaseCandidate,
     _utcnow,
 )
@@ -75,6 +76,10 @@ class LeaseClaimFairMixin:
                 skips += 1
                 if skip.tenant_id and skip.reason == "tenant lease rate limited":
                     rate_limited_tenants.add(skip.tenant_id)
+                continue
+            except LeaseError:
+                # Claim predicate race under load — try another candidate.
+                skips += 1
                 continue
         return claimed
 

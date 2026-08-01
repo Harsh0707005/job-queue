@@ -103,6 +103,14 @@ class WebhooksClaimBatchMixin:
                         error=None,
                     )
                 )
+                # Crash-recovery auto-success still counts for metrics integrity.
+                self._record_metric(
+                    conn,
+                    tenant_id=str(u["tenant_id"]),
+                    metric="webhook_success",
+                    count=1,
+                    now=now,
+                )
 
             remaining = max(0, limit - len(auto_rows))
             if remaining < 1:
@@ -210,6 +218,13 @@ class WebhooksClaimBatchMixin:
                             status_code=None,
                             error="max attempts exceeded",
                         )
+                    )
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(row["tenant_id"]),
+                        metric="webhook_fail",
+                        count=1,
+                        now=now,
                     )
                     continue
                 delivery = self._row_to_webhook_delivery(row)
