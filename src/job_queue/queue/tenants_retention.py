@@ -44,9 +44,12 @@ class TenantsRetentionMixin:
                 raise ValueError("metrics_seconds must be >= 0 or None")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            # Preserve existing metrics_retention_seconds on conflict; do not
+            # re-default NULL → 7d (that is only for brand-new settings rows).
             conn.execute(
                 """
-                INSERT INTO queue_settings (id) VALUES (1)
+                INSERT INTO queue_settings (id, metrics_retention_seconds)
+                VALUES (1, 604800)
                 ON CONFLICT (id) DO NOTHING
                 """
             )

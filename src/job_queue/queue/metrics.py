@@ -831,8 +831,14 @@ class MetricsMixin:
         now = _utcnow()
         m_sec = None if seconds is None else int(seconds)
         with self._pool.connection() as conn:
+            # Do not invent a non-null default on write: NULL means forever.
             conn.execute(
-                "INSERT INTO queue_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+                """
+                INSERT INTO queue_settings (id, metrics_retention_seconds)
+                VALUES (1, %s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (m_sec,),
             )
             conn.execute(
                 """
@@ -857,7 +863,9 @@ class MetricsMixin:
                 """
             ).fetchone()
             if row is None:
+                # No settings row yet: same default as schema INSERT for new installs.
                 return self._DEFAULT_METRICS_RETENTION_SECONDS
+            # Explicit NULL is keep-forever (must survive reconnect/init_schema).
             return row.get("metrics_retention_seconds")
 
     def purge_expired_metrics(self, *, limit: int = 5000) -> dict[str, int]:
@@ -884,15 +892,13 @@ class MetricsMixin:
         limit: int = 5000,
     ) -> tuple[int, int]:
         """Delete metric rows older than configured retention. Returns (buckets, snaps)."""
-        conn.execute(
-            "INSERT INTO queue_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
-        )
+        # Never INSERT a non-null default here: purge must honor intentional NULL.
         row = conn.execute(
             "SELECT metrics_retention_seconds FROM queue_settings WHERE id = 1"
         ).fetchone()
         seconds = row["metrics_retention_seconds"] if row else None
         if seconds is None:
-            # Keep forever when explicitly NULL.
+            # Missing row or explicit NULL → keep forever (no purge).
             return 0, 0
         seconds = int(seconds)
         if seconds < 0:

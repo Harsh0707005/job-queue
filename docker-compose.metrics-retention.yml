@@ -1,0 +1,31 @@
+# Verify metrics retention survives coordinator restarts under dual-coordinator fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.metrics-retention.yml down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.metrics-retention.yml up --build \
+#     --abort-on-container-exit --exit-code-from metrics-retention-soak \
+#     metrics-retention-soak
+
+services:
+  load-soak:
+    profiles: ["disabled"]
+  metrics-soak:
+    profiles: ["disabled"]
+
+  metrics-retention-soak:
+    build: .
+    command: ["python", "scripts/metrics_retention_restart_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      RESULTS_PATH: /results/metrics-retention-restart.json
+      COMPOSE_PROJECT_NAME: job-queue
+      LOG_LEVEL: INFO
+    volumes:
+      - ./deploy/load-results:/results
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy

@@ -1,0 +1,53 @@
+{
+  "ok": true,
+  "steps": [
+    {
+      "step": "after set null",
+      "expected": null,
+      "got": null,
+      "ok": true
+    },
+    {
+      "step": "after restart null",
+      "expected": null,
+      "got": null,
+      "ok": true
+    },
+    {
+      "step": "after set 1d",
+      "expected": 86400,
+      "got": 86400,
+      "ok": true
+    },
+    {
+      "step": "after restart 1d",
+      "expected": 86400,
+      "got": 86400,
+      "ok": true
+    },
+    {
+      "step": "after set null again",
+      "expected": null,
+      "got": null,
+      "ok": true
+    },
+    {
+      "step": "after restart null again",
+      "expected": null,
+      "got": null,
+      "ok": true
+    },
+    {
+      "step": "direct http://coordinator-1:8080",
+      "expected": null,
+      "got": null,
+      "ok": true
+    },
+    {
+      "step": "direct http://coordinator-2:8080",
+      "expected": null,
+      "got": null,
+      "ok": true
+    }
+  ]
+}

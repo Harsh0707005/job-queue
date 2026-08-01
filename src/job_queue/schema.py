@@ -293,13 +293,34 @@ ALTER TABLE queue_settings ADD CONSTRAINT queue_settings_metrics_ret_check CHECK
     metrics_retention_seconds IS NULL
     OR metrics_retention_seconds >= 0
 );
--- Default 7 days so history does not grow unbounded; override via API.
-UPDATE queue_settings
-SET metrics_retention_seconds = 604800
-WHERE metrics_retention_seconds IS NULL;
 
+-- Track one-time schema data migrations. Never re-apply defaults that would
+-- overwrite intentional NULL (keep forever) after operators set retention.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name        TEXT PRIMARY KEY,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- New installs only: create the singleton settings row with a 7-day metrics
+-- retention default. ON CONFLICT DO NOTHING preserves any existing row
+-- (including metrics_retention_seconds IS NULL = keep forever).
 INSERT INTO queue_settings (id, metrics_retention_seconds)
 VALUES (1, 604800) ON CONFLICT (id) DO NOTHING;
+
+-- One-time upgrade path: installs that already had queue_settings before
+-- metrics_retention_seconds existed get 7 days once. Subsequent init_schema
+-- runs (coordinator restart / reconnect) must NOT rewrite intentional NULL.
+WITH ins AS (
+    INSERT INTO schema_migrations (name)
+    VALUES ('metrics_retention_default_7d_v1')
+    ON CONFLICT (name) DO NOTHING
+    RETURNING 1
+)
+UPDATE queue_settings
+SET metrics_retention_seconds = 604800,
+    updated_at = NOW()
+WHERE metrics_retention_seconds IS NULL
+  AND EXISTS (SELECT 1 FROM ins);
 
 -- Per-tenant concurrency limits + pause flag (NULL row / missing = unlimited, not paused).
 -- Optional token-bucket rate limits (NULL rate = unlimited):
