@@ -28,23 +28,6 @@ services:
       - -c
       - max_connections=200
 
-  coordinator-1:
-    environment:
-      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
-      COORDINATOR_NODE: coordinator-1
-      LOG_LEVEL: WARNING
-      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
-      JOB_QUEUE_POOL_MIN: "4"
-      JOB_QUEUE_POOL_MAX: "64"
-  coordinator-2:
-    environment:
-      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
-      COORDINATOR_NODE: coordinator-2
-      LOG_LEVEL: WARNING
-      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
-      JOB_QUEUE_POOL_MIN: "4"
-      JOB_QUEUE_POOL_MAX: "64"
-
   worker-1:
     environment:
       <<: *batch_worker_env

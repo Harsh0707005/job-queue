@@ -312,20 +312,10 @@ def serve_coordinator(
     *,
     host: str = "0.0.0.0",
     port: int = 8080,
-    min_size: int | None = None,
-    max_size: int | None = None,
+    min_size: int = 2,
+    max_size: int = 20,
 ) -> None:
     """Bind ThreadingHTTPServer and serve forever."""
-    min_size = (
-        int(os.environ.get("JOB_QUEUE_POOL_MIN", "2"))
-        if min_size is None
-        else min_size
-    )
-    max_size = (
-        int(os.environ.get("JOB_QUEUE_POOL_MAX", "40"))
-        if max_size is None
-        else max_size
-    )
     queue = JobQueue.connect(dsn, min_size=min_size, max_size=max_size)
     coordinator = Coordinator(queue)
     handler = _make_handler(coordinator)

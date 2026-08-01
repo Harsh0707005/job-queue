@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from psycopg.errors import DeadlockDetected, UniqueViolation
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from job_queue.db import init_schema, transaction
@@ -226,31 +226,20 @@ class LeaseMixin:
         if limit > 500:
             raise ValueError("limit must be <= 500")
 
-        # Fair multi-tenant leasing takes per-tenant advisory locks; under
-        # high concurrency lock order can deadlock. Retry instead of 500ing
-        # the whole batch so workers keep draining.
-        last_exc: BaseException | None = None
-        for _attempt in range(5):
-            try:
-                if tenant_id is None:
-                    return self._lease_fair_batch(
-                        worker_id=worker_id,
-                        queue_name=queue_name,
-                        visibility_timeout_seconds=visibility_timeout_seconds,
-                        limit=limit,
-                    )
-                return self._lease_for_tenant_batch(
-                    tenant_id=tenant_id,
-                    worker_id=worker_id,
-                    queue_name=queue_name,
-                    visibility_timeout_seconds=visibility_timeout_seconds,
-                    limit=limit,
-                )
-            except DeadlockDetected as exc:
-                last_exc = exc
-                continue
-        assert last_exc is not None
-        raise last_exc
+        if tenant_id is None:
+            return self._lease_fair_batch(
+                worker_id=worker_id,
+                queue_name=queue_name,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                limit=limit,
+            )
+        return self._lease_for_tenant_batch(
+            tenant_id=tenant_id,
+            worker_id=worker_id,
+            queue_name=queue_name,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+            limit=limit,
+        )
 
 
     def _lease_for_tenant_batch(
