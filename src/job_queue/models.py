@@ -227,12 +227,17 @@ class JobRetentionSettings:
     ``completed_inherits`` / ``dead_inherits`` are True when that status uses
     the global default. When inherits is False and seconds is ``None``, the
     tenant explicitly keeps that status forever (does **not** follow global).
+
+    ``metrics_retention_seconds`` controls how long ``queue_metric_buckets`` and
+    ``queue_metric_snapshots`` are kept (``None`` = forever; default on new
+    installs is 7 days).
     """
 
     completed_retention_seconds: int | None
     dead_retention_seconds: int | None
     completed_inherits: bool = False
     dead_inherits: bool = False
+    metrics_retention_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,10 +247,16 @@ class RetentionPurgeResult:
     completed_deleted: int
     dead_deleted: int
     side_effects_deleted: int
+    metric_buckets_deleted: int = 0
+    metric_snapshots_deleted: int = 0
 
     @property
     def total_deleted(self) -> int:
         return self.completed_deleted + self.dead_deleted
+
+    @property
+    def metrics_deleted(self) -> int:
+        return self.metric_buckets_deleted + self.metric_snapshots_deleted
 
 
 @dataclass(frozen=True, slots=True)

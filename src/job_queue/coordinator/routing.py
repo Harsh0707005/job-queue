@@ -338,5 +338,11 @@ class RoutingMixin:
             return self._metrics_noisy(query)
         if method == "POST" and path == "/v1/metrics/sample":
             return self._metrics_sample(body)
+        if method == "POST" and path == "/v1/metrics/purge":
+            return self._metrics_purge(body)
+        if method == "GET" and path == "/v1/metrics/retention":
+            return self._get_metrics_retention()
+        if method == "POST" and path == "/v1/metrics/retention":
+            return self._set_metrics_retention(body)
 
         return 404, {"error": f"unknown route {method} {path}"}

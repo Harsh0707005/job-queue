@@ -198,6 +198,62 @@ def test_metrics_http_coordinator(postgres_url: str):
         q.close()
 
 
+def test_metrics_retention_purges_old_buckets_and_snapshots(queue: JobQueue):
+    """Aged metric history is deleted once retention elapses."""
+    from datetime import datetime, timezone
+
+    # Seed counters + a snapshot.
+    queue.enqueue(tenant_id="ret", payload={})
+    leased = queue.lease(tenant_id="ret", worker_id="w")
+    assert leased is not None
+    _ack(queue, leased, "w")
+    queue.sample_metrics(tenant_id="ret")
+
+    # Age everything beyond a short retention window.
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    with queue._pool.connection() as conn:
+        conn.execute(
+            "UPDATE queue_metric_buckets SET bucket_start = %s",
+            (old,),
+        )
+        conn.execute(
+            "UPDATE queue_metric_snapshots SET sampled_at = %s",
+            (old,),
+        )
+        conn.commit()
+
+    queue.set_metrics_retention(3600)  # 1 hour
+    assert queue.get_metrics_retention() == 3600
+    purged = queue.purge_expired_metrics(limit=5000)
+    assert purged["metric_buckets_deleted"] >= 1
+    assert purged["metric_snapshots_deleted"] >= 1
+
+    hist = queue.get_metrics_history(tenant_id="ret")
+    assert hist["buckets"] == []
+    # Forever keeps remaining inserts.
+    queue.set_metrics_retention(None)
+    assert queue.get_metrics_retention() is None
+    queue.enqueue(tenant_id="ret2", payload={})
+    queue.lease(tenant_id="ret2", worker_id="w")
+    assert queue.purge_expired_metrics()["metrics_deleted"] == 0
+
+
+def test_purge_expired_jobs_also_cleans_metrics(queue: JobQueue):
+    from datetime import datetime, timezone
+
+    queue.enqueue(tenant_id="pj", payload={})
+    j = queue.lease(tenant_id="pj", worker_id="w")
+    assert j is not None
+    _ack(queue, j, "w")
+    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    with queue._pool.connection() as conn:
+        conn.execute("UPDATE queue_metric_buckets SET bucket_start = %s", (old,))
+        conn.commit()
+    queue.set_metrics_retention(60)
+    result = queue.purge_expired_jobs(limit=100)
+    assert result.metric_buckets_deleted >= 1
+
+
 def test_max_runtime_dead_increments_dead_counter(queue: JobQueue):
     """System max-runtime dead-letter must count ``dead`` (not only worker nack)."""
     import time

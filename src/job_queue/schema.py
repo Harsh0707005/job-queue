@@ -286,7 +286,20 @@ CREATE TABLE IF NOT EXISTS queue_settings (
     )
 );
 
-INSERT INTO queue_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+-- How long metric buckets/snapshots are kept (NULL = keep forever).
+ALTER TABLE queue_settings ADD COLUMN IF NOT EXISTS metrics_retention_seconds INTEGER;
+ALTER TABLE queue_settings DROP CONSTRAINT IF EXISTS queue_settings_metrics_ret_check;
+ALTER TABLE queue_settings ADD CONSTRAINT queue_settings_metrics_ret_check CHECK (
+    metrics_retention_seconds IS NULL
+    OR metrics_retention_seconds >= 0
+);
+-- Default 7 days so history does not grow unbounded; override via API.
+UPDATE queue_settings
+SET metrics_retention_seconds = 604800
+WHERE metrics_retention_seconds IS NULL;
+
+INSERT INTO queue_settings (id, metrics_retention_seconds)
+VALUES (1, 604800) ON CONFLICT (id) DO NOTHING;
 
 -- Per-tenant concurrency limits + pause flag (NULL row / missing = unlimited, not paused).
 -- Optional token-bucket rate limits (NULL rate = unlimited):

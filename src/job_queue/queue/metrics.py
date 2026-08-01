@@ -811,3 +811,118 @@ class MetricsMixin:
         sink = io.BytesIO()
         pq.write_table(table, sink)
         return sink.getvalue()
+
+    # ------------------------------------------------------------------
+    # Retention (buckets + snapshots)
+    # ------------------------------------------------------------------
+
+    # Default when column is unset on very old installs without migration default.
+    _DEFAULT_METRICS_RETENTION_SECONDS = 7 * 24 * 3600
+
+    def set_metrics_retention(self, seconds: int | None) -> int | None:
+        """Set how long metric buckets/snapshots are kept.
+
+        ``None`` keeps history forever. ``0`` purges all rows on the next
+        cleaner pass. Positive values are seconds of age from
+        ``bucket_start`` / ``sampled_at``.
+        """
+        if seconds is not None and int(seconds) < 0:
+            raise ValueError("seconds must be >= 0 or None")
+        now = _utcnow()
+        m_sec = None if seconds is None else int(seconds)
+        with self._pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO queue_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+            )
+            conn.execute(
+                """
+                UPDATE queue_settings
+                SET metrics_retention_seconds = %s,
+                    updated_at = %s
+                WHERE id = 1
+                """,
+                (m_sec, now),
+            )
+            conn.commit()
+        return m_sec
+
+    def get_metrics_retention(self) -> int | None:
+        """Return metrics retention seconds (``None`` = keep forever)."""
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT metrics_retention_seconds
+                FROM queue_settings
+                WHERE id = 1
+                """
+            ).fetchone()
+            if row is None:
+                return self._DEFAULT_METRICS_RETENTION_SECONDS
+            return row.get("metrics_retention_seconds")
+
+    def purge_expired_metrics(self, *, limit: int = 5000) -> dict[str, int]:
+        """Delete aged metric buckets and snapshots. Returns delete counts."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        now = _utcnow()
+        with self._pool.connection() as conn:
+            buckets_n, snaps_n = self._purge_expired_metrics_locked(
+                conn, now=now, limit=limit
+            )
+            conn.commit()
+        return {
+            "metric_buckets_deleted": buckets_n,
+            "metric_snapshots_deleted": snaps_n,
+            "metrics_deleted": buckets_n + snaps_n,
+        }
+
+    def _purge_expired_metrics_locked(
+        self,
+        conn: Any,
+        *,
+        now: datetime,
+        limit: int = 5000,
+    ) -> tuple[int, int]:
+        """Delete metric rows older than configured retention. Returns (buckets, snaps)."""
+        conn.execute(
+            "INSERT INTO queue_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+        )
+        row = conn.execute(
+            "SELECT metrics_retention_seconds FROM queue_settings WHERE id = 1"
+        ).fetchone()
+        seconds = row["metrics_retention_seconds"] if row else None
+        if seconds is None:
+            # Keep forever when explicitly NULL.
+            return 0, 0
+        seconds = int(seconds)
+        if seconds < 0:
+            return 0, 0
+        cutoff = now - timedelta(seconds=seconds)
+        half = max(1, limit // 2)
+        buckets = conn.execute(
+            """
+            DELETE FROM queue_metric_buckets
+            WHERE ctid IN (
+                SELECT ctid FROM queue_metric_buckets
+                WHERE bucket_start < %s
+                ORDER BY bucket_start ASC
+                LIMIT %s
+            )
+            RETURNING 1
+            """,
+            (cutoff, half),
+        ).fetchall()
+        snaps = conn.execute(
+            """
+            DELETE FROM queue_metric_snapshots
+            WHERE ctid IN (
+                SELECT ctid FROM queue_metric_snapshots
+                WHERE sampled_at < %s
+                ORDER BY sampled_at ASC
+                LIMIT %s
+            )
+            RETURNING 1
+            """,
+            (cutoff, limit - len(buckets) if limit > len(buckets) else half),
+        ).fetchall()
+        return len(buckets), len(snaps)

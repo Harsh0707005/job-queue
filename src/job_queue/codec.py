@@ -353,6 +353,9 @@ def job_retention_to_dict(settings: Any) -> dict[str, Any]:
         "dead_retention_seconds": settings.dead_retention_seconds,
         "completed_inherits": bool(getattr(settings, "completed_inherits", False)),
         "dead_inherits": bool(getattr(settings, "dead_inherits", False)),
+        "metrics_retention_seconds": getattr(
+            settings, "metrics_retention_seconds", None
+        ),
     }
 
 
@@ -361,6 +364,13 @@ def retention_purge_to_dict(result: Any) -> dict[str, Any]:
         "completed_deleted": result.completed_deleted,
         "dead_deleted": result.dead_deleted,
         "side_effects_deleted": result.side_effects_deleted,
+        "metric_buckets_deleted": int(
+            getattr(result, "metric_buckets_deleted", 0) or 0
+        ),
+        "metric_snapshots_deleted": int(
+            getattr(result, "metric_snapshots_deleted", 0) or 0
+        ),
+        "metrics_deleted": int(getattr(result, "metrics_deleted", 0) or 0),
         "total_deleted": result.total_deleted,
     }
 

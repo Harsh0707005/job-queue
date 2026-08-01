@@ -40,15 +40,19 @@ class CleanerNode:
                 while not self._stop.is_set():
                     result = self.client.purge_expired_jobs(limit=self.batch_limit)
                     n = int(result.get("total_deleted") or 0)
-                    if n:
+                    metrics_n = int(result.get("metrics_deleted") or 0)
+                    if n or metrics_n:
                         self.deleted += n
                         logger.info(
-                            "purged completed=%s dead=%s total=%d",
+                            "purged completed=%s dead=%s metric_buckets=%s "
+                            "metric_snapshots=%s jobs_total=%d",
                             result.get("completed_deleted"),
                             result.get("dead_deleted"),
+                            result.get("metric_buckets_deleted"),
+                            result.get("metric_snapshots_deleted"),
                             self.deleted,
                         )
-                    if n == 0:
+                    if n == 0 and metrics_n == 0:
                         break
             except Exception:
                 logger.exception("purge-expired-jobs failed")

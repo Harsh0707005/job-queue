@@ -50,12 +50,15 @@ class RetentionCleaner:
         )
         if self.on_purge is not None:
             self.on_purge(result)
-        if result.total_deleted:
+        if result.total_deleted or getattr(result, "metrics_deleted", 0):
             logger.info(
-                "purged completed=%d dead=%d side_effects=%d",
+                "purged completed=%d dead=%d side_effects=%d "
+                "metric_buckets=%d metric_snapshots=%d",
                 result.completed_deleted,
                 result.dead_deleted,
                 result.side_effects_deleted,
+                getattr(result, "metric_buckets_deleted", 0),
+                getattr(result, "metric_snapshots_deleted", 0),
             )
         return result
 
@@ -67,7 +70,8 @@ class RetentionCleaner:
             while not self._stop.is_set():
                 result = self.run_once()
                 total += result.total_deleted
-                if result.total_deleted == 0:
+                metrics_n = int(getattr(result, "metrics_deleted", 0) or 0)
+                if result.total_deleted == 0 and metrics_n == 0:
                     break
             self._stop.wait(self.poll_interval_seconds)
         return total

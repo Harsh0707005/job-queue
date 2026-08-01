@@ -403,3 +403,22 @@ class ClientAdminMixin:
         payload = self._request("POST", "/v1/metrics/sample", body)
         assert payload is not None
         return payload
+
+    def metrics_purge(self, *, limit: int = 5000) -> dict[str, Any]:
+        payload = self._request("POST", "/v1/metrics/purge", {"limit": limit})
+        assert payload is not None
+        return payload
+
+    def get_metrics_retention(self) -> dict[str, Any]:
+        payload = self._request("GET", "/v1/metrics/retention")
+        assert payload is not None
+        return payload
+
+    def set_metrics_retention(self, seconds: int | None) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            "/v1/metrics/retention",
+            {"metrics_retention_seconds": seconds},
+        )
+        assert payload is not None
+        return payload

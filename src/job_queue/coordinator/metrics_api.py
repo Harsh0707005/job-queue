@@ -73,3 +73,38 @@ class MetricsApiMixin:
                 row["sampled_at"] = row["sampled_at"].isoformat()
             out.append(row)
         return 200, {"snapshots": out, "count": len(out)}
+
+    def _metrics_purge(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        try:
+            limit = int(body.get("limit") or 5000)
+            result = self.queue.purge_expired_metrics(limit=limit)
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 200, result
+
+    def _get_metrics_retention(self) -> tuple[int, dict[str, Any]]:
+        return 200, {
+            "metrics_retention_seconds": self.queue.get_metrics_retention()
+        }
+
+    def _set_metrics_retention(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if (
+            "metrics_retention_seconds" not in body
+            and "seconds" not in body
+            and "metrics_seconds" not in body
+        ):
+            return 400, {
+                "error": "metrics_retention_seconds required (null = keep forever)"
+            }
+        try:
+            raw = body.get(
+                "metrics_retention_seconds",
+                body.get("metrics_seconds", body.get("seconds")),
+            )
+            seconds = None if raw is None else int(raw)
+            applied = self.queue.set_metrics_retention(seconds)
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"metrics_retention_seconds": applied}

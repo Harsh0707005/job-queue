@@ -166,21 +166,26 @@ class TenantsApiLimitsMixin:
         return 200, out
 
     def _set_retention(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        if (
-            "completed_retention_seconds" not in body
-            and "completed_seconds" not in body
-            and "dead_retention_seconds" not in body
-            and "dead_seconds" not in body
-        ):
+        has_job = (
+            "completed_retention_seconds" in body
+            or "completed_seconds" in body
+            or "dead_retention_seconds" in body
+            or "dead_seconds" in body
+        )
+        has_metrics = (
+            "metrics_retention_seconds" in body or "metrics_seconds" in body
+        )
+        if not has_job and not has_metrics:
             return 400, {
-                "error": "completed_retention_seconds and/or "
-                "dead_retention_seconds required (null = keep forever)"
+                "error": "completed_retention_seconds, dead_retention_seconds, "
+                "and/or metrics_retention_seconds required (null = keep forever)"
             }
         try:
             c_raw = body.get(
                 "completed_retention_seconds", body.get("completed_seconds")
             )
             d_raw = body.get("dead_retention_seconds", body.get("dead_seconds"))
+            m_raw = body.get("metrics_retention_seconds", body.get("metrics_seconds"))
             # Allow partial update: only provided keys change.
             current = self.queue.get_job_retention()
             completed = (
@@ -194,10 +199,13 @@ class TenantsApiLimitsMixin:
                 if "dead_retention_seconds" not in body and "dead_seconds" not in body
                 else (None if d_raw is None else int(d_raw))
             )
-            settings = self.queue.set_job_retention(
-                completed_seconds=completed,
-                dead_seconds=dead,
-            )
+            kwargs: dict[str, Any] = {
+                "completed_seconds": completed,
+                "dead_seconds": dead,
+            }
+            if has_metrics:
+                kwargs["metrics_seconds"] = None if m_raw is None else int(m_raw)
+            settings = self.queue.set_job_retention(**kwargs)
         except (TypeError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 200, job_retention_to_dict(settings)

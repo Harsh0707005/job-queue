@@ -23,52 +23,76 @@ class TenantsRetentionMixin:
         *,
         completed_seconds: int | None = None,
         dead_seconds: int | None = None,
+        metrics_seconds: Any = _UNSET,
     ) -> JobRetentionSettings:
-        """Set global retention for terminal jobs (seconds).
+        """Set global retention for terminal jobs and metric history (seconds).
 
         Pass ``None`` for a status to keep those jobs forever. ``0`` means
         eligible for purge on the next cleaner pass. Per-tenant overrides via
         :meth:`set_tenant_job_retention` take precedence when set.
+
+        *metrics_seconds* controls ``queue_metric_buckets`` /
+        ``queue_metric_snapshots`` age (``None`` = keep forever). Omit to leave
+        the current metrics retention unchanged.
         """
         if completed_seconds is not None and completed_seconds < 0:
             raise ValueError("completed_seconds must be >= 0 or None")
         if dead_seconds is not None and dead_seconds < 0:
             raise ValueError("dead_seconds must be >= 0 or None")
+        if metrics_seconds is not _UNSET:
+            if metrics_seconds is not None and int(metrics_seconds) < 0:
+                raise ValueError("metrics_seconds must be >= 0 or None")
         now = _utcnow()
         with transaction(self._pool) as conn:
             conn.execute(
                 """
-                INSERT INTO queue_settings (
-                    id, completed_retention_seconds, dead_retention_seconds,
-                    updated_at
-                ) VALUES (1, %s, %s, %s)
-                ON CONFLICT (id) DO UPDATE
-                SET completed_retention_seconds = EXCLUDED.completed_retention_seconds,
-                    dead_retention_seconds = EXCLUDED.dead_retention_seconds,
-                    updated_at = EXCLUDED.updated_at
-                """,
-                (completed_seconds, dead_seconds, now),
+                INSERT INTO queue_settings (id) VALUES (1)
+                ON CONFLICT (id) DO NOTHING
+                """
             )
-        return JobRetentionSettings(
-            completed_retention_seconds=completed_seconds,
-            dead_retention_seconds=dead_seconds,
-        )
+            if metrics_seconds is _UNSET:
+                conn.execute(
+                    """
+                    UPDATE queue_settings
+                    SET completed_retention_seconds = %s,
+                        dead_retention_seconds = %s,
+                        updated_at = %s
+                    WHERE id = 1
+                    """,
+                    (completed_seconds, dead_seconds, now),
+                )
+            else:
+                m_sec = None if metrics_seconds is None else int(metrics_seconds)
+                conn.execute(
+                    """
+                    UPDATE queue_settings
+                    SET completed_retention_seconds = %s,
+                        dead_retention_seconds = %s,
+                        metrics_retention_seconds = %s,
+                        updated_at = %s
+                    WHERE id = 1
+                    """,
+                    (completed_seconds, dead_seconds, m_sec, now),
+                )
+        return self.get_job_retention()
 
     def get_job_retention(self) -> JobRetentionSettings:
-        """Return global completed/dead retention (None = keep forever)."""
+        """Return global completed/dead/metrics retention (None = keep forever)."""
         with self._pool.connection() as conn:
             row = conn.execute(
                 """
-                SELECT completed_retention_seconds, dead_retention_seconds
+                SELECT completed_retention_seconds, dead_retention_seconds,
+                       metrics_retention_seconds
                 FROM queue_settings
                 WHERE id = 1
                 """
             ).fetchone()
             if row is None:
-                return JobRetentionSettings(None, None)
+                return JobRetentionSettings(None, None, metrics_retention_seconds=None)
             return JobRetentionSettings(
                 completed_retention_seconds=row["completed_retention_seconds"],
                 dead_retention_seconds=row["dead_retention_seconds"],
+                metrics_retention_seconds=row.get("metrics_retention_seconds"),
             )
 
     def set_tenant_job_retention(
@@ -281,8 +305,14 @@ class TenantsRetentionMixin:
                     "DELETE FROM jobs WHERE id = ANY(%s)",
                     (all_ids,),
                 )
+            # Metric history purge shares the cleaner pass (global, not per-tenant).
+            buckets_n, snaps_n = self._purge_expired_metrics_locked(
+                conn, now=now, limit=limit
+            )
             return RetentionPurgeResult(
                 completed_deleted=len(completed_ids),
                 dead_deleted=len(dead_ids),
                 side_effects_deleted=side_n,
+                metric_buckets_deleted=buckets_n,
+                metric_snapshots_deleted=snaps_n,
             )
