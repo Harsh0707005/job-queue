@@ -1,0 +1,315 @@
+"""JobQueue tenant merge."""
+from __future__ import annotations
+
+import math
+
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import UUID, uuid4
+
+from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
+
+from job_queue.db import init_schema, transaction
+from job_queue.models import (
+    AuditConsistencyReport,
+    BulkCancelResult,
+    Job,
+    JobAuditEvent,
+    JobProgressEvent,
+    JobRetentionSettings,
+    JobSideEffect,
+    JobStatus,
+    PreemptResult,
+    RetentionPurgeResult,
+    Schedule,
+    ScheduleFire,
+    SpawnChildrenResult,
+    TenantMergeResult,
+    TenantOffboardResult,
+    TenantStats,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEvent,
+)
+from job_queue.queue._common import (
+    JOB_EVENTS_CHANNEL,
+    _ACTIVE_JOB_STATUSES,
+    _CANCELABLE_STATUSES,
+    _CANCEL_MATCHING_BATCH_DEFAULT,
+    _CANCEL_MATCHING_RETURN_CAP,
+    _DEDUPE_LOCK_CLASS,
+    _DEFAULT_ESTIMATE_SECONDS,
+    _DEPS_SATISFIED_SQL,
+    _EWMA_ALPHA,
+    _JOB_COLUMNS,
+    _MAX_LABELS,
+    _MAX_LABEL_LEN,
+    _MAX_PREEMPTS_PER_JOB,
+    _NOTIFY_MAX_BYTES,
+    _SCHEDULE_COLUMNS,
+    _SIDE_EFFECT_SELECT,
+    _TENANT_RETENTION_FOREVER,
+    _UNSET,
+    _WEBHOOK_DELIVERY_COLUMNS,
+    _WEBHOOK_ENDPOINT_COLUMNS,
+    ApprovalError,
+    ApprovalRequested,
+    CancelError,
+    ChildrenAwaited,
+    DependencyError,
+    LeaseError,
+    MergeError,
+    RateLimitError,
+    RebuildError,
+    ReplayError,
+    ScheduleError,
+    SpawnError,
+    _SkipLeaseCandidate,
+    _as_utc,
+    _normalize_labels,
+    _normalize_status_filter,
+    _row_to_job,
+    _row_to_schedule,
+    _utcnow,
+    compute_retry_backoff_seconds,
+)
+
+
+class TenantsMergeMixin:
+    def merge_tenant(
+        self,
+        source_tenant_id: str,
+        target_tenant_id: str,
+    ) -> TenantMergeResult:
+        """Transfer ownership of *source* into *target* without stopping workers.
+
+        Moves **all** of the source tenant's rows to the target in one
+        transaction:
+
+        * jobs (pending, leased/running, and terminal history)
+        * schedules
+        * webhook endpoints and deliveries (including ``delivering``)
+
+        Lease fencing tokens, ``leased_by``, and ``lease_tenant_id`` are
+        preserved so in-flight workers keep heartbeating / acking with the
+        pre-merge tenant (lease ops accept current owner **or** the frozen
+        claim tenant). Unrelated tenants remain rejected.
+
+        Conflict handling (so unique indexes cannot fail the transfer):
+
+        * Active ``dedupe_key`` collisions with the target → clear the
+          *source* job's dedupe key (job itself still moves).
+        * Schedule ``name`` collisions → rename source schedule to
+          ``{name}__from_{source_tenant_id}``.
+
+        Source is blocked for new work (paused + offboarding) for the
+        duration of the transfer, then its settings / fairness rows are
+        deleted. Target settings (pause, caps, offboarding) are unchanged.
+        Refuses to merge into an offboarding target, or if the target's
+        pending-job cap would be exceeded by the combined pending set.
+
+        After a successful call, ``tenant_is_empty(source)`` is True.
+        """
+        if not source_tenant_id or not target_tenant_id:
+            raise ValueError("source_tenant_id and target_tenant_id are required")
+        if source_tenant_id == target_tenant_id:
+            raise ValueError("source_tenant_id and target_tenant_id must differ")
+
+        now = _utcnow()
+        source = source_tenant_id
+        target = target_tenant_id
+
+        with transaction(self._pool) as conn:
+            # Serialize with enqueue / pending-cap / other merges for both
+            # tenants (ordered lock acquisition avoids deadlocks).
+            for tid in sorted((source, target)):
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (tid,),
+                )
+
+            if self._is_tenant_offboarding(conn, target):
+                raise MergeError(
+                    f"cannot merge into tenant {target!r}: target is offboarding"
+                )
+
+            # Block concurrent source enqueue / schedule / webhook registration.
+            conn.execute(
+                """
+                INSERT INTO tenant_settings (
+                    tenant_id, max_concurrent_leases, max_pending_jobs,
+                    paused, offboarding, updated_at
+                )
+                VALUES (%s, NULL, NULL, TRUE, TRUE, %s)
+                ON CONFLICT (tenant_id) DO UPDATE
+                SET paused = TRUE,
+                    offboarding = TRUE,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (source, now),
+            )
+
+            # Pending-cap: refuse if target would exceed after absorbing source.
+            target_limit = self._read_pending_limit(conn, target)
+            if target_limit is not None:
+                source_pending = self._count_pending(conn, source)
+                target_pending = self._count_pending(conn, target)
+                if source_pending + target_pending > target_limit:
+                    raise MergeError(
+                        f"cannot merge tenant {source!r} into {target!r}: "
+                        f"pending job cap would be exceeded "
+                        f"({source_pending}+{target_pending} > {target_limit}); "
+                        f"raise or clear the target pending limit first"
+                    )
+
+            # Resolve active dedupe collisions (prefer target's active key).
+            dedupe_cleared = conn.execute(
+                """
+                UPDATE jobs j
+                SET dedupe_key = NULL,
+                    updated_at = %s
+                WHERE j.tenant_id = %s
+                  AND j.dedupe_key IS NOT NULL
+                  AND j.status IN (
+                      'pending', 'leased', 'awaiting_approval', 'awaiting_children'
+                  )
+                  AND EXISTS (
+                        SELECT 1
+                        FROM jobs t
+                        WHERE t.tenant_id = %s
+                          AND t.queue_name = j.queue_name
+                          AND t.dedupe_key = j.dedupe_key
+                          AND t.status IN (
+                              'pending', 'leased',
+                              'awaiting_approval', 'awaiting_children'
+                          )
+                  )
+                RETURNING j.id
+                """,
+                (now, source, target),
+            ).fetchall()
+
+            # Resolve schedule name collisions (unique per tenant when set).
+            names_renamed = conn.execute(
+                """
+                UPDATE schedules s
+                SET name = s.name || %s,
+                    updated_at = %s
+                WHERE s.tenant_id = %s
+                  AND s.name IS NOT NULL
+                  AND EXISTS (
+                        SELECT 1
+                        FROM schedules t
+                        WHERE t.tenant_id = %s
+                          AND t.name = s.name
+                  )
+                RETURNING s.id
+                """,
+                (f"__from_{source}", now, source, target),
+            ).fetchall()
+
+            jobs_moved = conn.execute(
+                """
+                UPDATE jobs
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id, status
+                """,
+                (target, now, source),
+            ).fetchall()
+            for jm in jobs_moved:
+                moved_row = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                    (jm["id"],),
+                ).fetchone()
+                if moved_row is not None:
+                    self._append_job_audit(
+                        conn,
+                        job_row=moved_row,
+                        event_type="tenant_merged",
+                        from_status=jm["status"],
+                        actor="system",
+                        detail={
+                            "from_tenant": source,
+                            "to_tenant": target,
+                        },
+                        now=now,
+                    )
+            leased_moved = sum(
+                1 for r in jobs_moved if r["status"] == JobStatus.LEASED.value
+            )
+
+            sched_moved = conn.execute(
+                """
+                UPDATE schedules
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+
+            # Endpoints before deliveries is fine (no tenant FK); both move.
+            ep_moved = conn.execute(
+                """
+                UPDATE webhook_endpoints
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+            del_moved = conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+
+            # Side-effect markers follow job ownership (job_id unchanged).
+            conn.execute(
+                """
+                UPDATE job_side_effects
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (target, source),
+            )
+
+            # Drop source control-plane state (settings + fairness).
+            conn.execute(
+                "DELETE FROM tenant_settings WHERE tenant_id = %s",
+                (source,),
+            )
+            conn.execute(
+                "DELETE FROM tenant_fairness WHERE tenant_id = %s",
+                (source,),
+            )
+
+            if not self._tenant_is_empty(conn, source):
+                # Should be unreachable; surface loudly if a new table is added.
+                raise MergeError(
+                    f"merge left residual state on source tenant {source!r}"
+                )
+
+            return TenantMergeResult(
+                source_tenant_id=source,
+                target_tenant_id=target,
+                jobs_moved=len(jobs_moved),
+                jobs_leased_moved=leased_moved,
+                schedules_moved=len(sched_moved),
+                webhook_endpoints_moved=len(ep_moved),
+                webhook_deliveries_moved=len(del_moved),
+                dedupe_keys_cleared=len(dedupe_cleared),
+                schedule_names_renamed=len(names_renamed),
+                source_empty=True,
+            )

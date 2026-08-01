@@ -1,0 +1,378 @@
+"""JobQueue per-tenant lease claim helpers and locks."""
+from __future__ import annotations
+
+import json
+
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import UUID, uuid4
+
+from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
+
+from job_queue.db import init_schema, transaction
+from job_queue.models import (
+    AuditConsistencyReport,
+    BulkCancelResult,
+    Job,
+    JobAuditEvent,
+    JobProgressEvent,
+    JobRetentionSettings,
+    JobSideEffect,
+    JobStatus,
+    PreemptResult,
+    RetentionPurgeResult,
+    Schedule,
+    ScheduleFire,
+    SpawnChildrenResult,
+    TenantMergeResult,
+    TenantOffboardResult,
+    TenantStats,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEvent,
+)
+from job_queue.queue._common import (
+    JOB_EVENTS_CHANNEL,
+    _ACTIVE_JOB_STATUSES,
+    _CANCELABLE_STATUSES,
+    _CANCEL_MATCHING_BATCH_DEFAULT,
+    _CANCEL_MATCHING_RETURN_CAP,
+    _DEDUPE_LOCK_CLASS,
+    _DEFAULT_ESTIMATE_SECONDS,
+    _DEPS_SATISFIED_SQL,
+    _EWMA_ALPHA,
+    _JOB_COLUMNS,
+    _MAX_LABELS,
+    _MAX_LABEL_LEN,
+    _MAX_PREEMPTS_PER_JOB,
+    _NOTIFY_MAX_BYTES,
+    _SCHEDULE_COLUMNS,
+    _SIDE_EFFECT_SELECT,
+    _TENANT_RETENTION_FOREVER,
+    _UNSET,
+    _WEBHOOK_DELIVERY_COLUMNS,
+    _WEBHOOK_ENDPOINT_COLUMNS,
+    ApprovalError,
+    ApprovalRequested,
+    CancelError,
+    ChildrenAwaited,
+    DependencyError,
+    LeaseError,
+    MergeError,
+    RateLimitError,
+    RebuildError,
+    ReplayError,
+    ScheduleError,
+    SpawnError,
+    _SkipLeaseCandidate,
+    _as_utc,
+    _normalize_labels,
+    _normalize_status_filter,
+    _row_to_job,
+    _row_to_schedule,
+    _utcnow,
+    compute_retry_backoff_seconds,
+)
+
+
+class LeaseClaimTenantMixin:
+    def _lease_for_tenant_batch(
+        self,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        queue_name: str,
+        visibility_timeout_seconds: int | None,
+        limit: int,
+    ) -> list[Job]:
+        now = _utcnow()
+        claimed: list[Job] = []
+
+        with transaction(self._pool) as conn:
+            # Serialize lease decisions for this tenant so concurrency caps
+            # cannot be exceeded by racing workers.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (tenant_id,),
+            )
+
+            self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
+            # Offboarding: cancel abandoned expired leases so the tenant can empty.
+            self._reap_offboarding_expired_leases(
+                conn, now=now, tenant_id=tenant_id
+            )
+            # Parked-job deadlines (approval + await-children join).
+            self._expire_parked_timeouts_locked(
+                conn, now=now, tenant_id=tenant_id
+            )
+
+            # Paused: no new claims (pending or reclaim). In-flight holders
+            # still use heartbeat/ack/nack outside this path.
+            if self._is_tenant_paused(conn, tenant_id):
+                return []
+
+            conc_limit = self._read_concurrency_limit(conn, tenant_id)
+            leased_count = self._count_leased(conn, tenant_id)
+
+            # Deadline preemption: free a slot when an urgent pending job
+            # cannot wait for less-urgent holders to finish.
+            if conc_limit is not None and leased_count >= conc_limit:
+                if self._try_preempt_for_tenant(
+                    conn,
+                    tenant_id=tenant_id,
+                    queue_name=queue_name,
+                    now=now,
+                ):
+                    leased_count = self._count_leased(conn, tenant_id)
+
+            if conc_limit is not None and leased_count >= conc_limit:
+                # Only reclaim expired leases (does not increase concurrent
+                # holders beyond the cap in steady state).
+                candidates = conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM jobs
+                    WHERE tenant_id = %s
+                      AND queue_name = %s
+                      AND status = %s
+                      AND lease_expires_at < %s
+                      AND attempts < max_attempts
+                    ORDER BY priority DESC,
+                      (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
+                        - COALESCE(estimated_duration_seconds, 60)) ASC,
+                      created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                    """,
+                    (
+                        tenant_id,
+                        queue_name,
+                        JobStatus.LEASED.value,
+                        now,
+                        now,
+                        now,
+                        limit,
+                    ),
+                ).fetchall()
+            else:
+                take = limit
+                if conc_limit is not None:
+                    take = min(limit, conc_limit - leased_count)
+                    take = max(take, 0)
+                if take < 1:
+                    return []
+                candidates = conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM jobs
+                    WHERE tenant_id = %s
+                      AND queue_name = %s
+                      AND (
+                            (
+                                status = %s
+                                AND available_at <= %s
+                                AND {_DEPS_SATISFIED_SQL}
+                            )
+                         OR (
+                                status = %s
+                            AND lease_expires_at < %s
+                            AND attempts < max_attempts
+                         )
+                      )
+                    ORDER BY priority DESC,
+                      CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
+                      (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
+                        - COALESCE(estimated_duration_seconds, 60)) ASC,
+                      created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                    """,
+                    (
+                        tenant_id,
+                        queue_name,
+                        JobStatus.PENDING.value,
+                        now,
+                        JobStatus.LEASED.value,
+                        now,
+                        now,
+                        now,
+                        take,
+                    ),
+                ).fetchall()
+
+            for candidate in candidates:
+                # Rate-limit new pending claims only; reclaim is free so
+                # recovery is not blocked by a noisy tenant's throttle.
+                if candidate["status"] == JobStatus.PENDING.value:
+                    if not self._try_consume_lease_rate(
+                        conn, tenant_id, now=now
+                    ):
+                        break
+                claimed.append(
+                    self._claim_locked_job(
+                        conn,
+                        candidate,
+                        worker_id=worker_id,
+                        token=uuid4(),
+                        visibility_timeout_seconds=visibility_timeout_seconds,
+                        now=now,
+                    )
+                )
+        return claimed
+
+    def _claim_locked_job(
+        self,
+        conn: Any,
+        candidate: dict[str, Any],
+        *,
+        worker_id: str,
+        token: UUID,
+        visibility_timeout_seconds: int | None,
+        now: datetime,
+    ) -> Job:
+        new_attempts = candidate["attempts"] + 1
+        vt = visibility_timeout_seconds or candidate["visibility_timeout_seconds"]
+        max_rt = int(candidate.get("max_runtime_seconds") or 3600)
+        lease_expires = now + timedelta(seconds=vt)
+        hard = now + timedelta(seconds=max_rt)
+        if lease_expires > hard:
+            lease_expires = hard
+
+        from_status = candidate["status"]
+        row = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = %s,
+                lease_token = %s,
+                lease_tenant_id = %s,
+                lease_expires_at = %s,
+                lease_started_at = %s,
+                attempts = %s,
+                visibility_timeout_seconds = %s,
+                updated_at = %s,
+                last_error = NULL
+            WHERE id = %s
+              AND tenant_id = %s
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.LEASED.value,
+                worker_id,
+                token,
+                candidate["tenant_id"],
+                lease_expires,
+                now,
+                new_attempts,
+                vt,
+                now,
+                candidate["id"],
+                candidate["tenant_id"],
+            ),
+        ).fetchone()
+        assert row is not None
+        job = _row_to_job(row)
+        self._append_job_audit(
+            conn,
+            job_row=row,
+            event_type="leased",
+            from_status=from_status,
+            actor=worker_id,
+            detail={
+                "attempts": new_attempts,
+                "reclaim": from_status == JobStatus.LEASED.value,
+            },
+            now=now,
+        )
+        return job
+
+    def _lock_job_for_tenant(
+        self,
+        conn: Any,
+        job_id: UUID,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        row = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE id = %s AND tenant_id = %s
+            FOR UPDATE
+            """,
+            (job_id, tenant_id),
+        ).fetchone()
+        if row is None:
+            raise LeaseError(f"job {job_id} not found for tenant {tenant_id!r}")
+        return row
+
+    def _lock_job_for_lease(
+        self,
+        conn: Any,
+        job_id: UUID,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Lock a job for heartbeat / ack / nack / ensure_lease by id.
+
+        Tenant authorization is applied separately via
+        :meth:`_assert_lease_tenant` (current owner **or** frozen
+        ``lease_tenant_id``). Locking by id allows the row to be found after
+        ``merge_tenant`` moved ``tenant_id`` while the worker still holds the
+        pre-merge tenant string.
+        """
+        row = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            if tenant_id is not None:
+                raise LeaseError(
+                    f"job {job_id} not found for tenant {tenant_id!r}"
+                )
+            raise LeaseError(f"job {job_id} not found")
+        return row
+
+    @staticmethod
+    def _assert_lease_tenant(row: dict[str, Any], tenant_id: str) -> None:
+        """Reject lease ops from tenants that neither own nor claimed the job.
+
+        Accepts:
+        * current ``tenant_id`` (owner after merge or normal path)
+        * ``lease_tenant_id`` frozen at claim (pre-merge worker after transfer)
+
+        Rejects any other tenant even when the lease token is valid — that is
+        the cross-tenant safety boundary.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        current = row["tenant_id"]
+        claim_tenant = row.get("lease_tenant_id")
+        if tenant_id == current:
+            return
+        if claim_tenant is not None and tenant_id == claim_tenant:
+            return
+        raise LeaseError(
+            f"job {row['id']} not found for tenant {tenant_id!r}"
+        )
+
+    @staticmethod
+    def _count_leased(conn: Any, tenant_id: str) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM jobs
+            WHERE tenant_id = %s AND status = %s
+            """,
+            (tenant_id, JobStatus.LEASED.value),
+        ).fetchone()
+        assert row is not None
+        return int(row["n"])

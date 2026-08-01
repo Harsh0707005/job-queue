@@ -1,0 +1,258 @@
+"""JobQueue finalize_webhook_delivery."""
+from __future__ import annotations
+
+import json
+
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import UUID, uuid4
+
+from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
+
+from job_queue.db import init_schema, transaction
+from job_queue.models import (
+    AuditConsistencyReport,
+    BulkCancelResult,
+    Job,
+    JobAuditEvent,
+    JobProgressEvent,
+    JobRetentionSettings,
+    JobSideEffect,
+    JobStatus,
+    PreemptResult,
+    RetentionPurgeResult,
+    Schedule,
+    ScheduleFire,
+    SpawnChildrenResult,
+    TenantMergeResult,
+    TenantOffboardResult,
+    TenantStats,
+    WebhookDelivery,
+    WebhookEndpoint,
+    WebhookEvent,
+)
+from job_queue.queue._common import (
+    JOB_EVENTS_CHANNEL,
+    _ACTIVE_JOB_STATUSES,
+    _CANCELABLE_STATUSES,
+    _CANCEL_MATCHING_BATCH_DEFAULT,
+    _CANCEL_MATCHING_RETURN_CAP,
+    _DEDUPE_LOCK_CLASS,
+    _DEFAULT_ESTIMATE_SECONDS,
+    _DEPS_SATISFIED_SQL,
+    _EWMA_ALPHA,
+    _JOB_COLUMNS,
+    _MAX_LABELS,
+    _MAX_LABEL_LEN,
+    _MAX_PREEMPTS_PER_JOB,
+    _NOTIFY_MAX_BYTES,
+    _SCHEDULE_COLUMNS,
+    _SIDE_EFFECT_SELECT,
+    _TENANT_RETENTION_FOREVER,
+    _UNSET,
+    _WEBHOOK_DELIVERY_COLUMNS,
+    _WEBHOOK_ENDPOINT_COLUMNS,
+    ApprovalError,
+    ApprovalRequested,
+    CancelError,
+    ChildrenAwaited,
+    DependencyError,
+    LeaseError,
+    MergeError,
+    RateLimitError,
+    RebuildError,
+    ReplayError,
+    ScheduleError,
+    SpawnError,
+    _SkipLeaseCandidate,
+    _as_utc,
+    _normalize_labels,
+    _normalize_status_filter,
+    _row_to_job,
+    _row_to_schedule,
+    _utcnow,
+    compute_retry_backoff_seconds,
+)
+
+
+class WebhooksFinalizeMixin:
+    def finalize_webhook_delivery(
+        self,
+        delivery_id: UUID,
+        *,
+        status_code: int | None = None,
+        error: str | None = None,
+        endpoint_missing: bool = False,
+    ) -> Any | None:
+        """Finalize a claimed (delivering) webhook after the agent POSTed (or not).
+
+        On success, persists ``last_status_code`` first so a crash before the
+        status flip still prevents double-POST on reclaim.
+        Returns ``None`` if the delivery is no longer ``delivering`` (lost race).
+
+        While a tenant is offboarding, failed deliveries are forced terminal
+        (``dead``) instead of requeued to ``pending``, then the tenant is
+        auto-purged once no leased jobs / delivering webhooks remain.
+        """
+        from job_queue.webhooks import WebhookDeliveryResult
+
+        now = _utcnow()
+
+        if endpoint_missing:
+            with transaction(self._pool) as conn:
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'dead',
+                        delivering_until = NULL,
+                        last_error = %s,
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                    """,
+                    (
+                        "endpoint missing or disabled",
+                        now,
+                        now,
+                        delivery_id,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    return None
+                self._maybe_finalize_offboard(
+                    conn, tenant_id=updated["tenant_id"], now=now
+                )
+                return WebhookDeliveryResult(
+                    delivery=self._row_to_webhook_delivery(updated),
+                    success=False,
+                    status_code=None,
+                    error="endpoint missing or disabled",
+                )
+
+        success = status_code is not None and 200 <= int(status_code) < 300
+        detail = (error or "")[:2000] if error else None
+
+        # Load attempts / max under lock for retry vs dead decision.
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {self._WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (delivery_id,),
+            ).fetchone()
+            if row is None or row["status"] != "delivering":
+                return None
+
+            delivery = self._row_to_webhook_delivery(row)
+            attempts = delivery.attempts
+            tenant_id = delivery.tenant_id
+            offboarding = self._is_tenant_offboarding(conn, tenant_id)
+
+            if success:
+                # Single UPDATE: persist 2xx evidence and terminal status together.
+                # (Crash mid-statement still leaves status=delivering; reclaim
+                # auto-succeeds when last_status_code is 2xx.)
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'succeeded',
+                        delivering_until = NULL,
+                        last_status_code = %s,
+                        last_error = NULL,
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                    """,
+                    (int(status_code), now, now, delivery_id),
+                ).fetchone()
+                if updated is None:
+                    return None
+                self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
+                return WebhookDeliveryResult(
+                    delivery=self._row_to_webhook_delivery(updated),
+                    success=True,
+                    status_code=int(status_code),
+                    error=None,
+                )
+
+            # Offboarding: never requeue pending webhook work after a claim.
+            force_dead = offboarding or attempts >= delivery.max_attempts
+            if force_dead:
+                err = detail or "delivery failed"
+                if offboarding and attempts < delivery.max_attempts:
+                    err = (detail or "delivery failed") + " (tenant offboard)"
+                updated = conn.execute(
+                    f"""
+                    UPDATE webhook_deliveries
+                    SET status = 'dead',
+                        delivering_until = NULL,
+                        last_status_code = %s,
+                        last_error = %s,
+                        updated_at = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                      AND status = 'delivering'
+                    RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                    """,
+                    (
+                        status_code,
+                        err,
+                        now,
+                        now,
+                        delivery_id,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    return None
+                self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
+                return WebhookDeliveryResult(
+                    delivery=self._row_to_webhook_delivery(updated),
+                    success=False,
+                    status_code=status_code,
+                    error=err,
+                )
+
+            delay = compute_retry_backoff_seconds(
+                attempts,
+                base_seconds=delivery.backoff_base_seconds,
+                max_seconds=delivery.backoff_max_seconds,
+            )
+            next_at = now + timedelta(seconds=delay)
+            updated = conn.execute(
+                f"""
+                UPDATE webhook_deliveries
+                SET status = 'pending',
+                    delivering_until = NULL,
+                    last_status_code = %s,
+                    last_error = %s,
+                    next_attempt_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND status = 'delivering'
+                RETURNING {self._WEBHOOK_DELIVERY_COLUMNS}
+                """,
+                (
+                    status_code,
+                    detail or "delivery failed",
+                    next_at,
+                    now,
+                    delivery_id,
+                ),
+            ).fetchone()
+            if updated is None:
+                return None
+            return WebhookDeliveryResult(
+                delivery=self._row_to_webhook_delivery(updated),
+                success=False,
+                status_code=status_code,
+                error=detail or "delivery failed",
+            )
