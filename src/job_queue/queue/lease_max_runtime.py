@@ -97,6 +97,15 @@ class LeaseMaxRuntimeMixin:
                         detail={"reason": error},
                         now=now,
                     )
+                # System terminal paths must bump counters (not only worker nack).
+                if terminal == JobStatus.DEAD.value:
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(tenant_id),
+                        metric="dead",
+                        count=1,
+                        now=now,
+                    )
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=row["id"],
@@ -167,6 +176,14 @@ class LeaseMaxRuntimeMixin:
                         detail={"reason": error},
                         now=now,
                     )
+                # System force-release is operationally a nack/requeue.
+                self._record_metric(
+                    conn,
+                    tenant_id=str(tenant_id),
+                    metric="nack",
+                    count=1,
+                    now=now,
+                )
 
     def _dead_letter_exhausted_leases(
         self,
@@ -270,5 +287,13 @@ class LeaseMaxRuntimeMixin:
                     reason=f"parent job {dead['id']} dead-lettered",
                     now=now,
                 )
+            # Lease-expiry dead-letter (same txn as status flip).
+            self._record_metric(
+                conn,
+                tenant_id=str(tid),
+                metric="dead",
+                count=1,
+                now=now,
+            )
         for tid in tenants:
             self._maybe_finalize_offboard(conn, tenant_id=tid, now=now)

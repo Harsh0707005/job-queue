@@ -8,7 +8,7 @@ from datetime import timedelta
 
 import pytest
 
-from job_queue import JobQueue
+from job_queue import JobQueue, JobStatus, LeaseError
 from job_queue.queue.metrics import METRIC_ACK, METRIC_LEASE, OVERALL_TENANT
 from tests.helpers_queue import _ack, _nack
 
@@ -196,6 +196,59 @@ def test_metrics_http_coordinator(postgres_url: str):
             server.shutdown()
     finally:
         q.close()
+
+
+def test_max_runtime_dead_increments_dead_counter(queue: JobQueue):
+    """System max-runtime dead-letter must count ``dead`` (not only worker nack)."""
+    import time
+
+    job = queue.enqueue(
+        tenant_id="rt",
+        payload={},
+        visibility_timeout_seconds=30,
+        max_runtime_seconds=1,
+        max_attempts=1,
+        retry_backoff_base_seconds=0,
+    )
+    leased = queue.lease(tenant_id="rt", worker_id="w1")
+    assert leased is not None
+    time.sleep(1.1)
+    with pytest.raises(LeaseError, match="max runtime"):
+        queue.heartbeat(
+            leased.id,
+            tenant_id="rt",
+            worker_id="w1",
+            lease_token=leased.lease_token,
+        )
+    got = queue.get(job.id, tenant_id="rt")
+    assert got is not None and got.status == JobStatus.DEAD
+    snap = queue.get_metrics_snapshot(tenant_id="rt", window_seconds=600)
+    assert snap["throughput"]["dead"]["count"] >= 1
+
+
+def test_lease_expiry_exhausted_increments_dead_counter(queue: JobQueue):
+    """Expired leases past max_attempts must count ``dead`` on reclaim path."""
+    import time
+
+    job = queue.enqueue(
+        tenant_id="exp",
+        payload={},
+        visibility_timeout_seconds=1,
+        max_attempts=1,
+        retry_backoff_base_seconds=0,
+    )
+    leased = queue.lease(
+        tenant_id="exp", worker_id="w1", visibility_timeout_seconds=1
+    )
+    assert leased is not None and leased.id == job.id
+    time.sleep(1.2)
+    # Next lease attempt dead-letters the exhausted expired lease.
+    claimed = queue.lease(tenant_id="exp", worker_id="w2", visibility_timeout_seconds=30)
+    assert claimed is None  # nothing left claimable
+    got = queue.get(job.id, tenant_id="exp")
+    assert got is not None and got.status == JobStatus.DEAD
+    snap = queue.get_metrics_snapshot(tenant_id="exp", window_seconds=600)
+    assert snap["throughput"]["dead"]["count"] >= 1
 
 
 def test_remote_client_metrics(postgres_url: str):
