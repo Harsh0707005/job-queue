@@ -49,6 +49,9 @@ def queue(postgres_url: str):
     q = JobQueue.connect(postgres_url, min_size=1, max_size=8)
     with q._pool.connection() as conn:
         conn.execute("TRUNCATE jobs CASCADE")
+        # Audit is intentionally not FK-cascaded from jobs (rebuild survives row loss);
+        # clear it each test so list_orphaned_audit_jobs stays order-independent.
+        conn.execute("TRUNCATE job_audit_events")
         conn.execute("TRUNCATE tenant_settings")
         conn.execute("TRUNCATE tenant_fairness")
         conn.execute("TRUNCATE schedules")
