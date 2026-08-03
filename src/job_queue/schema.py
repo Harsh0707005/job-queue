@@ -714,4 +714,76 @@ CREATE TABLE IF NOT EXISTS queue_metric_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_queue_metric_snapshots_tenant_time
     ON queue_metric_snapshots (tenant_id, sampled_at DESC);
+
+-- Allow alert webhook deliveries without a job row (alert.fired stream).
+ALTER TABLE webhook_deliveries ALTER COLUMN job_id DROP NOT NULL;
+
+-- Metric alert rules (threshold checks evaluated periodically).
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id                  UUID PRIMARY KEY,
+    name                TEXT NOT NULL,
+    enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+    scope               TEXT NOT NULL DEFAULT 'overall',
+    tenant_id           TEXT,
+    worker_id           TEXT,
+    metric              TEXT NOT NULL,
+    comparator          TEXT NOT NULL DEFAULT 'gt',
+    threshold           DOUBLE PRECISION NOT NULL,
+    window_seconds      INTEGER NOT NULL DEFAULT 300,
+    cooldown_seconds    INTEGER NOT NULL DEFAULT 300,
+    last_fired_at       TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT alert_rules_scope_check CHECK (
+        scope IN ('overall', 'tenant', 'worker')
+    ),
+    CONSTRAINT alert_rules_comparator_check CHECK (
+        comparator IN ('gt', 'gte', 'lt', 'lte')
+    ),
+    CONSTRAINT alert_rules_window_check CHECK (window_seconds >= 1),
+    CONSTRAINT alert_rules_cooldown_check CHECK (cooldown_seconds >= 0),
+    CONSTRAINT alert_rules_tenant_scope_check CHECK (
+        (scope = 'tenant' AND tenant_id IS NOT NULL AND btrim(tenant_id) <> '')
+        OR (scope <> 'tenant')
+    ),
+    CONSTRAINT alert_rules_worker_scope_check CHECK (
+        (scope = 'worker' AND worker_id IS NOT NULL AND btrim(worker_id) <> '')
+        OR (scope <> 'worker')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled
+    ON alert_rules (enabled)
+    WHERE enabled = TRUE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_rules_name
+    ON alert_rules (name);
+
+-- Durable history of alert firings (for trends / audit).
+CREATE TABLE IF NOT EXISTS alert_events (
+    id                  UUID PRIMARY KEY,
+    rule_id             UUID NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    rule_name           TEXT NOT NULL,
+    metric              TEXT NOT NULL,
+    scope               TEXT NOT NULL,
+    tenant_id           TEXT,
+    worker_id           TEXT,
+    value               DOUBLE PRECISION NOT NULL,
+    threshold           DOUBLE PRECISION NOT NULL,
+    comparator          TEXT NOT NULL,
+    window_seconds      INTEGER,
+    detail              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fired_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_events_fired
+    ON alert_events (fired_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_events_rule_fired
+    ON alert_events (rule_id, fired_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_alert_events_tenant_fired
+    ON alert_events (tenant_id, fired_at DESC)
+    WHERE tenant_id IS NOT NULL;
+
 """

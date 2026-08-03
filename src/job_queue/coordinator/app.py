@@ -33,6 +33,7 @@ from job_queue.coordinator.audit import AuditApiMixin
 from job_queue.coordinator.admin import AdminApiMixin
 from job_queue.coordinator.workflow import WorkflowApiMixin
 from job_queue.coordinator.metrics_api import MetricsApiMixin
+from job_queue.coordinator.alerts_api import AlertsApiMixin
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class Coordinator(
     AdminApiMixin,
     WorkflowApiMixin,
     MetricsApiMixin,
+    AlertsApiMixin,
 ):
     """Thin HTTP façade over JobQueue (handlers split by domain)."""
 
@@ -312,6 +314,9 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
 
         def do_PUT(self) -> None:  # noqa: N802
             self._dispatch("PUT")
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._dispatch("DELETE")
 
     return Handler
 

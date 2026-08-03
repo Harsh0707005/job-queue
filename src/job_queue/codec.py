@@ -421,7 +421,7 @@ def webhook_delivery_to_dict(
         "id": str(d.id),
         "endpoint_id": str(d.endpoint_id),
         "tenant_id": d.tenant_id,
-        "job_id": str(d.job_id),
+        "job_id": str(d.job_id) if d.job_id is not None else None,
         "event": d.event,
         "payload": d.payload,
         "status": d.status,

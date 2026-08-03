@@ -180,6 +180,13 @@ class MetricsMixin:
             self._insert_snapshot(conn, overall)
             out.append(overall)
             conn.commit()
+        # Evaluate threshold alerts after gauges refresh (history + webhooks).
+        try:
+            self.evaluate_alerts(now=ts)
+        except Exception:  # noqa: BLE001 — sampling must not fail on alert bugs
+            import logging
+
+            logging.getLogger(__name__).exception("evaluate_alerts during sample failed")
         return out
 
     def _insert_snapshot(self, conn: Any, snap: dict[str, Any]) -> None:

@@ -22,6 +22,8 @@ from job_queue.models import (
     WebhookDelivery,
     WebhookEndpoint,
     WebhookEvent,
+    AlertRule,
+    AlertEvent,
 )
 from job_queue.queue import (
     ApprovalError,
@@ -60,6 +62,8 @@ from job_queue.remote import (
 )
 
 __all__ = [
+    "AlertEvent",
+    "AlertRule",
     "ApprovalError",
     "ApprovalRequested",
     "AuditConsistencyReport",

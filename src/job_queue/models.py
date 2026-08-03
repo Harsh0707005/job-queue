@@ -371,6 +371,46 @@ class WebhookEvent(str, Enum):
     JOB_COMPLETED = "job.completed"
     JOB_FAILED = "job.failed"
     JOB_DEAD = "job.dead"
+    ALERT_FIRED = "alert.fired"
+
+
+@dataclass(frozen=True, slots=True)
+class AlertRule:
+    """Threshold rule evaluated against live metrics."""
+
+    id: UUID
+    name: str
+    enabled: bool
+    scope: str  # overall | tenant | worker
+    tenant_id: str | None
+    worker_id: str | None
+    metric: str
+    comparator: str  # gt | gte | lt | lte
+    threshold: float
+    window_seconds: int
+    cooldown_seconds: int
+    last_fired_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AlertEvent:
+    """One recorded firing of an alert rule."""
+
+    id: UUID
+    rule_id: UUID
+    rule_name: str
+    metric: str
+    scope: str
+    tenant_id: str | None
+    worker_id: str | None
+    value: float
+    threshold: float
+    comparator: str
+    window_seconds: int | None
+    detail: dict[str, Any]
+    fired_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,7 +446,7 @@ class WebhookDelivery:
     id: UUID
     endpoint_id: UUID
     tenant_id: str
-    job_id: UUID
+    job_id: UUID | None
     event: str
     payload: dict[str, Any]
     status: str

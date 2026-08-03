@@ -345,4 +345,22 @@ class RoutingMixin:
         if method == "POST" and path == "/v1/metrics/retention":
             return self._set_metrics_retention(body)
 
+        # Metric threshold alerts + history.
+        if method == "POST" and path == "/v1/alerts/rules":
+            return self._create_alert_rule(body)
+        if method == "GET" and path == "/v1/alerts/rules":
+            return self._list_alert_rules(query)
+        if (
+            method == "POST"
+            and path.startswith("/v1/alerts/rules/")
+            and path.endswith("/enabled")
+        ):
+            return self._set_alert_rule_enabled(path, body)
+        if method == "DELETE" and path.startswith("/v1/alerts/rules/"):
+            return self._delete_alert_rule(path)
+        if method == "GET" and path == "/v1/alerts/events":
+            return self._list_alert_events(query)
+        if method == "POST" and path == "/v1/alerts/evaluate":
+            return self._evaluate_alerts(body)
+
         return 404, {"error": f"unknown route {method} {path}"}

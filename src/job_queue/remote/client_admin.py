@@ -422,3 +422,44 @@ class ClientAdminMixin:
         )
         assert payload is not None
         return payload
+
+    def create_alert_rule(self, **kwargs: Any) -> dict[str, Any]:
+        payload = self._request("POST", "/v1/alerts/rules", dict(kwargs))
+        assert payload is not None
+        return payload
+
+    def list_alert_rules(self, *, enabled_only: bool = False) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"enabled_only": "1" if enabled_only else "0"})
+        payload = self._request("GET", f"/v1/alerts/rules?{q}")
+        assert payload is not None
+        return payload
+
+    def delete_alert_rule(self, rule_id: str | UUID) -> dict[str, Any]:
+        payload = self._request("DELETE", f"/v1/alerts/rules/{rule_id}")
+        assert payload is not None
+        return payload
+
+    def evaluate_alerts(self) -> dict[str, Any]:
+        payload = self._request("POST", "/v1/alerts/evaluate", {})
+        assert payload is not None
+        return payload
+
+    def list_alert_events(
+        self,
+        *,
+        rule_id: str | UUID | None = None,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q: dict[str, Any] = {"limit": limit}
+        if rule_id is not None:
+            q["rule_id"] = str(rule_id)
+        if tenant_id is not None:
+            q["tenant_id"] = tenant_id
+        payload = self._request("GET", f"/v1/alerts/events?{urlencode(q)}")
+        assert payload is not None
+        return payload
