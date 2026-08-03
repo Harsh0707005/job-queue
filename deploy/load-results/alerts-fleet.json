@@ -2,15 +2,16 @@
   "ok": true,
   "label": "alerts-fleet",
   "total_jobs": 320,
-  "dead_jobs": 17,
-  "dead_forced": 17,
-  "completed_jobs": 335,
+  "dead_jobs": 23,
+  "dead_forced": 23,
+  "completed_jobs": 329,
   "evaluate_fired": 0,
-  "history_count": 5,
+  "history_count": 6,
   "overall_dead_events": 1,
   "rule_names_seen": [
     "alerts-fleet-dead-al-t00",
     "alerts-fleet-dead-al-t01",
+    "alerts-fleet-dead-al-t02",
     "alerts-fleet-dead-overall",
     "alerts-fleet-dl-lag",
     "alerts-fleet-wh-fail-rate"
@@ -20,5 +21,13 @@
   "ok_lag": true,
   "ok_tenant": true,
   "ok_require_tenant": true,
-  "ok_isolation": true
+  "ok_isolation": true,
+  "ok_auto_pause": true,
+  "ok_mute": true,
+  "ok_resolve": true,
+  "auto_pause_tenant": "al-t00",
+  "auto_pause_paused": true,
+  "auto_pause_in_detail": true,
+  "lease_while_paused_code": 204,
+  "lease_blocked": true
 }

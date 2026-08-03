@@ -227,6 +227,112 @@ def test_list_alert_events_requires_tenant_and_isolates(queue: JobQueue):
     assert all(e.tenant_id == ALERTS_OVERALL_TENANT for e in hist_all)
 
 
+def test_mute_suppresses_fire_and_unmute_restores(queue: JobQueue):
+    rule = queue.create_alert_rule(
+        name="mute-me",
+        metric="dead_count",
+        threshold=-1,
+        comparator="gt",
+        scope="tenant",
+        tenant_id="mute-t",
+        cooldown_seconds=0,
+    )
+    queue.enqueue(tenant_id="mute-t", payload={}, max_attempts=1)
+    j = queue.lease(tenant_id="mute-t", worker_id="w")
+    assert j is not None
+    _nack(queue, j, "w", error="e", requeue=True)
+
+    muted = queue.mute_alert_rule(rule.id, duration_seconds=3600)
+    assert muted.muted_until is not None
+    fired_while_muted = queue.evaluate_alerts()
+    assert not any(e.rule_name == "mute-me" for e in fired_while_muted)
+
+    queue.unmute_alert_rule(rule.id)
+    fired_after = queue.evaluate_alerts()
+    assert any(e.rule_name == "mute-me" for e in fired_after)
+
+
+def test_resolve_alert_event_in_history(queue: JobQueue):
+    queue.create_alert_rule(
+        name="resolve-me",
+        metric="dead_count",
+        threshold=-1,
+        comparator="gt",
+        scope="tenant",
+        tenant_id="res-t",
+        cooldown_seconds=0,
+    )
+    queue.enqueue(tenant_id="res-t", payload={}, max_attempts=1)
+    j = queue.lease(tenant_id="res-t", worker_id="w")
+    assert j is not None
+    _nack(queue, j, "w", error="e", requeue=True)
+    fired = queue.evaluate_alerts()
+    ev = next(e for e in fired if e.rule_name == "resolve-me")
+    assert ev.status == "open"
+    assert ev.resolved_at is None
+
+    resolved = queue.resolve_alert_event(
+        ev.id, tenant_id="res-t", resolved_by="ops", note="cleared dead letters"
+    )
+    assert resolved.status == "resolved"
+    assert resolved.resolved_at is not None
+    assert resolved.resolved_by == "ops"
+    assert resolved.resolution_note == "cleared dead letters"
+
+    open_hist = queue.list_alert_events(tenant_id="res-t", status="open")
+    closed = queue.list_alert_events(tenant_id="res-t", status="resolved")
+    assert not any(e.id == ev.id for e in open_hist)
+    assert any(e.id == ev.id for e in closed)
+
+    # Cross-tenant resolve rejected.
+    with pytest.raises(ValueError, match="not found"):
+        queue.resolve_alert_event(ev.id, tenant_id="other-tenant")
+
+
+def test_auto_pause_tenant_on_alert_fire(queue: JobQueue):
+    with pytest.raises(ValueError, match="auto_pause_tenant"):
+        queue.create_alert_rule(
+            name="bad-auto",
+            metric="dead_count",
+            threshold=0,
+            comparator="gt",
+            scope="overall",
+            auto_pause_tenant=True,
+        )
+
+    queue.create_alert_rule(
+        name="pause-overflow",
+        metric="dead_count",
+        threshold=0,
+        comparator="gt",
+        scope="tenant",
+        tenant_id="pause-t",
+        cooldown_seconds=0,
+        auto_pause_tenant=True,
+    )
+    queue.enqueue(tenant_id="pause-t", payload={}, max_attempts=1)
+    j = queue.lease(tenant_id="pause-t", worker_id="w")
+    assert j is not None
+    _nack(queue, j, "w", error="e", requeue=True)
+    assert not queue.is_tenant_paused("pause-t")
+
+    # Extra pending work that must not be leased after auto-pause.
+    queue.enqueue(tenant_id="pause-t", payload={"keep": True})
+    fired = queue.evaluate_alerts()
+    assert any(e.rule_name == "pause-overflow" for e in fired)
+    assert queue.is_tenant_paused("pause-t")
+    assert any(
+        e.detail.get("auto_paused_tenant") == "pause-t"
+        for e in fired
+        if e.rule_name == "pause-overflow"
+    )
+    # Lease should refuse while paused.
+    assert queue.lease(tenant_id="pause-t", worker_id="w2") is None
+
+    queue.resume_tenant("pause-t")
+    assert not queue.is_tenant_paused("pause-t")
+
+
 def test_alerts_http_api(postgres_url: str):
     import json
     import threading
@@ -284,9 +390,12 @@ def test_alerts_http_api(postgres_url: str):
                 "scope": "tenant",
                 "tenant_id": "http-al",
                 "cooldown_seconds": 0,
+                "auto_pause_tenant": True,
             },
         )
         assert created["rule"]["name"] == "http-dead"
+        assert created["rule"]["auto_pause_tenant"] is True
+        rid = created["rule"]["id"]
         rules = get("/v1/alerts/rules")
         assert rules["count"] >= 1
         q.enqueue(tenant_id="http-al", payload={}, max_attempts=1)
@@ -295,12 +404,24 @@ def test_alerts_http_api(postgres_url: str):
         _nack(q, j, "w", error="z", requeue=True)
         ev = post("/v1/alerts/evaluate", {})
         assert ev["count"] >= 1
+        assert q.is_tenant_paused("http-al")
         hist = get("/v1/alerts/events?tenant_id=http-al")
         assert hist["count"] >= 1
+        eid = hist["events"][0]["id"]
+        resolved = post(
+            f"/v1/alerts/events/{eid}/resolve",
+            {"tenant_id": "http-al", "resolved_by": "http-test", "note": "ok"},
+        )
+        assert resolved["event"]["status"] == "resolved"
+        muted = post(f"/v1/alerts/rules/{rid}/mute", {"duration_seconds": 600})
+        assert muted["rule"]["muted_until"] is not None
+        unmuted = post(f"/v1/alerts/rules/{rid}/unmute", {})
+        assert unmuted["rule"]["muted_until"] is None
         # Unscoped history listing must be rejected (tenant isolation).
         code, body = get_status("/v1/alerts/events?limit=10")
         assert code == 400
         assert "tenant_id" in str(body.get("error", "")).lower()
+        q.resume_tenant("http-al")
         server.shutdown()
     finally:
         q.close()

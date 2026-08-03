@@ -39,12 +39,13 @@ ALERT_METRICS = frozenset(
 _ALERT_RULE_COLUMNS = """
     id, name, enabled, scope, tenant_id, worker_id, metric, comparator,
     threshold, window_seconds, cooldown_seconds, last_fired_at,
-    created_at, updated_at
+    muted_until, auto_pause_tenant, created_at, updated_at
 """
 
 _ALERT_EVENT_COLUMNS = """
     id, rule_id, rule_name, metric, scope, tenant_id, worker_id,
-    value, threshold, comparator, window_seconds, detail, fired_at
+    value, threshold, comparator, window_seconds, detail, fired_at,
+    resolved_at, resolved_by, resolution_note
 """
 
 # Synthetic tenant used for overall-scoped alert webhook subscriptions.
@@ -65,6 +66,7 @@ class AlertsMixin:
         window_seconds: int = 300,
         cooldown_seconds: int = 300,
         enabled: bool = True,
+        auto_pause_tenant: bool = False,
         rule_id: UUID | None = None,
     ) -> AlertRule:
         if not name or not str(name).strip():
@@ -105,6 +107,9 @@ class AlertsMixin:
             raise ValueError("window_seconds must be >= 1")
         if cooldown_seconds < 0:
             raise ValueError("cooldown_seconds must be >= 0")
+        auto_pause = bool(auto_pause_tenant)
+        if auto_pause and scope != "tenant":
+            raise ValueError("auto_pause_tenant is only valid for scope=tenant")
         now = _utcnow()
         rid = rule_id or uuid4()
         try:
@@ -114,11 +119,13 @@ class AlertsMixin:
                     INSERT INTO alert_rules (
                         id, name, enabled, scope, tenant_id, worker_id, metric,
                         comparator, threshold, window_seconds, cooldown_seconds,
-                        last_fired_at, created_at, updated_at
+                        last_fired_at, muted_until, auto_pause_tenant,
+                        created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
-                        NULL, %s, %s
+                        NULL, NULL, %s,
+                        %s, %s
                     )
                     RETURNING {_ALERT_RULE_COLUMNS}
                     """,
@@ -134,6 +141,7 @@ class AlertsMixin:
                         float(threshold),
                         int(window_seconds),
                         int(cooldown_seconds),
+                        auto_pause,
                         now,
                         now,
                     ),
@@ -203,11 +211,129 @@ class AlertsMixin:
             raise ValueError(f"alert rule {rule_id} not found")
         return self._row_to_alert_rule(row)
 
+    def mute_alert_rule(
+        self,
+        rule_id: UUID,
+        *,
+        duration_seconds: int | None = None,
+        muted_until: datetime | None = None,
+        now: datetime | None = None,
+    ) -> AlertRule:
+        """Silence a rule until ``muted_until`` (or now + duration_seconds).
+
+        While muted, evaluation skips the rule (no new events / webhooks).
+        """
+        ts = now or _utcnow()
+        if muted_until is not None and duration_seconds is not None:
+            raise ValueError("pass duration_seconds or muted_until, not both")
+        if muted_until is None:
+            if duration_seconds is None:
+                raise ValueError("duration_seconds or muted_until is required")
+            if int(duration_seconds) < 1:
+                raise ValueError("duration_seconds must be >= 1")
+            until = ts + timedelta(seconds=int(duration_seconds))
+        else:
+            until = muted_until
+            if until.tzinfo is None:
+                # Treat naive as UTC wall time consistent with queue timestamps.
+                from datetime import timezone
+
+                until = until.replace(tzinfo=timezone.utc)
+            if until <= ts:
+                raise ValueError("muted_until must be in the future")
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                UPDATE alert_rules
+                SET muted_until = %s, updated_at = %s
+                WHERE id = %s
+                RETURNING {_ALERT_RULE_COLUMNS}
+                """,
+                (until, ts, rule_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"alert rule {rule_id} not found")
+        return self._row_to_alert_rule(row)
+
+    def unmute_alert_rule(self, rule_id: UUID) -> AlertRule:
+        """Clear mute so the rule evaluates again immediately."""
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                UPDATE alert_rules
+                SET muted_until = NULL, updated_at = %s
+                WHERE id = %s
+                RETURNING {_ALERT_RULE_COLUMNS}
+                """,
+                (now, rule_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"alert rule {rule_id} not found")
+        return self._row_to_alert_rule(row)
+
+    def resolve_alert_event(
+        self,
+        event_id: UUID,
+        *,
+        tenant_id: str,
+        resolved_by: str | None = None,
+        note: str | None = None,
+        now: datetime | None = None,
+    ) -> AlertEvent:
+        """Mark a history event resolved (tenant-scoped for isolation)."""
+        if not tenant_id or not str(tenant_id).strip():
+            raise ValueError("tenant_id is required")
+        tenant_id = str(tenant_id).strip()
+        ts = now or _utcnow()
+        by = str(resolved_by).strip() if resolved_by else None
+        res_note = str(note).strip() if note else None
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                UPDATE alert_events
+                SET resolved_at = %s,
+                    resolved_by = %s,
+                    resolution_note = %s
+                WHERE id = %s
+                  AND tenant_id = %s
+                  AND resolved_at IS NULL
+                RETURNING {_ALERT_EVENT_COLUMNS}
+                """,
+                (ts, by, res_note, event_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                existing = conn.execute(
+                    """
+                    SELECT id, tenant_id, resolved_at
+                    FROM alert_events
+                    WHERE id = %s
+                    """,
+                    (event_id,),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError(f"alert event {event_id} not found")
+                if existing["tenant_id"] != tenant_id:
+                    raise ValueError(
+                        f"alert event {event_id} not found for tenant {tenant_id!r}"
+                    )
+                # Already resolved — return current row.
+                row = conn.execute(
+                    f"""
+                    SELECT {_ALERT_EVENT_COLUMNS}
+                    FROM alert_events WHERE id = %s
+                    """,
+                    (event_id,),
+                ).fetchone()
+        assert row is not None
+        return self._row_to_alert_event(row)
+
     def list_alert_events(
         self,
         *,
         tenant_id: str,
         rule_id: UUID | None = None,
+        status: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[AlertEvent]:
@@ -216,6 +342,8 @@ class AlertsMixin:
         Overall / unscoped firings are stored under
         :data:`ALERTS_OVERALL_TENANT` (``__overall__``). Pass that value to
         read fleet-wide alert history.
+
+        ``status`` may be ``open`` or ``resolved`` to filter history.
         """
         if not tenant_id or not str(tenant_id).strip():
             raise ValueError("tenant_id is required")
@@ -229,6 +357,14 @@ class AlertsMixin:
         if rule_id is not None:
             clauses.append("rule_id = %s")
             params.append(rule_id)
+        if status is not None:
+            st = str(status).strip().lower()
+            if st == "open":
+                clauses.append("resolved_at IS NULL")
+            elif st == "resolved":
+                clauses.append("resolved_at IS NOT NULL")
+            else:
+                raise ValueError("status must be open or resolved")
         where = "WHERE " + " AND ".join(clauses)
         params.extend([limit, offset])
         with self._pool.connection() as conn:
@@ -249,12 +385,16 @@ class AlertsMixin:
 
         Cooldown and event insert are claimed under a per-rule row lock so
         concurrent evaluators (multi-coordinator) cannot double-fire the same
-        rule within the cooldown window.
+        rule within the cooldown window. Muted rules (``muted_until > now``)
+        are skipped. Tenant-scoped rules with ``auto_pause_tenant`` pause that
+        tenant on fire to stop further overflow.
         """
         ts = now or _utcnow()
         rules = self.list_alert_rules(enabled_only=True)
         fired: list[AlertEvent] = []
         for rule in rules:
+            if rule.muted_until is not None and ts < rule.muted_until:
+                continue
             value, detail = self._compute_alert_value(rule, now=ts)
             if value is None:
                 continue
@@ -428,12 +568,16 @@ class AlertsMixin:
             ).fetchone()
             if locked is None or not bool(locked["enabled"]):
                 return None
+            muted_until = locked.get("muted_until")
+            if muted_until is not None and now < muted_until:
+                return None
             last_fired = locked.get("last_fired_at")
             cool = int(locked["cooldown_seconds"])
             if last_fired is not None and cool > 0:
                 cool_until = last_fired + timedelta(seconds=cool)
                 if now < cool_until:
                     return None
+            auto_pause = bool(locked.get("auto_pause_tenant"))
             # Atomic claim: only one concurrent txn wins for this (rule, now)
             # window. For cooldown=0, last_fired_at < now still serializes
             # same-timestamp dual-coordinator races; sequential calls with a
@@ -444,6 +588,7 @@ class AlertsMixin:
                 SET last_fired_at = %s, updated_at = %s
                 WHERE id = %s
                   AND enabled = TRUE
+                  AND (muted_until IS NULL OR muted_until <= %s)
                   AND (
                     last_fired_at IS NULL
                     OR (
@@ -458,18 +603,30 @@ class AlertsMixin:
                   )
                 RETURNING id
                 """,
-                (now, now, rule.id, now, now),
+                (now, now, rule.id, now, now, now),
             ).fetchone()
             if claimed is None:
                 return None
+            tenant_paused = False
+            if (
+                auto_pause
+                and locked.get("scope") == "tenant"
+                and locked.get("tenant_id")
+            ):
+                tid = str(locked["tenant_id"])
+                self._pause_tenant_conn(conn, tid, now=now)
+                tenant_paused = True
+                payload_detail["auto_paused_tenant"] = tid
             row = conn.execute(
                 f"""
                 INSERT INTO alert_events (
                     id, rule_id, rule_name, metric, scope, tenant_id, worker_id,
-                    value, threshold, comparator, window_seconds, detail, fired_at
+                    value, threshold, comparator, window_seconds, detail, fired_at,
+                    resolved_at, resolved_by, resolution_note
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s,
+                    NULL, NULL, NULL
                 )
                 RETURNING {_ALERT_EVENT_COLUMNS}
                 """,
@@ -497,8 +654,28 @@ class AlertsMixin:
                 detail=payload_detail,
                 now=now,
             )
+            if tenant_paused:
+                # Keep detail consistent for callers.
+                pass
         assert row is not None
         return self._row_to_alert_event(row)
+
+    @staticmethod
+    def _pause_tenant_conn(conn: Any, tenant_id: str, *, now: datetime) -> None:
+        """Pause tenant inside an existing transaction (alert auto-pause)."""
+        conn.execute(
+            """
+            INSERT INTO tenant_settings (
+                tenant_id, max_concurrent_leases, max_pending_jobs,
+                paused, offboarding, updated_at
+            )
+            VALUES (%s, NULL, NULL, TRUE, FALSE, %s)
+            ON CONFLICT (tenant_id) DO UPDATE
+            SET paused = TRUE,
+                updated_at = EXCLUDED.updated_at
+            """,
+            (tenant_id, now),
+        )
 
     def _enqueue_alert_webhooks(
         self,
@@ -599,6 +776,8 @@ class AlertsMixin:
             window_seconds=int(row["window_seconds"]),
             cooldown_seconds=int(row["cooldown_seconds"]),
             last_fired_at=row.get("last_fired_at"),
+            muted_until=row.get("muted_until"),
+            auto_pause_tenant=bool(row.get("auto_pause_tenant") or False),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -623,4 +802,7 @@ class AlertsMixin:
             window_seconds=row.get("window_seconds"),
             detail=dict(detail),
             fired_at=row["fired_at"],
+            resolved_at=row.get("resolved_at"),
+            resolved_by=row.get("resolved_by"),
+            resolution_note=row.get("resolution_note"),
         )

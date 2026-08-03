@@ -441,6 +441,46 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def mute_alert_rule(
+        self,
+        rule_id: str | UUID,
+        *,
+        duration_seconds: int | None = None,
+        muted_until: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if duration_seconds is not None:
+            body["duration_seconds"] = duration_seconds
+        if muted_until is not None:
+            body["muted_until"] = muted_until
+        payload = self._request("POST", f"/v1/alerts/rules/{rule_id}/mute", body)
+        assert payload is not None
+        return payload
+
+    def unmute_alert_rule(self, rule_id: str | UUID) -> dict[str, Any]:
+        payload = self._request("POST", f"/v1/alerts/rules/{rule_id}/unmute", {})
+        assert payload is not None
+        return payload
+
+    def resolve_alert_event(
+        self,
+        event_id: str | UUID,
+        *,
+        tenant_id: str,
+        resolved_by: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if resolved_by is not None:
+            body["resolved_by"] = resolved_by
+        if note is not None:
+            body["note"] = note
+        payload = self._request(
+            "POST", f"/v1/alerts/events/{event_id}/resolve", body
+        )
+        assert payload is not None
+        return payload
+
     def evaluate_alerts(self) -> dict[str, Any]:
         payload = self._request("POST", "/v1/alerts/evaluate", {})
         assert payload is not None
@@ -451,6 +491,7 @@ class ClientAdminMixin:
         *,
         tenant_id: str,
         rule_id: str | UUID | None = None,
+        status: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -466,6 +507,8 @@ class ClientAdminMixin:
         }
         if rule_id is not None:
             q["rule_id"] = str(rule_id)
+        if status is not None:
+            q["status"] = status
         payload = self._request("GET", f"/v1/alerts/events?{urlencode(q)}")
         assert payload is not None
         return payload

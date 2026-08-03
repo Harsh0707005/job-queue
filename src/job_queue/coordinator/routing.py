@@ -356,10 +356,28 @@ class RoutingMixin:
             and path.endswith("/enabled")
         ):
             return self._set_alert_rule_enabled(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/alerts/rules/")
+            and path.endswith("/mute")
+        ):
+            return self._mute_alert_rule(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/alerts/rules/")
+            and path.endswith("/unmute")
+        ):
+            return self._unmute_alert_rule(path)
         if method == "DELETE" and path.startswith("/v1/alerts/rules/"):
             return self._delete_alert_rule(path)
         if method == "GET" and path == "/v1/alerts/events":
             return self._list_alert_events(query)
+        if (
+            method == "POST"
+            and path.startswith("/v1/alerts/events/")
+            and path.endswith("/resolve")
+        ):
+            return self._resolve_alert_event(path, body)
         if method == "POST" and path == "/v1/alerts/evaluate":
             return self._evaluate_alerts(body)
 

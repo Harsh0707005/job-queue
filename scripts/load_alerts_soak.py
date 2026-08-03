@@ -153,6 +153,8 @@ def main() -> int:
             "cooldown_seconds": 0,
         },
     ]
+    auto_pause_tid = tenants[0]  # al-t00: auto-pause on dead threshold
+    mute_tid = tenants[1] if len(tenants) > 1 else tenants[0]
     for tid in tenants[:3]:
         rules_spec.append(
             {
@@ -163,6 +165,8 @@ def main() -> int:
                 "scope": "tenant",
                 "tenant_id": tid,
                 "cooldown_seconds": 0,
+                # Overflow guard: pause tenant when dead threshold trips.
+                "auto_pause_tenant": tid == auto_pause_tid,
             }
         )
     rules_spec.append(
@@ -177,11 +181,16 @@ def main() -> int:
         }
     )
 
+    rule_ids: dict[str, str] = {}
     for r in rules_spec:
         code, body = http_json("POST", "/v1/alerts/rules", r)
         if code not in (200, 201):
             # name conflict from re-run: ignore
             logger.warning("create rule %s -> %s %s", r["name"], code, body)
+        else:
+            rule = body.get("rule") or {}
+            if rule.get("id") and rule.get("name"):
+                rule_ids[str(rule["name"])] = str(rule["id"])
 
     # 1) Seed dedicated max_attempts=1 jobs and nack them to DEAD before
     #    fleet workers drain the rest (avoids race with success path).
@@ -333,6 +342,140 @@ def main() -> int:
     )
     ok_lag = f"{LABEL}-dl-lag" in names or any("lag" in (n or "") for n in names)
     ok_tenant = any(f"{LABEL}-dead-{tid}" in names for tid in tenants[:3])
+
+    # --- auto-pause: tenant with auto_pause_tenant should be paused after fire
+    # Residue API takes ?tenant= (not tenant_id).
+    code_res, residue = http_json(
+        "GET",
+        "/v1/admin/tenant-residue?" + urlencode({"tenant": auto_pause_tid}),
+    )
+    paused_flag = False
+    if code_res == 200:
+        rows = residue.get("tenants") or []
+        for row in rows:
+            if row.get("tenant_id") == auto_pause_tid:
+                paused_flag = bool(row.get("paused"))
+                break
+    # Event detail records auto_paused_tenant on fire.
+    auto_pause_in_detail = any(
+        (e.get("detail") or {}).get("auto_paused_tenant") == auto_pause_tid
+        for e in events
+        if e.get("rule_name") == f"{LABEL}-dead-{auto_pause_tid}"
+    )
+    # Seed a pending job and confirm lease is blocked while paused.
+    http_json(
+        "POST",
+        "/v1/jobs",
+        {
+            "tenant_id": auto_pause_tid,
+            "payload": {"probe": "paused"},
+            "max_attempts": 1,
+        },
+    )
+    code_lease, lease_body = http_json(
+        "POST",
+        "/v1/lease",
+        {"tenant_id": auto_pause_tid, "worker_id": "pause-probe", "limit": 1},
+    )
+    lease_blocked = code_lease == 204 or not (
+        (lease_body.get("jobs") or lease_body.get("job"))
+        if isinstance(lease_body, dict)
+        else False
+    )
+    ok_auto_pause = paused_flag and auto_pause_in_detail and lease_blocked
+    # Resume so residual fleet teardown is clean.
+    http_json("POST", f"/v1/tenants/{auto_pause_tid}/resume", {})
+
+    # --- mute: silence tenant rule and ensure no new fire while muted
+    mute_rule_name = f"{LABEL}-dead-{mute_tid}"
+    mute_rid = rule_ids.get(mute_rule_name)
+    ok_mute = False
+    if mute_rid:
+        code_m, muted_body = http_json(
+            "POST",
+            f"/v1/alerts/rules/{mute_rid}/mute",
+            {"duration_seconds": 3600},
+        )
+        ok_mute = (
+            code_m == 200
+            and (muted_body.get("rule") or {}).get("muted_until") is not None
+        )
+        # Count events before re-evaluate.
+        code_before, hist_before = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode({"tenant_id": mute_tid, "limit": 200}),
+        )
+        n_before = len(
+            [
+                e
+                for e in (hist_before.get("events") or [])
+                if e.get("rule_name") == mute_rule_name
+            ]
+        ) if code_before == 200 else 0
+        http_json("POST", "/v1/alerts/evaluate", {})
+        code_after, hist_after = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode({"tenant_id": mute_tid, "limit": 200}),
+        )
+        n_after = len(
+            [
+                e
+                for e in (hist_after.get("events") or [])
+                if e.get("rule_name") == mute_rule_name
+            ]
+        ) if code_after == 200 else -1
+        ok_mute = ok_mute and n_after == n_before
+        http_json("POST", f"/v1/alerts/rules/{mute_rid}/unmute", {})
+
+    # --- resolve: mark one open event resolved in history
+    ok_resolve = False
+    code_open, open_hist = http_json(
+        "GET",
+        "/v1/alerts/events?"
+        + urlencode(
+            {"tenant_id": mute_tid, "status": "open", "limit": 10}
+        ),
+    )
+    open_events = open_hist.get("events") or [] if code_open == 200 else []
+    if open_events:
+        eid = open_events[0]["id"]
+        code_r, resolved_body = http_json(
+            "POST",
+            f"/v1/alerts/events/{eid}/resolve",
+            {
+                "tenant_id": mute_tid,
+                "resolved_by": "fleet-soak",
+                "note": "verified resolve path",
+            },
+        )
+        ev_r = (resolved_body.get("event") or {}) if code_r == 200 else {}
+        ok_resolve = ev_r.get("status") == "resolved" and ev_r.get("resolved_at")
+        # Open filter should exclude it.
+        code_open2, open_hist2 = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode(
+                {"tenant_id": mute_tid, "status": "open", "limit": 50}
+            ),
+        )
+        still_open = {
+            e.get("id") for e in (open_hist2.get("events") or [])
+        } if code_open2 == 200 else set()
+        ok_resolve = ok_resolve and eid not in still_open
+        code_closed, closed_hist = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode(
+                {"tenant_id": mute_tid, "status": "resolved", "limit": 50}
+            ),
+        )
+        closed_ids = {
+            e.get("id") for e in (closed_hist.get("events") or [])
+        } if code_closed == 200 else set()
+        ok_resolve = ok_resolve and eid in closed_ids
+
     # Pass if history recorded and at least dead-related + lag (or webhook rate).
     ok = (
         ok_hist
@@ -341,6 +484,9 @@ def main() -> int:
         and dead >= 1
         and ok_require_tenant
         and ok_isolation
+        and ok_auto_pause
+        and ok_mute
+        and ok_resolve
     )
 
     result = {
@@ -360,6 +506,14 @@ def main() -> int:
         "ok_tenant": ok_tenant,
         "ok_require_tenant": ok_require_tenant,
         "ok_isolation": ok_isolation,
+        "ok_auto_pause": ok_auto_pause,
+        "ok_mute": ok_mute,
+        "ok_resolve": ok_resolve,
+        "auto_pause_tenant": auto_pause_tid,
+        "auto_pause_paused": paused_flag,
+        "auto_pause_in_detail": auto_pause_in_detail,
+        "lease_while_paused_code": code_lease,
+        "lease_blocked": lease_blocked,
     }
     os.makedirs(os.path.dirname(RESULTS_PATH) or ".", exist_ok=True)
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:

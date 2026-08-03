@@ -390,6 +390,8 @@ class AlertRule:
     window_seconds: int
     cooldown_seconds: int
     last_fired_at: datetime | None
+    muted_until: datetime | None
+    auto_pause_tenant: bool
     created_at: datetime
     updated_at: datetime
 
@@ -411,6 +413,13 @@ class AlertEvent:
     window_seconds: int | None
     detail: dict[str, Any]
     fired_at: datetime
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
+    resolution_note: str | None = None
+
+    @property
+    def status(self) -> str:
+        return "resolved" if self.resolved_at is not None else "open"
 
 
 @dataclass(frozen=True, slots=True)

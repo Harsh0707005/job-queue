@@ -732,6 +732,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     window_seconds      INTEGER NOT NULL DEFAULT 300,
     cooldown_seconds    INTEGER NOT NULL DEFAULT 300,
     last_fired_at       TIMESTAMPTZ,
+    muted_until         TIMESTAMPTZ,
+    auto_pause_tenant   BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT alert_rules_scope_check CHECK (
@@ -749,8 +751,15 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     CONSTRAINT alert_rules_worker_scope_check CHECK (
         (scope = 'worker' AND worker_id IS NOT NULL AND btrim(worker_id) <> '')
         OR (scope <> 'worker')
+    ),
+    CONSTRAINT alert_rules_auto_pause_scope_check CHECK (
+        auto_pause_tenant = FALSE OR scope = 'tenant'
     )
 );
+
+-- Upgrade path for existing deployments.
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS auto_pause_tenant BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled
     ON alert_rules (enabled)
@@ -773,8 +782,15 @@ CREATE TABLE IF NOT EXISTS alert_events (
     comparator          TEXT NOT NULL,
     window_seconds      INTEGER,
     detail              JSONB NOT NULL DEFAULT '{}'::jsonb,
-    fired_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    fired_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at         TIMESTAMPTZ,
+    resolved_by         TEXT,
+    resolution_note     TEXT
 );
+
+ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS resolved_by TEXT;
+ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS resolution_note TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_alert_events_fired
     ON alert_events (fired_at DESC);
@@ -785,5 +801,9 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_rule_fired
 CREATE INDEX IF NOT EXISTS idx_alert_events_tenant_fired
     ON alert_events (tenant_id, fired_at DESC)
     WHERE tenant_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_alert_events_open
+    ON alert_events (tenant_id, fired_at DESC)
+    WHERE resolved_at IS NULL;
 
 """
