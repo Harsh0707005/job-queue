@@ -449,17 +449,23 @@ class ClientAdminMixin:
     def list_alert_events(
         self,
         *,
+        tenant_id: str,
         rule_id: str | UUID | None = None,
-        tenant_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> dict[str, Any]:
+        """List alert history for one tenant (required). Use ``__overall__`` for fleet-wide."""
         from urllib.parse import urlencode
 
-        q: dict[str, Any] = {"limit": limit}
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        q: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "limit": limit,
+            "offset": offset,
+        }
         if rule_id is not None:
             q["rule_id"] = str(rule_id)
-        if tenant_id is not None:
-            q["tenant_id"] = tenant_id
         payload = self._request("GET", f"/v1/alerts/events?{urlencode(q)}")
         assert payload is not None
         return payload

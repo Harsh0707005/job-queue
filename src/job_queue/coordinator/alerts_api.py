@@ -111,15 +111,17 @@ class AlertsApiMixin:
     def _list_alert_events(
         self, query: dict[str, list[str]]
     ) -> tuple[int, dict[str, Any]]:
+        tenant = (query.get("tenant_id") or [None])[0]
+        if not tenant or not str(tenant).strip():
+            return 400, {"error": "tenant_id is required"}
         try:
             limit = int((query.get("limit") or ["100"])[0])
             offset = int((query.get("offset") or ["0"])[0])
             rule_raw = (query.get("rule_id") or [None])[0]
-            tenant = (query.get("tenant_id") or [None])[0]
             rule_id = UUID(rule_raw) if rule_raw else None
             events = self.queue.list_alert_events(
+                tenant_id=str(tenant).strip(),
                 rule_id=rule_id,
-                tenant_id=tenant,
                 limit=limit,
                 offset=offset,
             )
@@ -128,6 +130,7 @@ class AlertsApiMixin:
         return 200, {
             "events": [_event_to_dict(e) for e in events],
             "count": len(events),
+            "tenant_id": str(tenant).strip(),
         }
 
     def _evaluate_alerts(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:

@@ -262,13 +262,70 @@ def main() -> int:
         time.sleep(1)
     logger.info("backlog settled completed=%s dead=%s", completed, dead)
 
-    # Evaluate alerts multiple times (sample + explicit)
+    # Evaluate alerts multiple times (sample + explicit). Concurrent evaluate
+    # from dual coordinators must not double-fire under cooldown.
     http_json("POST", "/v1/metrics/sample", {})
     code, ev = http_json("POST", "/v1/alerts/evaluate", {})
     fired = int(ev.get("count") or 0) if code == 200 else 0
-    code2, hist = http_json("GET", "/v1/alerts/events?" + urlencode({"limit": 200}))
-    events = hist.get("events") or [] if code2 == 200 else []
+
+    # Concurrent dual-coordinator evaluate race (cooldown=0 same-now de-dupe
+    # still serializes; fleet rules use cooldown 0 after first fire → 0 more).
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [
+            pool.submit(http_json, "POST", "/v1/alerts/evaluate", {})
+            for _ in range(4)
+        ]
+        for f in as_completed(futs):
+            f.result()
+
+    # Tenant-scoped history only (tenant_id required — no unscoped dump).
+    events: list[dict[str, Any]] = []
+    code_missing, missing_body = http_json(
+        "GET", "/v1/alerts/events?" + urlencode({"limit": 10})
+    )
+    ok_require_tenant = code_missing == 400 and "tenant_id" in str(
+        missing_body.get("error", "")
+    ).lower()
+
+    for tid in tenants[:3]:
+        code2, hist = http_json(
+            "GET",
+            "/v1/alerts/events?" + urlencode({"tenant_id": tid, "limit": 100}),
+        )
+        if code2 == 200:
+            for e in hist.get("events") or []:
+                if e.get("tenant_id") != tid:
+                    ok_require_tenant = False
+                events.append(e)
+    code_o, hist_o = http_json(
+        "GET",
+        "/v1/alerts/events?"
+        + urlencode({"tenant_id": "__overall__", "limit": 100}),
+    )
+    overall_events = hist_o.get("events") or [] if code_o == 200 else []
+    for e in overall_events:
+        if e.get("tenant_id") not in (None, "__overall__"):
+            ok_require_tenant = False
+        events.append(e)
+
     names = {e.get("rule_name") for e in events}
+
+    # Concurrent cooldown: after first evaluate, cooldown=0 rules may re-fire
+    # with later timestamps; for rules we re-create with high cooldown to
+    # assert single-fire, count overall dead rule events (should stay low).
+    dead_overall_events = [
+        e for e in overall_events if e.get("rule_name") == f"{LABEL}-dead-overall"
+    ]
+    # Isolation: tenant event list must not include other tenants.
+    ok_isolation = True
+    for tid in tenants[:3]:
+        code_t, hist_t = http_json(
+            "GET",
+            "/v1/alerts/events?" + urlencode({"tenant_id": tid, "limit": 100}),
+        )
+        for e in (hist_t.get("events") or []) if code_t == 200 else []:
+            if e.get("tenant_id") != tid:
+                ok_isolation = False
 
     ok_hist = len(events) >= 2
     ok_dead = f"{LABEL}-dead-overall" in names or any(
@@ -277,7 +334,14 @@ def main() -> int:
     ok_lag = f"{LABEL}-dl-lag" in names or any("lag" in (n or "") for n in names)
     ok_tenant = any(f"{LABEL}-dead-{tid}" in names for tid in tenants[:3])
     # Pass if history recorded and at least dead-related + lag (or webhook rate).
-    ok = ok_hist and ok_dead and (ok_lag or dead_forced > 0) and dead >= 1
+    ok = (
+        ok_hist
+        and ok_dead
+        and (ok_lag or dead_forced > 0)
+        and dead >= 1
+        and ok_require_tenant
+        and ok_isolation
+    )
 
     result = {
         "ok": ok,
@@ -288,11 +352,14 @@ def main() -> int:
         "completed_jobs": completed,
         "evaluate_fired": fired,
         "history_count": len(events),
+        "overall_dead_events": len(dead_overall_events),
         "rule_names_seen": sorted(n for n in names if n),
         "ok_hist": ok_hist,
         "ok_dead": ok_dead,
         "ok_lag": ok_lag,
         "ok_tenant": ok_tenant,
+        "ok_require_tenant": ok_require_tenant,
+        "ok_isolation": ok_isolation,
     }
     os.makedirs(os.path.dirname(RESULTS_PATH) or ".", exist_ok=True)
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:

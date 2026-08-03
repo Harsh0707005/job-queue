@@ -206,24 +206,30 @@ class AlertsMixin:
     def list_alert_events(
         self,
         *,
+        tenant_id: str,
         rule_id: UUID | None = None,
-        tenant_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[AlertEvent]:
+        """List alert history for a single tenant (required for isolation).
+
+        Overall / unscoped firings are stored under
+        :data:`ALERTS_OVERALL_TENANT` (``__overall__``). Pass that value to
+        read fleet-wide alert history.
+        """
+        if not tenant_id or not str(tenant_id).strip():
+            raise ValueError("tenant_id is required")
+        tenant_id = str(tenant_id).strip()
         if limit < 1:
             raise ValueError("limit must be >= 1")
         if offset < 0:
             raise ValueError("offset must be >= 0")
-        clauses: list[str] = []
-        params: list[Any] = []
+        clauses: list[str] = ["tenant_id = %s"]
+        params: list[Any] = [tenant_id]
         if rule_id is not None:
             clauses.append("rule_id = %s")
             params.append(rule_id)
-        if tenant_id is not None:
-            clauses.append("tenant_id = %s")
-            params.append(tenant_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = "WHERE " + " AND ".join(clauses)
         params.extend([limit, offset])
         with self._pool.connection() as conn:
             rows = conn.execute(
@@ -239,7 +245,12 @@ class AlertsMixin:
         return [self._row_to_alert_event(r) for r in rows]
 
     def evaluate_alerts(self, *, now: datetime | None = None) -> list[AlertEvent]:
-        """Evaluate all enabled rules; fire + record + webhook when breached."""
+        """Evaluate all enabled rules; fire + record + webhook when breached.
+
+        Cooldown and event insert are claimed under a per-rule row lock so
+        concurrent evaluators (multi-coordinator) cannot double-fire the same
+        rule within the cooldown window.
+        """
         ts = now or _utcnow()
         rules = self.list_alert_rules(enabled_only=True)
         fired: list[AlertEvent] = []
@@ -249,6 +260,7 @@ class AlertsMixin:
                 continue
             if not self._compare(value, rule.comparator, rule.threshold):
                 continue
+            # Cheap pre-check (not authoritative — race-safe claim is in _fire_alert).
             if rule.last_fired_at is not None and rule.cooldown_seconds > 0:
                 cool_until = rule.last_fired_at + timedelta(
                     seconds=rule.cooldown_seconds
@@ -256,7 +268,8 @@ class AlertsMixin:
                 if ts < cool_until:
                     continue
             ev = self._fire_alert(rule, value=float(value), detail=detail, now=ts)
-            fired.append(ev)
+            if ev is not None:
+                fired.append(ev)
         return fired
 
     def _compute_alert_value(
@@ -365,6 +378,16 @@ class AlertsMixin:
             return value <= threshold
         return False
 
+    def _event_tenant_id(self, rule: AlertRule) -> str:
+        """Tenant key stored on alert_events for isolation-scoped history reads.
+
+        Tenant-scoped rules use their tenant. Overall (and worker without a
+        tenant) firings are stored under :data:`ALERTS_OVERALL_TENANT`.
+        """
+        if rule.tenant_id and str(rule.tenant_id).strip():
+            return str(rule.tenant_id).strip()
+        return ALERTS_OVERALL_TENANT
+
     def _fire_alert(
         self,
         rule: AlertRule,
@@ -372,8 +395,16 @@ class AlertsMixin:
         value: float,
         detail: dict[str, Any],
         now: datetime,
-    ) -> AlertEvent:
+    ) -> AlertEvent | None:
+        """Atomically claim cooldown + append history + enqueue webhooks.
+
+        Uses ``SELECT ... FOR UPDATE`` on the rule row so concurrent
+        evaluators re-check cooldown under the lock; only the winner inserts
+        an ``alert_events`` row. Returns ``None`` if the claim loses (still
+        cooling down or rule disabled/deleted).
+        """
         event_id = uuid4()
+        event_tenant = self._event_tenant_id(rule)
         payload_detail = dict(detail)
         payload_detail.update(
             {
@@ -386,6 +417,51 @@ class AlertsMixin:
             }
         )
         with transaction(self._pool) as conn:
+            locked = conn.execute(
+                f"""
+                SELECT {_ALERT_RULE_COLUMNS}
+                FROM alert_rules
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (rule.id,),
+            ).fetchone()
+            if locked is None or not bool(locked["enabled"]):
+                return None
+            last_fired = locked.get("last_fired_at")
+            cool = int(locked["cooldown_seconds"])
+            if last_fired is not None and cool > 0:
+                cool_until = last_fired + timedelta(seconds=cool)
+                if now < cool_until:
+                    return None
+            # Atomic claim: only one concurrent txn wins for this (rule, now)
+            # window. For cooldown=0, last_fired_at < now still serializes
+            # same-timestamp dual-coordinator races; sequential calls with a
+            # later ``now`` still fire.
+            claimed = conn.execute(
+                """
+                UPDATE alert_rules
+                SET last_fired_at = %s, updated_at = %s
+                WHERE id = %s
+                  AND enabled = TRUE
+                  AND (
+                    last_fired_at IS NULL
+                    OR (
+                        cooldown_seconds > 0
+                        AND last_fired_at
+                            + (cooldown_seconds * INTERVAL '1 second') <= %s
+                    )
+                    OR (
+                        cooldown_seconds <= 0
+                        AND last_fired_at < %s
+                    )
+                  )
+                RETURNING id
+                """,
+                (now, now, rule.id, now, now),
+            ).fetchone()
+            if claimed is None:
+                return None
             row = conn.execute(
                 f"""
                 INSERT INTO alert_events (
@@ -403,7 +479,7 @@ class AlertsMixin:
                     rule.name,
                     rule.metric,
                     rule.scope,
-                    rule.tenant_id,
+                    event_tenant,
                     rule.worker_id,
                     value,
                     rule.threshold,
@@ -413,14 +489,6 @@ class AlertsMixin:
                     now,
                 ),
             ).fetchone()
-            conn.execute(
-                """
-                UPDATE alert_rules
-                SET last_fired_at = %s, updated_at = %s
-                WHERE id = %s
-                """,
-                (now, now, rule.id),
-            )
             self._enqueue_alert_webhooks(
                 conn,
                 event_id=event_id,
