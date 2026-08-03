@@ -542,6 +542,11 @@ class AlertsMixin:
         evaluators re-check cooldown under the lock; only the winner inserts
         an ``alert_events`` row. Returns ``None`` if the claim loses (still
         cooling down or rule disabled/deleted).
+
+        Order for ``auto_pause_tenant``: enqueue ``alert.fired`` webhooks
+        first, then pause the tenant so the paused-tenant gate cannot drop
+        the notification that caused the pause. Claim path also allows
+        ``alert.fired`` deliveries while paused.
         """
         event_id = uuid4()
         event_tenant = self._event_tenant_id(rule)
@@ -607,16 +612,16 @@ class AlertsMixin:
             ).fetchone()
             if claimed is None:
                 return None
-            tenant_paused = False
+            # Annotate first; pause *after* webhook enqueue so alert.fired
+            # deliveries are not skipped by the paused-tenant gate.
+            pause_tid: str | None = None
             if (
                 auto_pause
                 and locked.get("scope") == "tenant"
                 and locked.get("tenant_id")
             ):
-                tid = str(locked["tenant_id"])
-                self._pause_tenant_conn(conn, tid, now=now)
-                tenant_paused = True
-                payload_detail["auto_paused_tenant"] = tid
+                pause_tid = str(locked["tenant_id"])
+                payload_detail["auto_paused_tenant"] = pause_tid
             row = conn.execute(
                 f"""
                 INSERT INTO alert_events (
@@ -654,9 +659,8 @@ class AlertsMixin:
                 detail=payload_detail,
                 now=now,
             )
-            if tenant_paused:
-                # Keep detail consistent for callers.
-                pass
+            if pause_tid is not None:
+                self._pause_tenant_conn(conn, pause_tid, now=now)
         assert row is not None
         return self._row_to_alert_event(row)
 
@@ -699,10 +703,9 @@ class AlertsMixin:
             tenants = [ALERTS_OVERALL_TENANT]
 
         for tid in tenants:
-            if self._is_tenant_paused(conn, tid):
-                # Still allow overall alert channel even if "__overall__" has no settings.
-                if tid != ALERTS_OVERALL_TENANT:
-                    continue
+            # Never skip paused tenants for alert.fired: auto_pause_tenant
+            # pauses in the same txn *after* enqueue, and operators must still
+            # receive notifications while a tenant is paused for overflow.
             endpoints = conn.execute(
                 f"""
                 SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}

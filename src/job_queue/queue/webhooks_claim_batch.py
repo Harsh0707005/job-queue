@@ -81,11 +81,14 @@ class WebhooksClaimBatchMixin:
                       AND d2.last_status_code IS NOT NULL
                       AND d2.last_status_code >= 200
                       AND d2.last_status_code < 300
-                      AND NOT EXISTS (
-                            SELECT 1 FROM tenant_settings ts
-                            WHERE ts.tenant_id = d2.tenant_id
-                              AND ts.paused = TRUE
-                              AND ts.offboarding = FALSE
+                      AND (
+                            d2.event = 'alert.fired'
+                            OR NOT EXISTS (
+                                SELECT 1 FROM tenant_settings ts
+                                WHERE ts.tenant_id = d2.tenant_id
+                                  AND ts.paused = TRUE
+                                  AND ts.offboarding = FALSE
+                            )
                       )
                     FOR UPDATE OF d2 SKIP LOCKED
                     LIMIT %s
@@ -139,11 +142,14 @@ class WebhooksClaimBatchMixin:
                             )
                          )
                     )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM tenant_settings ts
-                        WHERE ts.tenant_id = d.tenant_id
-                          AND ts.paused = TRUE
+                    AND (
+                        d.event = 'alert.fired'
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM tenant_settings ts
+                            WHERE ts.tenant_id = d.tenant_id
+                              AND ts.paused = TRUE
+                        )
                     )
                     ORDER BY d.next_attempt_at ASC
                     FOR UPDATE OF d SKIP LOCKED

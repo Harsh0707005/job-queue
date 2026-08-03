@@ -333,6 +333,87 @@ def test_auto_pause_tenant_on_alert_fire(queue: JobQueue):
     assert not queue.is_tenant_paused("pause-t")
 
 
+def test_auto_pause_still_delivers_alert_webhook(queue: JobQueue):
+    """auto_pause must not swallow the alert.fired webhook for that tenant.
+
+    Pause happens after outbox enqueue, and claim allows alert.fired through
+    the paused-tenant filter so operators still get the notification.
+    """
+    sink = _WebhookCapture(fail_times=0)
+    try:
+        queue.register_webhook(
+            tenant_id="wh-pause",
+            url=sink.url,
+            events=[WebhookEvent.ALERT_FIRED.value],
+            secret="w" * 16,
+        )
+        queue.create_alert_rule(
+            name="pause-and-notify",
+            metric="dead_count",
+            threshold=0,
+            comparator="gt",
+            scope="tenant",
+            tenant_id="wh-pause",
+            cooldown_seconds=0,
+            auto_pause_tenant=True,
+        )
+        queue.enqueue(tenant_id="wh-pause", payload={}, max_attempts=1)
+        j = queue.lease(tenant_id="wh-pause", worker_id="w")
+        assert j is not None
+        _nack(queue, j, "w", error="boom", requeue=True)
+
+        fired = queue.evaluate_alerts()
+        assert any(e.rule_name == "pause-and-notify" for e in fired)
+        assert queue.is_tenant_paused("wh-pause")
+
+        # Outbox row must exist even though tenant is now paused.
+        with queue._pool.connection() as conn:
+            pending = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n
+                FROM webhook_deliveries
+                WHERE tenant_id = %s
+                  AND event = %s
+                  AND status IN ('pending', 'delivering', 'succeeded')
+                """,
+                ("wh-pause", WebhookEvent.ALERT_FIRED.value),
+            ).fetchone()
+        assert pending is not None and int(pending["n"]) >= 1
+
+        # Claim/deliver must succeed while paused (alert.fired exception).
+        delivered = False
+        for _ in range(25):
+            queue.process_webhook_deliveries(limit=20, http_timeout_seconds=2)
+            if sink.received:
+                delivered = True
+                break
+            time.sleep(0.05)
+        assert delivered, "alert.fired webhook not delivered after auto-pause"
+        body = sink.received[-1]["body"]
+        assert body["event"] == "alert.fired"
+        assert body["rule_name"] == "pause-and-notify"
+        assert body.get("detail", {}).get("auto_paused_tenant") == "wh-pause"
+
+        # Job webhooks for the same tenant must still be blocked while paused.
+        job_sink = _WebhookCapture(fail_times=0)
+        try:
+            queue.register_webhook(
+                tenant_id="wh-pause",
+                url=job_sink.url,
+                events=["job.completed"],
+                secret="j" * 16,
+            )
+            queue.enqueue(tenant_id="wh-pause", payload={"blocked": True})
+            # Still paused → no lease (and no job.completed webhook path).
+            assert queue.lease(tenant_id="wh-pause", worker_id="w3") is None
+        finally:
+            job_sink.stop()
+
+        queue.resume_tenant("wh-pause")
+    finally:
+        sink.stop()
+
+
 def test_alerts_http_api(postgres_url: str):
     import json
     import threading
