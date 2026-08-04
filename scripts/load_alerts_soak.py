@@ -119,7 +119,7 @@ def main() -> int:
         {
             "tenant_id": "__overall__",
             "url": sink,
-            "events": ["alert.fired"],
+            "events": ["alert.fired", "alert.resolved"],
             "secret": "fleet-alert-secret-16",
         },
     )

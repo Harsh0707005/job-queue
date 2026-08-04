@@ -3,6 +3,8 @@
 Rules evaluate against live gauges / throughput windows (and worker-level
 lease counts). When a rule fires, an ``alert_events`` row is appended and
 ``alert.fired`` webhook deliveries are enqueued (same outbox as job events).
+When an open event is resolved (manual or auto-recovery), ``alert.resolved``
+deliveries are enqueued the same way.
 """
 
 from __future__ import annotations
@@ -333,13 +335,18 @@ class AlertsMixin:
         note: str | None = None,
         now: datetime | None = None,
     ) -> AlertEvent:
-        """Mark a history event resolved (tenant-scoped for isolation)."""
+        """Mark a history event resolved (tenant-scoped for isolation).
+
+        On first resolve, enqueues ``alert.resolved`` webhook deliveries.
+        Idempotent re-resolve returns the existing row without re-notifying.
+        """
         if not tenant_id or not str(tenant_id).strip():
             raise ValueError("tenant_id is required")
         tenant_id = str(tenant_id).strip()
         ts = now or _utcnow()
         by = str(resolved_by).strip() if resolved_by else None
         res_note = str(note).strip() if note else None
+        newly_resolved = False
         with transaction(self._pool) as conn:
             row = conn.execute(
                 f"""
@@ -369,7 +376,7 @@ class AlertsMixin:
                     raise ValueError(
                         f"alert event {event_id} not found for tenant {tenant_id!r}"
                     )
-                # Already resolved — return current row.
+                # Already resolved — return current row (no re-notify).
                 row = conn.execute(
                     f"""
                     SELECT {_ALERT_EVENT_COLUMNS}
@@ -377,7 +384,14 @@ class AlertsMixin:
                     """,
                     (event_id,),
                 ).fetchone()
+            else:
+                newly_resolved = True
+                self._enqueue_alert_resolved_webhooks(
+                    conn, event_row=row, now=ts
+                )
         assert row is not None
+        # newly_resolved kept for clarity / future hooks
+        _ = newly_resolved
         return self._row_to_alert_event(row)
 
     def list_alert_events(
@@ -647,6 +661,10 @@ class AlertsMixin:
                 """,
                 (now, AUTO_RESOLVE_BY, note, rule.id),
             ).fetchall()
+            for r in rows:
+                self._enqueue_alert_resolved_webhooks(
+                    conn, event_row=r, now=now, recovery_value=value
+                )
         return [self._row_to_alert_event(r) for r in rows]
 
     def _compute_alert_value(
@@ -893,9 +911,19 @@ class AlertsMixin:
             ).fetchone()
             self._enqueue_alert_webhooks(
                 conn,
+                webhook_event=WebhookEvent.ALERT_FIRED.value,
                 event_id=event_id,
-                rule=rule,
+                rule_id=rule.id,
+                rule_name=rule.name,
+                metric=rule.metric,
+                scope=rule.scope,
+                route_tenant_id=event_tenant,
+                rule_tenant_id=rule.tenant_id,
+                worker_id=rule.worker_id,
                 value=value,
+                threshold=rule.threshold,
+                comparator=rule.comparator,
+                window_seconds=rule.window_seconds,
                 detail=payload_detail,
                 now=now,
             )
@@ -921,31 +949,87 @@ class AlertsMixin:
             (tenant_id, now),
         )
 
+    def _enqueue_alert_resolved_webhooks(
+        self,
+        conn: Any,
+        *,
+        event_row: dict[str, Any],
+        now: datetime,
+        recovery_value: float | None = None,
+    ) -> None:
+        """Enqueue alert.resolved for a just-closed history row."""
+        detail = event_row.get("detail") or {}
+        if isinstance(detail, str):
+            import json
+
+            detail = json.loads(detail)
+        detail = dict(detail)
+        if recovery_value is not None:
+            detail["recovery_value"] = float(recovery_value)
+        detail["resolved_by"] = event_row.get("resolved_by")
+        detail["resolution_note"] = event_row.get("resolution_note")
+        route_tid = event_row.get("tenant_id") or ALERTS_OVERALL_TENANT
+        self._enqueue_alert_webhooks(
+            conn,
+            webhook_event=WebhookEvent.ALERT_RESOLVED.value,
+            event_id=event_row["id"],
+            rule_id=event_row["rule_id"],
+            rule_name=event_row["rule_name"],
+            metric=event_row["metric"],
+            scope=event_row["scope"],
+            route_tenant_id=str(route_tid),
+            rule_tenant_id=event_row.get("tenant_id"),
+            worker_id=event_row.get("worker_id"),
+            value=float(event_row["value"]),
+            threshold=float(event_row["threshold"]),
+            comparator=event_row["comparator"],
+            window_seconds=event_row.get("window_seconds"),
+            detail=detail,
+            now=now,
+            resolved_at=event_row.get("resolved_at") or now,
+            resolved_by=event_row.get("resolved_by"),
+            resolution_note=event_row.get("resolution_note"),
+        )
+
     def _enqueue_alert_webhooks(
         self,
         conn: Any,
         *,
+        webhook_event: str,
         event_id: UUID,
-        rule: AlertRule,
+        rule_id: UUID,
+        rule_name: str,
+        metric: str,
+        scope: str,
+        route_tenant_id: str,
+        rule_tenant_id: str | None,
+        worker_id: str | None,
         value: float,
+        threshold: float,
+        comparator: str,
+        window_seconds: int | None,
         detail: dict[str, Any],
         now: datetime,
+        resolved_at: datetime | None = None,
+        resolved_by: str | None = None,
+        resolution_note: str | None = None,
     ) -> None:
-        """Enqueue alert.fired deliveries to matching webhook endpoints."""
-        event = WebhookEvent.ALERT_FIRED.value
-        # Tenant-scoped: that tenant's endpoints. Overall: __overall__ tenant.
-        # Worker-scoped: tenant endpoints if tenant set, else overall.
-        if rule.scope == "tenant" and rule.tenant_id:
-            tenants = [rule.tenant_id]
-        elif rule.scope == "worker" and rule.tenant_id:
-            tenants = [rule.tenant_id]
-        else:
-            tenants = [ALERTS_OVERALL_TENANT]
+        """Enqueue alert.fired / alert.resolved deliveries to matching endpoints.
+
+        Never skips paused tenants: operators must receive alert lifecycle
+        notifications even when auto_pause (or manual pause) has stopped the
+        tenant's job webhooks.
+
+        Outbox ``next_attempt_at`` uses wall-clock time (not a synthetic
+        evaluation ``now``) so deliveries are immediately claimable when
+        evaluate/auto-resolve passes an advanced timestamp for streak math.
+        """
+        event = webhook_event
+        tenants = [route_tenant_id or ALERTS_OVERALL_TENANT]
+        # Schedule for immediate claim under real time.
+        schedule_at = _utcnow()
 
         for tid in tenants:
-            # Never skip paused tenants for alert.fired: auto_pause_tenant
-            # pauses in the same txn *after* enqueue, and operators must still
-            # receive notifications while a tenant is paused for overflow.
             endpoints = conn.execute(
                 f"""
                 SELECT {self._WEBHOOK_ENDPOINT_COLUMNS}
@@ -958,23 +1042,32 @@ class AlertsMixin:
             ).fetchall()
             for ep in endpoints:
                 delivery_id = uuid4()
-                payload = {
+                payload: dict[str, Any] = {
                     "event": event,
                     "delivery_id": str(delivery_id),
                     "alert_event_id": str(event_id),
-                    "rule_id": str(rule.id),
-                    "rule_name": rule.name,
-                    "metric": rule.metric,
-                    "scope": rule.scope,
-                    "tenant_id": rule.tenant_id,
-                    "worker_id": rule.worker_id,
+                    "rule_id": str(rule_id),
+                    "rule_name": rule_name,
+                    "metric": metric,
+                    "scope": scope,
+                    "tenant_id": rule_tenant_id,
+                    "worker_id": worker_id,
                     "value": value,
-                    "threshold": rule.threshold,
-                    "comparator": rule.comparator,
-                    "window_seconds": rule.window_seconds,
+                    "threshold": threshold,
+                    "comparator": comparator,
+                    "window_seconds": window_seconds,
                     "detail": detail,
                     "timestamp": now.isoformat(),
                 }
+                if event == WebhookEvent.ALERT_RESOLVED.value:
+                    payload["resolved_at"] = (
+                        resolved_at.isoformat()
+                        if resolved_at is not None
+                        else now.isoformat()
+                    )
+                    payload["resolved_by"] = resolved_by
+                    payload["resolution_note"] = resolution_note
+                    payload["status"] = "resolved"
                 conn.execute(
                     f"""
                     INSERT INTO webhook_deliveries (
@@ -998,10 +1091,10 @@ class AlertsMixin:
                         ep["max_attempts"],
                         ep["backoff_base_seconds"],
                         ep["backoff_max_seconds"],
-                        now,
+                        schedule_at,
                         ep.get("secret"),
-                        now,
-                        now,
+                        schedule_at,
+                        schedule_at,
                     ),
                 )
 

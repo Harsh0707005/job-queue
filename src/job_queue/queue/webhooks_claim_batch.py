@@ -82,7 +82,7 @@ class WebhooksClaimBatchMixin:
                       AND d2.last_status_code >= 200
                       AND d2.last_status_code < 300
                       AND (
-                            d2.event = 'alert.fired'
+                            d2.event IN ('alert.fired', 'alert.resolved')
                             OR NOT EXISTS (
                                 SELECT 1 FROM tenant_settings ts
                                 WHERE ts.tenant_id = d2.tenant_id
@@ -143,7 +143,7 @@ class WebhooksClaimBatchMixin:
                          )
                     )
                     AND (
-                        d.event = 'alert.fired'
+                        d.event IN ('alert.fired', 'alert.resolved')
                         OR NOT EXISTS (
                             SELECT 1
                             FROM tenant_settings ts

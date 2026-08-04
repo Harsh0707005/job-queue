@@ -372,6 +372,7 @@ class WebhookEvent(str, Enum):
     JOB_FAILED = "job.failed"
     JOB_DEAD = "job.dead"
     ALERT_FIRED = "alert.fired"
+    ALERT_RESOLVED = "alert.resolved"
 
 
 @dataclass(frozen=True, slots=True)

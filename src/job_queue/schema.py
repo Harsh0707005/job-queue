@@ -715,7 +715,7 @@ CREATE TABLE IF NOT EXISTS queue_metric_snapshots (
 CREATE INDEX IF NOT EXISTS idx_queue_metric_snapshots_tenant_time
     ON queue_metric_snapshots (tenant_id, sampled_at DESC);
 
--- Allow alert webhook deliveries without a job row (alert.fired stream).
+-- Allow alert webhook deliveries without a job row (alert.fired / alert.resolved).
 ALTER TABLE webhook_deliveries ALTER COLUMN job_id DROP NOT NULL;
 
 -- Metric alert rules (threshold checks evaluated periodically).

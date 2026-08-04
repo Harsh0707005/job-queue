@@ -333,6 +333,123 @@ def test_auto_pause_tenant_on_alert_fire(queue: JobQueue):
     assert not queue.is_tenant_paused("pause-t")
 
 
+def test_alert_resolved_webhook_on_manual_and_auto_close(queue: JobQueue):
+    """alert.resolved is enqueued and delivered when an open alert closes."""
+    from datetime import timedelta
+
+    from job_queue.queue.alerts import AUTO_RESOLVE_BY
+
+    sink = _WebhookCapture(fail_times=0)
+    try:
+        queue.register_webhook(
+            tenant_id="ar-wh",
+            url=sink.url,
+            events=[
+                WebhookEvent.ALERT_FIRED.value,
+                WebhookEvent.ALERT_RESOLVED.value,
+            ],
+            secret="r" * 16,
+        )
+        queue.create_alert_rule(
+            name="resolve-stream",
+            metric="pending_count",
+            threshold=0,
+            comparator="gt",
+            scope="tenant",
+            tenant_id="ar-wh",
+            cooldown_seconds=0,
+            recovery_threshold=0,
+            recovery_evaluations=2,
+            healthy_interval_seconds=1,
+        )
+        queue.enqueue(tenant_id="ar-wh", payload={})
+        t0 = _utcnow()
+        fired = queue.evaluate_alerts(now=t0)
+        assert any(e.rule_name == "resolve-stream" for e in fired)
+        open_ev = next(
+            e
+            for e in queue.list_alert_events(tenant_id="ar-wh", status="open")
+            if e.rule_name == "resolve-stream"
+        )
+
+        # Manual resolve → alert.resolved webhook.
+        resolved = queue.resolve_alert_event(
+            open_ev.id,
+            tenant_id="ar-wh",
+            resolved_by="ops",
+            note="acked",
+        )
+        assert resolved.status == "resolved"
+        delivered_manual = False
+        for _ in range(25):
+            queue.process_webhook_deliveries(limit=20, http_timeout_seconds=2)
+            if any(
+                r["body"].get("event") == "alert.resolved"
+                for r in sink.received
+            ):
+                delivered_manual = True
+                break
+            time.sleep(0.05)
+        assert delivered_manual, "alert.resolved not delivered on manual resolve"
+        man = next(
+            r["body"]
+            for r in sink.received
+            if r["body"].get("event") == "alert.resolved"
+        )
+        assert man["alert_event_id"] == str(open_ev.id)
+        assert man["resolved_by"] == "ops"
+        assert man["status"] == "resolved"
+        assert man["rule_name"] == "resolve-stream"
+
+        # Fire again, then auto-resolve via healthy streak → alert.resolved.
+        queue.enqueue(tenant_id="ar-wh", payload={})
+        t1 = t0 + timedelta(seconds=30)
+        fired2 = queue.evaluate_alerts(now=t1)
+        assert any(e.rule_name == "resolve-stream" for e in fired2)
+        open2 = [
+            e
+            for e in queue.list_alert_events(tenant_id="ar-wh", status="open")
+            if e.rule_name == "resolve-stream"
+        ]
+        assert len(open2) >= 1
+        j = queue.lease(tenant_id="ar-wh", worker_id="w")
+        assert j is not None
+        _ack(queue, j, "w")
+        # Drain any leftover pending for this tenant.
+        while True:
+            j2 = queue.lease(tenant_id="ar-wh", worker_id="w")
+            if j2 is None:
+                break
+            _ack(queue, j2, "w")
+        before = len(
+            [r for r in sink.received if r["body"].get("event") == "alert.resolved"]
+        )
+        h1 = queue.evaluate_alerts(now=t1 + timedelta(seconds=5))
+        assert not any(e.rule_name == "resolve-stream" for e in h1.resolved)
+        auto = queue.evaluate_alerts(now=t1 + timedelta(seconds=5 + 2))
+        assert any(
+            e.rule_name == "resolve-stream" for e in auto.resolved
+        ), f"expected auto-resolve; fired={len(auto.fired)} resolved={[(e.rule_name, e.resolved_by) for e in auto.resolved]}"
+        delivered_auto = False
+        for _ in range(25):
+            queue.process_webhook_deliveries(limit=20, http_timeout_seconds=2)
+            after = [
+                r
+                for r in sink.received
+                if r["body"].get("event") == "alert.resolved"
+            ]
+            if len(after) > before:
+                delivered_auto = True
+                body = after[-1]["body"]
+                assert body["resolved_by"] == AUTO_RESOLVE_BY
+                assert body["event"] == "alert.resolved"
+                break
+            time.sleep(0.05)
+        assert delivered_auto, "alert.resolved not delivered on auto-resolve"
+    finally:
+        sink.stop()
+
+
 def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
     """Open events close after N spaced healthy samples past recovery line."""
     from datetime import timedelta
