@@ -170,6 +170,16 @@ class LeaseNackMixin:
                     tenant_id=owner_tenant,
                     now=now,
                 )
+            # Terminal workflow step failure triggers reverse compensation.
+            if new_status in (JobStatus.DEAD.value, JobStatus.FAILED.value):
+                if hasattr(self, "_on_workflow_step_terminal"):
+                    self._on_workflow_step_terminal(
+                        conn,
+                        updated,
+                        success=False,
+                        error=error,
+                        now=now,
+                    )
             # Offboarding: requeued pending is purged when no leases remain;
             # terminal nacks also trigger purge when this was the last holder.
             self._maybe_finalize_offboard(conn, tenant_id=job.tenant_id, now=now)

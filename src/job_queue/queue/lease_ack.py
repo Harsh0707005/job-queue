@@ -110,6 +110,15 @@ class LeaseAckMixin:
                         tenant_id=updated["tenant_id"],
                         now=now,
                     )
+                # Advance multi-step saga when a workflow step job completes.
+                if hasattr(self, "_on_workflow_step_terminal"):
+                    self._on_workflow_step_terminal(
+                        conn,
+                        updated,
+                        success=True,
+                        result=result,
+                        now=now,
+                    )
                 self._maybe_finalize_offboard(conn, tenant_id=job.tenant_id, now=now)
                 return job
 

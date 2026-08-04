@@ -828,4 +828,68 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_open
     ON alert_events (tenant_id, fired_at DESC)
     WHERE resolved_at IS NULL;
 
+-- Multi-step saga workflows: run + per-step jobs with reverse compensation.
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    id                  UUID PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    name                TEXT,
+    status              TEXT NOT NULL DEFAULT 'running',
+    steps_def           JSONB NOT NULL,
+    current_index       INTEGER NOT NULL DEFAULT 0,
+    fail_step_index     INTEGER,
+    fail_reason         TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    CONSTRAINT workflow_runs_status_check CHECK (
+        status IN ('running', 'compensating', 'completed', 'failed', 'cancelled')
+    ),
+    CONSTRAINT workflow_runs_current_index_check CHECK (current_index >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_tenant_created
+    ON workflow_runs (tenant_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_tenant_status
+    ON workflow_runs (tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS workflow_step_runs (
+    id                  UUID PRIMARY KEY,
+    run_id              UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    tenant_id           TEXT NOT NULL,
+    step_index          INTEGER NOT NULL,
+    name                TEXT NOT NULL,
+    direction           TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    job_id              UUID UNIQUE,
+    result              JSONB,
+    error               TEXT,
+    idempotency_key     TEXT NOT NULL,
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT workflow_step_runs_direction_check CHECK (
+        direction IN ('forward', 'compensate')
+    ),
+    CONSTRAINT workflow_step_runs_status_check CHECK (
+        status IN (
+            'pending', 'running', 'completed', 'failed',
+            'skipped', 'compensated'
+        )
+    ),
+    CONSTRAINT workflow_step_runs_index_check CHECK (step_index >= 0),
+    CONSTRAINT workflow_step_runs_unique_dir UNIQUE (run_id, step_index, direction)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_run
+    ON workflow_step_runs (run_id, step_index, direction);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_tenant_run
+    ON workflow_step_runs (tenant_id, run_id);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_job
+    ON workflow_step_runs (job_id)
+    WHERE job_id IS NOT NULL;
+
 """

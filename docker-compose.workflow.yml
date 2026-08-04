@@ -1,0 +1,160 @@
+# Multi-step saga workflows under multi-tenant multi-worker load.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml \
+#     down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml up --build \
+#     --abort-on-container-exit --exit-code-from workflow-soak workflow-soak
+
+x-worker: &worker_env
+  COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+  EFFECT_SINK_URL: http://effect-sink:8091
+  POLL_INTERVAL: "0.08"
+  VISIBILITY_TIMEOUT: "8"
+  BATCH_SIZE: "8"
+  LOG_LEVEL: WARNING
+
+services:
+  chaos:
+    profiles: ["disabled"]
+  soak:
+    profiles: ["disabled"]
+  scheduler:
+    profiles: ["disabled"]
+
+  effect-sink:
+    build: .
+    command: ["job-queue-effect-sink"]
+    environment:
+      PORT: "8091"
+      LOG_LEVEL: INFO
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  worker-1:
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w1
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-2:
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w2
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-3:
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w3
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-4:
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w4
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-5:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w5
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+  worker-6:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w6
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+  worker-7:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w7
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+  worker-8:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *worker_env
+      WORKER_ID: load-w8
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+
+  workflow-soak:
+    build: .
+    command: ["python", "scripts/load_workflow_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      TENANTS: "6"
+      HAPPY_PER_TENANT: "4"
+      FAIL_PER_TENANT: "3"
+      MAX_WALL_SECONDS: "240"
+      RESULTS_PATH: /results/workflow-fleet.json
+      LOAD_LABEL: workflow-fleet
+      LOG_LEVEL: INFO
+    volumes:
+      - ./deploy/load-results:/results
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      worker-7:
+        condition: service_started
+      worker-8:
+        condition: service_started

@@ -25,6 +25,11 @@ from job_queue.models import (
     AlertRule,
     AlertEvent,
     AlertEvaluationResult,
+    WorkflowRun,
+    WorkflowStepRun,
+    WorkflowRunStatus,
+    WorkflowStepStatus,
+    WorkflowStepDirection,
 )
 from job_queue.queue import (
     ApprovalError,
@@ -66,6 +71,11 @@ __all__ = [
     "AlertEvaluationResult",
     "AlertEvent",
     "AlertRule",
+    "WorkflowRun",
+    "WorkflowRunStatus",
+    "WorkflowStepDirection",
+    "WorkflowStepRun",
+    "WorkflowStepStatus",
     "ApprovalError",
     "ApprovalRequested",
     "AuditConsistencyReport",

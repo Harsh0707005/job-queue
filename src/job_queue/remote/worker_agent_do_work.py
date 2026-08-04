@@ -25,6 +25,10 @@ class RemoteWorkerDoWorkMixin:
         """
         payload = job.payload if isinstance(job.payload, dict) else {}
         kind = payload.get("kind")
+        # Multi-step saga forward / compensate step.
+        if kind == "workflow.step":
+            return self._do_workflow_step(job, lease_lost, payload)
+
         # Spawn subtasks and park until they complete (join).
         if (
             kind == "spawn"

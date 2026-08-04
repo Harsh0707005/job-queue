@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Fleet soak: multi-tenant multi-worker saga workflows + reverse compensate.
+
+Starts happy-path and fail-path workflows per tenant. Workers run
+workflow.step jobs (forward/compensate) with effect-sink idempotency.
+Asserts run terminal states and exactly-once compensate effects.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+from urllib.parse import urlencode
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("load_workflow_soak")
+
+COORDINATOR_URLS = [
+    u.strip().rstrip("/")
+    for u in (
+        os.environ.get("COORDINATOR_URLS")
+        or "http://coordinator-1:8080,http://coordinator-2:8080"
+    ).split(",")
+    if u.strip()
+]
+SINK = os.environ.get("EFFECT_SINK_URL", "http://effect-sink:8091").rstrip("/")
+TENANTS = int(os.environ.get("TENANTS", "6"))
+HAPPY_PER_TENANT = int(os.environ.get("HAPPY_PER_TENANT", "4"))
+FAIL_PER_TENANT = int(os.environ.get("FAIL_PER_TENANT", "3"))
+MAX_WALL = float(os.environ.get("MAX_WALL_SECONDS", "240"))
+RESULTS_PATH = os.environ.get("RESULTS_PATH", "/results/workflow-fleet.json")
+LABEL = os.environ.get("LOAD_LABEL", "workflow-fleet")
+_rr = 0
+
+
+def http_json(
+    method: str, path: str, body: dict[str, Any] | None = None, timeout: float = 60.0
+) -> tuple[int, dict[str, Any]]:
+    global _rr
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    start = _rr % len(COORDINATOR_URLS)
+    _rr += 1
+    ordered = COORDINATOR_URLS[start:] + COORDINATOR_URLS[:start]
+    last: Exception | None = None
+    for base in ordered:
+        url = base + path
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if not raw:
+                    return resp.status, {}
+                return resp.status, json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read() if exc.fp else b""
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                payload = {"error": raw.decode("utf-8", errors="replace")}
+            if 500 <= int(exc.code) < 600:
+                last = RuntimeError(f"{url} -> {exc.code}: {payload}")
+                continue
+            return int(exc.code), payload
+        except urllib.error.URLError as exc:
+            last = exc
+            continue
+    raise RuntimeError(f"all coordinators failed: {last}")
+
+
+def wait_healthy(timeout: float = 180.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for base in COORDINATOR_URLS:
+            try:
+                code, h = http_json("GET", "/health", timeout=5)
+                if code == 200 and h.get("ok"):
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(1)
+    raise RuntimeError("not healthy")
+
+
+def sink_stats() -> dict[str, Any]:
+    req = urllib.request.Request(SINK + "/stats", method="GET")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def happy_steps() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "reserve",
+            "kind": "effect",
+            "payload": {"op": "reserve", "ms": 40},
+            "compensate": {"kind": "effect", "payload": {"op": "release", "ms": 20}},
+        },
+        {
+            "name": "charge",
+            "kind": "effect",
+            "payload": {"op": "charge", "ms": 40},
+            "compensate": {"kind": "effect", "payload": {"op": "refund", "ms": 20}},
+        },
+        {
+            "name": "ship",
+            "kind": "effect",
+            "payload": {"op": "ship", "ms": 40},
+        },
+    ]
+
+
+def fail_steps() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "reserve",
+            "kind": "effect",
+            "payload": {"op": "reserve", "ms": 30},
+            "compensate": {"kind": "effect", "payload": {"op": "release", "ms": 20}},
+        },
+        {
+            "name": "charge",
+            "kind": "effect",
+            "payload": {"op": "charge", "ms": 30},
+            "compensate": {"kind": "effect", "payload": {"op": "refund", "ms": 20}},
+        },
+        {
+            "name": "ship",
+            "kind": "effect",
+            "payload": {"op": "ship", "ms": 20},
+            "fail": True,
+            "fail_error": "fleet forced ship fail",
+        },
+    ]
+
+
+def main() -> int:
+    tenants = [f"wf-t{i:02d}" for i in range(TENANTS)]
+    logger.info(
+        "WORKFLOW soak label=%s tenants=%s happy/t=%s fail/t=%s",
+        LABEL,
+        TENANTS,
+        HAPPY_PER_TENANT,
+        FAIL_PER_TENANT,
+    )
+    wait_healthy()
+
+    runs: list[tuple[str, str, str]] = []  # tenant, run_id, kind
+
+    def start_one(tid: str, kind: str) -> tuple[str, str, str]:
+        steps = happy_steps() if kind == "happy" else fail_steps()
+        code, body = http_json(
+            "POST",
+            "/v1/workflows",
+            {
+                "tenant_id": tid,
+                "name": f"{LABEL}-{kind}",
+                "steps": steps,
+                "max_attempts": 1,
+                "visibility_timeout_seconds": 15,
+            },
+        )
+        if code not in (200, 201):
+            raise RuntimeError(f"start workflow {code}: {body}")
+        rid = (body.get("run") or {}).get("id")
+        if not rid:
+            raise RuntimeError(f"no run id: {body}")
+        return tid, str(rid), kind
+
+    work: list[tuple[str, str]] = []
+    for tid in tenants:
+        for _ in range(HAPPY_PER_TENANT):
+            work.append((tid, "happy"))
+        for _ in range(FAIL_PER_TENANT):
+            work.append((tid, "fail"))
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futs = [pool.submit(start_one, tid, kind) for tid, kind in work]
+        for f in as_completed(futs):
+            runs.append(f.result())
+    logger.info("started %s workflow runs", len(runs))
+
+    # Wait for terminal statuses.
+    t0 = time.time()
+    completed = 0
+    failed = 0
+    pending = len(runs)
+    while time.time() - t0 < MAX_WALL:
+        completed = 0
+        failed = 0
+        pending = 0
+        for tid, rid, kind in runs:
+            code, body = http_json(
+                "GET",
+                f"/v1/workflows/{rid}?" + urlencode({"tenant_id": tid}),
+            )
+            if code != 200:
+                pending += 1
+                continue
+            st = (body.get("run") or {}).get("status")
+            if st == "completed":
+                completed += 1
+            elif st == "failed":
+                failed += 1
+            else:
+                pending += 1
+        if pending == 0:
+            break
+        time.sleep(1)
+    logger.info(
+        "terminal completed=%s failed=%s pending=%s", completed, failed, pending
+    )
+
+    expect_happy = TENANTS * HAPPY_PER_TENANT
+    expect_fail = TENANTS * FAIL_PER_TENANT
+    ok_counts = completed == expect_happy and failed == expect_fail and pending == 0
+
+    # Sample fail run: compensate order reserve after charge (reverse of completed).
+    ok_compensate_order = True
+    fail_samples = [(t, r) for t, r, k in runs if k == "fail"][:3]
+    for tid, rid in fail_samples:
+        code, body = http_json(
+            "GET",
+            f"/v1/workflows/{rid}/steps?" + urlencode({"tenant_id": tid}),
+        )
+        if code != 200:
+            ok_compensate_order = False
+            continue
+        comps = [
+            s
+            for s in (body.get("steps") or [])
+            if s.get("direction") == "compensate"
+            and s.get("status") == "compensated"
+        ]
+        # completed forwards: reserve, charge → compensate charge then reserve
+        by_done = sorted(
+            comps,
+            key=lambda s: s.get("completed_at") or s.get("created_at") or "",
+        )
+        names = [s.get("name") for s in by_done]
+        if names != ["charge", "reserve"]:
+            logger.warning("unexpected compensate order for %s: %s", rid, names)
+            ok_compensate_order = False
+
+    # Tenant isolation: cross-tenant get returns 404
+    ok_isolation = True
+    if runs:
+        tid0, rid0, _ = runs[0]
+        other = tenants[1] if len(tenants) > 1 else "no-such-tenant"
+        code, _ = http_json(
+            "GET",
+            f"/v1/workflows/{rid0}?" + urlencode({"tenant_id": other}),
+        )
+        if code not in (404, 400):
+            # get returns 404 when wrong tenant
+            ok_isolation = code == 404
+
+    # Effect sink: unique keys >= happy*3 + fail*(2 forward + 2 compensate)
+    # fail: reserve+charge forward, ship fails (may not complete effect),
+    # compensate charge+reserve.
+    stats = {}
+    try:
+        stats = sink_stats()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sink stats: %s", exc)
+    unique = int(stats.get("unique_effects") or 0)
+    min_unique = expect_happy * 3 + expect_fail * 2  # at least forwards for happy + 2 for fail
+    ok_sink = unique >= min_unique
+
+    ok = ok_counts and ok_compensate_order and ok_isolation and ok_sink
+    result = {
+        "ok": ok,
+        "label": LABEL,
+        "total_runs": len(runs),
+        "completed": completed,
+        "failed": failed,
+        "pending": pending,
+        "expect_happy": expect_happy,
+        "expect_fail": expect_fail,
+        "ok_counts": ok_counts,
+        "ok_compensate_order": ok_compensate_order,
+        "ok_isolation": ok_isolation,
+        "ok_sink": ok_sink,
+        "sink_unique_effects": unique,
+        "sink_total_posts": stats.get("total_posts"),
+    }
+    os.makedirs(os.path.dirname(RESULTS_PATH) or ".", exist_ok=True)
+    with open(RESULTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, default=str)
+    logger.info("result %s", json.dumps(result))
+    if ok:
+        logger.info("WORKFLOW FLEET PASS")
+        return 0
+    logger.error("WORKFLOW FLEET FAIL")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

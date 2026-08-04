@@ -20,6 +20,28 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class WorkflowRunStatus(str, Enum):
+    RUNNING = "running"
+    COMPENSATING = "compensating"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowStepStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    COMPENSATED = "compensated"
+
+
+class WorkflowStepDirection(str, Enum):
+    FORWARD = "forward"
+    COMPENSATE = "compensate"
+
+
 @dataclass(frozen=True, slots=True)
 class Job:
     """A unit of work leased by a worker.
@@ -441,6 +463,44 @@ class AlertEvaluationResult:
 
     def __len__(self) -> int:
         return len(self.fired)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRun:
+    """Multi-step saga run with optional reverse compensation."""
+
+    id: UUID
+    tenant_id: str
+    name: str | None
+    status: str
+    steps_def: list[dict[str, Any]]
+    current_index: int
+    fail_step_index: int | None
+    fail_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowStepRun:
+    """One forward or compensate unit of work in a workflow run."""
+
+    id: UUID
+    run_id: UUID
+    tenant_id: str
+    step_index: int
+    name: str
+    direction: str
+    status: str
+    job_id: UUID | None
+    result: dict[str, Any] | list[Any] | str | int | float | bool | None
+    error: str | None
+    idempotency_key: str
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

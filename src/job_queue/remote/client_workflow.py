@@ -1,4 +1,4 @@
-"""CoordinatorClient workflow: side effects, approvals, spawn/join."""
+"""CoordinatorClient workflow: side effects, approvals, spawn/join, sagas."""
 
 from __future__ import annotations
 
@@ -10,6 +10,29 @@ from job_queue.models import Job, SpawnChildrenResult
 
 
 class ClientWorkflowMixin:
+    def start_workflow(self, **kwargs: Any) -> dict[str, Any]:
+        payload = self._request("POST", "/v1/workflows", dict(kwargs))
+        assert payload is not None
+        return payload
+
+    def get_workflow(self, run_id: str | UUID, *, tenant_id: str) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"tenant_id": tenant_id})
+        payload = self._request("GET", f"/v1/workflows/{run_id}?{q}")
+        assert payload is not None
+        return payload
+
+    def list_workflow_steps(
+        self, run_id: str | UUID, *, tenant_id: str
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"tenant_id": tenant_id})
+        payload = self._request("GET", f"/v1/workflows/{run_id}/steps?{q}")
+        assert payload is not None
+        return payload
+
     def begin_side_effect(
         self,
         job_id: UUID,

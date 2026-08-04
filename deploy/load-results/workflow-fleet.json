@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "label": "workflow-fleet",
+  "total_runs": 42,
+  "completed": 24,
+  "failed": 18,
+  "pending": 0,
+  "expect_happy": 24,
+  "expect_fail": 18,
+  "ok_counts": true,
+  "ok_compensate_order": true,
+  "ok_isolation": true,
+  "ok_sink": true,
+  "sink_unique_effects": 144,
+  "sink_total_posts": 144
+}

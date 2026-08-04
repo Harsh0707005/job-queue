@@ -345,6 +345,14 @@ class RoutingMixin:
         if method == "POST" and path == "/v1/metrics/retention":
             return self._set_metrics_retention(body)
 
+        # Multi-step saga workflows.
+        if method == "POST" and path == "/v1/workflows":
+            return self._start_workflow(body)
+        if method == "GET" and path.startswith("/v1/workflows/"):
+            if path.rstrip("/").endswith("/steps"):
+                return self._list_workflow_steps(path, query)
+            return self._get_workflow(path, query)
+
         # Metric threshold alerts + history.
         if method == "POST" and path == "/v1/alerts/rules":
             return self._create_alert_rule(body)
