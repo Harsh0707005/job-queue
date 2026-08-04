@@ -25,6 +25,9 @@ def _rule_to_dict(r: AlertRule) -> dict[str, Any]:
         "last_fired_at": r.last_fired_at.isoformat() if r.last_fired_at else None,
         "muted_until": r.muted_until.isoformat() if r.muted_until else None,
         "auto_pause_tenant": r.auto_pause_tenant,
+        "recovery_threshold": r.recovery_threshold,
+        "recovery_evaluations": r.recovery_evaluations,
+        "healthy_streak": r.healthy_streak,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
     }
@@ -65,6 +68,8 @@ def _parse_rule_id(path: str, *, min_parts: int = 4) -> UUID | None:
 class AlertsApiMixin:
     def _create_alert_rule(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
+            rec_raw = body.get("recovery_threshold", None)
+            rec_threshold = float(rec_raw) if rec_raw is not None else None
             rule = self.queue.create_alert_rule(
                 name=str(body.get("name") or ""),
                 metric=str(body.get("metric") or ""),
@@ -77,6 +82,12 @@ class AlertsApiMixin:
                 cooldown_seconds=int(body.get("cooldown_seconds") or 300),
                 enabled=bool(body.get("enabled", True)),
                 auto_pause_tenant=bool(body.get("auto_pause_tenant", False)),
+                recovery_threshold=rec_threshold,
+                recovery_evaluations=int(
+                    body["recovery_evaluations"]
+                    if body.get("recovery_evaluations") is not None
+                    else 2
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             return 400, {"error": str(exc)}
@@ -213,10 +224,12 @@ class AlertsApiMixin:
 
     def _evaluate_alerts(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
-            fired = self.queue.evaluate_alerts()
+            result = self.queue.evaluate_alerts()
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {
-            "fired": [_event_to_dict(e) for e in fired],
-            "count": len(fired),
+            "fired": [_event_to_dict(e) for e in result.fired],
+            "resolved": [_event_to_dict(e) for e in result.resolved],
+            "count": len(result.fired),
+            "resolved_count": len(result.resolved),
         }

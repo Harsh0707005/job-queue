@@ -333,6 +333,83 @@ def test_auto_pause_tenant_on_alert_fire(queue: JobQueue):
     assert not queue.is_tenant_paused("pause-t")
 
 
+def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
+    """Open events close after N consecutive healthy samples past recovery line."""
+    from job_queue.queue.alerts import AUTO_RESOLVE_BY
+
+    # Fire when pending > 5; recover only when pending <= 2 (hysteresis).
+    rule = queue.create_alert_rule(
+        name="pending-hysteresis",
+        metric="pending_count",
+        threshold=5,
+        comparator="gt",
+        scope="tenant",
+        tenant_id="ar-hyst",
+        cooldown_seconds=0,
+        recovery_threshold=2,
+        recovery_evaluations=2,
+    )
+    assert rule.recovery_threshold == 2.0
+    assert rule.recovery_evaluations == 2
+
+    # Seed 8 pending jobs → breach.
+    for _ in range(8):
+        queue.enqueue(tenant_id="ar-hyst", payload={})
+    result = queue.evaluate_alerts()
+    assert any(e.rule_name == "pending-hysteresis" for e in result.fired)
+    open1 = queue.list_alert_events(tenant_id="ar-hyst", status="open")
+    assert len(open1) >= 1
+    open_ids = {e.id for e in open1}
+
+    # Drain to 4 pending: still above recovery (2) but not above fire (5).
+    # Gray zone — must not auto-resolve or count as healthy.
+    for _ in range(4):
+        j = queue.lease(tenant_id="ar-hyst", worker_id="w")
+        assert j is not None
+        _ack(queue, j, "w")
+    mid = queue.evaluate_alerts()
+    assert not any(e.rule_name == "pending-hysteresis" for e in mid.resolved)
+    open_mid = queue.list_alert_events(tenant_id="ar-hyst", status="open")
+    assert open_ids.issubset({e.id for e in open_mid})
+
+    # Drain to 0 pending: fully healthy.
+    while True:
+        j = queue.lease(tenant_id="ar-hyst", worker_id="w")
+        if j is None:
+            break
+        _ack(queue, j, "w")
+
+    # First healthy evaluate: streak=1, not yet resolved.
+    first_h = queue.evaluate_alerts()
+    assert not any(e.id in open_ids for e in first_h.resolved)
+    still_open = queue.list_alert_events(tenant_id="ar-hyst", status="open")
+    assert open_ids.issubset({e.id for e in still_open})
+
+    # Second consecutive healthy evaluate: auto-resolve.
+    second_h = queue.evaluate_alerts()
+    assert any(e.id in open_ids for e in second_h.resolved)
+    closed = queue.list_alert_events(tenant_id="ar-hyst", status="resolved")
+    closed_ids = {e.id for e in closed}
+    assert open_ids.issubset(closed_ids)
+    for e in closed:
+        if e.id in open_ids:
+            assert e.resolved_by == AUTO_RESOLVE_BY
+            assert e.status == "resolved"
+            assert "auto-resolved" in (e.resolution_note or "")
+
+    # recovery_threshold validation
+    with pytest.raises(ValueError, match="recovery_threshold"):
+        queue.create_alert_rule(
+            name="bad-rec",
+            metric="pending_count",
+            threshold=5,
+            comparator="gt",
+            scope="tenant",
+            tenant_id="ar-bad",
+            recovery_threshold=10,  # above fire line — invalid
+        )
+
+
 def test_auto_pause_still_delivers_alert_webhook(queue: JobQueue):
     """auto_pause must not swallow the alert.fired webhook for that tenant.
 

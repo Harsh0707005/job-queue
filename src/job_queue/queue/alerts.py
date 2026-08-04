@@ -14,9 +14,12 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
-from job_queue.models import AlertEvent, AlertRule, WebhookEvent
+from job_queue.models import AlertEvaluationResult, AlertEvent, AlertRule, WebhookEvent
 from job_queue.queue._common import _utcnow
 from job_queue.queue.metrics import OVERALL_TENANT
+
+# resolved_by marker for automatic recovery closes.
+AUTO_RESOLVE_BY = "auto"
 
 # Supported metric names for alert rules.
 ALERT_METRICS = frozenset(
@@ -39,7 +42,8 @@ ALERT_METRICS = frozenset(
 _ALERT_RULE_COLUMNS = """
     id, name, enabled, scope, tenant_id, worker_id, metric, comparator,
     threshold, window_seconds, cooldown_seconds, last_fired_at,
-    muted_until, auto_pause_tenant, created_at, updated_at
+    muted_until, auto_pause_tenant, recovery_threshold, recovery_evaluations,
+    healthy_streak, created_at, updated_at
 """
 
 _ALERT_EVENT_COLUMNS = """
@@ -67,6 +71,8 @@ class AlertsMixin:
         cooldown_seconds: int = 300,
         enabled: bool = True,
         auto_pause_tenant: bool = False,
+        recovery_threshold: float | None = None,
+        recovery_evaluations: int = 2,
         rule_id: UUID | None = None,
     ) -> AlertRule:
         if not name or not str(name).strip():
@@ -110,6 +116,19 @@ class AlertsMixin:
         auto_pause = bool(auto_pause_tenant)
         if auto_pause and scope != "tenant":
             raise ValueError("auto_pause_tenant is only valid for scope=tenant")
+        rec_evals = int(recovery_evaluations)
+        if rec_evals < 0:
+            raise ValueError("recovery_evaluations must be >= 0 (0 disables auto-resolve)")
+        fire_threshold = float(threshold)
+        if recovery_threshold is None:
+            rec_threshold: float | None = None
+        else:
+            rec_threshold = float(recovery_threshold)
+            self._validate_recovery_threshold(
+                comparator=comparator,
+                fire_threshold=fire_threshold,
+                recovery_threshold=rec_threshold,
+            )
         now = _utcnow()
         rid = rule_id or uuid4()
         try:
@@ -120,11 +139,13 @@ class AlertsMixin:
                         id, name, enabled, scope, tenant_id, worker_id, metric,
                         comparator, threshold, window_seconds, cooldown_seconds,
                         last_fired_at, muted_until, auto_pause_tenant,
+                        recovery_threshold, recovery_evaluations, healthy_streak,
                         created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         NULL, NULL, %s,
+                        %s, %s, 0,
                         %s, %s
                     )
                     RETURNING {_ALERT_RULE_COLUMNS}
@@ -138,10 +159,12 @@ class AlertsMixin:
                         worker_id,
                         metric,
                         comparator,
-                        float(threshold),
+                        fire_threshold,
                         int(window_seconds),
                         int(cooldown_seconds),
                         auto_pause,
+                        rec_threshold,
+                        rec_evals,
                         now,
                         now,
                     ),
@@ -154,6 +177,27 @@ class AlertsMixin:
             raise
         assert row is not None
         return self._row_to_alert_rule(row)
+
+    @staticmethod
+    def _validate_recovery_threshold(
+        *,
+        comparator: str,
+        fire_threshold: float,
+        recovery_threshold: float,
+    ) -> None:
+        """Ensure recovery threshold sits on the healthy side of the fire line."""
+        if comparator in ("gt", "gte"):
+            if recovery_threshold > fire_threshold:
+                raise ValueError(
+                    "recovery_threshold must be <= threshold for gt/gte "
+                    "(hysteresis band below the fire line)"
+                )
+        elif comparator in ("lt", "lte"):
+            if recovery_threshold < fire_threshold:
+                raise ValueError(
+                    "recovery_threshold must be >= threshold for lt/lte "
+                    "(hysteresis band above the fire line)"
+                )
 
     def list_alert_rules(self, *, enabled_only: bool = False) -> list[AlertRule]:
         with self._pool.connection() as conn:
@@ -380,37 +424,184 @@ class AlertsMixin:
             ).fetchall()
         return [self._row_to_alert_event(r) for r in rows]
 
-    def evaluate_alerts(self, *, now: datetime | None = None) -> list[AlertEvent]:
-        """Evaluate all enabled rules; fire + record + webhook when breached.
+    def evaluate_alerts(
+        self, *, now: datetime | None = None
+    ) -> AlertEvaluationResult:
+        """Evaluate all enabled rules; fire on breach, auto-resolve on recovery.
 
         Cooldown and event insert are claimed under a per-rule row lock so
         concurrent evaluators (multi-coordinator) cannot double-fire the same
         rule within the cooldown window. Muted rules (``muted_until > now``)
         are skipped. Tenant-scoped rules with ``auto_pause_tenant`` pause that
         tenant on fire to stop further overflow.
+
+        Auto-resolve: when the metric is healthy vs ``recovery_threshold``
+        (defaults to fire ``threshold``) for ``recovery_evaluations``
+        consecutive evaluates, all open history events for that rule are
+        closed with ``resolved_by=auto``. The hysteresis band between fire
+        and recovery thresholds prevents flip-flop; set
+        ``recovery_evaluations=0`` to disable auto-resolve.
         """
         ts = now or _utcnow()
         rules = self.list_alert_rules(enabled_only=True)
         fired: list[AlertEvent] = []
+        resolved: list[AlertEvent] = []
         for rule in rules:
             if rule.muted_until is not None and ts < rule.muted_until:
                 continue
             value, detail = self._compute_alert_value(rule, now=ts)
             if value is None:
                 continue
-            if not self._compare(value, rule.comparator, rule.threshold):
+            v = float(value)
+            if self._compare(v, rule.comparator, rule.threshold):
+                # Breach: reset healthy streak, then fire if cooldown allows.
+                self._set_healthy_streak(rule.id, streak=0, now=ts)
+                if rule.last_fired_at is not None and rule.cooldown_seconds > 0:
+                    cool_until = rule.last_fired_at + timedelta(
+                        seconds=rule.cooldown_seconds
+                    )
+                    if ts < cool_until:
+                        continue
+                ev = self._fire_alert(rule, value=v, detail=detail, now=ts)
+                if ev is not None:
+                    fired.append(ev)
                 continue
-            # Cheap pre-check (not authoritative — race-safe claim is in _fire_alert).
-            if rule.last_fired_at is not None and rule.cooldown_seconds > 0:
-                cool_until = rule.last_fired_at + timedelta(
-                    seconds=rule.cooldown_seconds
-                )
-                if ts < cool_until:
-                    continue
-            ev = self._fire_alert(rule, value=float(value), detail=detail, now=ts)
-            if ev is not None:
-                fired.append(ev)
-        return fired
+
+            # Not breaching fire threshold — track recovery hysteresis.
+            if rule.recovery_evaluations <= 0:
+                continue
+            closed = self._record_healthy_and_maybe_resolve(
+                rule, value=v, now=ts
+            )
+            resolved.extend(closed)
+        return AlertEvaluationResult(fired=fired, resolved=resolved)
+
+    def _recovery_threshold_value(self, rule: AlertRule) -> float:
+        if rule.recovery_threshold is not None:
+            return float(rule.recovery_threshold)
+        return float(rule.threshold)
+
+    def _is_recovered(self, value: float, rule: AlertRule) -> bool:
+        """True when value is on the healthy side of the recovery threshold.
+
+        For gt/gte fire rules, healthy means value is strictly below (or at for
+        gt) the recovery line. Uses inverted comparators so a recovery_threshold
+        below the fire threshold creates a non-flapping hysteresis band.
+        """
+        rec = self._recovery_threshold_value(rule)
+        comp = rule.comparator
+        if comp == "gt":
+            # Fire when value > T; recovered when value <= rec (rec <= T).
+            return value <= rec
+        if comp == "gte":
+            # Fire when value >= T; recovered when value < rec (rec <= T).
+            return value < rec
+        if comp == "lt":
+            # Fire when value < T; recovered when value >= rec (rec >= T).
+            return value >= rec
+        if comp == "lte":
+            # Fire when value <= T; recovered when value > rec (rec >= T).
+            return value > rec
+        return False
+
+    def _set_healthy_streak(
+        self, rule_id: UUID, *, streak: int, now: datetime
+    ) -> None:
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                UPDATE alert_rules
+                SET healthy_streak = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (max(0, int(streak)), now, rule_id),
+            )
+
+    def _record_healthy_and_maybe_resolve(
+        self,
+        rule: AlertRule,
+        *,
+        value: float,
+        now: datetime,
+    ) -> list[AlertEvent]:
+        """Atomically update healthy streak; auto-resolve when threshold met.
+
+        Under a rule row lock so concurrent multi-coordinator evaluates
+        correctly count consecutive healthy samples and only resolve once.
+        """
+        recovered = self._is_recovered(value, rule)
+        with transaction(self._pool) as conn:
+            locked = conn.execute(
+                f"""
+                SELECT {_ALERT_RULE_COLUMNS}
+                FROM alert_rules
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (rule.id,),
+            ).fetchone()
+            if locked is None or not bool(locked["enabled"]):
+                return []
+            need = int(locked.get("recovery_evaluations") or 0)
+            if need <= 0:
+                return []
+            # Rebuild a transient rule view with locked recovery fields.
+            locked_rule = self._row_to_alert_rule(locked)
+            if not recovered:
+                # Gray zone or not fully healthy — reset streak.
+                if int(locked.get("healthy_streak") or 0) != 0:
+                    conn.execute(
+                        """
+                        UPDATE alert_rules
+                        SET healthy_streak = 0, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (now, rule.id),
+                    )
+                return []
+            # Re-validate with locked recovery_threshold (may have been updated).
+            if not self._is_recovered(value, locked_rule):
+                if int(locked.get("healthy_streak") or 0) != 0:
+                    conn.execute(
+                        """
+                        UPDATE alert_rules
+                        SET healthy_streak = 0, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (now, rule.id),
+                    )
+                return []
+            new_streak = int(locked.get("healthy_streak") or 0) + 1
+            # Cap streak at need so it does not grow forever after resolve.
+            stored = min(new_streak, need)
+            conn.execute(
+                """
+                UPDATE alert_rules
+                SET healthy_streak = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (stored, now, rule.id),
+            )
+            if new_streak < need:
+                return []
+            rec_val = self._recovery_threshold_value(locked_rule)
+            note = (
+                f"auto-resolved after {new_streak} consecutive healthy "
+                f"evaluation(s); value={value} recovery_threshold={rec_val}"
+            )
+            rows = conn.execute(
+                f"""
+                UPDATE alert_events
+                SET resolved_at = %s,
+                    resolved_by = %s,
+                    resolution_note = %s
+                WHERE rule_id = %s
+                  AND resolved_at IS NULL
+                RETURNING {_ALERT_EVENT_COLUMNS}
+                """,
+                (now, AUTO_RESOLVE_BY, note, rule.id),
+            ).fetchall()
+        return [self._row_to_alert_event(r) for r in rows]
 
     def _compute_alert_value(
         self, rule: AlertRule, *, now: datetime
@@ -590,7 +781,9 @@ class AlertsMixin:
             claimed = conn.execute(
                 """
                 UPDATE alert_rules
-                SET last_fired_at = %s, updated_at = %s
+                SET last_fired_at = %s,
+                    updated_at = %s,
+                    healthy_streak = 0
                 WHERE id = %s
                   AND enabled = TRUE
                   AND (muted_until IS NULL OR muted_until <= %s)
@@ -766,6 +959,7 @@ class AlertsMixin:
                 )
 
     def _row_to_alert_rule(self, row: dict[str, Any]) -> AlertRule:
+        rec_th = row.get("recovery_threshold")
         return AlertRule(
             id=row["id"],
             name=row["name"],
@@ -781,6 +975,9 @@ class AlertsMixin:
             last_fired_at=row.get("last_fired_at"),
             muted_until=row.get("muted_until"),
             auto_pause_tenant=bool(row.get("auto_pause_tenant") or False),
+            recovery_threshold=float(rec_th) if rec_th is not None else None,
+            recovery_evaluations=int(row.get("recovery_evaluations") or 0),
+            healthy_streak=int(row.get("healthy_streak") or 0),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

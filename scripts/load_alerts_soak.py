@@ -167,6 +167,9 @@ def main() -> int:
                 "cooldown_seconds": 0,
                 # Overflow guard: pause tenant when dead threshold trips.
                 "auto_pause_tenant": tid == auto_pause_tid,
+                # Auto-resolve after 2 consecutive healthy samples once dead=0.
+                "recovery_threshold": 0,
+                "recovery_evaluations": 2,
             }
         )
     rules_spec.append(
@@ -476,6 +479,104 @@ def main() -> int:
         } if code_closed == 200 else set()
         ok_resolve = ok_resolve and eid in closed_ids
 
+    # --- auto-resolve: recover dead_count for a tenant, require 2 healthy evals
+    ar_tid = tenants[2] if len(tenants) > 2 else tenants[0]
+    ar_rule_name = f"{LABEL}-dead-{ar_tid}"
+    ok_auto_resolve = False
+    auto_resolved_count = 0
+    # Capture open events before recovery.
+    code_ar0, ar_open0 = http_json(
+        "GET",
+        "/v1/alerts/events?"
+        + urlencode(
+            {"tenant_id": ar_tid, "status": "open", "limit": 100}
+        ),
+    )
+    ar_open_ids = {
+        e.get("id")
+        for e in (ar_open0.get("events") or [])
+        if e.get("rule_name") == ar_rule_name
+    } if code_ar0 == 200 else set()
+    if ar_open_ids:
+        # Replay dead letters so dead_count can fall to 0 (metric recovers).
+        http_json(
+            "POST",
+            "/v1/dead-letters/replay",
+            {
+                "tenant_id": ar_tid,
+                "limit": 500,
+                "reset_attempts": True,
+                "max_attempts": 3,
+            },
+        )
+        # Drain replayed jobs via fleet workers.
+        t_ar = time.time()
+        while time.time() - t_ar < 60:
+            code_s, snap = http_json(
+                "GET",
+                "/v1/metrics/snapshot?"
+                + urlencode({"tenant_id": ar_tid, "window_seconds": 60}),
+            )
+            gauges = (snap.get("gauges") or {}) if code_s == 200 else {}
+            ar_dead = int(gauges.get("dead") or 0)
+            ar_pending = int(gauges.get("pending") or 0)
+            ar_leased = int(gauges.get("leased") or 0)
+            if ar_dead == 0 and ar_pending == 0 and ar_leased == 0:
+                break
+            time.sleep(0.5)
+        # One healthy eval should not resolve yet (recovery_evaluations=2).
+        code_e1, ev1 = http_json("POST", "/v1/alerts/evaluate", {})
+        resolved1 = [
+            e
+            for e in (ev1.get("resolved") or [])
+            if e.get("rule_name") == ar_rule_name
+        ] if code_e1 == 200 else []
+        # Second consecutive healthy eval auto-resolves.
+        code_e2, ev2 = http_json("POST", "/v1/alerts/evaluate", {})
+        resolved2 = [
+            e
+            for e in (ev2.get("resolved") or [])
+            if e.get("rule_name") == ar_rule_name
+        ] if code_e2 == 200 else []
+        auto_resolved_count = len(resolved2)
+        # First pass must not fully close (unless already streak from earlier evals).
+        code_ar1, ar_open1 = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode(
+                {"tenant_id": ar_tid, "status": "open", "limit": 100}
+            ),
+        )
+        code_ar2, ar_closed = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode(
+                {
+                    "tenant_id": ar_tid,
+                    "status": "resolved",
+                    "limit": 100,
+                }
+            ),
+        )
+        closed_auto = [
+            e
+            for e in (ar_closed.get("events") or [])
+            if e.get("id") in ar_open_ids and e.get("resolved_by") == "auto"
+        ] if code_ar2 == 200 else []
+        # Either second evaluate returned resolved, or history shows auto close.
+        ok_auto_resolve = len(closed_auto) >= 1 and (
+            auto_resolved_count >= 1 or len(resolved1) >= 1
+        )
+        # Prefer strict: open set no longer contains those ids.
+        still_open = {
+            e.get("id")
+            for e in (ar_open1.get("events") or [])
+            if e.get("rule_name") == ar_rule_name
+        } if code_ar1 == 200 else set()
+        # After 2 healthy evals open should be empty for those ids.
+        # (If first eval already had streak>=2 from sample, resolved1 may close.)
+        ok_auto_resolve = ok_auto_resolve and not (ar_open_ids & still_open)
+
     # Pass if history recorded and at least dead-related + lag (or webhook rate).
     ok = (
         ok_hist
@@ -487,6 +588,7 @@ def main() -> int:
         and ok_auto_pause
         and ok_mute
         and ok_resolve
+        and ok_auto_resolve
     )
 
     result = {
@@ -509,6 +611,9 @@ def main() -> int:
         "ok_auto_pause": ok_auto_pause,
         "ok_mute": ok_mute,
         "ok_resolve": ok_resolve,
+        "ok_auto_resolve": ok_auto_resolve,
+        "auto_resolved_count": auto_resolved_count,
+        "auto_resolve_tenant": ar_tid,
         "auto_pause_tenant": auto_pause_tid,
         "auto_pause_paused": paused_flag,
         "auto_pause_in_detail": auto_pause_in_detail,

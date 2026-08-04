@@ -392,6 +392,9 @@ class AlertRule:
     last_fired_at: datetime | None
     muted_until: datetime | None
     auto_pause_tenant: bool
+    recovery_threshold: float | None
+    recovery_evaluations: int
+    healthy_streak: int
     created_at: datetime
     updated_at: datetime
 
@@ -420,6 +423,21 @@ class AlertEvent:
     @property
     def status(self) -> str:
         return "resolved" if self.resolved_at is not None else "open"
+
+
+@dataclass(frozen=True, slots=True)
+class AlertEvaluationResult:
+    """Result of one evaluate_alerts pass (fires + auto-resolves)."""
+
+    fired: list[AlertEvent]
+    resolved: list[AlertEvent]
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        """Iterate fired events for backward-compatible ``for e in result``."""
+        return iter(self.fired)
+
+    def __len__(self) -> int:
+        return len(self.fired)
 
 
 @dataclass(frozen=True, slots=True)
