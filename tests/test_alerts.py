@@ -334,7 +334,9 @@ def test_auto_pause_tenant_on_alert_fire(queue: JobQueue):
 
 
 def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
-    """Open events close after N consecutive healthy samples past recovery line."""
+    """Open events close after N spaced healthy samples past recovery line."""
+    from datetime import timedelta
+
     from job_queue.queue.alerts import AUTO_RESOLVE_BY
 
     # Fire when pending > 5; recover only when pending <= 2 (hysteresis).
@@ -348,14 +350,17 @@ def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
         cooldown_seconds=0,
         recovery_threshold=2,
         recovery_evaluations=2,
+        healthy_interval_seconds=5,
     )
     assert rule.recovery_threshold == 2.0
     assert rule.recovery_evaluations == 2
+    assert rule.healthy_interval_seconds == 5
 
+    t0 = _utcnow()
     # Seed 8 pending jobs → breach.
     for _ in range(8):
         queue.enqueue(tenant_id="ar-hyst", payload={})
-    result = queue.evaluate_alerts()
+    result = queue.evaluate_alerts(now=t0)
     assert any(e.rule_name == "pending-hysteresis" for e in result.fired)
     open1 = queue.list_alert_events(tenant_id="ar-hyst", status="open")
     assert len(open1) >= 1
@@ -367,7 +372,7 @@ def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
         j = queue.lease(tenant_id="ar-hyst", worker_id="w")
         assert j is not None
         _ack(queue, j, "w")
-    mid = queue.evaluate_alerts()
+    mid = queue.evaluate_alerts(now=t0 + timedelta(seconds=1))
     assert not any(e.rule_name == "pending-hysteresis" for e in mid.resolved)
     open_mid = queue.list_alert_events(tenant_id="ar-hyst", status="open")
     assert open_ids.issubset({e.id for e in open_mid})
@@ -380,13 +385,20 @@ def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
         _ack(queue, j, "w")
 
     # First healthy evaluate: streak=1, not yet resolved.
-    first_h = queue.evaluate_alerts()
+    first_h = queue.evaluate_alerts(now=t0 + timedelta(seconds=2))
     assert not any(e.id in open_ids for e in first_h.resolved)
     still_open = queue.list_alert_events(tenant_id="ar-hyst", status="open")
     assert open_ids.issubset({e.id for e in still_open})
 
-    # Second consecutive healthy evaluate: auto-resolve.
-    second_h = queue.evaluate_alerts()
+    # Same-window re-eval (before healthy_interval elapses): no second tick.
+    same_window = queue.evaluate_alerts(now=t0 + timedelta(seconds=3))
+    assert not any(e.id in open_ids for e in same_window.resolved)
+    rule_mid = queue.get_alert_rule(rule.id)
+    assert rule_mid is not None
+    assert rule_mid.healthy_streak == 1
+
+    # Second spaced healthy evaluate (after interval): auto-resolve.
+    second_h = queue.evaluate_alerts(now=t0 + timedelta(seconds=2 + 5))
     assert any(e.id in open_ids for e in second_h.resolved)
     closed = queue.list_alert_events(tenant_id="ar-hyst", status="resolved")
     closed_ids = {e.id for e in closed}
@@ -408,6 +420,53 @@ def test_auto_resolve_after_healthy_streak_with_hysteresis(queue: JobQueue):
             tenant_id="ar-bad",
             recovery_threshold=10,  # above fire line — invalid
         )
+
+
+def test_concurrent_healthy_ticks_do_not_instant_resolve(queue: JobQueue):
+    """Parallel evaluates at the same timestamp only count one healthy tick."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import timedelta
+
+    queue.create_alert_rule(
+        name="race-recover",
+        metric="pending_count",
+        threshold=0,
+        comparator="gt",
+        scope="tenant",
+        tenant_id="ar-race",
+        cooldown_seconds=0,
+        recovery_threshold=0,
+        recovery_evaluations=2,
+        healthy_interval_seconds=5,
+    )
+    # Breach then drain.
+    queue.enqueue(tenant_id="ar-race", payload={})
+    t0 = _utcnow()
+    fired = queue.evaluate_alerts(now=t0)
+    assert any(e.rule_name == "race-recover" for e in fired)
+    j = queue.lease(tenant_id="ar-race", worker_id="w")
+    assert j is not None
+    _ack(queue, j, "w")
+
+    t_healthy = t0 + timedelta(seconds=1)
+
+    def _eval() -> int:
+        r = queue.evaluate_alerts(now=t_healthy)
+        return sum(1 for e in r.resolved if e.rule_name == "race-recover")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [pool.submit(_eval) for _ in range(8)]
+        resolved_counts = [f.result() for f in as_completed(futs)]
+    assert sum(resolved_counts) == 0, (
+        f"concurrent same-now ticks must not resolve; got {resolved_counts}"
+    )
+    open_ev = queue.list_alert_events(tenant_id="ar-race", status="open")
+    assert any(e.rule_name == "race-recover" for e in open_ev)
+
+    # After the interval, a single sequential tick may advance to resolve.
+    later = queue.evaluate_alerts(now=t_healthy + timedelta(seconds=5))
+    # streak was 1 from concurrent window, +1 now = 2 → resolve
+    assert any(e.rule_name == "race-recover" for e in later.resolved)
 
 
 def test_auto_pause_still_delivers_alert_webhook(queue: JobQueue):

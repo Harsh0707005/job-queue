@@ -43,7 +43,8 @@ _ALERT_RULE_COLUMNS = """
     id, name, enabled, scope, tenant_id, worker_id, metric, comparator,
     threshold, window_seconds, cooldown_seconds, last_fired_at,
     muted_until, auto_pause_tenant, recovery_threshold, recovery_evaluations,
-    healthy_streak, created_at, updated_at
+    healthy_interval_seconds, healthy_streak, last_healthy_at,
+    created_at, updated_at
 """
 
 _ALERT_EVENT_COLUMNS = """
@@ -73,6 +74,7 @@ class AlertsMixin:
         auto_pause_tenant: bool = False,
         recovery_threshold: float | None = None,
         recovery_evaluations: int = 2,
+        healthy_interval_seconds: int = 1,
         rule_id: UUID | None = None,
     ) -> AlertRule:
         if not name or not str(name).strip():
@@ -119,6 +121,9 @@ class AlertsMixin:
         rec_evals = int(recovery_evaluations)
         if rec_evals < 0:
             raise ValueError("recovery_evaluations must be >= 0 (0 disables auto-resolve)")
+        healthy_iv = int(healthy_interval_seconds)
+        if healthy_iv < 0:
+            raise ValueError("healthy_interval_seconds must be >= 0")
         fire_threshold = float(threshold)
         if recovery_threshold is None:
             rec_threshold: float | None = None
@@ -139,13 +144,15 @@ class AlertsMixin:
                         id, name, enabled, scope, tenant_id, worker_id, metric,
                         comparator, threshold, window_seconds, cooldown_seconds,
                         last_fired_at, muted_until, auto_pause_tenant,
-                        recovery_threshold, recovery_evaluations, healthy_streak,
+                        recovery_threshold, recovery_evaluations,
+                        healthy_interval_seconds, healthy_streak, last_healthy_at,
                         created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         NULL, NULL, %s,
-                        %s, %s, 0,
+                        %s, %s,
+                        %s, 0, NULL,
                         %s, %s
                     )
                     RETURNING {_ALERT_RULE_COLUMNS}
@@ -165,6 +172,7 @@ class AlertsMixin:
                         auto_pause,
                         rec_threshold,
                         rec_evals,
+                        healthy_iv,
                         now,
                         now,
                     ),
@@ -437,10 +445,13 @@ class AlertsMixin:
 
         Auto-resolve: when the metric is healthy vs ``recovery_threshold``
         (defaults to fire ``threshold``) for ``recovery_evaluations``
-        consecutive evaluates, all open history events for that rule are
-        closed with ``resolved_by=auto``. The hysteresis band between fire
-        and recovery thresholds prevents flip-flop; set
-        ``recovery_evaluations=0`` to disable auto-resolve.
+        *spaced* healthy ticks, all open history events for that rule are
+        closed with ``resolved_by=auto``. Each healthy tick is only counted
+        if at least ``healthy_interval_seconds`` has elapsed since
+        ``last_healthy_at``, so concurrent multi-coordinator evaluates in the
+        same window cannot inflate the streak and resolve instantly. The
+        hysteresis band between fire and recovery thresholds also prevents
+        flip-flop; set ``recovery_evaluations=0`` to disable auto-resolve.
         """
         ts = now or _utcnow()
         rules = self.list_alert_rules(enabled_only=True)
@@ -455,7 +466,7 @@ class AlertsMixin:
             v = float(value)
             if self._compare(v, rule.comparator, rule.threshold):
                 # Breach: reset healthy streak, then fire if cooldown allows.
-                self._set_healthy_streak(rule.id, streak=0, now=ts)
+                self._reset_healthy_progress(rule.id, now=ts)
                 if rule.last_fired_at is not None and rule.cooldown_seconds > 0:
                     cool_until = rule.last_fired_at + timedelta(
                         seconds=rule.cooldown_seconds
@@ -504,18 +515,41 @@ class AlertsMixin:
             return value > rec
         return False
 
-    def _set_healthy_streak(
-        self, rule_id: UUID, *, streak: int, now: datetime
-    ) -> None:
+    def _reset_healthy_progress(self, rule_id: UUID, *, now: datetime) -> None:
+        """Clear healthy streak and last tick timestamp (breach / gray zone)."""
         with transaction(self._pool) as conn:
             conn.execute(
                 """
                 UPDATE alert_rules
-                SET healthy_streak = %s, updated_at = %s
+                SET healthy_streak = 0,
+                    last_healthy_at = NULL,
+                    updated_at = %s
                 WHERE id = %s
+                  AND (healthy_streak <> 0 OR last_healthy_at IS NOT NULL)
                 """,
-                (max(0, int(streak)), now, rule_id),
+                (now, rule_id),
             )
+
+    @staticmethod
+    def _healthy_tick_due(
+        *,
+        last_healthy_at: datetime | None,
+        interval_seconds: int,
+        now: datetime,
+    ) -> bool:
+        """Whether enough time has passed to count another healthy tick.
+
+        Concurrent evaluates that share the same ``now`` (or land inside the
+        interval window) only produce one tick: the first writer wins and
+        sets ``last_healthy_at``.
+        """
+        if last_healthy_at is None:
+            return True
+        iv = max(0, int(interval_seconds))
+        if iv <= 0:
+            # Still serialize same-timestamp dual hits.
+            return last_healthy_at < now
+        return last_healthy_at + timedelta(seconds=iv) <= now
 
     def _record_healthy_and_maybe_resolve(
         self,
@@ -526,8 +560,10 @@ class AlertsMixin:
     ) -> list[AlertEvent]:
         """Atomically update healthy streak; auto-resolve when threshold met.
 
-        Under a rule row lock so concurrent multi-coordinator evaluates
-        correctly count consecutive healthy samples and only resolve once.
+        Under a rule row lock. A healthy tick is counted only when
+        ``healthy_interval_seconds`` has elapsed since ``last_healthy_at``,
+        so parallel multi-coordinator hits in the same window do not advance
+        the streak (and cannot auto-resolve instantly).
         """
         recovered = self._is_recovered(value, rule)
         with transaction(self._pool) as conn:
@@ -545,49 +581,59 @@ class AlertsMixin:
             need = int(locked.get("recovery_evaluations") or 0)
             if need <= 0:
                 return []
-            # Rebuild a transient rule view with locked recovery fields.
             locked_rule = self._row_to_alert_rule(locked)
-            if not recovered:
-                # Gray zone or not fully healthy — reset streak.
-                if int(locked.get("healthy_streak") or 0) != 0:
+            if not recovered or not self._is_recovered(value, locked_rule):
+                # Gray zone / not healthy — reset progress.
+                if (
+                    int(locked.get("healthy_streak") or 0) != 0
+                    or locked.get("last_healthy_at") is not None
+                ):
                     conn.execute(
                         """
                         UPDATE alert_rules
-                        SET healthy_streak = 0, updated_at = %s
+                        SET healthy_streak = 0,
+                            last_healthy_at = NULL,
+                            updated_at = %s
                         WHERE id = %s
                         """,
                         (now, rule.id),
                     )
                 return []
-            # Re-validate with locked recovery_threshold (may have been updated).
-            if not self._is_recovered(value, locked_rule):
-                if int(locked.get("healthy_streak") or 0) != 0:
-                    conn.execute(
-                        """
-                        UPDATE alert_rules
-                        SET healthy_streak = 0, updated_at = %s
-                        WHERE id = %s
-                        """,
-                        (now, rule.id),
-                    )
+
+            last_h = locked.get("last_healthy_at")
+            interval = int(
+                locked.get("healthy_interval_seconds")
+                if locked.get("healthy_interval_seconds") is not None
+                else 1
+            )
+            if not self._healthy_tick_due(
+                last_healthy_at=last_h,
+                interval_seconds=interval,
+                now=now,
+            ):
+                # Too soon since last counted tick (or concurrent same-window
+                # hit) — do not advance streak.
                 return []
+
             new_streak = int(locked.get("healthy_streak") or 0) + 1
-            # Cap streak at need so it does not grow forever after resolve.
             stored = min(new_streak, need)
             conn.execute(
                 """
                 UPDATE alert_rules
-                SET healthy_streak = %s, updated_at = %s
+                SET healthy_streak = %s,
+                    last_healthy_at = %s,
+                    updated_at = %s
                 WHERE id = %s
                 """,
-                (stored, now, rule.id),
+                (stored, now, now, rule.id),
             )
             if new_streak < need:
                 return []
             rec_val = self._recovery_threshold_value(locked_rule)
             note = (
                 f"auto-resolved after {new_streak} consecutive healthy "
-                f"evaluation(s); value={value} recovery_threshold={rec_val}"
+                f"evaluation(s) spaced by >= {interval}s; value={value} "
+                f"recovery_threshold={rec_val}"
             )
             rows = conn.execute(
                 f"""
@@ -783,7 +829,8 @@ class AlertsMixin:
                 UPDATE alert_rules
                 SET last_fired_at = %s,
                     updated_at = %s,
-                    healthy_streak = 0
+                    healthy_streak = 0,
+                    last_healthy_at = NULL
                 WHERE id = %s
                   AND enabled = TRUE
                   AND (muted_until IS NULL OR muted_until <= %s)
@@ -960,6 +1007,7 @@ class AlertsMixin:
 
     def _row_to_alert_rule(self, row: dict[str, Any]) -> AlertRule:
         rec_th = row.get("recovery_threshold")
+        hiv = row.get("healthy_interval_seconds")
         return AlertRule(
             id=row["id"],
             name=row["name"],
@@ -977,7 +1025,9 @@ class AlertsMixin:
             auto_pause_tenant=bool(row.get("auto_pause_tenant") or False),
             recovery_threshold=float(rec_th) if rec_th is not None else None,
             recovery_evaluations=int(row.get("recovery_evaluations") or 0),
+            healthy_interval_seconds=int(hiv) if hiv is not None else 1,
             healthy_streak=int(row.get("healthy_streak") or 0),
+            last_healthy_at=row.get("last_healthy_at"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

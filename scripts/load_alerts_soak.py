@@ -167,9 +167,10 @@ def main() -> int:
                 "cooldown_seconds": 0,
                 # Overflow guard: pause tenant when dead threshold trips.
                 "auto_pause_tenant": tid == auto_pause_tid,
-                # Auto-resolve after 2 consecutive healthy samples once dead=0.
+                # Auto-resolve after 2 spaced healthy samples once dead=0.
                 "recovery_threshold": 0,
                 "recovery_evaluations": 2,
+                "healthy_interval_seconds": 1,
             }
         )
     rules_spec.append(
@@ -524,14 +525,31 @@ def main() -> int:
             if ar_dead == 0 and ar_pending == 0 and ar_leased == 0:
                 break
             time.sleep(0.5)
-        # One healthy eval should not resolve yet (recovery_evaluations=2).
+        # Concurrent same-window evaluates must not instant-resolve
+        # (healthy_interval_seconds gates ticks).
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [
+                pool.submit(http_json, "POST", "/v1/alerts/evaluate", {})
+                for _ in range(4)
+            ]
+            concurrent_resolved = 0
+            for f in as_completed(futs):
+                code_c, body_c = f.result()
+                if code_c == 200:
+                    concurrent_resolved += sum(
+                        1
+                        for e in (body_c.get("resolved") or [])
+                        if e.get("rule_name") == ar_rule_name
+                    )
+        # One healthy eval should not resolve yet (need 2 spaced ticks).
         code_e1, ev1 = http_json("POST", "/v1/alerts/evaluate", {})
         resolved1 = [
             e
             for e in (ev1.get("resolved") or [])
             if e.get("rule_name") == ar_rule_name
         ] if code_e1 == 200 else []
-        # Second consecutive healthy eval auto-resolves.
+        # Wait past healthy_interval_seconds before second tick.
+        time.sleep(1.2)
         code_e2, ev2 = http_json("POST", "/v1/alerts/evaluate", {})
         resolved2 = [
             e
@@ -539,14 +557,6 @@ def main() -> int:
             if e.get("rule_name") == ar_rule_name
         ] if code_e2 == 200 else []
         auto_resolved_count = len(resolved2)
-        # First pass must not fully close (unless already streak from earlier evals).
-        code_ar1, ar_open1 = http_json(
-            "GET",
-            "/v1/alerts/events?"
-            + urlencode(
-                {"tenant_id": ar_tid, "status": "open", "limit": 100}
-            ),
-        )
         code_ar2, ar_closed = http_json(
             "GET",
             "/v1/alerts/events?"
@@ -563,19 +573,26 @@ def main() -> int:
             for e in (ar_closed.get("events") or [])
             if e.get("id") in ar_open_ids and e.get("resolved_by") == "auto"
         ] if code_ar2 == 200 else []
-        # Either second evaluate returned resolved, or history shows auto close.
-        ok_auto_resolve = len(closed_auto) >= 1 and (
-            auto_resolved_count >= 1 or len(resolved1) >= 1
+        code_ar1, ar_open1 = http_json(
+            "GET",
+            "/v1/alerts/events?"
+            + urlencode(
+                {"tenant_id": ar_tid, "status": "open", "limit": 100}
+            ),
         )
-        # Prefer strict: open set no longer contains those ids.
         still_open = {
             e.get("id")
             for e in (ar_open1.get("events") or [])
             if e.get("rule_name") == ar_rule_name
         } if code_ar1 == 200 else set()
-        # After 2 healthy evals open should be empty for those ids.
-        # (If first eval already had streak>=2 from sample, resolved1 may close.)
-        ok_auto_resolve = ok_auto_resolve and not (ar_open_ids & still_open)
+        # Concurrent burst must not resolve; after spaced second tick, closed.
+        ok_auto_resolve = (
+            concurrent_resolved == 0
+            and len(resolved1) == 0
+            and len(closed_auto) >= 1
+            and auto_resolved_count >= 1
+            and not (ar_open_ids & still_open)
+        )
 
     # Pass if history recorded and at least dead-related + lag (or webhook rate).
     ok = (

@@ -738,7 +738,10 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     -- for recovery_evaluations consecutive evaluates before open events close.
     recovery_threshold  DOUBLE PRECISION,
     recovery_evaluations INTEGER NOT NULL DEFAULT 2,
+    -- Min seconds between counted healthy ticks (dedupes concurrent evaluates).
+    healthy_interval_seconds INTEGER NOT NULL DEFAULT 1,
     healthy_streak      INTEGER NOT NULL DEFAULT 0,
+    last_healthy_at     TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT alert_rules_scope_check CHECK (
@@ -763,6 +766,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     CONSTRAINT alert_rules_recovery_evaluations_check CHECK (
         recovery_evaluations >= 0
     ),
+    CONSTRAINT alert_rules_healthy_interval_check CHECK (
+        healthy_interval_seconds >= 0
+    ),
     CONSTRAINT alert_rules_healthy_streak_check CHECK (
         healthy_streak >= 0
     )
@@ -773,7 +779,9 @@ ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS auto_pause_tenant BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS recovery_threshold DOUBLE PRECISION;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS recovery_evaluations INTEGER NOT NULL DEFAULT 2;
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS healthy_interval_seconds INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS healthy_streak INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS last_healthy_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled
     ON alert_rules (enabled)

@@ -394,7 +394,9 @@ class AlertRule:
     auto_pause_tenant: bool
     recovery_threshold: float | None
     recovery_evaluations: int
+    healthy_interval_seconds: int
     healthy_streak: int
+    last_healthy_at: datetime | None
     created_at: datetime
     updated_at: datetime
 

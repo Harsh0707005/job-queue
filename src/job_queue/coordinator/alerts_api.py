@@ -27,7 +27,11 @@ def _rule_to_dict(r: AlertRule) -> dict[str, Any]:
         "auto_pause_tenant": r.auto_pause_tenant,
         "recovery_threshold": r.recovery_threshold,
         "recovery_evaluations": r.recovery_evaluations,
+        "healthy_interval_seconds": r.healthy_interval_seconds,
         "healthy_streak": r.healthy_streak,
+        "last_healthy_at": (
+            r.last_healthy_at.isoformat() if r.last_healthy_at else None
+        ),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
     }
@@ -87,6 +91,11 @@ class AlertsApiMixin:
                     body["recovery_evaluations"]
                     if body.get("recovery_evaluations") is not None
                     else 2
+                ),
+                healthy_interval_seconds=int(
+                    body["healthy_interval_seconds"]
+                    if body.get("healthy_interval_seconds") is not None
+                    else 1
                 ),
             )
         except (KeyError, TypeError, ValueError) as exc:
