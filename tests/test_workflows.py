@@ -152,3 +152,117 @@ def test_workflow_tenant_isolation(queue: JobQueue):
         queue.list_workflow_steps(r1.id, tenant_id="iso-b")
     assert queue.get_workflow(r1.id, tenant_id="iso-b") is None
     assert queue.get_workflow(r1.id, tenant_id="iso-a") is not None
+
+
+def test_workflow_compensates_on_lease_expiry_dead(queue: JobQueue):
+    """Worker crash / lease expiry that dead-letters a step must compensate."""
+    import time
+
+    run = queue.start_workflow(
+        tenant_id="wf-exp",
+        max_attempts=1,
+        visibility_timeout_seconds=1,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {
+                "name": "b",
+                "payload": {"op": "b"},
+                "compensate": {"payload": {"op": "undo_b"}},
+            },
+        ],
+    )
+    _drive_step(queue, "wf-exp")  # complete a
+    # Lease b then abandon (crash simulation).
+    jb = queue.lease(
+        tenant_id="wf-exp",
+        worker_id="doomed",
+        visibility_timeout_seconds=1,
+    )
+    assert jb is not None
+    assert jb.payload.get("step_name") == "b"
+    time.sleep(1.3)
+    # Next lease triggers dead-letter of exhausted expired lease + compensate.
+    # With max_attempts=1, expired b becomes dead (not reclaimed).
+    jc = queue.lease(tenant_id="wf-exp", worker_id="w2")
+    assert jc is not None
+    assert jc.payload.get("direction") == "compensate"
+    assert jc.payload.get("step_name") == "a"
+    _ack(queue, jc, "w2", result={"undid": "a"})
+    done = queue.get_workflow(run.id, tenant_id="wf-exp")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-exp")
+    forwards = {s.name: s for s in steps if s.direction == "forward"}
+    assert forwards["a"].status == WorkflowStepStatus.COMPLETED.value
+    assert forwards["b"].status == WorkflowStepStatus.FAILED.value
+    comps = [
+        s
+        for s in steps
+        if s.direction == "compensate"
+        and s.status == WorkflowStepStatus.COMPENSATED.value
+    ]
+    assert [s.name for s in comps] == ["a"]
+
+
+def test_workflow_compensates_on_max_runtime(queue: JobQueue):
+    """Max-runtime force-release to dead must start reverse compensation."""
+    import time
+
+    run = queue.start_workflow(
+        tenant_id="wf-rt",
+        max_attempts=1,
+        visibility_timeout_seconds=30,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {
+                "name": "b",
+                "payload": {"op": "b"},
+                "compensate": {"payload": {"op": "undo_b"}},
+            },
+        ],
+    )
+    # Override max_runtime on step jobs via direct lease after first step.
+    _drive_step(queue, "wf-rt")
+    jb = queue.lease(tenant_id="wf-rt", worker_id="slow")
+    assert jb is not None
+    # Force short max runtime and expired lease_started via SQL.
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET max_runtime_seconds = 1,
+                lease_started_at = NOW() - INTERVAL '5 seconds',
+                lease_expires_at = NOW() + INTERVAL '60 seconds'
+            WHERE id = %s
+            """,
+            (jb.id,),
+        )
+        conn.commit()
+    # Heartbeat / ack path runs max-runtime check.
+    from job_queue.queue import LeaseError
+
+    with pytest.raises(LeaseError):
+        queue.heartbeat(
+            jb.id,
+            tenant_id="wf-rt",
+            worker_id="slow",
+            lease_token=jb.lease_token,
+        )
+    # Compensating job for a should be claimable.
+    time.sleep(0.05)
+    jc = queue.lease(tenant_id="wf-rt", worker_id="w2")
+    assert jc is not None, "expected compensate job after max-runtime dead"
+    assert jc.payload.get("direction") == "compensate"
+    assert jc.payload.get("step_name") == "a"
+    _ack(queue, jc, "w2")
+    done = queue.get_workflow(run.id, tenant_id="wf-rt")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value

@@ -124,6 +124,20 @@ class LeaseMaxRuntimeMixin:
                     event=WebhookEvent.JOB_DEAD,
                     now=now,
                 )
+            # System terminal (max runtime) must drive saga compensation too.
+            if dead_row is not None and terminal in (
+                JobStatus.DEAD.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            ):
+                if hasattr(self, "_on_workflow_step_terminal"):
+                    self._on_workflow_step_terminal(
+                        conn,
+                        dead_row,
+                        success=False,
+                        error=error,
+                        now=now,
+                    )
             self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
         else:
             base = row.get("retry_backoff_base_seconds")
@@ -285,6 +299,18 @@ class LeaseMaxRuntimeMixin:
                     event=WebhookEvent.JOB_DEAD,
                     now=now,
                 )
+                # Lease-expiry dead must reverse-compensate completed saga steps.
+                if hasattr(self, "_on_workflow_step_terminal"):
+                    self._on_workflow_step_terminal(
+                        conn,
+                        full,
+                        success=False,
+                        error=str(
+                            full.get("last_error")
+                            or "exceeded max_attempts after lease expiry"
+                        ),
+                        now=now,
+                    )
             else:
                 self._cascade_cancel_dependents(
                     conn,
