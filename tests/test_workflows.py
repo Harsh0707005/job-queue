@@ -6,6 +6,7 @@ import pytest
 
 from job_queue import JobQueue, JobStatus
 from job_queue.models import WorkflowRunStatus, WorkflowStepStatus
+from job_queue.queue._common import CancelError, LeaseError
 from tests.helpers_queue import _ack, _nack
 
 
@@ -734,3 +735,190 @@ def test_workflow_compensates_on_max_runtime(queue: JobQueue):
     done = queue.get_workflow(run.id, tenant_id="wf-rt")
     assert done is not None
     assert done.status == WorkflowRunStatus.FAILED.value
+
+
+def test_workflow_cancel_stops_pending_steps(queue: JobQueue):
+    """Cancel marks run cancelled and prevents further pending step leases."""
+    run = queue.start_workflow(
+        tenant_id="wf-can",
+        max_attempts=1,
+        steps=[
+            {"name": "a", "payload": {"op": "a"}, "compensate": {"payload": {}}},
+            {"name": "b", "payload": {"op": "b"}},
+            {"name": "c", "payload": {"op": "c"}},
+        ],
+    )
+    out = queue.cancel_workflow(
+        run.id, tenant_id="wf-can", reason="user aborted"
+    )
+    assert out["run"].status == WorkflowRunStatus.CANCELLED.value
+    assert out["run"].fail_reason == "user aborted"
+    assert out["cancelled_pending"] >= 1
+    assert out["left_in_flight"] == 0
+    # Pending step job cancelled — nothing to lease.
+    assert queue.lease(tenant_id="wf-can", worker_id="w") is None
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-can")
+    assert all(
+        s.status == WorkflowStepStatus.SKIPPED.value
+        for s in steps
+        if s.direction == "forward"
+    )
+    # Idempotent re-cancel.
+    out2 = queue.cancel_workflow(run.id, tenant_id="wf-can")
+    assert out2["run"].status == WorkflowRunStatus.CANCELLED.value
+
+
+def test_workflow_cancel_lets_in_flight_finish(queue: JobQueue):
+    """Default release_in_flight=False: worker may ack; no fan-out after cancel."""
+    run = queue.start_workflow(
+        tenant_id="wf-fin",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {"name": "b", "payload": {"op": "b"}},
+        ],
+    )
+    j = queue.lease(tenant_id="wf-fin", worker_id="w")
+    assert j is not None
+    assert j.payload.get("step_name") == "a"
+
+    out = queue.cancel_workflow(
+        run.id, tenant_id="wf-fin", release_in_flight=False
+    )
+    assert out["run"].status == WorkflowRunStatus.CANCELLED.value
+    assert out["left_in_flight"] == 1
+    assert out["released_in_flight"] == 0
+
+    # Worker finishes naturally.
+    _ack(queue, j, "w", result={"ok": "a"})
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-fin")
+    forwards = {s.name: s for s in steps if s.direction == "forward"}
+    assert forwards["a"].status == WorkflowStepStatus.COMPLETED.value
+    # Step b must never start.
+    assert "b" not in forwards or forwards["b"].status == WorkflowStepStatus.SKIPPED.value
+    assert queue.lease(tenant_id="wf-fin", worker_id="w") is None
+    done = queue.get_workflow(run.id, tenant_id="wf-fin")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.CANCELLED.value
+
+
+def test_workflow_cancel_release_in_flight(queue: JobQueue):
+    """release_in_flight=True clears the lease so the worker cannot complete."""
+    run = queue.start_workflow(
+        tenant_id="wf-rel",
+        max_attempts=1,
+        steps=[
+            {"name": "a", "payload": {"op": "a"}},
+            {"name": "b", "payload": {"op": "b"}},
+        ],
+    )
+    j = queue.lease(tenant_id="wf-rel", worker_id="w")
+    assert j is not None
+    token = j.lease_token
+
+    out = queue.cancel_workflow(
+        run.id,
+        tenant_id="wf-rel",
+        release_in_flight=True,
+        reason="kill mid-step",
+    )
+    assert out["released_in_flight"] == 1
+    assert out["left_in_flight"] == 0
+    job = queue.get(j.id, tenant_id="wf-rel")
+    assert job is not None
+    assert job.status == JobStatus.CANCELLED
+
+    with pytest.raises(LeaseError):
+        queue.ack(
+            j.id,
+            tenant_id="wf-rel",
+            worker_id="w",
+            lease_token=token,
+            result={"should": "fail"},
+        )
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-rel")
+    forwards = {s.name: s for s in steps if s.direction == "forward"}
+    assert forwards["a"].status == WorkflowStepStatus.SKIPPED.value
+    done = queue.get_workflow(run.id, tenant_id="wf-rel")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.CANCELLED.value
+
+
+def test_workflow_cancel_rejects_terminal_runs(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="wf-term",
+        max_attempts=1,
+        steps=[{"name": "only", "payload": {}}],
+    )
+    _drive_step(queue, "wf-term")
+    done = queue.get_workflow(run.id, tenant_id="wf-term")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+    with pytest.raises(CancelError, match="cannot be cancelled"):
+        queue.cancel_workflow(run.id, tenant_id="wf-term")
+
+
+def test_workflow_cancel_mid_compensate_stops_chain(queue: JobQueue):
+    """Cancel while compensating: pending undos skipped; chain does not continue."""
+    run = queue.start_workflow(
+        tenant_id="wf-cc",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {
+                "name": "b",
+                "payload": {"op": "b"},
+                "compensate": {"payload": {"op": "undo_b"}},
+            },
+            {"name": "c", "payload": {"op": "c"}, "fail": True},
+        ],
+    )
+    _drive_step(queue, "wf-cc")  # a
+    _drive_step(queue, "wf-cc")  # b
+    _drive_step(queue, "wf-cc", fail=True)  # c → compensating b
+
+    mid = queue.get_workflow(run.id, tenant_id="wf-cc")
+    assert mid is not None
+    assert mid.status == WorkflowRunStatus.COMPENSATING.value
+
+    out = queue.cancel_workflow(
+        run.id, tenant_id="wf-cc", reason="stop undo", release_in_flight=False
+    )
+    assert out["run"].status == WorkflowRunStatus.CANCELLED.value
+    # Pending compensate for a (placeholder or pending job) stopped.
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-cc")
+    comps = [s for s in steps if s.direction == "compensate"]
+    # b may still be pending/running or skipped; a must not become compensated later
+    # if it was still pending without progress.
+    pending_or_skipped = [
+        s
+        for s in comps
+        if s.status
+        in (
+            WorkflowStepStatus.PENDING.value,
+            WorkflowStepStatus.SKIPPED.value,
+            WorkflowStepStatus.RUNNING.value,
+        )
+    ]
+    assert pending_or_skipped or any(
+        s.status == WorkflowStepStatus.SKIPPED.value for s in comps
+    )
+    # No further compensate work after cancel (if b was still claimable and left
+    # in-flight, finishing it must not enqueue a).
+    jb = queue.lease(tenant_id="wf-cc", worker_id="w")
+    if jb is not None:
+        assert jb.payload.get("direction") == "compensate"
+        _ack(queue, jb, "w", result={"undid": jb.payload.get("step_name")})
+    # After any remaining in-flight compensate finishes, still no new work.
+    assert queue.lease(tenant_id="wf-cc", worker_id="w") is None
+    final = queue.get_workflow(run.id, tenant_id="wf-cc")
+    assert final is not None
+    assert final.status == WorkflowRunStatus.CANCELLED.value

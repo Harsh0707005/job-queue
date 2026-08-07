@@ -45,6 +45,26 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def cancel_workflow(
+        self,
+        run_id: str | UUID,
+        *,
+        tenant_id: str,
+        reason: str | None = None,
+        release_in_flight: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "release_in_flight": release_in_flight,
+        }
+        if reason is not None:
+            body["reason"] = reason
+        payload = self._request(
+            "POST", f"/v1/workflows/{run_id}/cancel", body
+        )
+        assert payload is not None
+        return payload
+
     def begin_side_effect(
         self,
         job_id: UUID,

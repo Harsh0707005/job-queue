@@ -24,7 +24,12 @@ from job_queue.models import (
     WorkflowStepRun,
     WorkflowStepStatus,
 )
-from job_queue.queue._common import _JOB_COLUMNS, _row_to_job, _utcnow
+from job_queue.queue._common import (
+    CancelError,
+    _JOB_COLUMNS,
+    _row_to_job,
+    _utcnow,
+)
 
 WORKFLOW_STEP_KIND = "workflow.step"
 
@@ -150,6 +155,340 @@ class WorkflowsMixin:
                 (run_id, tenant_id),
             ).fetchall()
         return [self._row_to_workflow_step(r) for r in rows]
+
+    def cancel_workflow(
+        self,
+        run_id: UUID,
+        *,
+        tenant_id: str,
+        reason: str | None = None,
+        release_in_flight: bool = False,
+    ) -> dict[str, Any]:
+        """Cancel a running (or compensating) workflow.
+
+        * Always stops **pending** step jobs (never leased) and marks those
+          step_runs ``skipped``.
+        * **In-flight** (leased) steps:
+            - ``release_in_flight=False`` (default): leave the lease alone so
+              the worker can finish; on ack/nack the run will not fan-out or
+              start compensation.
+            - ``release_in_flight=True``: cancel the job (clear fencing token)
+              and mark the step ``skipped`` so the worker cannot complete it.
+
+        Idempotent when already ``cancelled``. Terminal ``completed`` /
+        ``failed`` raise :class:`CancelError`.
+        """
+        if not tenant_id or not str(tenant_id).strip():
+            raise ValueError("tenant_id is required")
+        tenant_id = str(tenant_id).strip()
+        now = _utcnow()
+        cancel_reason = (
+            str(reason).strip()
+            if reason is not None and str(reason).strip()
+            else "workflow cancelled"
+        )
+        with transaction(self._pool) as conn:
+            run = conn.execute(
+                f"""
+                SELECT {_RUN_COLUMNS}
+                FROM workflow_runs
+                WHERE id = %s AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (run_id, tenant_id),
+            ).fetchone()
+            if run is None:
+                raise CancelError(
+                    f"workflow run {run_id} not found for tenant {tenant_id!r}"
+                )
+            status = str(run["status"])
+            if status == WorkflowRunStatus.CANCELLED.value:
+                # Idempotent re-cancel: still report current step inventory.
+                return self._cancel_workflow_result(
+                    conn,
+                    run=run,
+                    cancelled_pending=0,
+                    released_in_flight=0,
+                    left_in_flight=self._count_in_flight_steps(conn, run_id),
+                    release_in_flight=release_in_flight,
+                    reason=run.get("fail_reason") or cancel_reason,
+                )
+            if status in (
+                WorkflowRunStatus.COMPLETED.value,
+                WorkflowRunStatus.FAILED.value,
+            ):
+                raise CancelError(
+                    f"workflow run {run_id} cannot be cancelled "
+                    f"(status={status})"
+                )
+            if status not in (
+                WorkflowRunStatus.RUNNING.value,
+                WorkflowRunStatus.COMPENSATING.value,
+            ):
+                raise CancelError(
+                    f"workflow run {run_id} cannot be cancelled "
+                    f"(status={status})"
+                )
+
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status = %s,
+                    fail_reason = %s,
+                    completed_at = COALESCE(completed_at, %s),
+                    updated_at = %s
+                WHERE id = %s
+                """,
+                (
+                    WorkflowRunStatus.CANCELLED.value,
+                    cancel_reason,
+                    now,
+                    now,
+                    run_id,
+                ),
+            )
+            run = dict(run)
+            run["status"] = WorkflowRunStatus.CANCELLED.value
+            run["fail_reason"] = cancel_reason
+            run["completed_at"] = run.get("completed_at") or now
+
+            cancelled_pending, released, left = self._cancel_workflow_steps_locked(
+                conn,
+                run=run,
+                release_in_flight=bool(release_in_flight),
+                reason=cancel_reason,
+                now=now,
+            )
+            return self._cancel_workflow_result(
+                conn,
+                run=run,
+                cancelled_pending=cancelled_pending,
+                released_in_flight=released,
+                left_in_flight=left,
+                release_in_flight=bool(release_in_flight),
+                reason=cancel_reason,
+            )
+
+    def _cancel_workflow_result(
+        self,
+        conn: Any,
+        *,
+        run: dict[str, Any],
+        cancelled_pending: int,
+        released_in_flight: int,
+        left_in_flight: int,
+        release_in_flight: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        row = conn.execute(
+            f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
+            (run["id"],),
+        ).fetchone()
+        assert row is not None
+        return {
+            "run": self._row_to_workflow_run(row),
+            "cancelled_pending": int(cancelled_pending),
+            "released_in_flight": int(released_in_flight),
+            "left_in_flight": int(left_in_flight),
+            "release_in_flight": bool(release_in_flight),
+            "reason": reason,
+        }
+
+    def _count_in_flight_steps(self, conn: Any, run_id: UUID) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM workflow_step_runs s
+            JOIN jobs j ON j.id = s.job_id
+            WHERE s.run_id = %s
+              AND s.status IN ('pending', 'running')
+              AND j.status = 'leased'
+            """,
+            (run_id,),
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+    def _cancel_workflow_steps_locked(
+        self,
+        conn: Any,
+        *,
+        run: dict[str, Any],
+        release_in_flight: bool,
+        reason: str,
+        now: Any,
+    ) -> tuple[int, int, int]:
+        """Cancel pending step jobs; optionally release leased ones.
+
+        Returns ``(cancelled_pending, released_in_flight, left_in_flight)``.
+        """
+        steps = conn.execute(
+            f"""
+            SELECT {_STEP_COLUMNS}
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND status IN (%s, %s)
+            FOR UPDATE
+            """,
+            (
+                run["id"],
+                WorkflowStepStatus.PENDING.value,
+                WorkflowStepStatus.RUNNING.value,
+            ),
+        ).fetchall()
+        cancelled_pending = 0
+        released = 0
+        left = 0
+        err = f"cancelled: {reason}"
+        for srow in steps:
+            job = None
+            if srow.get("job_id") is not None:
+                job = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s FOR UPDATE",
+                    (srow["job_id"],),
+                ).fetchone()
+
+            # Placeholder compensate step with no job yet.
+            if job is None:
+                conn.execute(
+                    """
+                    UPDATE workflow_step_runs
+                    SET status = %s,
+                        error = %s,
+                        completed_at = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        WorkflowStepStatus.SKIPPED.value,
+                        err,
+                        now,
+                        now,
+                        srow["id"],
+                    ),
+                )
+                cancelled_pending += 1
+                continue
+
+            jstatus = str(job["status"])
+            if jstatus == JobStatus.PENDING.value:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = %s,
+                        leased_by = NULL,
+                        lease_token = NULL,
+                        lease_tenant_id = NULL,
+                        lease_expires_at = NULL,
+                        lease_started_at = NULL,
+                        completed_at = %s,
+                        updated_at = %s,
+                        last_error = COALESCE(last_error, %s)
+                    WHERE id = %s
+                      AND status = %s
+                    """,
+                    (
+                        JobStatus.CANCELLED.value,
+                        now,
+                        now,
+                        err,
+                        srow["job_id"],
+                        JobStatus.PENDING.value,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE workflow_step_runs
+                    SET status = %s,
+                        error = %s,
+                        completed_at = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        WorkflowStepStatus.SKIPPED.value,
+                        err,
+                        now,
+                        now,
+                        srow["id"],
+                    ),
+                )
+                cancelled_pending += 1
+                continue
+
+            if jstatus == JobStatus.LEASED.value:
+                if release_in_flight:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = %s,
+                            leased_by = NULL,
+                            lease_token = NULL,
+                            lease_tenant_id = NULL,
+                            lease_expires_at = NULL,
+                            lease_started_at = NULL,
+                            completed_at = %s,
+                            updated_at = %s,
+                            last_error = %s
+                        WHERE id = %s
+                          AND status = %s
+                        """,
+                        (
+                            JobStatus.CANCELLED.value,
+                            now,
+                            now,
+                            "cancelled while running (workflow cancel)",
+                            srow["job_id"],
+                            JobStatus.LEASED.value,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE workflow_step_runs
+                        SET status = %s,
+                            error = %s,
+                            completed_at = %s,
+                            updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            WorkflowStepStatus.SKIPPED.value,
+                            err,
+                            now,
+                            now,
+                            srow["id"],
+                        ),
+                    )
+                    released += 1
+                else:
+                    left += 1
+                continue
+
+            # Job already terminal while step still pending/running — skip step.
+            if jstatus in (
+                JobStatus.CANCELLED.value,
+                JobStatus.COMPLETED.value,
+                JobStatus.DEAD.value,
+                JobStatus.FAILED.value,
+            ):
+                conn.execute(
+                    """
+                    UPDATE workflow_step_runs
+                    SET status = %s,
+                        error = COALESCE(error, %s),
+                        completed_at = COALESCE(completed_at, %s),
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        WorkflowStepStatus.SKIPPED.value,
+                        err,
+                        now,
+                        now,
+                        srow["id"],
+                    ),
+                )
+                cancelled_pending += 1
+        return cancelled_pending, released, left
 
     def _on_workflow_step_terminal(
         self,
@@ -485,6 +824,9 @@ class WorkflowsMixin:
                 now=now,
             )
             return
+        # Cancelled run: in-flight worker finished — record result, no fan-out.
+        if run["status"] == WorkflowRunStatus.CANCELLED.value:
+            return
 
         self._enqueue_ready_forward_steps(
             conn,
@@ -578,6 +920,7 @@ class WorkflowsMixin:
                 now=now,
             )
             return
+        # Cancelled: in-flight nack/dead after cancel — no compensate fan-out.
         if run["status"] in (
             WorkflowRunStatus.FAILED.value,
             WorkflowRunStatus.COMPLETED.value,
@@ -634,6 +977,17 @@ class WorkflowsMixin:
         now: Any,
     ) -> int:
         """Enqueue every forward step whose dependencies are all completed."""
+        st = conn.execute(
+            "SELECT status FROM workflow_runs WHERE id = %s",
+            (run_id,),
+        ).fetchone()
+        if st is not None and st["status"] in (
+            WorkflowRunStatus.CANCELLED.value,
+            WorkflowRunStatus.FAILED.value,
+            WorkflowRunStatus.COMPLETED.value,
+            WorkflowRunStatus.COMPENSATING.value,
+        ):
+            return 0
         completed = {
             int(r["step_index"])
             for r in conn.execute(
@@ -939,6 +1293,8 @@ class WorkflowsMixin:
         Same ``idempotency_key`` is reused so external undo stays exactly-once
         even when a new job is enqueued after worker crash / lease expiry.
         """
+        if run["status"] == WorkflowRunStatus.CANCELLED.value:
+            return
         if step["status"] in (
             WorkflowStepStatus.COMPENSATED.value,
             WorkflowStepStatus.FAILED.value,
@@ -1075,6 +1431,15 @@ class WorkflowsMixin:
         now: Any,
     ) -> None:
         """Enqueue next lower pending compensate job or finish the run."""
+        if run["status"] == WorkflowRunStatus.CANCELLED.value:
+            return
+        # Re-read status in case cancel raced (caller held lock usually).
+        cur = conn.execute(
+            "SELECT status FROM workflow_runs WHERE id = %s",
+            (run["id"],),
+        ).fetchone()
+        if cur is not None and cur["status"] == WorkflowRunStatus.CANCELLED.value:
+            return
         nxt = conn.execute(
             f"""
             SELECT {_STEP_COLUMNS}
@@ -1283,6 +1648,9 @@ class WorkflowsMixin:
                 step["id"],
             ),
         )
+        # Cancelled mid-compensate: record this undo, do not chain further.
+        if run["status"] == WorkflowRunStatus.CANCELLED.value:
+            return
         job = conn.execute(
             f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
             (step["job_id"],),

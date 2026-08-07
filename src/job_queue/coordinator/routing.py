@@ -366,6 +366,12 @@ class RoutingMixin:
             return self._start_workflow(body)
         if method == "POST" and path == "/v1/workflows/process-compensation":
             return self._process_workflow_compensation(body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/workflows/")
+            and path.rstrip("/").endswith("/cancel")
+        ):
+            return self._cancel_workflow(path, body)
         if method == "GET" and path.startswith("/v1/workflows/"):
             if path.rstrip("/").endswith("/steps"):
                 return self._list_workflow_steps(path, query)

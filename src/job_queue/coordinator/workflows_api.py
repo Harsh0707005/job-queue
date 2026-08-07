@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.models import WorkflowRun, WorkflowStepRun
+from job_queue.queue._common import CancelError
 
 
 def _run_to_dict(r: WorkflowRun) -> dict[str, Any]:
@@ -140,3 +141,38 @@ class WorkflowsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"repaired": n}
+
+    def _cancel_workflow(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # /v1/workflows/{id}/cancel
+        if len(parts) < 4:
+            return 400, {"error": "invalid workflow cancel path"}
+        try:
+            rid = UUID(parts[2])
+        except ValueError:
+            return 400, {"error": "invalid workflow id"}
+        tenant = body.get("tenant_id")
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            out = self.queue.cancel_workflow(
+                rid,
+                tenant_id=str(tenant),
+                reason=body.get("reason"),
+                release_in_flight=bool(body.get("release_in_flight", False)),
+            )
+        except CancelError as exc:
+            return 409, {"error": str(exc)}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        run = out["run"]
+        return 200, {
+            "run": _run_to_dict(run),
+            "cancelled_pending": out["cancelled_pending"],
+            "released_in_flight": out["released_in_flight"],
+            "left_in_flight": out["left_in_flight"],
+            "release_in_flight": out["release_in_flight"],
+            "reason": out["reason"],
+        }
