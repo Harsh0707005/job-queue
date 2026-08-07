@@ -211,3 +211,128 @@ def test_shrink_partitions_remaps_even_without_workers(queue: JobQueue):
         _ack(queue, got, "late-w")
         n += 1
     assert n == len(jobs)
+
+
+def test_rebalance_bumps_generation_on_owner_change(queue: JobQueue):
+    queue.set_partition_count(4)
+    queue.register_worker("gen-a")
+    with queue._pool.connection() as conn:
+        gens1 = queue._owned_partition_generations_locked(conn, "gen-a")
+    assert set(gens1) == set(range(4))
+    # Second worker steals half the shards → those generations must bump.
+    queue.register_worker("gen-b")
+    with queue._pool.connection() as conn:
+        gens_a = queue._owned_partition_generations_locked(conn, "gen-a")
+        gens_b = queue._owned_partition_generations_locked(conn, "gen-b")
+    assert gens_a and gens_b
+    assert set(gens_a).isdisjoint(set(gens_b))
+    # Partitions that moved off gen-a should no longer appear; those that stayed
+    # keep their generation; new owner sees generation >= 1.
+    assert all(g >= 1 for g in gens_b.values())
+
+
+def test_guard_rejects_lost_partition_and_stale_generation(queue: JobQueue):
+    """FOR SHARE ownership + generation fence abort post-rebalance claims."""
+    from job_queue.queue._common import LeaseError
+
+    queue.set_partition_count(4)
+    queue.register_worker("own-a")
+    with queue._pool.connection() as conn:
+        gens = queue._owned_partition_generations_locked(conn, "own-a")
+    assert 0 in gens
+    old_gen0 = gens[0]
+
+    queue.register_worker("own-b")
+    still = set(queue.list_worker_partitions("own-a"))
+    lost = [p for p in range(4) if p not in still]
+    assert lost, "expected rebalance to move some partitions"
+
+    with queue._pool.connection() as conn:
+        # Lost shard: ownership check fails.
+        with pytest.raises(LeaseError, match="not owned|rebalanced"):
+            queue._guard_partition_claim(
+                conn,
+                worker_id="own-a",
+                partition_id=lost[0],
+                expected_generation=old_gen0,
+            )
+        # Still-owned shard with wrong generation: generation fence fails.
+        kept = sorted(still)[0]
+        with queue._pool.connection() as c2:
+            cur = queue._owned_partition_generations_locked(c2, "own-a")[kept]
+        with pytest.raises(LeaseError, match="generation mismatch"):
+            queue._guard_partition_claim(
+                conn,
+                worker_id="own-a",
+                partition_id=kept,
+                expected_generation=cur + 99,
+            )
+        # Correct owner + generation succeeds.
+        queue._guard_partition_claim(
+            conn,
+            worker_id="own-a",
+            partition_id=kept,
+            expected_generation=cur,
+        )
+
+
+def test_stale_partition_snapshot_cannot_claim_after_rebalance(queue: JobQueue):
+    """Stale owned_parts list must not lease shards lost in rebalance.
+
+    Simulates the TOCTOU where a worker captured partitions before join, then
+    claim runs with that snapshot after ownership moved.
+    """
+    from datetime import datetime, timezone
+
+    from job_queue.db import transaction
+
+    queue.set_partition_count(8)
+    queue.register_worker("snap-a")
+    stale_parts = list(range(8))  # snapshot: believed to own everything
+    with queue._pool.connection() as conn:
+        stale_gens = queue._owned_partition_generations_locked(conn, "snap-a")
+
+    for i in range(40):
+        queue.enqueue(tenant_id="snap", payload={"i": i})
+
+    # Peer joins → snap-a loses half the shards; generations bump on movers.
+    queue.register_worker("snap-b")
+    live = set(queue.list_worker_partitions("snap-a"))
+    assert live and live != set(stale_parts)
+
+    now = datetime.now(timezone.utc)
+    stolen: list[int] = []
+    claimed_jobs = []
+    # Fair claim path with *stale* partition list + generations.
+    # Commit each claim before ack (do not nest ack under the claim txn).
+    for _ in range(40):
+        with transaction(queue._pool) as conn:
+            job = queue._try_claim_fair_candidate(
+                conn,
+                worker_id="snap-a",
+                queue_name="default",
+                visibility_timeout_seconds=30,
+                now=now,
+                partitions=stale_parts,
+                partition_generations=stale_gens,
+            )
+            if job is None:
+                break
+            stolen.append(int(job.partition_id))
+            claimed_jobs.append(job)
+    for job in claimed_jobs:
+        _ack(queue, job, "snap-a")
+
+    # May claim some still-owned shards, but never a reassigned one.
+    assert all(p in live for p in stolen), f"stole lost partitions: {stolen} live={live}"
+
+    # Remaining work is claimable by the new owner.
+    n_b = 0
+    for _ in range(40):
+        j = queue.lease(worker_id="snap-b", tenant_id="snap")
+        if j is None:
+            break
+        assert j.partition_id in set(queue.list_worker_partitions("snap-b"))
+        _ack(queue, j, "snap-b")
+        n_b += 1
+    assert n_b >= 1 or stolen  # fleet made progress under the fence

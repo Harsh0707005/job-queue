@@ -68,10 +68,17 @@ class LeaseClaimFairMixin:
                 pass
 
         # Resolve partition filter once ([] = no claim; None = open/all).
+        # Snapshot generations for the rebalance fence inside each claim txn.
         owned_parts: list[int] | None = None
+        part_gens: dict[int, int] | None = None
         if hasattr(self, "_worker_partition_filter"):
             with self._pool.connection() as conn:
                 owned_parts = self._worker_partition_filter(conn, worker_id)
+                if owned_parts is not None and owned_parts:
+                    if hasattr(self, "_owned_partition_generations_locked"):
+                        part_gens = self._owned_partition_generations_locked(
+                            conn, worker_id
+                        )
             if owned_parts is not None and not owned_parts:
                 return []
 
@@ -89,6 +96,7 @@ class LeaseClaimFairMixin:
                         now=now,
                         exclude_tenants=rate_limited_tenants,
                         partitions=owned_parts,
+                        partition_generations=part_gens,
                     )
                     if job is None:
                         break
@@ -99,7 +107,7 @@ class LeaseClaimFairMixin:
                     rate_limited_tenants.add(skip.tenant_id)
                 continue
             except LeaseError:
-                # Claim predicate race under load — try another candidate.
+                # Claim predicate race under load / rebalance fence — try again.
                 skips += 1
                 continue
         return claimed
@@ -114,6 +122,7 @@ class LeaseClaimFairMixin:
         now: datetime,
         exclude_tenants: set[str] | None = None,
         partitions: list[int] | None = None,
+        partition_generations: dict[int, int] | None = None,
     ) -> Job | None:
         token = uuid4()
         # Priority lanes first (higher priority always before lower), then
@@ -124,11 +133,19 @@ class LeaseClaimFairMixin:
         excluded = sorted(exclude_tenants or ())
         exclude_sql = ""
         part_sql = ""
+        part_params: list[Any] = []
         params: list[Any] = [queue_name]
         if excluded:
             exclude_sql = "AND jobs.tenant_id <> ALL(%s)"
             params.append(excluded)
-        if partitions is not None:
+        if hasattr(self, "_partition_claim_predicate"):
+            part_sql, part_params = self._partition_claim_predicate(
+                worker_id=worker_id,
+                owned_parts=partitions,
+                jobs_alias="jobs",
+            )
+            params.extend(part_params)
+        elif partitions is not None:
             part_sql = "AND jobs.partition_id = ANY(%s)"
             params.append(list(partitions))
         params.extend(
@@ -207,6 +224,18 @@ class LeaseClaimFairMixin:
 
         if candidate is None:
             return None
+
+        # Rebalance fence: ownership/generation must still match under lock.
+        if partitions is not None and hasattr(self, "_guard_partition_claim"):
+            exp = None
+            if partition_generations is not None:
+                exp = partition_generations.get(int(candidate["partition_id"]))
+            self._guard_partition_claim(
+                conn,
+                worker_id=worker_id,
+                partition_id=int(candidate["partition_id"]),
+                expected_generation=exp,
+            )
 
         # Re-check pause + concurrency under tenant lock (closes races).
         conn.execute(

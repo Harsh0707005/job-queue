@@ -58,9 +58,15 @@ class LeaseClaimTenantMixin:
                 pass
 
         owned_parts: list[int] | None = None
+        part_gens: dict[int, int] | None = None
         if hasattr(self, "_worker_partition_filter"):
             with self._pool.connection() as conn:
                 owned_parts = self._worker_partition_filter(conn, worker_id)
+                if owned_parts is not None and owned_parts:
+                    if hasattr(self, "_owned_partition_generations_locked"):
+                        part_gens = self._owned_partition_generations_locked(
+                            conn, worker_id
+                        )
             if owned_parts is not None and not owned_parts:
                 return []
 
@@ -93,7 +99,13 @@ class LeaseClaimTenantMixin:
 
             part_sql = ""
             part_params: list[Any] = []
-            if owned_parts is not None:
+            if hasattr(self, "_partition_claim_predicate"):
+                part_sql, part_params = self._partition_claim_predicate(
+                    worker_id=worker_id,
+                    owned_parts=owned_parts,
+                    jobs_alias="jobs",
+                )
+            elif owned_parts is not None:
                 part_sql = "AND partition_id = ANY(%s)"
                 part_params = [list(owned_parts)]
 
@@ -114,7 +126,7 @@ class LeaseClaimTenantMixin:
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
                       created_at ASC
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF jobs SKIP LOCKED
                     LIMIT %s
                     """,
                     tuple(
@@ -160,7 +172,7 @@ class LeaseClaimTenantMixin:
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
                       created_at ASC
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF jobs SKIP LOCKED
                     LIMIT %s
                     """,
                     tuple(
@@ -179,6 +191,20 @@ class LeaseClaimTenantMixin:
                 ).fetchall()
 
             for candidate in candidates:
+                # Rebalance fence before claim: lost ownership / generation bump.
+                if owned_parts is not None and hasattr(self, "_guard_partition_claim"):
+                    exp = None
+                    if part_gens is not None:
+                        exp = part_gens.get(int(candidate["partition_id"]))
+                    try:
+                        self._guard_partition_claim(
+                            conn,
+                            worker_id=worker_id,
+                            partition_id=int(candidate["partition_id"]),
+                            expected_generation=exp,
+                        )
+                    except LeaseError:
+                        continue
                 # Rate-limit new pending claims only; reclaim is free so
                 # recovery is not blocked by a noisy tenant's throttle.
                 if candidate["status"] == JobStatus.PENDING.value:

@@ -333,6 +333,134 @@ def edge_dead_cannot_steal(partition_count: int) -> dict[str, Any]:
     return {"phantom": phantom, "stolen": stolen, "partition_count": partition_count}
 
 
+def _assignment_generation_map() -> dict[int, tuple[str | None, int]]:
+    """partition_id → (worker_id, generation)."""
+    payload = get_assignments()
+    out: dict[int, tuple[str | None, int]] = {}
+    for a in payload.get("assignments") or []:
+        out[int(a["partition_id"])] = (
+            a.get("worker_id"),
+            int(a.get("generation") or 0),
+        )
+    return out
+
+
+def edge_rebalance_under_drain(
+    partition_count: int, min_workers: int, tenants: list[str]
+) -> dict[str, Any]:
+    """Join/leave phantoms while backlog drains; generations must advance.
+
+    Asserts exclusive ownership after each rebalance and that a just-evicted
+    phantom cannot lease any ready work (generation/ownership fence).
+    """
+    # Seed extra backlog so rebalance races with claim activity.
+    extra = 0
+    for tid in tenants[:4]:
+        for i in range(15):
+            code, _ = http_json(
+                "POST",
+                "/v1/jobs",
+                {
+                    "tenant_id": tid,
+                    "payload": {"edge": "rebalance", "i": i},
+                    "priority": 5,
+                    "max_attempts": 3,
+                    "visibility_timeout_seconds": 30,
+                },
+            )
+            if code in (200, 201):
+                extra += 1
+
+    gens_before = _assignment_generation_map()
+    max_gen_before = max((g for _, g in gens_before.values()), default=0)
+
+    join_leave_rounds = 3
+    phantom_stolen = 0
+    gen_bumps = 0
+    for r in range(join_leave_rounds):
+        phantom = f"phantom-rb-{r}-{int(time.time())}"
+        code, reg = http_json(
+            "POST", "/v1/workers/register", {"worker_id": phantom}
+        )
+        if code != 200:
+            raise RuntimeError(f"rebalance register failed {code}: {reg}")
+        parts = set(int(p) for p in (reg.get("partitions") or []))
+        if not parts:
+            raise AssertionError(f"round {r}: phantom got no partitions")
+        after_join = ownership_map(get_assignments())
+        assert_exclusive_full_cover(
+            after_join,
+            partition_count=partition_count,
+            min_workers=min_workers + 1,
+        )
+        gens_join = _assignment_generation_map()
+        # At least one partition assigned to phantom should show generation > 0.
+        for p in parts:
+            owner, gen = gens_join.get(p, (None, 0))
+            if owner != phantom:
+                raise AssertionError(
+                    f"round {r}: partition {p} owner={owner} expected {phantom}"
+                )
+            if gen > 0:
+                gen_bumps += 1
+
+        # Evict phantom → ownership returns to fleet; it must not claim.
+        code, _ = http_json(
+            "POST", "/v1/workers/deregister", {"worker_id": phantom}
+        )
+        if code != 200:
+            raise RuntimeError(f"rebalance deregister failed {code}")
+        after_leave = ownership_map(get_assignments())
+        if phantom in after_leave:
+            raise AssertionError(f"round {r}: phantom still owns shards")
+        assert_exclusive_full_cover(
+            after_leave,
+            partition_count=partition_count,
+            min_workers=min_workers,
+        )
+
+        for _ in range(4):
+            code, lease = http_json(
+                "POST",
+                "/v1/lease",
+                {"worker_id": phantom, "limit": 8},
+            )
+            if code == 204:
+                continue
+            if code != 200:
+                raise RuntimeError(f"evicted phantom lease {code}: {lease}")
+            jobs = lease.get("jobs") or (
+                [] if not lease.get("job") else [lease["job"]]
+            )
+            phantom_stolen += len(jobs)
+        if phantom_stolen:
+            raise AssertionError(
+                f"evicted phantom leased {phantom_stolen} jobs after rebalance"
+            )
+        time.sleep(0.3)
+
+    gens_after = _assignment_generation_map()
+    max_gen_after = max((g for _, g in gens_after.values()), default=0)
+    if max_gen_after < max_gen_before:
+        raise AssertionError(
+            f"generation went backwards {max_gen_before} → {max_gen_after}"
+        )
+    # Join/leave should have bumped generations for moved shards.
+    if gen_bumps < join_leave_rounds:
+        raise AssertionError(
+            f"expected generation bumps on join, got gen_bumps={gen_bumps}"
+        )
+
+    return {
+        "rounds": join_leave_rounds,
+        "extra_jobs": extra,
+        "phantom_stolen": phantom_stolen,
+        "gen_bumps_observed": gen_bumps,
+        "max_generation_before": max_gen_before,
+        "max_generation_after": max_gen_after,
+    }
+
+
 def wait_drain(total: int, timeout: float) -> dict[str, Any]:
     deadline = time.time() + timeout
     last: dict[str, Any] = {}
@@ -428,8 +556,17 @@ def main() -> int:
         raise RuntimeError(f"enqueue errors={errors} done={done}")
     logger.info("enqueued %s jobs in %.1fs", done, enq_s)
 
-    # +1 for zombie-edge job
-    drain = wait_drain(total + 1, timeout=MAX_WALL)
+    # Rebalance while the fleet is draining (generation fence under load).
+    edges["rebalance_under_drain"] = edge_rebalance_under_drain(
+        PARTITION_COUNT, MIN_FLEET_WORKERS, tenants
+    )
+    logger.info(
+        "edge rebalance-under-drain ok: %s", edges["rebalance_under_drain"]
+    )
+    extra_jobs = int(edges["rebalance_under_drain"].get("extra_jobs") or 0)
+
+    # +1 for zombie-edge job + rebalance-edge extras
+    drain = wait_drain(total + 1 + extra_jobs, timeout=MAX_WALL)
     drain_s = time.perf_counter() - t0
 
     final = ownership_map(get_assignments())

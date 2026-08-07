@@ -353,6 +353,21 @@ class PartitionsMixin:
         ).fetchall()
         return [int(r["partition_id"]) for r in rows]
 
+    def _owned_partition_generations_locked(
+        self, conn: Any, worker_id: str
+    ) -> dict[int, int]:
+        """Map partition_id → assignment generation for this worker."""
+        rows = conn.execute(
+            """
+            SELECT partition_id, generation
+            FROM partition_assignments
+            WHERE worker_id = %s
+            ORDER BY partition_id ASC
+            """,
+            (worker_id,),
+        ).fetchall()
+        return {int(r["partition_id"]): int(r["generation"] or 0) for r in rows}
+
     def _worker_partition_filter(
         self, conn: Any, worker_id: str
     ) -> list[int] | None:
@@ -365,6 +380,10 @@ class PartitionsMixin:
 
         Production default requires registration so a free-for-all worker cannot
         steal shards from a partitioned fleet.
+
+        Callers must still enforce live ownership inside the claim transaction
+        (see :meth:`_partition_claim_predicate` / :meth:`_guard_partition_claim`)
+        because this snapshot can go stale across rebalance.
         """
         require = bool(getattr(self, "require_worker_registration", True))
         reg = conn.execute(
@@ -380,6 +399,96 @@ class PartitionsMixin:
         if str(reg["status"]) != "active":
             return []
         return self._owned_partitions_locked(conn, worker_id)
+
+    def _partition_claim_predicate(
+        self,
+        *,
+        worker_id: str,
+        owned_parts: list[int] | None,
+        jobs_alias: str = "jobs",
+    ) -> tuple[str, list[Any]]:
+        """SQL fragment that enforces *live* ownership at claim time.
+
+        When *owned_parts* is ``None`` (open/unpartitioned test mode) no filter
+        is applied. Otherwise claims must join ``partition_assignments`` so a
+        worker cannot use a stale partition list after rebalance reassigned the
+        shard (generation bump + owner change).
+        """
+        if owned_parts is None:
+            return "", []
+        if not owned_parts:
+            return "AND FALSE", []
+        # Prefer index-friendly partition set AND live owner match. The EXISTS
+        # is the generation/ownership guardrail: even if *owned_parts* is stale
+        # and still lists a lost shard, the join rejects the claim.
+        sql = f"""
+              AND {jobs_alias}.partition_id = ANY(%s)
+              AND EXISTS (
+                    SELECT 1
+                    FROM partition_assignments pa
+                    WHERE pa.partition_id = {jobs_alias}.partition_id
+                      AND pa.worker_id = %s
+              )
+        """
+        return sql, [list(owned_parts), worker_id]
+
+    def _guard_partition_claim(
+        self,
+        conn: Any,
+        *,
+        worker_id: str,
+        partition_id: int,
+        expected_generation: int | None = None,
+        require_registration: bool | None = None,
+    ) -> None:
+        """Abort claim if the worker no longer owns *partition_id* (rebalance).
+
+        Takes ``FOR SHARE`` on the assignment row so concurrent rebalance
+        (which updates owner/generation) serializes correctly with the claim.
+        When *expected_generation* is set, a generation mismatch also aborts —
+        the worker's view of the shard is stale even if ownership flipped back.
+        """
+        from job_queue.queue._common import LeaseError
+
+        require = (
+            bool(require_registration)
+            if require_registration is not None
+            else bool(getattr(self, "require_worker_registration", True))
+        )
+        if not require:
+            # Open mode (unit tests): no membership fence.
+            reg = conn.execute(
+                """
+                SELECT 1 FROM worker_nodes
+                WHERE worker_id = %s AND status = 'active'
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            if reg is None:
+                return
+
+        row = conn.execute(
+            """
+            SELECT worker_id, generation
+            FROM partition_assignments
+            WHERE partition_id = %s
+            FOR SHARE
+            """,
+            (int(partition_id),),
+        ).fetchone()
+        if row is None or row.get("worker_id") != worker_id:
+            raise LeaseError(
+                f"partition {partition_id} not owned by worker {worker_id!r} "
+                f"(rebalanced or unassigned)"
+            )
+        if expected_generation is not None:
+            cur = int(row.get("generation") or 0)
+            if cur != int(expected_generation):
+                raise LeaseError(
+                    f"partition {partition_id} generation mismatch "
+                    f"(worker={expected_generation} current={cur}); rebalance fence"
+                )
 
     def _max_generation(self) -> int:
         with self._pool.connection() as conn:

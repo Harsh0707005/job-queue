@@ -40,11 +40,11 @@
       15
     ]
   },
-  "enqueue_seconds": 1.166,
-  "drain_seconds": 3.176,
+  "enqueue_seconds": 1.336,
+  "drain_seconds": 5.0,
   "edges": {
     "join_leave": {
-      "phantom": "phantom-join-1786113205",
+      "phantom": "phantom-join-1786133837",
       "parts_on_join": [
         8
       ],
@@ -52,20 +52,28 @@
       "owners_after_leave": 8
     },
     "death_timeout": {
-      "phantom": "phantom-die-1786113205",
+      "phantom": "phantom-die-1786133837",
       "expired": 1,
       "owners_after": 8
     },
     "dead_cannot_steal": {
-      "phantom": "phantom-zombie-1786113208",
+      "phantom": "phantom-zombie-1786133840",
       "stolen": 0,
       "partition_count": 16
+    },
+    "rebalance_under_drain": {
+      "rounds": 3,
+      "extra_jobs": 60,
+      "phantom_stolen": 0,
+      "gen_bumps_observed": 3,
+      "max_generation_before": 13,
+      "max_generation_after": 19
     }
   },
   "drain": {
     "pending": 0,
     "leased": 0,
-    "completed": 322,
+    "completed": 381,
     "dead": 0,
     "failed": 0
   }
