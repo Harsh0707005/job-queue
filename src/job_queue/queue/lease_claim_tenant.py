@@ -282,6 +282,8 @@ class LeaseClaimTenantMixin:
             wait_count=wait_count,
             now=now,
         )
+        if hasattr(self, "_mark_workflow_step_leased"):
+            self._mark_workflow_step_leased(conn, row, now=now)
         return job
 
     def _lock_job_for_tenant(

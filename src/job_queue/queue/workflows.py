@@ -242,101 +242,184 @@ class WorkflowsMixin:
     ) -> int:
         """Repair stuck compensating runs (dead compensate jobs, missing next).
 
-        Safe to call from lease maintenance or a soak/scheduler loop. Returns
-        the number of step redrives / chain advances performed.
+        Each repair runs in its **own** transaction so one failure cannot roll
+        back unrelated fixes. Only treats a step as stuck when its linked job
+        is terminal (or missing) — never when the job is still pending/leased.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
-        now = _utcnow()
         fixed = 0
-        with transaction(self._pool) as conn:
-            # 1) Compensate step still "running" but job already terminal.
-            params: list[Any] = [
-                WorkflowStepDirection.COMPENSATE.value,
-                WorkflowStepStatus.RUNNING.value,
-                JobStatus.DEAD.value,
-                JobStatus.FAILED.value,
-                JobStatus.CANCELLED.value,
-                JobStatus.COMPLETED.value,
-            ]
-            tenant_clause = ""
-            if tenant_id is not None:
-                tenant_clause = "AND s.tenant_id = %s"
-                params.append(str(tenant_id).strip())
-            params.append(limit)
-            stuck = conn.execute(
-                f"""
-                SELECT s.id
-                FROM workflow_step_runs s
-                JOIN jobs j ON j.id = s.job_id
-                WHERE s.direction = %s
-                  AND s.status = %s
-                  AND j.status IN (%s, %s, %s, %s)
-                {tenant_clause}
-                ORDER BY s.updated_at ASC
-                LIMIT %s
-                FOR UPDATE OF s SKIP LOCKED
-                """,
-                tuple(params),
-            ).fetchall()
-            for row in stuck:
-                step = conn.execute(
-                    f"""
-                    SELECT {_STEP_COLUMNS}
-                    FROM workflow_step_runs WHERE id = %s FOR UPDATE
-                    """,
-                    (row["id"],),
-                ).fetchone()
-                if step is None:
-                    continue
-                run = conn.execute(
-                    f"""
-                    SELECT {_RUN_COLUMNS}
-                    FROM workflow_runs WHERE id = %s FOR UPDATE
-                    """,
-                    (step["run_id"],),
-                ).fetchone()
-                if run is None or run["status"] != WorkflowRunStatus.COMPENSATING.value:
-                    continue
-                job = conn.execute(
-                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-                    (step["job_id"],),
-                ).fetchone()
-                err = None
-                if job is not None:
-                    err = job.get("last_error") or f"job ended as {job.get('status')}"
-                self._fail_or_redrive_compensate_step(
-                    conn,
-                    run=run,
-                    step=step,
-                    error=str(err or "compensate job terminal"),
-                    now=now,
-                )
-                fixed += 1
 
-            # 2) Compensating runs with no active claimable work — advance chain.
+        # Phase 1: collect candidate step ids (read-only snapshot).
+        params: list[Any] = [
+            WorkflowStepDirection.COMPENSATE.value,
+            WorkflowStepStatus.PENDING.value,
+            WorkflowStepStatus.RUNNING.value,
+            JobStatus.DEAD.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.COMPLETED.value,
+        ]
+        tenant_clause = ""
+        if tenant_id is not None:
+            tenant_clause = "AND s.tenant_id = %s"
+            params.append(str(tenant_id).strip())
+        params.append(limit)
+        with self._pool.connection() as conn:
+            stuck_ids = [
+                r["id"]
+                for r in conn.execute(
+                    f"""
+                    SELECT s.id
+                    FROM workflow_step_runs s
+                    JOIN jobs j ON j.id = s.job_id
+                    WHERE s.direction = %s
+                      AND s.status IN (%s, %s)
+                      AND j.status IN (%s, %s, %s, %s)
+                    {tenant_clause}
+                    ORDER BY s.updated_at ASC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                ).fetchall()
+            ]
+            # Also: step has job_id but job row is gone.
+            params2: list[Any] = [
+                WorkflowStepDirection.COMPENSATE.value,
+                WorkflowStepStatus.PENDING.value,
+                WorkflowStepStatus.RUNNING.value,
+            ]
+            t2 = ""
+            if tenant_id is not None:
+                t2 = "AND s.tenant_id = %s"
+                params2.append(str(tenant_id).strip())
+            params2.append(limit)
+            missing_job_ids = [
+                r["id"]
+                for r in conn.execute(
+                    f"""
+                    SELECT s.id
+                    FROM workflow_step_runs s
+                    WHERE s.direction = %s
+                      AND s.status IN (%s, %s)
+                      AND s.job_id IS NOT NULL
+                      AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = s.job_id)
+                    {t2}
+                    ORDER BY s.updated_at ASC
+                    LIMIT %s
+                    """,
+                    tuple(params2),
+                ).fetchall()
+            ]
             rparams: list[Any] = [WorkflowRunStatus.COMPENSATING.value]
             rtenant = ""
             if tenant_id is not None:
                 rtenant = "AND tenant_id = %s"
                 rparams.append(str(tenant_id).strip())
-            rparams.append(max(1, limit - fixed))
-            orphan_runs = conn.execute(
+            rparams.append(limit)
+            orphan_run_ids = [
+                r["id"]
+                for r in conn.execute(
+                    f"""
+                    SELECT id
+                    FROM workflow_runs
+                    WHERE status = %s
+                    {rtenant}
+                    ORDER BY updated_at ASC
+                    LIMIT %s
+                    """,
+                    tuple(rparams),
+                ).fetchall()
+            ]
+
+        for sid in stuck_ids + missing_job_ids:
+            if fixed >= limit:
+                break
+            try:
+                if self._repair_one_stuck_compensate_step(sid):
+                    fixed += 1
+            except Exception:  # noqa: BLE001
+                # Isolate failures — never abort the whole sweep.
+                continue
+
+        for rid in orphan_run_ids:
+            if fixed >= limit:
+                break
+            try:
+                if self._repair_one_compensate_run(rid):
+                    fixed += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return fixed
+
+    def _repair_one_stuck_compensate_step(self, step_id: UUID) -> bool:
+        """Redrive a single compensate step whose job is terminal/missing."""
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            step = conn.execute(
+                f"""
+                SELECT {_STEP_COLUMNS}
+                FROM workflow_step_runs WHERE id = %s FOR UPDATE
+                """,
+                (step_id,),
+            ).fetchone()
+            if step is None:
+                return False
+            if step["direction"] != WorkflowStepDirection.COMPENSATE.value:
+                return False
+            if step["status"] not in (
+                WorkflowStepStatus.PENDING.value,
+                WorkflowStepStatus.RUNNING.value,
+            ):
+                return False
+            run = conn.execute(
                 f"""
                 SELECT {_RUN_COLUMNS}
-                FROM workflow_runs
-                WHERE status = %s
-                {rtenant}
-                ORDER BY updated_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
+                FROM workflow_runs WHERE id = %s FOR UPDATE
                 """,
-                tuple(rparams),
-            ).fetchall()
-            for run in orphan_runs:
-                if self._ensure_compensate_progress(conn, run=run, now=now):
-                    fixed += 1
-        return fixed
+                (step["run_id"],),
+            ).fetchone()
+            if run is None or run["status"] != WorkflowRunStatus.COMPENSATING.value:
+                return False
+            job = None
+            if step.get("job_id") is not None:
+                job = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                    (step["job_id"],),
+                ).fetchone()
+            # Healthy in-flight work: do not redrive.
+            if job is not None and job["status"] in (
+                JobStatus.PENDING.value,
+                JobStatus.LEASED.value,
+            ):
+                return False
+            err = (
+                (job.get("last_error") if job else None)
+                or (f"job ended as {job['status']}" if job else "compensate job missing")
+            )
+            self._fail_or_redrive_compensate_step(
+                conn,
+                run=run,
+                step=step,
+                error=str(err),
+                now=now,
+            )
+            return True
+
+    def _repair_one_compensate_run(self, run_id: UUID) -> bool:
+        """Advance one compensating run if it has no claimable compensate work."""
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            run = conn.execute(
+                f"""
+                SELECT {_RUN_COLUMNS}
+                FROM workflow_runs WHERE id = %s FOR UPDATE
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None or run["status"] != WorkflowRunStatus.COMPENSATING.value:
+                return False
+            return self._ensure_compensate_progress(conn, run=run, now=now)
 
     def _complete_forward_step(
         self,
@@ -613,6 +696,14 @@ class WorkflowsMixin:
         vt = int(job["visibility_timeout_seconds"]) if job else 30
 
         if retry < max_retries:
+            # Only redrive when linked job is missing or terminal — never when
+            # a healthy pending/leased job is still attached.
+            if job is not None and job["status"] in (
+                JobStatus.PENDING.value,
+                JobStatus.LEASED.value,
+            ):
+                return
+            new_retry = retry + 1
             updated = conn.execute(
                 f"""
                 UPDATE workflow_step_runs
@@ -621,6 +712,7 @@ class WorkflowsMixin:
                     error = %s,
                     retry_count = %s,
                     completed_at = NULL,
+                    started_at = NULL,
                     updated_at = %s
                 WHERE id = %s
                   AND status NOT IN ('compensated', 'failed', 'skipped')
@@ -629,7 +721,7 @@ class WorkflowsMixin:
                 (
                     WorkflowStepStatus.PENDING.value,
                     error,
-                    retry + 1,
+                    new_retry,
                     now,
                     step["id"],
                 ),
@@ -651,6 +743,7 @@ class WorkflowsMixin:
                 max_attempts=max_attempts,
                 visibility_timeout_seconds=vt,
                 now=now,
+                dedupe_suffix=f"r{new_retry}",
             )
             conn.execute(
                 """
@@ -771,30 +864,28 @@ class WorkflowsMixin:
     def _ensure_compensate_progress(
         self, conn: Any, *, run: dict[str, Any], now: Any
     ) -> bool:
-        """If compensating with no active job, enqueue next or finalize."""
+        """If compensating with no claimable job, enqueue next or redrive dead.
+
+        A step with ``job_id`` pointing at a *pending* or *leased* job is
+        healthy (not stuck), even if step status is still ``pending`` (job
+        enqueued but not yet claimed).
+        """
         active = conn.execute(
             """
             SELECT 1
             FROM workflow_step_runs s
-            LEFT JOIN jobs j ON j.id = s.job_id
+            JOIN jobs j ON j.id = s.job_id
             WHERE s.run_id = %s
               AND s.direction = 'compensate'
-              AND (
-                    s.status = 'running'
-                    AND j.status = 'leased'
-                 OR (
-                        s.status = 'pending'
-                    AND s.job_id IS NOT NULL
-                    AND j.status IN ('pending', 'leased')
-                 )
-              )
+              AND s.status IN ('pending', 'running')
+              AND j.status IN ('pending', 'leased')
             LIMIT 1
             """,
             (run["id"],),
         ).fetchone()
         if active is not None:
             return False
-        # Prefer redrive of highest-index pending/running compensate.
+        # Highest-index non-terminal compensate that needs work.
         stuck = conn.execute(
             f"""
             SELECT {_STEP_COLUMNS}
@@ -824,35 +915,49 @@ class WorkflowsMixin:
                 ),
             )
             return True
-        if stuck["status"] == WorkflowStepStatus.RUNNING.value:
+        # Linked job terminal or missing → redrive.
+        job = None
+        if stuck.get("job_id") is not None:
+            job = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (stuck["job_id"],),
+            ).fetchone()
+        if job is not None and job["status"] in (
+            JobStatus.PENDING.value,
+            JobStatus.LEASED.value,
+        ):
+            return False
+        if stuck.get("job_id") is not None:
+            err = (
+                (job.get("last_error") if job else None)
+                or (f"job ended as {job['status']}" if job else "compensate job missing")
+            )
             self._fail_or_redrive_compensate_step(
                 conn,
                 run=run,
                 step=stuck,
-                error="compensate job missing or not claimable",
+                error=str(err),
                 now=now,
             )
             return True
-        # pending without job
+        # pending without job — enqueue first time only.
         steps_def = run["steps_def"]
         if isinstance(steps_def, str):
             import json
 
             steps_def = json.loads(steps_def)
-        if stuck.get("job_id") is None:
-            self._enqueue_job_for_step(
-                conn,
-                run_id=run["id"],
-                tenant_id=run["tenant_id"],
-                step_row=stuck,
-                steps_def=steps_def,
-                queue_name="default",
-                max_attempts=3,
-                visibility_timeout_seconds=30,
-                now=now,
-            )
-            return True
-        return False
+        self._enqueue_job_for_step(
+            conn,
+            run_id=run["id"],
+            tenant_id=run["tenant_id"],
+            step_row=stuck,
+            steps_def=steps_def,
+            queue_name="default",
+            max_attempts=3,
+            visibility_timeout_seconds=30,
+            now=now,
+        )
+        return True
 
     def _complete_compensate_step(
         self,
@@ -977,6 +1082,7 @@ class WorkflowsMixin:
         max_attempts: int,
         visibility_timeout_seconds: int,
         now: Any,
+        dedupe_suffix: str | None = None,
     ) -> dict[str, Any]:
         if step_row.get("job_id") is not None:
             return step_row
@@ -1006,6 +1112,11 @@ class WorkflowsMixin:
             payload["force_fail"] = True
             payload["error"] = str(sdef.get("fail_error") or "workflow step forced fail")
         labels = [f"workflow:{run_id}", f"wf-step:{idx}", f"wf-dir:{direction}"]
+        # Include redrive suffix so a new pending job does not collide with a
+        # still-active prior job row under the active dedupe unique index.
+        dedupe = f"wf:{run_id}:{idx}:{direction}"
+        if dedupe_suffix:
+            dedupe = f"{dedupe}:{dedupe_suffix}"
         conn.execute(
             f"""
             INSERT INTO jobs (
@@ -1037,29 +1148,39 @@ class WorkflowsMixin:
                 max_attempts,
                 visibility_timeout_seconds,
                 now,
-                f"wf:{run_id}:{idx}:{direction}",
+                dedupe,
                 [],
                 labels,
                 now,
                 now,
             ),
         )
+        # Keep step status pending until a worker actually leases the job.
+        # Marking running here caused process_workflow_compensation to treat
+        # healthy pending jobs as stuck and redrive (unique/dedupe conflicts).
         updated = conn.execute(
             f"""
             UPDATE workflow_step_runs
-            SET job_id = %s, status = %s, started_at = COALESCE(started_at, %s),
+            SET job_id = %s,
+                status = %s,
                 updated_at = %s
             WHERE id = %s
+              AND job_id IS NULL
             RETURNING {_STEP_COLUMNS}
             """,
             (
                 job_id,
-                WorkflowStepStatus.RUNNING.value,
-                now,
+                WorkflowStepStatus.PENDING.value,
                 now,
                 step_row["id"],
             ),
         ).fetchone()
+        if updated is None:
+            # Concurrent enqueue won; re-read.
+            updated = conn.execute(
+                f"SELECT {_STEP_COLUMNS} FROM workflow_step_runs WHERE id = %s",
+                (step_row["id"],),
+            ).fetchone()
         assert updated is not None
         # Lightweight audit on the step job.
         job_row = conn.execute(
@@ -1077,6 +1198,36 @@ class WorkflowsMixin:
                 now=now,
             )
         return updated
+
+    def _mark_workflow_step_leased(
+        self, conn: Any, job_row: dict[str, Any], *, now: Any = None
+    ) -> None:
+        """Flip step_run pending→running when its job is actually leased."""
+        payload = job_row.get("payload") or {}
+        if isinstance(payload, str):
+            import json
+
+            payload = json.loads(payload)
+        if not isinstance(payload, dict) or payload.get("kind") != WORKFLOW_STEP_KIND:
+            return
+        ts = now or _utcnow()
+        conn.execute(
+            """
+            UPDATE workflow_step_runs
+            SET status = %s,
+                started_at = COALESCE(started_at, %s),
+                updated_at = %s
+            WHERE job_id = %s
+              AND status = %s
+            """,
+            (
+                WorkflowStepStatus.RUNNING.value,
+                ts,
+                ts,
+                job_row["id"],
+                WorkflowStepStatus.PENDING.value,
+            ),
+        )
 
     @staticmethod
     def _normalize_step_def(raw: Any, index: int) -> dict[str, Any]:

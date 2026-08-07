@@ -208,6 +208,153 @@ def test_workflow_compensates_on_lease_expiry_dead(queue: JobQueue):
     assert [s.name for s in comps] == ["a"]
 
 
+def test_workflow_enqueue_keeps_step_pending_until_lease(queue: JobQueue):
+    """Enqueued compensate jobs stay pending; sweep must not redrive them."""
+    run = queue.start_workflow(
+        tenant_id="wf-pend",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {"name": "b", "payload": {"op": "b"}, "fail": True},
+        ],
+    )
+    _drive_step(queue, "wf-pend")
+    _drive_step(queue, "wf-pend", fail=True)
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-pend")
+    comps = [s for s in steps if s.direction == "compensate"]
+    assert len(comps) == 1
+    assert comps[0].status == WorkflowStepStatus.PENDING.value
+    assert comps[0].job_id is not None
+    assert comps[0].retry_count == 0
+    # Job is pending (not leased yet).
+    j = queue.get(comps[0].job_id, tenant_id="wf-pend")
+    assert j is not None and j.status == JobStatus.PENDING
+    # Sweep must NOT treat this as stuck / redrive (would unique-conflict).
+    n = queue.process_workflow_compensation(tenant_id="wf-pend", limit=20)
+    assert n == 0
+    steps2 = queue.list_workflow_steps(run.id, tenant_id="wf-pend")
+    c2 = [s for s in steps2 if s.direction == "compensate"][0]
+    assert c2.job_id == comps[0].job_id
+    assert c2.retry_count == 0
+    assert c2.status == WorkflowStepStatus.PENDING.value
+
+
+def test_workflow_compensation_sweep_isolates_txn_per_repair(queue: JobQueue):
+    """Each stuck compensate is repaired in its own txn (no all-or-nothing)."""
+    # Two independent fail runs → two compensate jobs to force-dead without
+    # inline redrive (simulate missed terminal hook / crash mid-sweep).
+    runs = []
+    for tid in ("wf-iso1", "wf-iso2"):
+        r = queue.start_workflow(
+            tenant_id=tid,
+            max_attempts=1,
+            max_compensate_retries=3,
+            steps=[
+                {
+                    "name": "a",
+                    "payload": {"op": "a"},
+                    "compensate": {"payload": {"op": "undo_a"}},
+                },
+                {"name": "b", "payload": {"op": "b"}, "fail": True},
+            ],
+        )
+        _drive_step(queue, tid)
+        _drive_step(queue, tid, fail=True)
+        runs.append((tid, r.id))
+
+    # Force-dead the compensate jobs *without* running workflow terminal hooks,
+    # leaving step_runs linked to dead jobs (stuck state for the sweeper).
+    for tid, rid in runs:
+        steps = queue.list_workflow_steps(rid, tenant_id=tid)
+        comp = next(s for s in steps if s.direction == "compensate")
+        assert comp.job_id is not None
+        with queue._pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'dead',
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    completed_at = NOW(),
+                    last_error = 'simulated kill',
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (comp.job_id,),
+            )
+            conn.execute(
+                """
+                UPDATE workflow_step_runs
+                SET status = 'running', started_at = COALESCE(started_at, NOW())
+                WHERE id = %s
+                """,
+                (comp.id,),
+            )
+            conn.commit()
+
+    # Sweep must redrive both (separate transactions).
+    n = queue.process_workflow_compensation(limit=20)
+    assert n >= 2
+    for tid, rid in runs:
+        steps = queue.list_workflow_steps(rid, tenant_id=tid)
+        comps = [s for s in steps if s.direction == "compensate"]
+        assert comps
+        assert comps[0].retry_count >= 1
+        assert comps[0].job_id is not None
+        j = queue.get(comps[0].job_id, tenant_id=tid)
+        assert j is not None and j.status == JobStatus.PENDING
+        # Second sweep is a no-op (healthy pending jobs).
+    assert queue.process_workflow_compensation(limit=20) == 0
+
+
+def test_workflow_compensation_does_not_redrive_healthy_pending_job(queue: JobQueue):
+    """Even if step_run is wrongly marked running, pending job is not redriven."""
+    run = queue.start_workflow(
+        tenant_id="wf-healthy",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {"name": "b", "payload": {"op": "b"}, "fail": True},
+        ],
+    )
+    _drive_step(queue, "wf-healthy")
+    _drive_step(queue, "wf-healthy", fail=True)
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-healthy")
+    comp = next(s for s in steps if s.direction == "compensate")
+    # Simulate old buggy state: step marked running while job still pending.
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE workflow_step_runs
+            SET status = 'running', started_at = NOW()
+            WHERE id = %s
+            """,
+            (comp.id,),
+        )
+        conn.commit()
+    n = queue.process_workflow_compensation(tenant_id="wf-healthy", limit=10)
+    assert n == 0
+    steps2 = queue.list_workflow_steps(run.id, tenant_id="wf-healthy")
+    c2 = next(s for s in steps2 if s.direction == "compensate")
+    assert c2.job_id == comp.job_id
+    assert c2.retry_count == 0
+    # Lease flips to running for real.
+    j = queue.lease(tenant_id="wf-healthy", worker_id="w")
+    assert j is not None and j.id == comp.job_id
+    steps3 = queue.list_workflow_steps(run.id, tenant_id="wf-healthy")
+    c3 = next(s for s in steps3 if s.direction == "compensate")
+    assert c3.status == WorkflowStepStatus.RUNNING.value
+    _ack(queue, j, "w")
+
+
 def test_workflow_compensate_redrive_after_kill(queue: JobQueue):
     """Killed compensate worker must not leave the run stuck compensating."""
     import time
