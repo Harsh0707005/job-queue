@@ -38,6 +38,8 @@ SINK = os.environ.get("EFFECT_SINK_URL", "http://effect-sink:8091").rstrip("/")
 TENANTS = int(os.environ.get("TENANTS", "6"))
 HAPPY_PER_TENANT = int(os.environ.get("HAPPY_PER_TENANT", "4"))
 FAIL_PER_TENANT = int(os.environ.get("FAIL_PER_TENANT", "3"))
+PARALLEL_HAPPY_PER_TENANT = int(os.environ.get("PARALLEL_HAPPY_PER_TENANT", "2"))
+PARALLEL_FAIL_PER_TENANT = int(os.environ.get("PARALLEL_FAIL_PER_TENANT", "2"))
 MAX_WALL = float(os.environ.get("MAX_WALL_SECONDS", "240"))
 RESULTS_PATH = os.environ.get("RESULTS_PATH", "/results/workflow-fleet.json")
 LABEL = os.environ.get("LOAD_LABEL", "workflow-fleet")
@@ -148,21 +150,123 @@ def fail_steps() -> list[dict[str, Any]]:
     ]
 
 
+def parallel_happy_steps() -> list[dict[str, Any]]:
+    """Fan-out two branches then join — exercises multi-worker concurrent steps."""
+    return [
+        {
+            "name": "setup",
+            "kind": "effect",
+            "payload": {"op": "setup", "ms": 30},
+            "compensate": {"kind": "effect", "payload": {"op": "undo_setup", "ms": 15}},
+        },
+        {
+            "type": "parallel",
+            "name": "fan",
+            "branches": [
+                [
+                    {
+                        "name": "left",
+                        "kind": "effect",
+                        "payload": {"op": "left", "ms": 50},
+                        "compensate": {
+                            "kind": "effect",
+                            "payload": {"op": "undo_left", "ms": 15},
+                        },
+                    }
+                ],
+                [
+                    {
+                        "name": "right",
+                        "kind": "effect",
+                        "payload": {"op": "right", "ms": 50},
+                        "compensate": {
+                            "kind": "effect",
+                            "payload": {"op": "undo_right", "ms": 15},
+                        },
+                    }
+                ],
+            ],
+        },
+        {
+            "name": "join",
+            "kind": "effect",
+            "payload": {"op": "join", "ms": 30},
+        },
+    ]
+
+
+def parallel_fail_steps() -> list[dict[str, Any]]:
+    """One branch fails; sibling may still be in-flight — settle then compensate."""
+    return [
+        {
+            "name": "setup",
+            "kind": "effect",
+            "payload": {"op": "setup", "ms": 25},
+            "compensate": {"kind": "effect", "payload": {"op": "undo_setup", "ms": 15}},
+        },
+        {
+            "type": "parallel",
+            "name": "fan",
+            "branches": [
+                [
+                    {
+                        "name": "slow_ok",
+                        "kind": "effect",
+                        "payload": {"op": "slow_ok", "ms": 80},
+                        "compensate": {
+                            "kind": "effect",
+                            "payload": {"op": "undo_slow", "ms": 15},
+                        },
+                    }
+                ],
+                [
+                    {
+                        "name": "boom",
+                        "kind": "effect",
+                        "payload": {"op": "boom", "ms": 20},
+                        "fail": True,
+                        "fail_error": "fleet parallel branch fail",
+                    }
+                ],
+            ],
+        },
+        {
+            "name": "join",
+            "kind": "effect",
+            "payload": {"op": "join", "ms": 20},
+        },
+    ]
+
+
 def main() -> int:
     tenants = [f"wf-t{i:02d}" for i in range(TENANTS)]
     logger.info(
-        "WORKFLOW soak label=%s tenants=%s happy/t=%s fail/t=%s",
+        "WORKFLOW soak label=%s tenants=%s happy/t=%s fail/t=%s "
+        "par_happy/t=%s par_fail/t=%s",
         LABEL,
         TENANTS,
         HAPPY_PER_TENANT,
         FAIL_PER_TENANT,
+        PARALLEL_HAPPY_PER_TENANT,
+        PARALLEL_FAIL_PER_TENANT,
     )
     wait_healthy()
 
     runs: list[tuple[str, str, str]] = []  # tenant, run_id, kind
 
+    def steps_for(kind: str) -> list[dict[str, Any]]:
+        if kind == "happy":
+            return happy_steps()
+        if kind == "fail":
+            return fail_steps()
+        if kind == "par_happy":
+            return parallel_happy_steps()
+        if kind == "par_fail":
+            return parallel_fail_steps()
+        raise ValueError(f"unknown kind {kind}")
+
     def start_one(tid: str, kind: str) -> tuple[str, str, str]:
-        steps = happy_steps() if kind == "happy" else fail_steps()
+        steps = steps_for(kind)
         code, body = http_json(
             "POST",
             "/v1/workflows",
@@ -188,6 +292,10 @@ def main() -> int:
             work.append((tid, "happy"))
         for _ in range(FAIL_PER_TENANT):
             work.append((tid, "fail"))
+        for _ in range(PARALLEL_HAPPY_PER_TENANT):
+            work.append((tid, "par_happy"))
+        for _ in range(PARALLEL_FAIL_PER_TENANT):
+            work.append((tid, "par_fail"))
 
     with ThreadPoolExecutor(max_workers=16) as pool:
         futs = [pool.submit(start_one, tid, kind) for tid, kind in work]
@@ -195,9 +303,12 @@ def main() -> int:
             runs.append(f.result())
     logger.info("started %s workflow runs", len(runs))
 
-    # Wait until at least one fail-path run is compensating, then kill workers
-    # mid-compensation so redrive / reclaim must finish the reverse chain.
+    # Wait until happy paths finish and fail-path runs are compensating, then
+    # kill workers mid-compensation so redrive/reclaim must finish the reverse
+    # chain. Do not kill while parallel happy fan-out/join is still in flight.
     kill_done = False
+    happy_kinds = {"happy", "par_happy"}
+    expect_happy_kinds = sum(1 for _, _, k in runs if k in happy_kinds)
     t0 = time.time()
     completed = 0
     failed = 0
@@ -207,6 +318,7 @@ def main() -> int:
         failed = 0
         pending = 0
         compensating = 0
+        happy_completed = 0
         for tid, rid, kind in runs:
             code, body = http_json(
                 "GET",
@@ -218,6 +330,8 @@ def main() -> int:
             st = (body.get("run") or {}).get("status")
             if st == "completed":
                 completed += 1
+                if kind in happy_kinds:
+                    happy_completed += 1
             elif st == "failed":
                 failed += 1
             else:
@@ -236,6 +350,7 @@ def main() -> int:
         if (
             not kill_done
             and compensating >= max(1, FAIL_PER_TENANT)
+            and happy_completed >= expect_happy_kinds
         ):
             # Kill workers via Docker Engine API (no docker CLI required).
             try:
@@ -297,11 +412,11 @@ def main() -> int:
         "terminal completed=%s failed=%s pending=%s", completed, failed, pending
     )
 
-    expect_happy = TENANTS * HAPPY_PER_TENANT
-    expect_fail = TENANTS * FAIL_PER_TENANT
+    expect_happy = TENANTS * (HAPPY_PER_TENANT + PARALLEL_HAPPY_PER_TENANT)
+    expect_fail = TENANTS * (FAIL_PER_TENANT + PARALLEL_FAIL_PER_TENANT)
     ok_counts = completed == expect_happy and failed == expect_fail and pending == 0
 
-    # Sample fail run: compensate order reserve after charge (reverse of completed).
+    # Sample linear fail run: compensate order charge then reserve.
     ok_compensate_order = True
     fail_samples = [(t, r) for t, r, k in runs if k == "fail"][:3]
     for tid, rid in fail_samples:
@@ -328,6 +443,64 @@ def main() -> int:
             logger.warning("unexpected compensate order for %s: %s", rid, names)
             ok_compensate_order = False
 
+    # Parallel fail: setup (+ maybe slow_ok) compensated; boom failed; no join.
+    ok_parallel_fail = True
+    par_fail_samples = [(t, r) for t, r, k in runs if k == "par_fail"][:4]
+    for tid, rid in par_fail_samples:
+        code, body = http_json(
+            "GET",
+            f"/v1/workflows/{rid}/steps?" + urlencode({"tenant_id": tid}),
+        )
+        if code != 200:
+            ok_parallel_fail = False
+            continue
+        steps = body.get("steps") or []
+        forwards = {s.get("name"): s for s in steps if s.get("direction") == "forward"}
+        if forwards.get("boom", {}).get("status") != "failed":
+            logger.warning("par_fail %s boom not failed: %s", rid, forwards.get("boom"))
+            ok_parallel_fail = False
+        if "join" in forwards and forwards["join"].get("status") not in (
+            "skipped",
+            None,
+        ):
+            # join should never complete on branch fail
+            if forwards["join"].get("status") == "completed":
+                logger.warning("par_fail %s join completed unexpectedly", rid)
+                ok_parallel_fail = False
+        comps = {
+            s.get("name")
+            for s in steps
+            if s.get("direction") == "compensate"
+            and s.get("status") == "compensated"
+        }
+        if "setup" not in comps:
+            logger.warning("par_fail %s missing setup compensate: %s", rid, comps)
+            ok_parallel_fail = False
+
+    # Parallel happy: all four forwards completed.
+    ok_parallel_happy = True
+    for tid, rid, kind in runs:
+        if kind != "par_happy":
+            continue
+        code, body = http_json(
+            "GET",
+            f"/v1/workflows/{rid}/steps?" + urlencode({"tenant_id": tid}),
+        )
+        if code != 200:
+            ok_parallel_happy = False
+            continue
+        forwards = [
+            s
+            for s in (body.get("steps") or [])
+            if s.get("direction") == "forward"
+        ]
+        names = {s.get("name") for s in forwards}
+        if names != {"setup", "left", "right", "join"}:
+            logger.warning("par_happy %s unexpected steps %s", rid, names)
+            ok_parallel_happy = False
+        if any(s.get("status") != "completed" for s in forwards):
+            ok_parallel_happy = False
+
     # Tenant isolation: cross-tenant get returns 404
     ok_isolation = True
     if runs:
@@ -350,7 +523,12 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("sink stats: %s", exc)
     unique = int(stats.get("unique_effects") or 0)
-    min_unique = expect_happy * 3 + expect_fail * 2  # at least forwards for happy + 2 for fail
+    # linear happy 3 + par happy 4 + fail compensates (lower bound)
+    min_unique = (
+        TENANTS * HAPPY_PER_TENANT * 3
+        + TENANTS * PARALLEL_HAPPY_PER_TENANT * 4
+        + TENANTS * FAIL_PER_TENANT * 2
+    )
     ok_sink = unique >= min_unique
 
     # After kill/restart, no run should remain stuck in compensating.
@@ -359,6 +537,8 @@ def main() -> int:
     ok = (
         ok_counts
         and ok_compensate_order
+        and ok_parallel_fail
+        and ok_parallel_happy
         and ok_isolation
         and ok_sink
         and ok_no_stuck
@@ -374,6 +554,8 @@ def main() -> int:
         "expect_fail": expect_fail,
         "ok_counts": ok_counts,
         "ok_compensate_order": ok_compensate_order,
+        "ok_parallel_fail": ok_parallel_fail,
+        "ok_parallel_happy": ok_parallel_happy,
         "ok_isolation": ok_isolation,
         "ok_sink": ok_sink,
         "ok_no_stuck": ok_no_stuck,

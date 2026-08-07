@@ -311,6 +311,254 @@ def test_workflow_compensation_sweep_isolates_txn_per_repair(queue: JobQueue):
     assert queue.process_workflow_compensation(limit=20) == 0
 
 
+def test_workflow_parallel_happy_path_fanout_join(queue: JobQueue):
+    """Parallel branches run concurrently then join into a later step."""
+    run = queue.start_workflow(
+        tenant_id="wf-par",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "setup",
+                "payload": {"op": "setup"},
+                "compensate": {"payload": {"op": "undo_setup"}},
+            },
+            {
+                "type": "parallel",
+                "name": "fan",
+                "branches": [
+                    [
+                        {
+                            "name": "left",
+                            "payload": {"op": "left"},
+                            "compensate": {"payload": {"op": "undo_left"}},
+                        }
+                    ],
+                    [
+                        {
+                            "name": "right",
+                            "payload": {"op": "right"},
+                            "compensate": {"payload": {"op": "undo_right"}},
+                        }
+                    ],
+                ],
+            },
+            {
+                "name": "join",
+                "payload": {"op": "join"},
+            },
+        ],
+    )
+    # Root only: setup.
+    j0 = queue.lease(tenant_id="wf-par", worker_id="w")
+    assert j0 is not None and j0.payload.get("step_name") == "setup"
+    _ack(queue, j0, "w", result={"ok": "setup"})
+
+    # Fan-out: both branch roots ready.
+    names: set[str] = set()
+    j1 = queue.lease(tenant_id="wf-par", worker_id="w1")
+    j2 = queue.lease(tenant_id="wf-par", worker_id="w2")
+    assert j1 is not None and j2 is not None
+    names.add(str(j1.payload.get("step_name")))
+    names.add(str(j2.payload.get("step_name")))
+    assert names == {"left", "right"}
+    _ack(queue, j1, "w1", result={"ok": j1.payload.get("step_name")})
+    _ack(queue, j2, "w2", result={"ok": j2.payload.get("step_name")})
+
+    # Join after both branches complete.
+    j3 = queue.lease(tenant_id="wf-par", worker_id="w")
+    assert j3 is not None and j3.payload.get("step_name") == "join"
+    _ack(queue, j3, "w", result={"ok": "join"})
+
+    done = queue.get_workflow(run.id, tenant_id="wf-par")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+    forwards = [
+        s
+        for s in queue.list_workflow_steps(run.id, tenant_id="wf-par")
+        if s.direction == "forward"
+    ]
+    assert {s.name for s in forwards} == {"setup", "left", "right", "join"}
+    assert all(s.status == WorkflowStepStatus.COMPLETED.value for s in forwards)
+    # Expanded DAG keeps branch metadata on parallel leaves.
+    assert any(s.get("parallel_group") == "fan" for s in done.steps_def)
+
+
+def test_workflow_parallel_branch_fail_settles_sibling_then_compensates(
+    queue: JobQueue,
+):
+    """One branch fails: in-flight sibling finishes, then reverse compensate.
+
+    Workers are never force-killed mid-step; leased sibling work is allowed to
+    complete, then undo runs for every completed forward step.
+    """
+    run = queue.start_workflow(
+        tenant_id="wf-par-fail",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "setup",
+                "payload": {"op": "setup"},
+                "compensate": {"payload": {"op": "undo_setup"}},
+            },
+            {
+                "type": "parallel",
+                "name": "fan",
+                "branches": [
+                    [
+                        {
+                            "name": "slow_ok",
+                            "payload": {"op": "slow"},
+                            "compensate": {"payload": {"op": "undo_slow"}},
+                        }
+                    ],
+                    [
+                        {
+                            "name": "boom",
+                            "payload": {"op": "boom"},
+                            "fail": True,
+                            "compensate": {"payload": {"op": "undo_boom"}},
+                        }
+                    ],
+                ],
+            },
+            {
+                "name": "join",
+                "payload": {"op": "join"},
+                "compensate": {"payload": {"op": "undo_join"}},
+            },
+        ],
+    )
+    # setup
+    js = queue.lease(tenant_id="wf-par-fail", worker_id="w")
+    assert js is not None
+    _ack(queue, js, "w", result={"ok": "setup"})
+
+    # Lease both branches (simulate concurrent multi-worker fleet).
+    ja = queue.lease(tenant_id="wf-par-fail", worker_id="w-slow")
+    jb = queue.lease(tenant_id="wf-par-fail", worker_id="w-boom")
+    assert ja is not None and jb is not None
+    by_name = {
+        str(ja.payload.get("step_name")): (ja, "w-slow"),
+        str(jb.payload.get("step_name")): (jb, "w-boom"),
+    }
+    assert set(by_name) == {"slow_ok", "boom"}
+
+    # Fail boom first while slow_ok is still leased (worker mid-step).
+    boom_job, boom_w = by_name["boom"]
+    _nack(queue, boom_job, boom_w, error="branch boom", requeue=True)
+
+    mid = queue.get_workflow(run.id, tenant_id="wf-par-fail")
+    assert mid is not None
+    assert mid.status == WorkflowRunStatus.COMPENSATING.value
+    # Join must not have been enqueued.
+    steps_mid = queue.list_workflow_steps(run.id, tenant_id="wf-par-fail")
+    assert not any(s.name == "join" for s in steps_mid if s.direction == "forward")
+
+    # Sibling still holds lease — no compensate yet (settle wait).
+    # Complete slow_ok successfully (worker finishes naturally).
+    slow_job, slow_w = by_name["slow_ok"]
+    _ack(queue, slow_job, slow_w, result={"ok": "slow"})
+
+    # Now reverse compensate: highest completed index first (slow_ok then setup).
+    c1 = queue.lease(tenant_id="wf-par-fail", worker_id="w")
+    assert c1 is not None
+    assert c1.payload.get("direction") == "compensate"
+    assert c1.payload.get("step_name") == "slow_ok"
+    _ack(queue, c1, "w", result={"undid": "slow"})
+
+    c2 = queue.lease(tenant_id="wf-par-fail", worker_id="w")
+    assert c2 is not None
+    assert c2.payload.get("direction") == "compensate"
+    assert c2.payload.get("step_name") == "setup"
+    _ack(queue, c2, "w", result={"undid": "setup"})
+
+    done = queue.get_workflow(run.id, tenant_id="wf-par-fail")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-par-fail")
+    forwards = {s.name: s for s in steps if s.direction == "forward"}
+    assert forwards["setup"].status == WorkflowStepStatus.COMPLETED.value
+    assert forwards["slow_ok"].status == WorkflowStepStatus.COMPLETED.value
+    assert forwards["boom"].status == WorkflowStepStatus.FAILED.value
+    assert "join" not in forwards
+    comps = [
+        s.name
+        for s in steps
+        if s.direction == "compensate"
+        and s.status == WorkflowStepStatus.COMPENSATED.value
+    ]
+    assert set(comps) == {"setup", "slow_ok"}
+
+
+def test_workflow_parallel_branch_fail_cancels_unstarted_sibling(queue: JobQueue):
+    """Pending (not leased) sibling is skipped; no mid-step kill required."""
+    run = queue.start_workflow(
+        tenant_id="wf-par-skip",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "setup",
+                "payload": {"op": "setup"},
+                "compensate": {"payload": {"op": "undo_setup"}},
+            },
+            {
+                "type": "parallel",
+                "name": "fan",
+                "branches": [
+                    [
+                        {
+                            "name": "keep",
+                            "payload": {"op": "keep"},
+                            "compensate": {"payload": {"op": "undo_keep"}},
+                        }
+                    ],
+                    [
+                        {
+                            "name": "fail_me",
+                            "payload": {"op": "x"},
+                            "fail": True,
+                        }
+                    ],
+                ],
+            },
+        ],
+    )
+    _drive_step(queue, "wf-par-skip")  # setup
+    # Lease only the failing branch; leave sibling pending in the queue.
+    j = queue.lease(tenant_id="wf-par-skip", worker_id="w")
+    assert j is not None
+    # Prefer failing the boom step; if we got keep first, ack and lease again.
+    if j.payload.get("step_name") == "keep":
+        _ack(queue, j, "w", result={"ok": True})
+        j = queue.lease(tenant_id="wf-par-skip", worker_id="w")
+        assert j is not None
+    assert j.payload.get("step_name") == "fail_me"
+    _nack(queue, j, "w", error="boom", requeue=True)
+
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-par-skip")
+    forwards = {s.name: s for s in steps if s.direction == "forward"}
+    # Sibling either completed (if we acked keep first) or skipped if still pending.
+    assert forwards["fail_me"].status == WorkflowStepStatus.FAILED.value
+    if "keep" in forwards and forwards["keep"].status == WorkflowStepStatus.SKIPPED.value:
+        # Unstarted path: only setup needs compensate (if defined and completed).
+        c = queue.lease(tenant_id="wf-par-skip", worker_id="w")
+        assert c is not None
+        assert c.payload.get("step_name") == "setup"
+        _ack(queue, c, "w")
+    else:
+        # keep completed before fail: compensate keep then setup.
+        for expected in ("keep", "setup"):
+            c = queue.lease(tenant_id="wf-par-skip", worker_id="w")
+            assert c is not None
+            assert c.payload.get("direction") == "compensate"
+            assert c.payload.get("step_name") == expected
+            _ack(queue, c, "w")
+
+    done = queue.get_workflow(run.id, tenant_id="wf-par-skip")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+
+
 def test_workflow_compensation_does_not_redrive_healthy_pending_job(queue: JobQueue):
     """Even if step_run is wrongly marked running, pending job is not redriven."""
     run = queue.start_workflow(

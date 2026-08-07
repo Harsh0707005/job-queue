@@ -1,9 +1,11 @@
 """Multi-step saga workflows with reverse-order compensation.
 
-Each step is a normal queue job (single-worker lease). On terminal forward
-failure the orchestrator enqueues compensate jobs for completed steps in
-reverse order. Durable step_run rows + unique (run, index, direction) prevent
-double compensation under reclaim or dual coordinators.
+Each step is a normal queue job (single-worker lease). Workflows may be linear
+or include ``type: parallel`` branch blocks that fan-out and join. On terminal
+forward failure the orchestrator settles in-flight sibling branches (does not
+kill workers mid-step), then enqueues compensate jobs for completed steps in
+reverse step order. Durable step_run rows + unique (run, index, direction)
+prevent double compensation under reclaim or dual coordinators.
 """
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ class WorkflowsMixin:
             raise ValueError("steps must be a non-empty list")
         if int(max_compensate_retries) < 0:
             raise ValueError("max_compensate_retries must be >= 0")
-        normalized = [self._normalize_step_def(s, i) for i, s in enumerate(steps)]
+        normalized = self._expand_and_normalize_steps(steps)
         now = _utcnow()
         rid = run_id or uuid4()
         with transaction(self._pool) as conn:
@@ -90,13 +92,12 @@ class WorkflowsMixin:
                     now,
                 ),
             )
-            self._create_and_enqueue_step(
+            # Fan-out: enqueue every root step (empty depends_on).
+            self._enqueue_ready_forward_steps(
                 conn,
                 run_id=rid,
                 tenant_id=tenant_id,
                 steps_def=normalized,
-                step_index=0,
-                direction=WorkflowStepDirection.FORWARD.value,
                 queue_name=queue_name,
                 max_attempts=max_attempts,
                 visibility_timeout_seconds=visibility_timeout_seconds,
@@ -452,8 +453,61 @@ class WorkflowsMixin:
             import json
 
             steps_def = json.loads(steps_def)
-        next_idx = int(step["step_index"]) + 1
-        if next_idx >= len(steps_def):
+        idx = int(step["step_index"])
+        conn.execute(
+            """
+            UPDATE workflow_runs
+            SET current_index = GREATEST(current_index, %s),
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (idx + 1, now, run["id"]),
+        )
+
+        job = conn.execute(
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+            (step["job_id"],),
+        ).fetchone()
+        qn = job["queue_name"] if job else "default"
+        ma = int(job["max_attempts"]) if job else 3
+        vt = int(job["visibility_timeout_seconds"]) if job else 30
+
+        # Sibling completed while run is already compensating: do not fan-out;
+        # wait for other in-flight forwards, then undo completed work.
+        if run["status"] == WorkflowRunStatus.COMPENSATING.value:
+            self._try_start_compensate_if_settled(
+                conn,
+                run=run,
+                steps_def=steps_def,
+                queue_name=qn,
+                max_attempts=ma,
+                visibility_timeout_seconds=vt,
+                now=now,
+            )
+            return
+
+        self._enqueue_ready_forward_steps(
+            conn,
+            run_id=run["id"],
+            tenant_id=run["tenant_id"],
+            steps_def=steps_def,
+            queue_name=qn,
+            max_attempts=ma,
+            visibility_timeout_seconds=vt,
+            now=now,
+        )
+
+        completed_n = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'forward'
+              AND status = %s
+            """,
+            (run["id"], WorkflowStepStatus.COMPLETED.value),
+        ).fetchone()
+        if completed_n and int(completed_n["n"]) >= len(steps_def):
             conn.execute(
                 """
                 UPDATE workflow_runs
@@ -462,43 +516,17 @@ class WorkflowsMixin:
                     completed_at = %s,
                     updated_at = %s
                 WHERE id = %s
+                  AND status = %s
                 """,
                 (
                     WorkflowRunStatus.COMPLETED.value,
-                    next_idx,
+                    len(steps_def),
                     now,
                     now,
                     run["id"],
+                    WorkflowRunStatus.RUNNING.value,
                 ),
             )
-            return
-        conn.execute(
-            """
-            UPDATE workflow_runs
-            SET current_index = %s, updated_at = %s
-            WHERE id = %s
-            """,
-            (next_idx, now, run["id"]),
-        )
-        # Inherit job knobs from the completed step job when present.
-        job = conn.execute(
-            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-            (step["job_id"],),
-        ).fetchone()
-        self._create_and_enqueue_step(
-            conn,
-            run_id=run["id"],
-            tenant_id=run["tenant_id"],
-            steps_def=steps_def,
-            step_index=next_idx,
-            direction=WorkflowStepDirection.FORWARD.value,
-            queue_name=job["queue_name"] if job else "default",
-            max_attempts=int(job["max_attempts"]) if job else 3,
-            visibility_timeout_seconds=(
-                int(job["visibility_timeout_seconds"]) if job else 30
-            ),
-            now=now,
-        )
 
     def _fail_forward_step(
         self,
@@ -524,6 +552,39 @@ class WorkflowsMixin:
             ),
         )
         fail_idx = int(step["step_index"])
+        steps_def = run["steps_def"]
+        if isinstance(steps_def, str):
+            import json
+
+            steps_def = json.loads(steps_def)
+
+        job = conn.execute(
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+            (step["job_id"],),
+        ).fetchone()
+        qn = job["queue_name"] if job else "default"
+        ma = int(job["max_attempts"]) if job else 3
+        vt = int(job["visibility_timeout_seconds"]) if job else 30
+
+        # Already compensating (sibling failed earlier): settle then compensate.
+        if run["status"] == WorkflowRunStatus.COMPENSATING.value:
+            self._try_start_compensate_if_settled(
+                conn,
+                run=run,
+                steps_def=steps_def,
+                queue_name=qn,
+                max_attempts=ma,
+                visibility_timeout_seconds=vt,
+                now=now,
+            )
+            return
+        if run["status"] in (
+            WorkflowRunStatus.FAILED.value,
+            WorkflowRunStatus.COMPLETED.value,
+            WorkflowRunStatus.CANCELLED.value,
+        ):
+            return
+
         conn.execute(
             """
             UPDATE workflow_runs
@@ -541,28 +602,234 @@ class WorkflowsMixin:
                 run["id"],
             ),
         )
-        steps_def = run["steps_def"]
-        if isinstance(steps_def, str):
-            import json
+        # Refresh local status for settle helpers.
+        run = dict(run)
+        run["status"] = WorkflowRunStatus.COMPENSATING.value
+        run["fail_step_index"] = fail_idx
 
-            steps_def = json.loads(steps_def)
+        # Cancel unstarted siblings only — never interrupt a leased worker mid-step.
+        self._cancel_unstarted_forward_siblings(
+            conn, run=run, failed_step_id=step["id"], now=now
+        )
+        self._try_start_compensate_if_settled(
+            conn,
+            run=run,
+            steps_def=steps_def,
+            queue_name=qn,
+            max_attempts=ma,
+            visibility_timeout_seconds=vt,
+            now=now,
+        )
 
-        # Build reverse compensate chain for completed forwards only.
-        # Enqueue highest-index compensate first; others wait until prior acks.
-        to_compensate: list[int] = []
-        for i in range(fail_idx - 1, -1, -1):
-            completed = conn.execute(
+    def _enqueue_ready_forward_steps(
+        self,
+        conn: Any,
+        *,
+        run_id: UUID,
+        tenant_id: str,
+        steps_def: list[dict[str, Any]],
+        queue_name: str,
+        max_attempts: int,
+        visibility_timeout_seconds: int,
+        now: Any,
+    ) -> int:
+        """Enqueue every forward step whose dependencies are all completed."""
+        completed = {
+            int(r["step_index"])
+            for r in conn.execute(
                 """
-                SELECT id, status FROM workflow_step_runs
-                WHERE run_id = %s AND step_index = %s AND direction = 'forward'
+                SELECT step_index
+                FROM workflow_step_runs
+                WHERE run_id = %s
+                  AND direction = 'forward'
+                  AND status = %s
                 """,
-                (run["id"], i),
-            ).fetchone()
-            if completed is None or completed["status"] != WorkflowStepStatus.COMPLETED.value:
+                (run_id, WorkflowStepStatus.COMPLETED.value),
+            ).fetchall()
+        }
+        existing = {
+            int(r["step_index"])
+            for r in conn.execute(
+                """
+                SELECT step_index
+                FROM workflow_step_runs
+                WHERE run_id = %s AND direction = 'forward'
+                """,
+                (run_id,),
+            ).fetchall()
+        }
+        n = 0
+        for i, sdef in enumerate(steps_def):
+            if i in existing:
                 continue
+            deps = [int(d) for d in (sdef.get("depends_on_indices") or [])]
+            if any(d not in completed for d in deps):
+                continue
+            self._create_and_enqueue_step(
+                conn,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                steps_def=steps_def,
+                step_index=i,
+                direction=WorkflowStepDirection.FORWARD.value,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
+            n += 1
+        return n
+
+    def _cancel_unstarted_forward_siblings(
+        self,
+        conn: Any,
+        *,
+        run: dict[str, Any],
+        failed_step_id: Any,
+        now: Any,
+    ) -> int:
+        """Skip pending (not leased) sibling forwards; leave in-flight alone."""
+        rows = conn.execute(
+            f"""
+            SELECT {_STEP_COLUMNS}
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'forward'
+              AND status IN (%s, %s)
+              AND id <> %s
+            FOR UPDATE
+            """,
+            (
+                run["id"],
+                WorkflowStepStatus.PENDING.value,
+                WorkflowStepStatus.RUNNING.value,
+                failed_step_id,
+            ),
+        ).fetchall()
+        cancelled = 0
+        for srow in rows:
+            job = None
+            if srow.get("job_id") is not None:
+                job = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s FOR UPDATE",
+                    (srow["job_id"],),
+                ).fetchone()
+            # In-flight lease: worker keeps running; settle later on its terminal.
+            if job is not None and job["status"] == JobStatus.LEASED.value:
+                continue
+            if srow["status"] == WorkflowStepStatus.RUNNING.value and (
+                job is None or job["status"] == JobStatus.LEASED.value
+            ):
+                continue
+            if job is not None and job["status"] == JobStatus.PENDING.value:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = %s,
+                        leased_by = NULL,
+                        lease_token = NULL,
+                        completed_at = %s,
+                        updated_at = %s,
+                        last_error = COALESCE(last_error, %s)
+                    WHERE id = %s
+                      AND status = %s
+                    """,
+                    (
+                        JobStatus.CANCELLED.value,
+                        now,
+                        now,
+                        "workflow sibling failed; unstarted branch cancelled",
+                        srow["job_id"],
+                        JobStatus.PENDING.value,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE workflow_step_runs
+                SET status = %s,
+                    error = %s,
+                    completed_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                """,
+                (
+                    WorkflowStepStatus.SKIPPED.value,
+                    "cancelled: sibling branch failed",
+                    now,
+                    now,
+                    srow["id"],
+                ),
+            )
+            cancelled += 1
+        return cancelled
+
+    def _active_forward_work(self, conn: Any, *, run_id: UUID) -> bool:
+        """True if any forward step still has claimable/in-flight work."""
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM workflow_step_runs s
+            JOIN jobs j ON j.id = s.job_id
+            WHERE s.run_id = %s
+              AND s.direction = 'forward'
+              AND s.status IN ('pending', 'running')
+              AND j.status IN ('pending', 'leased')
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        return row is not None
+
+    def _try_start_compensate_if_settled(
+        self,
+        conn: Any,
+        *,
+        run: dict[str, Any],
+        steps_def: list[dict[str, Any]],
+        queue_name: str,
+        max_attempts: int,
+        visibility_timeout_seconds: int,
+        now: Any,
+    ) -> bool:
+        """When no forward work remains, begin reverse compensate of completed.
+
+        In-flight sibling branches are allowed to finish their current lease
+        (no mid-step kill); only then does undo start.
+        """
+        if self._active_forward_work(conn, run_id=run["id"]):
+            return False
+
+        already = conn.execute(
+            """
+            SELECT 1 FROM workflow_step_runs
+            WHERE run_id = %s AND direction = 'compensate'
+            LIMIT 1
+            """,
+            (run["id"],),
+        ).fetchone()
+        if already is not None:
+            # Chain already materialised — only redrive/advance (avoid re-entry
+            # into this method via _ensure_compensate_progress).
+            return False
+
+        # All completed forwards (including siblings that finished after fail).
+        completed_rows = conn.execute(
+            """
+            SELECT step_index, name
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'forward'
+              AND status = %s
+            ORDER BY step_index DESC
+            """,
+            (run["id"], WorkflowStepStatus.COMPLETED.value),
+        ).fetchall()
+
+        to_compensate: list[int] = []
+        for crow in completed_rows:
+            i = int(crow["step_index"])
             sdef = steps_def[i] if i < len(steps_def) else {}
             if not sdef.get("compensate"):
-                # No undo defined — record skipped.
                 conn.execute(
                     f"""
                     INSERT INTO workflow_step_runs (
@@ -581,7 +848,7 @@ class WorkflowsMixin:
                         run["id"],
                         run["tenant_id"],
                         i,
-                        str(sdef.get("name") or f"step-{i}"),
+                        str(sdef.get("name") or crow["name"] or f"step-{i}"),
                         WorkflowStepDirection.COMPENSATE.value,
                         WorkflowStepStatus.SKIPPED.value,
                         f"{run['id']}:{i}:compensate",
@@ -600,16 +867,18 @@ class WorkflowsMixin:
                 UPDATE workflow_runs
                 SET status = %s, completed_at = %s, updated_at = %s
                 WHERE id = %s
+                  AND status = %s
                 """,
-                (WorkflowRunStatus.FAILED.value, now, now, run["id"]),
+                (
+                    WorkflowRunStatus.FAILED.value,
+                    now,
+                    now,
+                    run["id"],
+                    WorkflowRunStatus.COMPENSATING.value,
+                ),
             )
-            return
+            return True
 
-        # Create pending compensate step_runs for all; enqueue only first.
-        job = conn.execute(
-            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-            (step["job_id"],),
-        ).fetchone()
         first = True
         for i in to_compensate:
             if first:
@@ -620,16 +889,13 @@ class WorkflowsMixin:
                     steps_def=steps_def,
                     step_index=i,
                     direction=WorkflowStepDirection.COMPENSATE.value,
-                    queue_name=job["queue_name"] if job else "default",
-                    max_attempts=int(job["max_attempts"]) if job else 3,
-                    visibility_timeout_seconds=(
-                        int(job["visibility_timeout_seconds"]) if job else 30
-                    ),
+                    queue_name=queue_name,
+                    max_attempts=max_attempts,
+                    visibility_timeout_seconds=visibility_timeout_seconds,
                     now=now,
                 )
                 first = False
             else:
-                # Placeholder pending without job until previous compensate acks.
                 sdef = steps_def[i]
                 conn.execute(
                     f"""
@@ -657,6 +923,7 @@ class WorkflowsMixin:
                         now,
                     ),
                 )
+        return True
 
     def _fail_or_redrive_compensate_step(
         self,
@@ -869,7 +1136,38 @@ class WorkflowsMixin:
         A step with ``job_id`` pointing at a *pending* or *leased* job is
         healthy (not stuck), even if step status is still ``pending`` (job
         enqueued but not yet claimed).
+
+        While sibling forward branches are still leased, do nothing — wait for
+        natural terminal (never kill mid-step).
         """
+        if self._active_forward_work(conn, run_id=run["id"]):
+            return False
+
+        # Compensate chain not started yet (waiting on settle) → begin now.
+        any_comp = conn.execute(
+            """
+            SELECT 1 FROM workflow_step_runs
+            WHERE run_id = %s AND direction = 'compensate'
+            LIMIT 1
+            """,
+            (run["id"],),
+        ).fetchone()
+        if any_comp is None:
+            steps_def = run["steps_def"]
+            if isinstance(steps_def, str):
+                import json
+
+                steps_def = json.loads(steps_def)
+            return self._try_start_compensate_if_settled(
+                conn,
+                run=run,
+                steps_def=steps_def,
+                queue_name="default",
+                max_attempts=3,
+                visibility_timeout_seconds=30,
+                now=now,
+            )
+
         active = conn.execute(
             """
             SELECT 1
@@ -1236,23 +1534,154 @@ class WorkflowsMixin:
             ),
         )
 
+    @classmethod
+    def _expand_and_normalize_steps(
+        cls, raw_steps: Sequence[Any]
+    ) -> list[dict[str, Any]]:
+        """Flatten linear + parallel branch blocks into a DAG of leaf steps.
+
+        Parallel block form::
+
+            {
+              "type": "parallel",  # or kind: "parallel"
+              "name": "fan",
+              "branches": [
+                [{"name": "a1", ...}, {"name": "a2", ...}],
+                [{"name": "b1", ...}],
+              ],
+            }
+
+        Each branch runs concurrently after the previous wave; the next
+        sequential step depends on every branch tail (join).
+        """
+        if not raw_steps:
+            raise ValueError("steps must be a non-empty list")
+        flat: list[dict[str, Any]] = []
+        # Indices of the previous wave that subsequent steps depend on.
+        prev_wave: list[int] = []
+
+        def _is_parallel(item: Any) -> bool:
+            if not isinstance(item, dict):
+                return False
+            t = str(item.get("type") or item.get("kind") or "").strip().lower()
+            return t == "parallel" or isinstance(item.get("branches"), list)
+
+        def _append_leaf(
+            raw: Any,
+            *,
+            depends: list[int],
+            parallel_group: str | None = None,
+            branch_id: int | None = None,
+            path: str,
+        ) -> int:
+            if _is_parallel(raw):
+                raise ValueError(f"{path}: nested parallel blocks are not supported")
+            idx = len(flat)
+            leaf = cls._normalize_leaf_step(raw, idx, path=path)
+            leaf["depends_on_indices"] = list(depends)
+            if parallel_group is not None:
+                leaf["parallel_group"] = parallel_group
+            if branch_id is not None:
+                leaf["branch_id"] = int(branch_id)
+            flat.append(leaf)
+            return idx
+
+        for bi, item in enumerate(raw_steps):
+            path = f"steps[{bi}]"
+            if not isinstance(item, dict):
+                raise ValueError(f"{path} must be an object")
+            if _is_parallel(item):
+                branches = item.get("branches")
+                if not isinstance(branches, list) or not branches:
+                    raise ValueError(f"{path}.branches must be a non-empty list")
+                pg = str(item.get("name") or f"parallel-{bi}").strip()
+                tails: list[int] = []
+                for b_i, branch in enumerate(branches):
+                    if not isinstance(branch, list) or not branch:
+                        raise ValueError(
+                            f"{path}.branches[{b_i}] must be a non-empty step list"
+                        )
+                    dep = list(prev_wave)
+                    last: int | None = None
+                    for s_i, sraw in enumerate(branch):
+                        last = _append_leaf(
+                            sraw,
+                            depends=dep if s_i == 0 else [int(last)],  # type: ignore[arg-type]
+                            parallel_group=pg,
+                            branch_id=b_i,
+                            path=f"{path}.branches[{b_i}][{s_i}]",
+                        )
+                        dep = [last]
+                    assert last is not None
+                    tails.append(last)
+                if not tails:
+                    raise ValueError(f"{path}: parallel block produced no steps")
+                prev_wave = tails
+            else:
+                idx = _append_leaf(
+                    item,
+                    depends=list(prev_wave),
+                    path=path,
+                )
+                prev_wave = [idx]
+
+        if not flat:
+            raise ValueError("steps expanded to an empty workflow")
+        # Resolve optional depends_on by name (advanced); indices win if both set.
+        by_name = {s["name"]: i for i, s in enumerate(flat)}
+        if len(by_name) != len(flat):
+            # Duplicate names only illegal when referenced by depends_on.
+            pass
+        for i, s in enumerate(flat):
+            if s.get("depends_on_indices") is not None and "depends_on" not in s:
+                # Already set by expansion; drop any raw name list residue.
+                s.pop("depends_on", None)
+                continue
+            names = s.pop("depends_on", None)
+            if names is None:
+                s.setdefault("depends_on_indices", [])
+                continue
+            if not isinstance(names, list):
+                raise ValueError(f"steps[{i}].depends_on must be a list of names")
+            deps: list[int] = []
+            for n in names:
+                key = str(n).strip()
+                if key not in by_name:
+                    raise ValueError(
+                        f"steps[{i}].depends_on unknown step name {key!r}"
+                    )
+                di = by_name[key]
+                if di >= i:
+                    raise ValueError(
+                        f"steps[{i}].depends_on {key!r} must precede the step"
+                    )
+                deps.append(di)
+            s["depends_on_indices"] = deps
+        return flat
+
     @staticmethod
-    def _normalize_step_def(raw: Any, index: int) -> dict[str, Any]:
+    def _normalize_leaf_step(raw: Any, index: int, *, path: str = "") -> dict[str, Any]:
+        label = path or f"steps[{index}]"
         if not isinstance(raw, dict):
-            raise ValueError(f"steps[{index}] must be an object")
+            raise ValueError(f"{label} must be an object")
+        if str(raw.get("type") or "").strip().lower() == "parallel":
+            raise ValueError(f"{label}: unexpected parallel marker on leaf")
         name = str(raw.get("name") or f"step-{index}").strip()
         if not name:
-            raise ValueError(f"steps[{index}].name is required")
+            raise ValueError(f"{label}.name is required")
         kind = str(raw.get("kind") or "effect").strip()
+        if kind == "parallel":
+            raise ValueError(f"{label}: kind=parallel requires branches")
         payload = raw.get("payload")
         if payload is None:
             payload = {}
         if not isinstance(payload, dict):
-            raise ValueError(f"steps[{index}].payload must be an object")
+            raise ValueError(f"{label}.payload must be an object")
         out: dict[str, Any] = {
             "name": name,
             "kind": kind,
             "payload": dict(payload),
+            "depends_on_indices": [],
         }
         if raw.get("fail"):
             out["fail"] = True
@@ -1261,12 +1690,20 @@ class WorkflowsMixin:
         comp = raw.get("compensate")
         if comp is not None:
             if not isinstance(comp, dict):
-                raise ValueError(f"steps[{index}].compensate must be an object")
+                raise ValueError(f"{label}.compensate must be an object")
             out["compensate"] = {
                 "kind": str(comp.get("kind") or "effect").strip(),
                 "payload": dict(comp.get("payload") or {}),
             }
+        # Preserve explicit name-based depends_on for post-pass resolution.
+        if raw.get("depends_on") is not None:
+            out["depends_on"] = raw["depends_on"]
         return out
+
+    @staticmethod
+    def _normalize_step_def(raw: Any, index: int) -> dict[str, Any]:
+        """Backward-compatible single-leaf normalizer."""
+        return WorkflowsMixin._normalize_leaf_step(raw, index)
 
     @staticmethod
     def _row_to_workflow_run(row: dict[str, Any]) -> WorkflowRun:

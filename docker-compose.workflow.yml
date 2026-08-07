@@ -127,9 +127,11 @@ services:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       EFFECT_SINK_URL: http://effect-sink:8091
       TENANTS: "6"
-      HAPPY_PER_TENANT: "4"
-      FAIL_PER_TENANT: "3"
-      MAX_WALL_SECONDS: "300"
+      HAPPY_PER_TENANT: "3"
+      FAIL_PER_TENANT: "2"
+      PARALLEL_HAPPY_PER_TENANT: "2"
+      PARALLEL_FAIL_PER_TENANT: "2"
+      MAX_WALL_SECONDS: "360"
       RESULTS_PATH: /results/workflow-fleet.json
       LOAD_LABEL: workflow-fleet
       LOG_LEVEL: INFO

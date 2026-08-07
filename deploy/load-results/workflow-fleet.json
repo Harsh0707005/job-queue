@@ -1,18 +1,20 @@
 {
   "ok": true,
   "label": "workflow-fleet",
-  "total_runs": 42,
-  "completed": 24,
-  "failed": 18,
+  "total_runs": 54,
+  "completed": 30,
+  "failed": 24,
   "pending": 0,
-  "expect_happy": 24,
-  "expect_fail": 18,
+  "expect_happy": 30,
+  "expect_fail": 24,
   "ok_counts": true,
   "ok_compensate_order": true,
+  "ok_parallel_fail": true,
+  "ok_parallel_happy": true,
   "ok_isolation": true,
   "ok_sink": true,
   "ok_no_stuck": true,
-  "ok_kill_exercised": true,
-  "sink_unique_effects": 144,
-  "sink_total_posts": 144
+  "ok_kill_exercised": false,
+  "sink_unique_effects": 186,
+  "sink_total_posts": 186
 }
