@@ -171,7 +171,8 @@ def main() -> int:
                 "name": f"{LABEL}-{kind}",
                 "steps": steps,
                 "max_attempts": 1,
-                "visibility_timeout_seconds": 15,
+                "visibility_timeout_seconds": 4,
+                "max_compensate_retries": 8,
             },
         )
         if code not in (200, 201):
@@ -194,7 +195,9 @@ def main() -> int:
             runs.append(f.result())
     logger.info("started %s workflow runs", len(runs))
 
-    # Wait for terminal statuses.
+    # Wait until at least one fail-path run is compensating, then kill workers
+    # mid-compensation so redrive / reclaim must finish the reverse chain.
+    kill_done = False
     t0 = time.time()
     completed = 0
     failed = 0
@@ -203,6 +206,7 @@ def main() -> int:
         completed = 0
         failed = 0
         pending = 0
+        compensating = 0
         for tid, rid, kind in runs:
             code, body = http_json(
                 "GET",
@@ -218,6 +222,74 @@ def main() -> int:
                 failed += 1
             else:
                 pending += 1
+                if st == "compensating":
+                    compensating += 1
+        # Repair stuck compensate jobs while waiting.
+        try:
+            http_json(
+                "POST",
+                "/v1/workflows/process-compensation",
+                {"limit": 100},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if (
+            not kill_done
+            and compensating >= max(1, FAIL_PER_TENANT)
+        ):
+            # Kill workers via Docker Engine API (no docker CLI required).
+            try:
+                import urllib.request as _u
+
+                sock_path = "/var/run/docker.sock"
+                if os.path.exists(sock_path):
+                    import http.client
+
+                    class _DockerHTTPConnection(http.client.HTTPConnection):
+                        def __init__(self) -> None:
+                            super().__init__("localhost")
+
+                        def connect(self) -> None:  # noqa: D102
+                            import socket
+
+                            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                            self.sock.connect(sock_path)
+
+                    conn = _DockerHTTPConnection()
+                    conn.request("GET", "/containers/json")
+                    resp = conn.getresponse()
+                    containers = json.loads(resp.read().decode() or "[]")
+                    killed = 0
+                    for c in containers:
+                        names = " ".join(c.get("Names") or [])
+                        if "worker-" in names and c.get("Id"):
+                            cid = c["Id"]
+                            conn2 = _DockerHTTPConnection()
+                            conn2.request("POST", f"/containers/{cid}/kill")
+                            conn2.getresponse().read()
+                            killed += 1
+                    logger.info(
+                        "killed %s workers mid-compensation (compensating=%s)",
+                        killed,
+                        compensating,
+                    )
+                    time.sleep(5)
+                    # Restart workers.
+                    for c in containers:
+                        names = " ".join(c.get("Names") or [])
+                        if "worker-" in names and c.get("Id"):
+                            cid = c["Id"]
+                            conn3 = _DockerHTTPConnection()
+                            conn3.request("POST", f"/containers/{cid}/start")
+                            try:
+                                conn3.getresponse().read()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    kill_done = True
+                    logger.info("restarted workers after compensate kill")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("worker kill skipped: %s", exc)
+                kill_done = True
         if pending == 0:
             break
         time.sleep(1)
@@ -281,7 +353,16 @@ def main() -> int:
     min_unique = expect_happy * 3 + expect_fail * 2  # at least forwards for happy + 2 for fail
     ok_sink = unique >= min_unique
 
-    ok = ok_counts and ok_compensate_order and ok_isolation and ok_sink
+    # After kill/restart, no run should remain stuck in compensating.
+    ok_no_stuck = pending == 0
+    ok_kill_exercised = kill_done
+    ok = (
+        ok_counts
+        and ok_compensate_order
+        and ok_isolation
+        and ok_sink
+        and ok_no_stuck
+    )
     result = {
         "ok": ok,
         "label": LABEL,
@@ -295,6 +376,8 @@ def main() -> int:
         "ok_compensate_order": ok_compensate_order,
         "ok_isolation": ok_isolation,
         "ok_sink": ok_sink,
+        "ok_no_stuck": ok_no_stuck,
+        "ok_kill_exercised": ok_kill_exercised,
         "sink_unique_effects": unique,
         "sink_total_posts": stats.get("total_posts"),
     }

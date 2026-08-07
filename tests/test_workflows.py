@@ -208,6 +208,79 @@ def test_workflow_compensates_on_lease_expiry_dead(queue: JobQueue):
     assert [s.name for s in comps] == ["a"]
 
 
+def test_workflow_compensate_redrive_after_kill(queue: JobQueue):
+    """Killed compensate worker must not leave the run stuck compensating."""
+    import time
+
+    run = queue.start_workflow(
+        tenant_id="wf-comp-kill",
+        max_attempts=1,
+        visibility_timeout_seconds=1,
+        max_compensate_retries=3,
+        steps=[
+            {
+                "name": "a",
+                "payload": {"op": "a"},
+                "compensate": {"payload": {"op": "undo_a"}},
+            },
+            {
+                "name": "b",
+                "payload": {"op": "b"},
+                "compensate": {"payload": {"op": "undo_b"}},
+            },
+            {"name": "c", "payload": {"op": "c"}, "fail": True},
+        ],
+    )
+    _drive_step(queue, "wf-comp-kill")  # a
+    _drive_step(queue, "wf-comp-kill")  # b
+    _drive_step(queue, "wf-comp-kill", fail=True)  # c → compensating
+
+    # Lease first compensate (b) and crash (abandon lease).
+    jc = queue.lease(
+        tenant_id="wf-comp-kill",
+        worker_id="comp-doomed",
+        visibility_timeout_seconds=1,
+    )
+    assert jc is not None
+    assert jc.payload.get("direction") == "compensate"
+    assert jc.payload.get("step_name") == "b"
+    time.sleep(1.3)
+    # Dead-letter + redrive creates a fresh compensate job (same idempotency).
+    n = queue.process_workflow_compensation(tenant_id="wf-comp-kill", limit=20)
+    assert n >= 0
+    # Either process redrive or lease maintenance path enqueued a new job.
+    j2 = queue.lease(tenant_id="wf-comp-kill", worker_id="comp-ok")
+    if j2 is None:
+        queue.process_workflow_compensation(tenant_id="wf-comp-kill", limit=20)
+        j2 = queue.lease(tenant_id="wf-comp-kill", worker_id="comp-ok")
+    assert j2 is not None
+    assert j2.payload.get("direction") == "compensate"
+    assert j2.payload.get("step_name") == "b"
+    assert j2.payload.get("idempotency_key") == jc.payload.get("idempotency_key")
+    _ack(queue, j2, "comp-ok", result={"undid": "b"})
+
+    # Next: compensate a.
+    j3 = queue.lease(tenant_id="wf-comp-kill", worker_id="comp-ok")
+    assert j3 is not None
+    assert j3.payload.get("step_name") == "a"
+    _ack(queue, j3, "comp-ok", result={"undid": "a"})
+
+    done = queue.get_workflow(run.id, tenant_id="wf-comp-kill")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-comp-kill")
+    comps = {
+        s.name: s
+        for s in steps
+        if s.direction == "compensate"
+        and s.status == WorkflowStepStatus.COMPENSATED.value
+    }
+    assert set(comps) == {"a", "b"}
+    # At least one redrive was recorded on b.
+    b_steps = [s for s in steps if s.direction == "compensate" and s.name == "b"]
+    assert b_steps and b_steps[0].retry_count >= 1
+
+
 def test_workflow_compensates_on_max_runtime(queue: JobQueue):
     """Max-runtime force-release to dead must start reverse compensation."""
     import time

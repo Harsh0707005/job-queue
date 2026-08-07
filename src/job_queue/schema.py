@@ -838,13 +838,17 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     current_index       INTEGER NOT NULL DEFAULT 0,
     fail_step_index     INTEGER,
     fail_reason         TEXT,
+    max_compensate_retries INTEGER NOT NULL DEFAULT 5,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at        TIMESTAMPTZ,
     CONSTRAINT workflow_runs_status_check CHECK (
         status IN ('running', 'compensating', 'completed', 'failed', 'cancelled')
     ),
-    CONSTRAINT workflow_runs_current_index_check CHECK (current_index >= 0)
+    CONSTRAINT workflow_runs_current_index_check CHECK (current_index >= 0),
+    CONSTRAINT workflow_runs_max_comp_retries_check CHECK (
+        max_compensate_retries >= 0
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_tenant_created
@@ -865,6 +869,7 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     result              JSONB,
     error               TEXT,
     idempotency_key     TEXT NOT NULL,
+    retry_count         INTEGER NOT NULL DEFAULT 0,
     started_at          TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -879,8 +884,14 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
         )
     ),
     CONSTRAINT workflow_step_runs_index_check CHECK (step_index >= 0),
+    CONSTRAINT workflow_step_runs_retry_check CHECK (retry_count >= 0),
     CONSTRAINT workflow_step_runs_unique_dir UNIQUE (run_id, step_index, direction)
 );
+
+ALTER TABLE workflow_step_runs ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+
+-- Per-run cap for redriving failed/killed compensate jobs (not job max_attempts).
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS max_compensate_retries INTEGER NOT NULL DEFAULT 5;
 
 CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_run
     ON workflow_step_runs (run_id, step_index, direction);
@@ -891,5 +902,9 @@ CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_tenant_run
 CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_job
     ON workflow_step_runs (job_id)
     WHERE job_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_compensating
+    ON workflow_runs (status, updated_at)
+    WHERE status = 'compensating';
 
 """

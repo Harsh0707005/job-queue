@@ -9,7 +9,7 @@ x-worker: &worker_env
   COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
   EFFECT_SINK_URL: http://effect-sink:8091
   POLL_INTERVAL: "0.08"
-  VISIBILITY_TIMEOUT: "8"
+  VISIBILITY_TIMEOUT: "3"
   BATCH_SIZE: "8"
   LOG_LEVEL: WARNING
 
@@ -129,12 +129,13 @@ services:
       TENANTS: "6"
       HAPPY_PER_TENANT: "4"
       FAIL_PER_TENANT: "3"
-      MAX_WALL_SECONDS: "240"
+      MAX_WALL_SECONDS: "300"
       RESULTS_PATH: /results/workflow-fleet.json
       LOAD_LABEL: workflow-fleet
       LOG_LEVEL: INFO
     volumes:
       - ./deploy/load-results:/results
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       coordinator-1:
         condition: service_healthy

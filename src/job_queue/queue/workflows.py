@@ -28,14 +28,18 @@ WORKFLOW_STEP_KIND = "workflow.step"
 
 _RUN_COLUMNS = """
     id, tenant_id, name, status, steps_def, current_index,
-    fail_step_index, fail_reason, created_at, updated_at, completed_at
+    fail_step_index, fail_reason, max_compensate_retries,
+    created_at, updated_at, completed_at
 """
 
 _STEP_COLUMNS = """
     id, run_id, tenant_id, step_index, name, direction, status, job_id,
-    result, error, idempotency_key, started_at, completed_at,
+    result, error, idempotency_key, retry_count, started_at, completed_at,
     created_at, updated_at
 """
+
+# Default redrives when a compensate job dies (crash / timeout / nack).
+DEFAULT_MAX_COMPENSATE_RETRIES = 5
 
 
 class WorkflowsMixin:
@@ -48,6 +52,7 @@ class WorkflowsMixin:
         queue_name: str = "default",
         max_attempts: int = 3,
         visibility_timeout_seconds: int = 30,
+        max_compensate_retries: int = DEFAULT_MAX_COMPENSATE_RETRIES,
         run_id: UUID | None = None,
     ) -> WorkflowRun:
         """Start a multi-step workflow and enqueue the first forward step job."""
@@ -56,6 +61,8 @@ class WorkflowsMixin:
         tenant_id = str(tenant_id).strip()
         if not steps or not isinstance(steps, list):
             raise ValueError("steps must be a non-empty list")
+        if int(max_compensate_retries) < 0:
+            raise ValueError("max_compensate_retries must be >= 0")
         normalized = [self._normalize_step_def(s, i) for i, s in enumerate(steps)]
         now = _utcnow()
         rid = run_id or uuid4()
@@ -64,11 +71,12 @@ class WorkflowsMixin:
                 f"""
                 INSERT INTO workflow_runs (
                     id, tenant_id, name, status, steps_def, current_index,
-                    fail_step_index, fail_reason, created_at, updated_at,
-                    completed_at
+                    fail_step_index, fail_reason, max_compensate_retries,
+                    created_at, updated_at, completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, 0,
-                    NULL, NULL, %s, %s, NULL
+                    NULL, NULL, %s,
+                    %s, %s, NULL
                 )
                 """,
                 (
@@ -77,6 +85,7 @@ class WorkflowsMixin:
                     str(name).strip() if name else None,
                     WorkflowRunStatus.RUNNING.value,
                     Jsonb(normalized),
+                    int(max_compensate_retries),
                     now,
                     now,
                 ),
@@ -214,38 +223,120 @@ class WorkflowsMixin:
                     conn, run=run, step=step, error=error, now=ts
                 )
             else:
-                # Compensate job failed terminally — mark failed and end run.
-                conn.execute(
-                    """
-                    UPDATE workflow_step_runs
-                    SET status = %s, error = %s, completed_at = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        WorkflowStepStatus.FAILED.value,
-                        error or "compensate failed",
-                        ts,
-                        ts,
-                        step["id"],
-                    ),
+                # Compensate job died (nack/dead, lease expiry, max-runtime).
+                # Redrive with a new job + same idempotency key so undo is not
+                # stuck in compensating; after retry budget, continue reverse chain.
+                self._fail_or_redrive_compensate_step(
+                    conn,
+                    run=run,
+                    step=step,
+                    error=error or "compensate failed",
+                    now=ts,
                 )
-                conn.execute(
-                    """
-                    UPDATE workflow_runs
-                    SET status = %s,
-                        fail_reason = %s,
-                        completed_at = %s,
-                        updated_at = %s
-                    WHERE id = %s
+
+    def process_workflow_compensation(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 50,
+    ) -> int:
+        """Repair stuck compensating runs (dead compensate jobs, missing next).
+
+        Safe to call from lease maintenance or a soak/scheduler loop. Returns
+        the number of step redrives / chain advances performed.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        now = _utcnow()
+        fixed = 0
+        with transaction(self._pool) as conn:
+            # 1) Compensate step still "running" but job already terminal.
+            params: list[Any] = [
+                WorkflowStepDirection.COMPENSATE.value,
+                WorkflowStepStatus.RUNNING.value,
+                JobStatus.DEAD.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+                JobStatus.COMPLETED.value,
+            ]
+            tenant_clause = ""
+            if tenant_id is not None:
+                tenant_clause = "AND s.tenant_id = %s"
+                params.append(str(tenant_id).strip())
+            params.append(limit)
+            stuck = conn.execute(
+                f"""
+                SELECT s.id
+                FROM workflow_step_runs s
+                JOIN jobs j ON j.id = s.job_id
+                WHERE s.direction = %s
+                  AND s.status = %s
+                  AND j.status IN (%s, %s, %s, %s)
+                {tenant_clause}
+                ORDER BY s.updated_at ASC
+                LIMIT %s
+                FOR UPDATE OF s SKIP LOCKED
+                """,
+                tuple(params),
+            ).fetchall()
+            for row in stuck:
+                step = conn.execute(
+                    f"""
+                    SELECT {_STEP_COLUMNS}
+                    FROM workflow_step_runs WHERE id = %s FOR UPDATE
                     """,
-                    (
-                        WorkflowRunStatus.FAILED.value,
-                        f"compensate step {step['step_index']} failed: {error}",
-                        ts,
-                        ts,
-                        run["id"],
-                    ),
+                    (row["id"],),
+                ).fetchone()
+                if step is None:
+                    continue
+                run = conn.execute(
+                    f"""
+                    SELECT {_RUN_COLUMNS}
+                    FROM workflow_runs WHERE id = %s FOR UPDATE
+                    """,
+                    (step["run_id"],),
+                ).fetchone()
+                if run is None or run["status"] != WorkflowRunStatus.COMPENSATING.value:
+                    continue
+                job = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                    (step["job_id"],),
+                ).fetchone()
+                err = None
+                if job is not None:
+                    err = job.get("last_error") or f"job ended as {job.get('status')}"
+                self._fail_or_redrive_compensate_step(
+                    conn,
+                    run=run,
+                    step=step,
+                    error=str(err or "compensate job terminal"),
+                    now=now,
                 )
+                fixed += 1
+
+            # 2) Compensating runs with no active claimable work — advance chain.
+            rparams: list[Any] = [WorkflowRunStatus.COMPENSATING.value]
+            rtenant = ""
+            if tenant_id is not None:
+                rtenant = "AND tenant_id = %s"
+                rparams.append(str(tenant_id).strip())
+            rparams.append(max(1, limit - fixed))
+            orphan_runs = conn.execute(
+                f"""
+                SELECT {_RUN_COLUMNS}
+                FROM workflow_runs
+                WHERE status = %s
+                {rtenant}
+                ORDER BY updated_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                tuple(rparams),
+            ).fetchall()
+            for run in orphan_runs:
+                if self._ensure_compensate_progress(conn, run=run, now=now):
+                    fixed += 1
+        return fixed
 
     def _complete_forward_step(
         self,
@@ -393,11 +484,11 @@ class WorkflowsMixin:
                     f"""
                     INSERT INTO workflow_step_runs (
                         id, run_id, tenant_id, step_index, name, direction,
-                        status, job_id, result, error, idempotency_key,
+                        status, job_id, result, error, idempotency_key, retry_count,
                         started_at, completed_at, created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
-                        %s, NULL, NULL, NULL, %s,
+                        %s, NULL, NULL, NULL, %s, 0,
                         %s, %s, %s, %s
                     )
                     ON CONFLICT (run_id, step_index, direction) DO NOTHING
@@ -461,11 +552,11 @@ class WorkflowsMixin:
                     f"""
                     INSERT INTO workflow_step_runs (
                         id, run_id, tenant_id, step_index, name, direction,
-                        status, job_id, result, error, idempotency_key,
+                        status, job_id, result, error, idempotency_key, retry_count,
                         started_at, completed_at, created_at, updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
-                        %s, NULL, NULL, NULL, %s,
+                        %s, NULL, NULL, NULL, %s, 0,
                         NULL, NULL, %s, %s
                     )
                     ON CONFLICT (run_id, step_index, direction) DO NOTHING
@@ -483,6 +574,285 @@ class WorkflowsMixin:
                         now,
                     ),
                 )
+
+    def _fail_or_redrive_compensate_step(
+        self,
+        conn: Any,
+        *,
+        run: dict[str, Any],
+        step: dict[str, Any],
+        error: str,
+        now: Any,
+    ) -> None:
+        """Redrive a killed/failed compensate job or continue reverse chain.
+
+        Same ``idempotency_key`` is reused so external undo stays exactly-once
+        even when a new job is enqueued after worker crash / lease expiry.
+        """
+        if step["status"] in (
+            WorkflowStepStatus.COMPENSATED.value,
+            WorkflowStepStatus.FAILED.value,
+            WorkflowStepStatus.SKIPPED.value,
+        ):
+            return
+        max_retries = int(
+            run.get("max_compensate_retries")
+            if run.get("max_compensate_retries") is not None
+            else DEFAULT_MAX_COMPENSATE_RETRIES
+        )
+        retry = int(step.get("retry_count") or 0)
+        # Inherit knobs from the dead job when present.
+        job = None
+        if step.get("job_id") is not None:
+            job = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (step["job_id"],),
+            ).fetchone()
+        queue_name = job["queue_name"] if job else "default"
+        max_attempts = int(job["max_attempts"]) if job else 3
+        vt = int(job["visibility_timeout_seconds"]) if job else 30
+
+        if retry < max_retries:
+            updated = conn.execute(
+                f"""
+                UPDATE workflow_step_runs
+                SET status = %s,
+                    job_id = NULL,
+                    error = %s,
+                    retry_count = %s,
+                    completed_at = NULL,
+                    updated_at = %s
+                WHERE id = %s
+                  AND status NOT IN ('compensated', 'failed', 'skipped')
+                RETURNING {_STEP_COLUMNS}
+                """,
+                (
+                    WorkflowStepStatus.PENDING.value,
+                    error,
+                    retry + 1,
+                    now,
+                    step["id"],
+                ),
+            ).fetchone()
+            if updated is None:
+                return
+            steps_def = run["steps_def"]
+            if isinstance(steps_def, str):
+                import json
+
+                steps_def = json.loads(steps_def)
+            self._enqueue_job_for_step(
+                conn,
+                run_id=run["id"],
+                tenant_id=run["tenant_id"],
+                step_row=updated,
+                steps_def=steps_def,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=vt,
+                now=now,
+            )
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET updated_at = %s
+                WHERE id = %s AND status = %s
+                """,
+                (now, run["id"], WorkflowRunStatus.COMPENSATING.value),
+            )
+            return
+
+        # Retry budget exhausted — mark this undo failed, continue reverse chain.
+        conn.execute(
+            """
+            UPDATE workflow_step_runs
+            SET status = %s,
+                error = %s,
+                completed_at = %s,
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (
+                WorkflowStepStatus.FAILED.value,
+                f"{error} (after {retry} redrives)",
+                now,
+                now,
+                step["id"],
+            ),
+        )
+        reason = (
+            f"compensate step {step['step_index']} ({step['name']}) failed "
+            f"after {retry} redrives: {error}"
+        )
+        conn.execute(
+            """
+            UPDATE workflow_runs
+            SET fail_reason = COALESCE(fail_reason || '; ', '') || %s,
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (reason, now, run["id"]),
+        )
+        self._continue_compensate_chain(
+            conn,
+            run=run,
+            after_step_index=int(step["step_index"]),
+            queue_name=queue_name,
+            max_attempts=max_attempts,
+            visibility_timeout_seconds=vt,
+            now=now,
+        )
+
+    def _continue_compensate_chain(
+        self,
+        conn: Any,
+        *,
+        run: dict[str, Any],
+        after_step_index: int,
+        queue_name: str,
+        max_attempts: int,
+        visibility_timeout_seconds: int,
+        now: Any,
+    ) -> None:
+        """Enqueue next lower pending compensate job or finish the run."""
+        nxt = conn.execute(
+            f"""
+            SELECT {_STEP_COLUMNS}
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'compensate'
+              AND status = 'pending'
+              AND job_id IS NULL
+              AND step_index < %s
+            ORDER BY step_index DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (run["id"], after_step_index),
+        ).fetchone()
+        steps_def = run["steps_def"]
+        if isinstance(steps_def, str):
+            import json
+
+            steps_def = json.loads(steps_def)
+        if nxt is not None:
+            self._enqueue_job_for_step(
+                conn,
+                run_id=run["id"],
+                tenant_id=run["tenant_id"],
+                step_row=nxt,
+                steps_def=steps_def,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
+            return
+        remaining = conn.execute(
+            """
+            SELECT 1 FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'compensate'
+              AND status IN ('pending', 'running')
+            LIMIT 1
+            """,
+            (run["id"],),
+        ).fetchone()
+        if remaining is None:
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status = %s, completed_at = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (WorkflowRunStatus.FAILED.value, now, now, run["id"]),
+            )
+
+    def _ensure_compensate_progress(
+        self, conn: Any, *, run: dict[str, Any], now: Any
+    ) -> bool:
+        """If compensating with no active job, enqueue next or finalize."""
+        active = conn.execute(
+            """
+            SELECT 1
+            FROM workflow_step_runs s
+            LEFT JOIN jobs j ON j.id = s.job_id
+            WHERE s.run_id = %s
+              AND s.direction = 'compensate'
+              AND (
+                    s.status = 'running'
+                    AND j.status = 'leased'
+                 OR (
+                        s.status = 'pending'
+                    AND s.job_id IS NOT NULL
+                    AND j.status IN ('pending', 'leased')
+                 )
+              )
+            LIMIT 1
+            """,
+            (run["id"],),
+        ).fetchone()
+        if active is not None:
+            return False
+        # Prefer redrive of highest-index pending/running compensate.
+        stuck = conn.execute(
+            f"""
+            SELECT {_STEP_COLUMNS}
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'compensate'
+              AND status IN ('pending', 'running')
+            ORDER BY step_index DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (run["id"],),
+        ).fetchone()
+        if stuck is None:
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status = %s, completed_at = %s, updated_at = %s
+                WHERE id = %s AND status = %s
+                """,
+                (
+                    WorkflowRunStatus.FAILED.value,
+                    now,
+                    now,
+                    run["id"],
+                    WorkflowRunStatus.COMPENSATING.value,
+                ),
+            )
+            return True
+        if stuck["status"] == WorkflowStepStatus.RUNNING.value:
+            self._fail_or_redrive_compensate_step(
+                conn,
+                run=run,
+                step=stuck,
+                error="compensate job missing or not claimable",
+                now=now,
+            )
+            return True
+        # pending without job
+        steps_def = run["steps_def"]
+        if isinstance(steps_def, str):
+            import json
+
+            steps_def = json.loads(steps_def)
+        if stuck.get("job_id") is None:
+            self._enqueue_job_for_step(
+                conn,
+                run_id=run["id"],
+                tenant_id=run["tenant_id"],
+                step_row=stuck,
+                steps_def=steps_def,
+                queue_name="default",
+                max_attempts=3,
+                visibility_timeout_seconds=30,
+                now=now,
+            )
+            return True
+        return False
 
     def _complete_compensate_step(
         self,
@@ -510,67 +880,21 @@ class WorkflowsMixin:
                 step["id"],
             ),
         )
-        # Next lower pending compensate without a job yet.
-        nxt = conn.execute(
-            f"""
-            SELECT {_STEP_COLUMNS}
-            FROM workflow_step_runs
-            WHERE run_id = %s
-              AND direction = 'compensate'
-              AND status = 'pending'
-              AND job_id IS NULL
-              AND step_index < %s
-            ORDER BY step_index DESC
-            LIMIT 1
-            FOR UPDATE
-            """,
-            (run["id"], step["step_index"]),
+        job = conn.execute(
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+            (step["job_id"],),
         ).fetchone()
-        steps_def = run["steps_def"]
-        if isinstance(steps_def, str):
-            import json
-
-            steps_def = json.loads(steps_def)
-        if nxt is not None:
-            job = conn.execute(
-                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-                (step["job_id"],),
-            ).fetchone()
-            # Attach a job to this pending compensate row.
-            self._enqueue_job_for_step(
-                conn,
-                run_id=run["id"],
-                tenant_id=run["tenant_id"],
-                step_row=nxt,
-                steps_def=steps_def,
-                queue_name=job["queue_name"] if job else "default",
-                max_attempts=int(job["max_attempts"]) if job else 3,
-                visibility_timeout_seconds=(
-                    int(job["visibility_timeout_seconds"]) if job else 30
-                ),
-                now=now,
-            )
-            return
-        # No more compensates → run failed (saga rolled back).
-        remaining = conn.execute(
-            """
-            SELECT 1 FROM workflow_step_runs
-            WHERE run_id = %s
-              AND direction = 'compensate'
-              AND status IN ('pending', 'running')
-            LIMIT 1
-            """,
-            (run["id"],),
-        ).fetchone()
-        if remaining is None:
-            conn.execute(
-                """
-                UPDATE workflow_runs
-                SET status = %s, completed_at = %s, updated_at = %s
-                WHERE id = %s
-                """,
-                (WorkflowRunStatus.FAILED.value, now, now, run["id"]),
-            )
+        self._continue_compensate_chain(
+            conn,
+            run=run,
+            after_step_index=int(step["step_index"]),
+            queue_name=job["queue_name"] if job else "default",
+            max_attempts=int(job["max_attempts"]) if job else 3,
+            visibility_timeout_seconds=(
+                int(job["visibility_timeout_seconds"]) if job else 30
+            ),
+            now=now,
+        )
 
     def _create_and_enqueue_step(
         self,
@@ -594,11 +918,11 @@ class WorkflowsMixin:
             f"""
             INSERT INTO workflow_step_runs (
                 id, run_id, tenant_id, step_index, name, direction,
-                status, job_id, result, error, idempotency_key,
+                status, job_id, result, error, idempotency_key, retry_count,
                 started_at, completed_at, created_at, updated_at
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
-                %s, NULL, NULL, NULL, %s,
+                %s, NULL, NULL, NULL, %s, 0,
                 NULL, NULL, %s, %s
             )
             ON CONFLICT (run_id, step_index, direction) DO NOTHING
@@ -802,6 +1126,11 @@ class WorkflowsMixin:
             current_index=int(row["current_index"]),
             fail_step_index=row.get("fail_step_index"),
             fail_reason=row.get("fail_reason"),
+            max_compensate_retries=int(
+                row.get("max_compensate_retries")
+                if row.get("max_compensate_retries") is not None
+                else DEFAULT_MAX_COMPENSATE_RETRIES
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row.get("completed_at"),
@@ -826,6 +1155,7 @@ class WorkflowsMixin:
             result=result,
             error=row.get("error"),
             idempotency_key=row["idempotency_key"],
+            retry_count=int(row.get("retry_count") or 0),
             started_at=row.get("started_at"),
             completed_at=row.get("completed_at"),
             created_at=row["created_at"],

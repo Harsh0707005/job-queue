@@ -54,6 +54,12 @@ class LeaseClaimFairMixin:
             self._preempt_blocked_urgent(
                 conn, queue_name=queue_name, now=now, limit=max(4, limit)
             )
+        # Saga compensate redrive (own txn; must not hold locks across claims).
+        if hasattr(self, "process_workflow_compensation"):
+            try:
+                self.process_workflow_compensation(limit=max(8, limit))
+            except Exception:  # noqa: BLE001
+                pass
 
         # One transaction per claim so per-tenant advisory locks cannot invert
         # across tenants inside a multi-claim batch (was a multi-worker deadlock

@@ -477,6 +477,7 @@ class WorkflowRun:
     current_index: int
     fail_step_index: int | None
     fail_reason: str | None
+    max_compensate_retries: int
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -497,6 +498,7 @@ class WorkflowStepRun:
     result: dict[str, Any] | list[Any] | str | int | float | bool | None
     error: str | None
     idempotency_key: str
+    retry_count: int
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime

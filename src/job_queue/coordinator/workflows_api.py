@@ -18,6 +18,7 @@ def _run_to_dict(r: WorkflowRun) -> dict[str, Any]:
         "current_index": r.current_index,
         "fail_step_index": r.fail_step_index,
         "fail_reason": r.fail_reason,
+        "max_compensate_retries": r.max_compensate_retries,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
@@ -37,6 +38,7 @@ def _step_to_dict(s: WorkflowStepRun) -> dict[str, Any]:
         "result": s.result,
         "error": s.error,
         "idempotency_key": s.idempotency_key,
+        "retry_count": s.retry_count,
         "started_at": s.started_at.isoformat() if s.started_at else None,
         "completed_at": s.completed_at.isoformat() if s.completed_at else None,
         "created_at": s.created_at.isoformat() if s.created_at else None,
@@ -61,6 +63,11 @@ class WorkflowsApiMixin:
                 max_attempts=int(body.get("max_attempts") or 3),
                 visibility_timeout_seconds=int(
                     body.get("visibility_timeout_seconds") or 30
+                ),
+                max_compensate_retries=int(
+                    body["max_compensate_retries"]
+                    if body.get("max_compensate_retries") is not None
+                    else 5
                 ),
             )
         except (TypeError, ValueError) as exc:
@@ -119,3 +126,17 @@ class WorkflowsApiMixin:
             "count": len(steps),
             "tenant_id": str(tenant),
         }
+
+    def _process_workflow_compensation(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            n = self.queue.process_workflow_compensation(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 50),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"repaired": n}

@@ -44,6 +44,13 @@ class LeaseClaimTenantMixin:
             self._dead_letter_exhausted_leases(conn, now=now, tenant_id=tenant_id)
             self._reap_offboarding_expired_leases(conn, now=now, tenant_id=tenant_id)
             self._expire_parked_timeouts_locked(conn, now=now, tenant_id=tenant_id)
+        if hasattr(self, "process_workflow_compensation"):
+            try:
+                self.process_workflow_compensation(
+                    tenant_id=tenant_id, limit=max(8, limit)
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         with transaction(self._pool) as conn:
             # Serialize lease decisions for this tenant so concurrency caps

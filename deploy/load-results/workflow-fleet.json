@@ -11,6 +11,8 @@
   "ok_compensate_order": true,
   "ok_isolation": true,
   "ok_sink": true,
+  "ok_no_stuck": true,
+  "ok_kill_exercised": true,
   "sink_unique_effects": 144,
   "sink_total_posts": 144
 }
