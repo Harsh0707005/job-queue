@@ -4,7 +4,9 @@ Jobs receive a stable ``partition_id`` at enqueue. Registered workers own a
 subset of partitions (rebalanced when workers join/leave/die) and only lease
 work from those shards, reducing claim contention as the fleet grows.
 
-Unregistered workers (unit tests / legacy) may still lease any partition.
+Unregistered workers cannot lease any shard (membership is required). When
+``partition_count`` shrinks, non-terminal jobs are rematerialized into the new
+range so work is never stranded on deleted shards.
 """
 
 from __future__ import annotations
@@ -14,10 +16,21 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.db import transaction
+from job_queue.models import JobStatus
 from job_queue.queue._common import (
     DEFAULT_PARTITION_COUNT,
     WORKER_HEARTBEAT_TTL_SECONDS,
     _utcnow,
+)
+
+# Statuses that can still be claimed / reclaimed / resumed — must stay inside
+# the live partition range after shrink.
+_REMAP_STATUSES = (
+    JobStatus.PENDING.value,
+    JobStatus.LEASED.value,
+    JobStatus.AWAITING_APPROVAL.value,
+    JobStatus.AWAITING_CHILDREN.value,
+    JobStatus.FAILED.value,
 )
 
 
@@ -27,7 +40,7 @@ class PartitionsMixin:
             return self._partition_count(conn)
 
     def set_partition_count(self, count: int) -> int:
-        """Set global partition count and rebalance active workers."""
+        """Set global partition count, remap stranded jobs, rebalance workers."""
         n = int(count)
         if n < 1 or n > 4096:
             raise ValueError("partition_count must be in 1..4096")
@@ -42,6 +55,9 @@ class PartitionsMixin:
                 (n, now),
             )
             self._ensure_partition_rows(conn, n, now=now)
+            # Shrink (or any change) must not leave claimable jobs on deleted
+            # partition ids; rematerialize into [0, n).
+            self._remap_job_partitions_locked(conn, n, now=now)
             self._rebalance_partitions_locked(conn, now=now)
         return n
 
@@ -218,6 +234,38 @@ class PartitionsMixin:
         ).fetchone()
         return int(row["p"] if row else 0)
 
+    def _remap_job_partitions_locked(
+        self, conn: Any, count: int, *, now: datetime
+    ) -> int:
+        """Recompute partition_id for non-terminal jobs into ``[0, count)``.
+
+        Uses the same ``hashtext(tenant:job_id) % count`` formula as enqueue so
+        assignment stays consistent with newly inserted work. Returns the number
+        of rows updated (including no-ops that rewrote the same value).
+        """
+        n = max(1, int(count))
+        # Any claimable/in-flight row, plus anything already outside the range
+        # (defensive if status set was incomplete).
+        rows = conn.execute(
+            """
+            UPDATE jobs
+            SET partition_id = abs(hashtext(tenant_id || ':' || id::text)) %% %s,
+                updated_at = %s
+            WHERE status = ANY(%s)
+               OR partition_id >= %s
+            RETURNING id
+            """,
+            (n, now, list(_REMAP_STATUSES), n),
+        ).fetchall()
+        return len(rows)
+
+    def remap_job_partitions(self) -> int:
+        """Public repair: rematerialize non-terminal jobs into current range."""
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            n = self._partition_count(conn)
+            return self._remap_job_partitions_locked(conn, n, now=now)
+
     def _ensure_partition_rows(
         self, conn: Any, count: int, *, now: datetime
     ) -> None:
@@ -308,13 +356,17 @@ class PartitionsMixin:
     def _worker_partition_filter(
         self, conn: Any, worker_id: str
     ) -> list[int] | None:
-        """Return owned partitions, empty list if dead, or None if unregistered.
+        """Return owned partitions for lease claim filtering.
 
-        * ``None`` — never registered (unit tests / legacy): lease any partition.
-        * ``[]`` — registered but dead/inactive: lease nothing (do not steal
-          shards after rebalance or timeout).
+        * ``[]`` — unregistered, or registered but dead/inactive: lease nothing.
         * non-empty list — active owner: lease only those partitions.
+        * ``None`` — only when ``require_worker_registration`` is False (unit
+          tests that never join membership): lease any partition.
+
+        Production default requires registration so a free-for-all worker cannot
+        steal shards from a partitioned fleet.
         """
+        require = bool(getattr(self, "require_worker_registration", True))
         reg = conn.execute(
             """
             SELECT status FROM worker_nodes
@@ -324,7 +376,7 @@ class PartitionsMixin:
             (worker_id,),
         ).fetchone()
         if reg is None:
-            return None
+            return [] if require else None
         if str(reg["status"]) != "active":
             return []
         return self._owned_partitions_locked(conn, worker_id)

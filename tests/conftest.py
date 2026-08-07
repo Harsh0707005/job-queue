@@ -45,8 +45,18 @@ def postgres_url():
 
 @pytest.fixture
 def queue(postgres_url: str):
-    """Fresh JobQueue against the session Postgres, with a clean jobs table."""
-    q = JobQueue.connect(postgres_url, min_size=1, max_size=8)
+    """Fresh JobQueue against the session Postgres, with a clean jobs table.
+
+    Most unit suites never register workers for partition membership. They opt
+    out of strict registration so lease paths stay free-for-all. Partition
+    tests re-enable ``require_worker_registration`` explicitly.
+    """
+    q = JobQueue.connect(
+        postgres_url,
+        min_size=1,
+        max_size=8,
+        require_worker_registration=False,
+    )
     with q._pool.connection() as conn:
         conn.execute("TRUNCATE jobs CASCADE")
         # Audit is intentionally not FK-cascaded from jobs (rebuild survives row loss);

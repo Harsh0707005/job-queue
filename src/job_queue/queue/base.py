@@ -27,16 +27,29 @@ class BaseMixin:
     def __init__(self, pool: ConnectionPool, *, dsn: str | None = None) -> None:
         self._pool = pool
         self._dsn = dsn
+        # When True (default), only registered active workers may lease, and
+        # only from partitions they own. Unit tests may set False so legacy
+        # suites that never join membership still lease freely.
+        self.require_worker_registration = True
 
     @classmethod
-    def connect(cls, dsn: str, *, min_size: int = 1, max_size: int = 10) -> JobQueue:
+    def connect(
+        cls,
+        dsn: str,
+        *,
+        min_size: int = 1,
+        max_size: int = 10,
+        require_worker_registration: bool = True,
+    ) -> JobQueue:
         """Open a pool, ensure schema exists, return a ready queue."""
         from job_queue.db import create_pool
 
         pool = create_pool(dsn, min_size=min_size, max_size=max_size)
         with pool.connection() as conn:
             init_schema(conn)
-        return cls(pool, dsn=dsn)
+        q = cls(pool, dsn=dsn)
+        q.require_worker_registration = bool(require_worker_registration)
+        return q
 
     def close(self) -> None:
         self._pool.close()

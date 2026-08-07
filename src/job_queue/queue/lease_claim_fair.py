@@ -67,7 +67,7 @@ class LeaseClaimFairMixin:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Resolve partition filter once (None = unregistered → all partitions).
+        # Resolve partition filter once ([] = no claim; None = open/all).
         owned_parts: list[int] | None = None
         if hasattr(self, "_worker_partition_filter"):
             with self._pool.connection() as conn:

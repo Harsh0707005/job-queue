@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import time
 
-from job_queue import JobQueue
+import pytest
+
+from job_queue import JobQueue, JobStatus
 from tests.helpers_queue import _ack
+
+
+@pytest.fixture(autouse=True)
+def _strict_partition_registration(queue: JobQueue):
+    """Partition suite exercises real membership (production default)."""
+    queue.require_worker_registration = True
+    yield
+    queue.require_worker_registration = True
 
 
 def test_enqueue_assigns_partition_ids(queue: JobQueue):
@@ -52,14 +62,31 @@ def test_registered_workers_split_partitions_and_lease_only_owned(queue: JobQueu
     assert seen2
 
 
-def test_unregistered_worker_leases_all_partitions(queue: JobQueue):
-    """Legacy / unit-test path: no registration → full queue access."""
+def test_unregistered_worker_cannot_lease_any_shard(queue: JobQueue):
+    """Membership required: free-for-all workers must not steal shards."""
     queue.set_partition_count(4)
-    queue.register_worker("other-w")
-    queue.enqueue(tenant_id="u1", payload={"x": 1})
-    j = queue.lease(worker_id="unregistered-w", tenant_id="u1")
-    assert j is not None
-    _ack(queue, j, "unregistered-w")
+    queue.register_worker("fleet-w")
+    j = queue.enqueue(tenant_id="u1", payload={"x": 1})
+    assert 0 <= j.partition_id < 4
+
+    # Unregistered id must get nothing even when work is ready.
+    for _ in range(5):
+        assert queue.lease(worker_id="unregistered-w", tenant_id="u1") is None
+        assert queue.lease(worker_id="unregistered-w") is None  # fair path too
+
+    # Registered owner still drains.
+    got = queue.lease(worker_id="fleet-w", tenant_id="u1")
+    assert got is not None
+    assert got.id == j.id
+    _ack(queue, got, "fleet-w")
+
+
+def test_unregistered_worker_cannot_lease_even_when_fleet_empty(queue: JobQueue):
+    """No registered peers still blocks unregistered claims under strict mode."""
+    queue.set_partition_count(4)
+    queue.enqueue(tenant_id="empty-fleet", payload={"x": 1})
+    assert queue.lease(worker_id="stranger", tenant_id="empty-fleet") is None
+    assert queue.lease(worker_id="stranger") is None
 
 
 def test_rebalance_on_worker_join_and_leave(queue: JobQueue):
@@ -127,3 +154,60 @@ def test_dead_worker_cannot_lease_after_rebalance(queue: JobQueue):
         _ack(queue, j, "alive-w")
         n += 1
     assert n == 12
+
+
+def test_shrink_partitions_remaps_jobs_so_they_remain_claimable(queue: JobQueue):
+    """Shrinking partition_count must not strand jobs on deleted shards."""
+    queue.set_partition_count(16)
+    queue.register_worker("shrink-w")
+
+    jobs = [queue.enqueue(tenant_id="sh", payload={"i": i}) for i in range(48)]
+    high = [j for j in jobs if j.partition_id >= 4]
+    # With 48 jobs over 16 shards we expect some in the upper range.
+    assert high, "expected some jobs on partitions >= 4 to exercise shrink"
+
+    queue.set_partition_count(4)
+    assert queue.get_partition_count() == 4
+    assert set(queue.list_worker_partitions("shrink-w")) == set(range(4))
+
+    # Every pending job must sit in the live range.
+    for j in jobs:
+        refreshed = queue.get(j.id, tenant_id="sh")
+        assert refreshed is not None
+        assert refreshed.status == JobStatus.PENDING
+        assert 0 <= refreshed.partition_id < 4
+
+    # Registered worker drains the full backlog (nothing stranded).
+    claimed = 0
+    for _ in range(80):
+        got = queue.lease(worker_id="shrink-w", tenant_id="sh")
+        if got is None:
+            break
+        assert 0 <= got.partition_id < 4
+        _ack(queue, got, "shrink-w")
+        claimed += 1
+    assert claimed == len(jobs)
+
+
+def test_shrink_partitions_remaps_even_without_workers(queue: JobQueue):
+    """Rematerialize runs on shrink even before any worker has registered."""
+    queue.set_partition_count(8)
+    jobs = [queue.enqueue(tenant_id="nw", payload={"i": i}) for i in range(20)]
+    assert any(j.partition_id >= 2 for j in jobs)
+
+    queue.set_partition_count(2)
+    for j in jobs:
+        refreshed = queue.get(j.id, tenant_id="nw")
+        assert refreshed is not None
+        assert 0 <= refreshed.partition_id < 2
+
+    # After a worker joins the shrunk map, all work is claimable.
+    queue.register_worker("late-w")
+    n = 0
+    for _ in range(40):
+        got = queue.lease(worker_id="late-w", tenant_id="nw")
+        if got is None:
+            break
+        _ack(queue, got, "late-w")
+        n += 1
+    assert n == len(jobs)
