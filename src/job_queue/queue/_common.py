@@ -43,8 +43,11 @@ _JOB_COLUMNS = """
     approval_deadline_at, approval_message, approval_outcome,
     approval_resolved_at, await_children_started_at,
     await_children_deadline_at, await_children_outcome,
-    await_children_resolved_at, last_error
+    await_children_resolved_at, last_error, partition_id
 """
+
+DEFAULT_PARTITION_COUNT = 32
+WORKER_HEARTBEAT_TTL_SECONDS = 30
 
 _MAX_LABELS = 32
 
@@ -211,6 +214,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         await_children_outcome=row.get("await_children_outcome"),
         await_children_resolved_at=row.get("await_children_resolved_at"),
         last_error=row["last_error"],
+        partition_id=int(row["partition_id"]) if row.get("partition_id") is not None else 0,
     )
 
 

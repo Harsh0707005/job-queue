@@ -345,6 +345,22 @@ class RoutingMixin:
         if method == "POST" and path == "/v1/metrics/retention":
             return self._set_metrics_retention(body)
 
+        # Worker partition ownership / rebalance.
+        if method == "POST" and path == "/v1/workers/register":
+            return self._register_worker(body)
+        if method == "POST" and path == "/v1/workers/heartbeat":
+            return self._worker_heartbeat(body)
+        if method == "POST" and path == "/v1/workers/deregister":
+            return self._deregister_worker(body)
+        if method == "GET" and path == "/v1/workers/partitions":
+            return self._list_worker_partitions(query)
+        if method == "GET" and path == "/v1/partitions":
+            return self._list_partition_assignments()
+        if method == "POST" and path == "/v1/workers/process-timeouts":
+            return self._process_worker_timeouts(body)
+        if method == "POST" and path == "/v1/partitions/count":
+            return self._set_partition_count(body)
+
         # Multi-step saga workflows.
         if method == "POST" and path == "/v1/workflows":
             return self._start_workflow(body)

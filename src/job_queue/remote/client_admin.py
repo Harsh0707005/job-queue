@@ -423,6 +423,63 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def register_worker(
+        self, worker_id: str, *, heartbeat_ttl_seconds: int | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"worker_id": worker_id}
+        if heartbeat_ttl_seconds is not None:
+            body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
+        payload = self._request("POST", "/v1/workers/register", body)
+        assert payload is not None
+        return payload
+
+    def worker_heartbeat(
+        self, worker_id: str, *, heartbeat_ttl_seconds: int | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"worker_id": worker_id}
+        if heartbeat_ttl_seconds is not None:
+            body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
+        payload = self._request("POST", "/v1/workers/heartbeat", body)
+        assert payload is not None
+        return payload
+
+    def deregister_worker(self, worker_id: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST", "/v1/workers/deregister", {"worker_id": worker_id}
+        )
+        assert payload is not None
+        return payload
+
+    def list_worker_partitions(self, worker_id: str) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"worker_id": worker_id})
+        payload = self._request("GET", f"/v1/workers/partitions?{q}")
+        assert payload is not None
+        return payload
+
+    def list_partition_assignments(self) -> dict[str, Any]:
+        payload = self._request("GET", "/v1/partitions")
+        assert payload is not None
+        return payload
+
+    def process_worker_timeouts(
+        self, *, heartbeat_ttl_seconds: int | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if heartbeat_ttl_seconds is not None:
+            body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
+        payload = self._request("POST", "/v1/workers/process-timeouts", body)
+        assert payload is not None
+        return payload
+
+    def set_partition_count(self, partition_count: int) -> dict[str, Any]:
+        payload = self._request(
+            "POST", "/v1/partitions/count", {"partition_count": partition_count}
+        )
+        assert payload is not None
+        return payload
+
     def create_alert_rule(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/alerts/rules", dict(kwargs))
         assert payload is not None

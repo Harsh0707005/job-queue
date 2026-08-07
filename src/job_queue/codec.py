@@ -92,6 +92,7 @@ def job_to_dict(
         "await_children_outcome": job.await_children_outcome,
         "await_children_resolved_at": _dt(job.await_children_resolved_at),
         "last_error": job.last_error,
+        "partition_id": int(job.partition_id),
     }
 
 
@@ -164,6 +165,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         await_children_outcome=data.get("await_children_outcome"),
         await_children_resolved_at=parse_dt("await_children_resolved_at"),
         last_error=data.get("last_error"),
+        partition_id=int(data.get("partition_id") or 0),
     )
 
 

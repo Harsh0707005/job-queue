@@ -294,6 +294,47 @@ ALTER TABLE queue_settings ADD CONSTRAINT queue_settings_metrics_ret_check CHECK
     OR metrics_retention_seconds >= 0
 );
 
+-- Queue partition count for sharding lease work across workers.
+ALTER TABLE queue_settings ADD COLUMN IF NOT EXISTS partition_count INTEGER NOT NULL DEFAULT 32;
+ALTER TABLE queue_settings DROP CONSTRAINT IF EXISTS queue_settings_partition_count_check;
+ALTER TABLE queue_settings ADD CONSTRAINT queue_settings_partition_count_check CHECK (
+    partition_count >= 1 AND partition_count <= 4096
+);
+
+-- Shard key on jobs (assigned at enqueue; claim filters by owned partitions).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS partition_id INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_partition_id_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_partition_id_check CHECK (partition_id >= 0);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_partition_claim
+    ON jobs (queue_name, partition_id, status, priority DESC, created_at ASC);
+
+-- Live worker registry for partition ownership / rebalance.
+CREATE TABLE IF NOT EXISTS worker_nodes (
+    worker_id           TEXT PRIMARY KEY,
+    status              TEXT NOT NULL DEFAULT 'active',
+    last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT worker_nodes_status_check CHECK (status IN ('active', 'dead'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_nodes_active_seen
+    ON worker_nodes (status, last_seen_at DESC);
+
+-- Partition → worker assignment (generation bumps on rebalance).
+CREATE TABLE IF NOT EXISTS partition_assignments (
+    partition_id        INTEGER PRIMARY KEY,
+    worker_id           TEXT,
+    generation          BIGINT NOT NULL DEFAULT 0,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT partition_assignments_id_check CHECK (partition_id >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_partition_assignments_worker
+    ON partition_assignments (worker_id)
+    WHERE worker_id IS NOT NULL;
+
 -- Track one-time schema data migrations. Never re-apply defaults that would
 -- overwrite intentional NULL (keep forever) after operators set retention.
 CREATE TABLE IF NOT EXISTS schema_migrations (

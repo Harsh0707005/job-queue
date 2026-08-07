@@ -61,6 +61,16 @@ def queue(postgres_url: str):
         conn.execute("TRUNCATE queue_metric_snapshots")
         conn.execute("TRUNCATE alert_events CASCADE")
         conn.execute("TRUNCATE alert_rules CASCADE")
+        # Partition ownership must not leak across tests.
+        conn.execute("TRUNCATE partition_assignments")
+        conn.execute("TRUNCATE worker_nodes")
+        conn.execute(
+            """
+            UPDATE queue_settings
+            SET partition_count = 32, updated_at = NOW()
+            WHERE id = 1
+            """
+        )
         conn.commit()
     yield q
     q.close()

@@ -168,6 +168,15 @@ class SchedulesProcessMixin:
                         # Intentionally no pending-cap / enqueue-rate checks:
                         # schedule materialization is system-timed work.
                         sched_labels = list(sched_row.get("labels") or [])
+                        part_id = (
+                            self._compute_partition_id(
+                                conn,
+                                tenant_id=str(sched_row["tenant_id"]),
+                                job_id=job_id,
+                            )
+                            if hasattr(self, "_compute_partition_id")
+                            else 0
+                        )
                         job_row = conn.execute(
                             f"""
                             INSERT INTO jobs (
@@ -177,7 +186,7 @@ class SchedulesProcessMixin:
                                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
                                 labels,
-                                created_at, updated_at
+                                created_at, updated_at, partition_id
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
                                 0, %s, %s,
@@ -185,7 +194,7 @@ class SchedulesProcessMixin:
                                 1, 300,
                                 %s, NULL, %s, %s,
                                 %s,
-                                %s, %s
+                                %s, %s, %s
                             )
                             RETURNING {_JOB_COLUMNS}
                             """,
@@ -204,6 +213,7 @@ class SchedulesProcessMixin:
                                 sched_labels,
                                 now,
                                 now,
+                                part_id,
                             ),
                         ).fetchone()
                         if job_row is not None:

@@ -1127,7 +1127,7 @@ class WorkflowsMixin:
                 available_at, dedupe_key, schedule_id, depends_on,
                 labels,
                 deadline_at, estimated_duration_seconds, preemptible,
-                created_at, updated_at
+                created_at, updated_at, partition_id
             ) VALUES (
                 %s, %s, %s, %s, %s, 0,
                 0, %s, %s,
@@ -1136,7 +1136,7 @@ class WorkflowsMixin:
                 %s, %s, NULL, %s,
                 %s,
                 NULL, NULL, TRUE,
-                %s, %s
+                %s, %s, %s
             )
             """,
             (
@@ -1153,6 +1153,13 @@ class WorkflowsMixin:
                 labels,
                 now,
                 now,
+                (
+                    self._compute_partition_id(
+                        conn, tenant_id=tenant_id, job_id=job_id
+                    )
+                    if hasattr(self, "_compute_partition_id")
+                    else 0
+                ),
             ),
         )
         # Keep step status pending until a worker actually leases the job.

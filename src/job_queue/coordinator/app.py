@@ -35,6 +35,7 @@ from job_queue.coordinator.workflow import WorkflowApiMixin
 from job_queue.coordinator.metrics_api import MetricsApiMixin
 from job_queue.coordinator.alerts_api import AlertsApiMixin
 from job_queue.coordinator.workflows_api import WorkflowsApiMixin
+from job_queue.coordinator.partitions_api import PartitionsApiMixin
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class Coordinator(
     MetricsApiMixin,
     AlertsApiMixin,
     WorkflowsApiMixin,
+    PartitionsApiMixin,
 ):
     """Thin HTTP façade over JobQueue (handlers split by domain)."""
 

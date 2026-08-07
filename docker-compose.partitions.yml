@@ -1,0 +1,121 @@
+# Queue partitions under multi-tenant multi-worker fleet load.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.partitions.yml \
+#     down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.partitions.yml up --build \
+#     --abort-on-container-exit --exit-code-from partitions-soak partitions-soak
+
+x-batch-worker: &batch_worker_env
+  COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+  POLL_INTERVAL: "0.05"
+  VISIBILITY_TIMEOUT: "30"
+  BATCH_SIZE: "16"
+  LOG_LEVEL: WARNING
+
+services:
+  chaos:
+    profiles: ["disabled"]
+  soak:
+    profiles: ["disabled"]
+  scheduler:
+    profiles: ["disabled"]
+
+  worker-1:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w1
+  worker-2:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w2
+  worker-3:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w3
+  worker-4:
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w4
+
+  worker-5:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w5
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+  worker-6:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w6
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+  worker-7:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w7
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+  worker-8:
+    build: .
+    command: ["job-queue-worker-agent"]
+    environment:
+      <<: *batch_worker_env
+      WORKER_ID: load-w8
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  partitions-soak:
+    build: .
+    command: ["python", "scripts/load_partitions_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "8"
+      JOBS_PER_TENANT: "40"
+      ENQUEUE_WORKERS: "12"
+      PARTITION_COUNT: "16"
+      MIN_FLEET_WORKERS: "4"
+      MAX_WALL_SECONDS: "240"
+      LOAD_LABEL: partitions-fleet
+      RESULTS_PATH: /results/partitions-fleet.json
+      LOG_LEVEL: INFO
+    volumes:
+      - ./deploy/load-results:/results
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      worker-7:
+        condition: service_started
+      worker-8:
+        condition: service_started

@@ -1,0 +1,72 @@
+{
+  "label": "partitions-fleet",
+  "ok": true,
+  "tenants": 8,
+  "jobs_per_tenant": 40,
+  "total_jobs": 320,
+  "partition_count": 16,
+  "fleet_workers": 8,
+  "ownership": {
+    "load-w1": [
+      0,
+      8
+    ],
+    "load-w2": [
+      1,
+      9
+    ],
+    "load-w3": [
+      2,
+      10
+    ],
+    "load-w4": [
+      3,
+      11
+    ],
+    "load-w5": [
+      4,
+      12
+    ],
+    "load-w6": [
+      5,
+      13
+    ],
+    "load-w7": [
+      6,
+      14
+    ],
+    "load-w8": [
+      7,
+      15
+    ]
+  },
+  "enqueue_seconds": 1.166,
+  "drain_seconds": 3.176,
+  "edges": {
+    "join_leave": {
+      "phantom": "phantom-join-1786113205",
+      "parts_on_join": [
+        8
+      ],
+      "owners_after_join": 9,
+      "owners_after_leave": 8
+    },
+    "death_timeout": {
+      "phantom": "phantom-die-1786113205",
+      "expired": 1,
+      "owners_after": 8
+    },
+    "dead_cannot_steal": {
+      "phantom": "phantom-zombie-1786113208",
+      "stolen": 0,
+      "partition_count": 16
+    }
+  },
+  "drain": {
+    "pending": 0,
+    "leased": 0,
+    "completed": 322,
+    "dead": 0,
+    "failed": 0
+  }
+}

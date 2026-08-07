@@ -15,6 +15,7 @@ from job_queue.queue.dead_letters import DeadLettersMixin
 from job_queue.queue.metrics import MetricsMixin
 from job_queue.queue.alerts import AlertsMixin
 from job_queue.queue.workflows import WorkflowsMixin
+from job_queue.queue.partitions import PartitionsMixin
 from job_queue.queue.misc import MiscMixin
 
 
@@ -32,6 +33,7 @@ class JobQueue(
     MetricsMixin,
     AlertsMixin,
     WorkflowsMixin,
+    PartitionsMixin,
     MiscMixin,
 ):
     """PostgreSQL-backed multi-tenant job queue (split across domain mixins)."""

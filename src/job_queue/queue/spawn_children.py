@@ -176,6 +176,11 @@ class SpawnChildrenMixin:
                             job=_row_to_job(row),
                         )
 
+                part_id = (
+                    self._compute_partition_id(conn, tenant_id=tenant_id, job_id=cid)
+                    if hasattr(self, "_compute_partition_id")
+                    else 0
+                )
                 crow = conn.execute(
                     f"""
                     INSERT INTO jobs (
@@ -186,7 +191,7 @@ class SpawnChildrenMixin:
                         available_at, dedupe_key, schedule_id, depends_on,
                         parent_job_id, waiting_on, labels,
                         deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at
+                        created_at, updated_at, partition_id
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -195,7 +200,7 @@ class SpawnChildrenMixin:
                         %s, %s, NULL, '{{}}'::uuid[],
                         %s, '{{}}'::uuid[], %s,
                         NULL, %s, %s,
-                        %s, %s
+                        %s, %s, %s
                     )
                     RETURNING {_JOB_COLUMNS}
                     """,
@@ -219,6 +224,7 @@ class SpawnChildrenMixin:
                         preemptible,
                         now,
                         now,
+                        part_id,
                     ),
                 ).fetchone()
                 assert crow is not None

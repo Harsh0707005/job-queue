@@ -60,6 +60,20 @@ class LeaseClaimFairMixin:
                 self.process_workflow_compensation(limit=max(8, limit))
             except Exception:  # noqa: BLE001
                 pass
+        # Expire dead workers and rebalance partition ownership.
+        if hasattr(self, "process_worker_timeouts"):
+            try:
+                self.process_worker_timeouts()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Resolve partition filter once (None = unregistered → all partitions).
+        owned_parts: list[int] | None = None
+        if hasattr(self, "_worker_partition_filter"):
+            with self._pool.connection() as conn:
+                owned_parts = self._worker_partition_filter(conn, worker_id)
+            if owned_parts is not None and not owned_parts:
+                return []
 
         # One transaction per claim so per-tenant advisory locks cannot invert
         # across tenants inside a multi-claim batch (was a multi-worker deadlock
@@ -74,6 +88,7 @@ class LeaseClaimFairMixin:
                         visibility_timeout_seconds=visibility_timeout_seconds,
                         now=now,
                         exclude_tenants=rate_limited_tenants,
+                        partitions=owned_parts,
                     )
                     if job is None:
                         break
@@ -98,6 +113,7 @@ class LeaseClaimFairMixin:
         visibility_timeout_seconds: int | None,
         now: datetime,
         exclude_tenants: set[str] | None = None,
+        partitions: list[int] | None = None,
     ) -> Job | None:
         token = uuid4()
         # Priority lanes first (higher priority always before lower), then
@@ -107,10 +123,14 @@ class LeaseClaimFairMixin:
         # work of quieter tenants, and low-priority noise cannot starve high.
         excluded = sorted(exclude_tenants or ())
         exclude_sql = ""
+        part_sql = ""
         params: list[Any] = [queue_name]
         if excluded:
             exclude_sql = "AND jobs.tenant_id <> ALL(%s)"
             params.append(excluded)
+        if partitions is not None:
+            part_sql = "AND jobs.partition_id = ANY(%s)"
+            params.append(list(partitions))
         params.extend(
             [
                 JobStatus.PENDING.value,
@@ -128,6 +148,7 @@ class LeaseClaimFairMixin:
             FROM jobs
             WHERE queue_name = %s
               {exclude_sql}
+              {part_sql}
               AND NOT EXISTS (
                     SELECT 1
                     FROM tenant_settings ts

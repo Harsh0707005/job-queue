@@ -132,6 +132,7 @@ class Job:
     await_children_outcome: str | None
     await_children_resolved_at: datetime | None
     last_error: str | None
+    partition_id: int = 0
 
     @property
     def is_leased(self) -> bool:

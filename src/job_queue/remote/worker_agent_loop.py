@@ -48,11 +48,45 @@ class RemoteWorkerLoopMixin:
         self._held: dict[Any, Job] = {}
         self._lease_lock = threading.Lock()
         self.processed = 0
+        self._partitioned = False
+        self._partitions: list[int] = []
+
+    def _register_partitions(self) -> None:
+        """Register with coordinator for partition ownership (best-effort)."""
+        try:
+            out = self.client.register_worker(self.worker_id)
+            self._partitions = list(out.get("partitions") or [])
+            self._partitioned = True
+            logger.info(
+                "worker %s registered partitions=%s (n=%s)",
+                self.worker_id,
+                self._partitions[:8],
+                len(self._partitions),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("worker partition register failed worker=%s", self.worker_id)
+            self._partitioned = False
+
+    def _heartbeat_partitions(self) -> None:
+        if not self._partitioned:
+            return
+        try:
+            out = self.client.worker_heartbeat(self.worker_id)
+            self._partitions = list(out.get("partitions") or [])
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "worker partition heartbeat failed worker=%s", self.worker_id
+            )
 
     def stop(self) -> None:
         """Stop the run loop without waiting. Prefer :meth:`drain` for deploys."""
         self._draining.set()
         self._stop.set()
+        try:
+            if self._partitioned:
+                self.client.deregister_worker(self.worker_id)
+        except Exception:  # noqa: BLE001
+            pass
         self._release_held_except_active(reason="stop")
 
     def drain(self, timeout_seconds: float | None = None) -> DrainResult:
@@ -130,7 +164,15 @@ class RemoteWorkerLoopMixin:
             self.batch_size,
             self.drain_timeout_seconds,
         )
+        self._register_partitions()
+        last_part_hb = time.monotonic()
         while not self._stop.is_set() and not self._draining.is_set():
+            # Keep partition ownership fresh; rebalance when peers join/leave.
+            if time.monotonic() - last_part_hb >= max(
+                2.0, self.heartbeat_interval_seconds
+            ):
+                self._heartbeat_partitions()
+                last_part_hb = time.monotonic()
             try:
                 jobs = self.client.lease_batch(
                     worker_id=self.worker_id,

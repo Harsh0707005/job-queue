@@ -158,6 +158,9 @@ class JobsEnqueueCoreMixin:
                 self._assert_pending_capacity(conn, tenant_id)
                 self._consume_enqueue_rate(conn, tenant_id, now=now)
 
+                part_id = self._compute_partition_id(
+                    conn, tenant_id=tenant_id, job_id=jid
+                )
                 # ON CONFLICT remains a safety net for any missed paths.
                 row = conn.execute(
                     f"""
@@ -169,7 +172,7 @@ class JobsEnqueueCoreMixin:
                         available_at, dedupe_key, schedule_id, depends_on,
                         labels,
                         deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at
+                        created_at, updated_at, partition_id
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -178,7 +181,7 @@ class JobsEnqueueCoreMixin:
                         %s, %s, NULL, %s,
                         %s,
                         %s, %s, %s,
-                        %s, %s
+                        %s, %s, %s
                     )
                     ON CONFLICT (tenant_id, queue_name, dedupe_key)
                         WHERE dedupe_key IS NOT NULL
@@ -210,6 +213,7 @@ class JobsEnqueueCoreMixin:
                         bool(preemptible),
                         now,
                         now,
+                        part_id,
                     ),
                 ).fetchone()
 
@@ -244,6 +248,9 @@ class JobsEnqueueCoreMixin:
 
             self._assert_pending_capacity(conn, tenant_id)
             self._consume_enqueue_rate(conn, tenant_id, now=now)
+            part_id = self._compute_partition_id(
+                conn, tenant_id=tenant_id, job_id=jid
+            )
 
             row = conn.execute(
                 f"""
@@ -255,7 +262,7 @@ class JobsEnqueueCoreMixin:
                     available_at, dedupe_key, schedule_id, depends_on,
                     labels,
                     deadline_at, estimated_duration_seconds, preemptible,
-                    created_at, updated_at
+                    created_at, updated_at, partition_id
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     0, %s, %s,
@@ -264,7 +271,7 @@ class JobsEnqueueCoreMixin:
                     %s, NULL, NULL, %s,
                     %s,
                     %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 RETURNING {_JOB_COLUMNS}
                 """,
@@ -288,6 +295,7 @@ class JobsEnqueueCoreMixin:
                     bool(preemptible),
                     now,
                     now,
+                    part_id,
                 ),
             ).fetchone()
             assert row is not None

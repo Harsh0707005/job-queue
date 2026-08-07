@@ -301,6 +301,16 @@ class AuditRebuildOneMixin:
         result = snap.get("result")
         checkpoint = snap.get("checkpoint")
 
+        job_uuid = UUID(str(snap["id"]))
+        tenant = str(snap["tenant_id"])
+        if snap.get("partition_id") is not None:
+            part_id = int(snap["partition_id"])
+        elif hasattr(self, "_compute_partition_id"):
+            part_id = self._compute_partition_id(
+                conn, tenant_id=tenant, job_id=job_uuid
+            )
+        else:
+            part_id = 0
         conn.execute(
             """
             INSERT INTO jobs (
@@ -320,7 +330,7 @@ class AuditRebuildOneMixin:
                 approval_message, approval_outcome, approval_resolved_at,
                 await_children_started_at, await_children_deadline_at,
                 await_children_outcome, await_children_resolved_at,
-                last_error
+                last_error, partition_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
@@ -338,12 +348,12 @@ class AuditRebuildOneMixin:
                 %s, %s, %s,
                 %s, %s,
                 %s, %s,
-                %s
+                %s, %s
             )
             """,
             (
-                UUID(str(snap["id"])),
-                snap["tenant_id"],
+                job_uuid,
+                tenant,
                 snap["queue_name"],
                 Jsonb(payload),
                 snap["status"],
@@ -391,5 +401,6 @@ class AuditRebuildOneMixin:
                 snap.get("await_children_outcome"),
                 _parse_dt("await_children_resolved_at"),
                 snap.get("last_error"),
+                part_id,
             ),
         )

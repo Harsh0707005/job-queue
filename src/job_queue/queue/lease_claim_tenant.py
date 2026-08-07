@@ -51,6 +51,18 @@ class LeaseClaimTenantMixin:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        if hasattr(self, "process_worker_timeouts"):
+            try:
+                self.process_worker_timeouts()
+            except Exception:  # noqa: BLE001
+                pass
+
+        owned_parts: list[int] | None = None
+        if hasattr(self, "_worker_partition_filter"):
+            with self._pool.connection() as conn:
+                owned_parts = self._worker_partition_filter(conn, worker_id)
+            if owned_parts is not None and not owned_parts:
+                return []
 
         with transaction(self._pool) as conn:
             # Serialize lease decisions for this tenant so concurrency caps
@@ -79,6 +91,12 @@ class LeaseClaimTenantMixin:
                 ):
                     leased_count = self._count_leased(conn, tenant_id)
 
+            part_sql = ""
+            part_params: list[Any] = []
+            if owned_parts is not None:
+                part_sql = "AND partition_id = ANY(%s)"
+                part_params = [list(owned_parts)]
+
             if conc_limit is not None and leased_count >= conc_limit:
                 # Only reclaim expired leases (does not increase concurrent
                 # holders beyond the cap in steady state).
@@ -88,6 +106,7 @@ class LeaseClaimTenantMixin:
                     FROM jobs
                     WHERE tenant_id = %s
                       AND queue_name = %s
+                      {part_sql}
                       AND status = %s
                       AND lease_expires_at < %s
                       AND attempts < max_attempts
@@ -98,14 +117,16 @@ class LeaseClaimTenantMixin:
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
                     """,
-                    (
-                        tenant_id,
-                        queue_name,
-                        JobStatus.LEASED.value,
-                        now,
-                        now,
-                        now,
-                        limit,
+                    tuple(
+                        [tenant_id, queue_name]
+                        + part_params
+                        + [
+                            JobStatus.LEASED.value,
+                            now,
+                            now,
+                            now,
+                            limit,
+                        ]
                     ),
                 ).fetchall()
             else:
@@ -121,6 +142,7 @@ class LeaseClaimTenantMixin:
                     FROM jobs
                     WHERE tenant_id = %s
                       AND queue_name = %s
+                      {part_sql}
                       AND (
                             (
                                 status = %s
@@ -141,16 +163,18 @@ class LeaseClaimTenantMixin:
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
                     """,
-                    (
-                        tenant_id,
-                        queue_name,
-                        JobStatus.PENDING.value,
-                        now,
-                        JobStatus.LEASED.value,
-                        now,
-                        now,
-                        now,
-                        take,
+                    tuple(
+                        [tenant_id, queue_name]
+                        + part_params
+                        + [
+                            JobStatus.PENDING.value,
+                            now,
+                            JobStatus.LEASED.value,
+                            now,
+                            now,
+                            now,
+                            take,
+                        ]
                     ),
                 ).fetchall()
 
