@@ -162,6 +162,11 @@ class WorkflowsApiMixin:
                 tenant_id=str(tenant),
                 reason=body.get("reason"),
                 release_in_flight=bool(body.get("release_in_flight", False)),
+                compensate=(
+                    bool(body["compensate"])
+                    if body.get("compensate") is not None
+                    else True
+                ),
             )
         except CancelError as exc:
             return 409, {"error": str(exc)}
@@ -174,5 +179,6 @@ class WorkflowsApiMixin:
             "released_in_flight": out["released_in_flight"],
             "left_in_flight": out["left_in_flight"],
             "release_in_flight": out["release_in_flight"],
+            "compensate": out.get("compensate", True),
             "reason": out["reason"],
         }

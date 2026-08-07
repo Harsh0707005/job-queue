@@ -52,10 +52,12 @@ class ClientWorkflowMixin:
         tenant_id: str,
         reason: str | None = None,
         release_in_flight: bool = False,
+        compensate: bool = True,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "tenant_id": tenant_id,
             "release_in_flight": release_in_flight,
+            "compensate": compensate,
         }
         if reason is not None:
             body["reason"] = reason

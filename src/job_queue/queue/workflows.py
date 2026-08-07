@@ -163,17 +163,23 @@ class WorkflowsMixin:
         tenant_id: str,
         reason: str | None = None,
         release_in_flight: bool = False,
+        compensate: bool = True,
     ) -> dict[str, Any]:
         """Cancel a running (or compensating) workflow.
 
         * Always stops **pending** step jobs (never leased) and marks those
-          step_runs ``skipped``.
+          step_runs ``skipped`` (forward always; compensate steps only when
+          *compensate* is False).
         * **In-flight** (leased) steps:
             - ``release_in_flight=False`` (default): leave the lease alone so
-              the worker can finish; on ack/nack the run will not fan-out or
-              start compensation.
+              the worker can finish; no new forward fan-out.
             - ``release_in_flight=True``: cancel the job (clear fencing token)
-              and mark the step ``skipped`` so the worker cannot complete it.
+              and mark the step ``skipped``.
+        * **Completed** forward steps:
+            - ``compensate=True`` (default): reverse-order undo like a failure
+              (run goes ``compensating`` then ends as ``cancelled``).
+            - ``compensate=False``: leave completed steps as-is; run ends
+              ``cancelled`` immediately.
 
         Idempotent when already ``cancelled``. Terminal ``completed`` /
         ``failed`` raise :class:`CancelError`.
@@ -182,10 +188,18 @@ class WorkflowsMixin:
             raise ValueError("tenant_id is required")
         tenant_id = str(tenant_id).strip()
         now = _utcnow()
-        cancel_reason = (
+        want_compensate = bool(compensate)
+        want_release = bool(release_in_flight)
+        raw_reason = (
             str(reason).strip()
             if reason is not None and str(reason).strip()
             else "workflow cancelled"
+        )
+        # Prefix so terminal-after-undo can mark CANCELLED instead of FAILED.
+        cancel_reason = (
+            raw_reason
+            if raw_reason.startswith("cancelled")
+            else f"cancelled: {raw_reason}"
         )
         with transaction(self._pool) as conn:
             run = conn.execute(
@@ -203,14 +217,14 @@ class WorkflowsMixin:
                 )
             status = str(run["status"])
             if status == WorkflowRunStatus.CANCELLED.value:
-                # Idempotent re-cancel: still report current step inventory.
                 return self._cancel_workflow_result(
                     conn,
                     run=run,
                     cancelled_pending=0,
                     released_in_flight=0,
                     left_in_flight=self._count_in_flight_steps(conn, run_id),
-                    release_in_flight=release_in_flight,
+                    release_in_flight=want_release,
+                    compensate=want_compensate,
                     reason=run.get("fail_reason") or cancel_reason,
                 )
             if status in (
@@ -230,42 +244,79 @@ class WorkflowsMixin:
                     f"(status={status})"
                 )
 
+            # When undoing, stop new forward work but keep compensate chain.
+            # Without undo, freeze as cancelled immediately.
+            if want_compensate:
+                target_status = WorkflowRunStatus.COMPENSATING.value
+                completed_at = None
+            else:
+                target_status = WorkflowRunStatus.CANCELLED.value
+                completed_at = now
+
             conn.execute(
                 """
                 UPDATE workflow_runs
                 SET status = %s,
                     fail_reason = %s,
-                    completed_at = COALESCE(completed_at, %s),
+                    completed_at = COALESCE(%s, completed_at),
                     updated_at = %s
                 WHERE id = %s
                 """,
-                (
-                    WorkflowRunStatus.CANCELLED.value,
-                    cancel_reason,
-                    now,
-                    now,
-                    run_id,
-                ),
+                (target_status, cancel_reason, completed_at, now, run_id),
             )
             run = dict(run)
-            run["status"] = WorkflowRunStatus.CANCELLED.value
+            run["status"] = target_status
             run["fail_reason"] = cancel_reason
-            run["completed_at"] = run.get("completed_at") or now
+            if completed_at is not None:
+                run["completed_at"] = completed_at
 
+            # Drop pending forwards always. Pending compensate undos only when
+            # caller does not want reverse compensation.
+            only_dirs = (
+                (WorkflowStepDirection.FORWARD.value,)
+                if want_compensate
+                else None
+            )
             cancelled_pending, released, left = self._cancel_workflow_steps_locked(
                 conn,
                 run=run,
-                release_in_flight=bool(release_in_flight),
+                release_in_flight=want_release,
                 reason=cancel_reason,
                 now=now,
+                only_directions=only_dirs,
             )
+
+            if want_compensate:
+                steps_def = run["steps_def"]
+                if isinstance(steps_def, str):
+                    import json
+
+                    steps_def = json.loads(steps_def)
+                self._try_start_compensate_if_settled(
+                    conn,
+                    run=run,
+                    steps_def=list(steps_def),
+                    queue_name="default",
+                    max_attempts=3,
+                    visibility_timeout_seconds=30,
+                    now=now,
+                )
+                # If nothing to undo and no in-flight left, settle to cancelled.
+                row_chk = conn.execute(
+                    f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
+                    (run_id,),
+                ).fetchone()
+                if row_chk is not None:
+                    run = dict(row_chk)
+
             return self._cancel_workflow_result(
                 conn,
                 run=run,
                 cancelled_pending=cancelled_pending,
                 released_in_flight=released,
                 left_in_flight=left,
-                release_in_flight=bool(release_in_flight),
+                release_in_flight=want_release,
+                compensate=want_compensate,
                 reason=cancel_reason,
             )
 
@@ -278,6 +329,7 @@ class WorkflowsMixin:
         released_in_flight: int,
         left_in_flight: int,
         release_in_flight: bool,
+        compensate: bool,
         reason: str,
     ) -> dict[str, Any]:
         row = conn.execute(
@@ -291,8 +343,19 @@ class WorkflowsMixin:
             "released_in_flight": int(released_in_flight),
             "left_in_flight": int(left_in_flight),
             "release_in_flight": bool(release_in_flight),
+            "compensate": bool(compensate),
             "reason": reason,
         }
+
+    @staticmethod
+    def _is_cancel_compensate_reason(fail_reason: Any) -> bool:
+        return str(fail_reason or "").startswith("cancelled")
+
+    def _compensate_done_status(self, run: dict[str, Any]) -> str:
+        """Terminal status after reverse chain: cancelled vs failed."""
+        if self._is_cancel_compensate_reason(run.get("fail_reason")):
+            return WorkflowRunStatus.CANCELLED.value
+        return WorkflowRunStatus.FAILED.value
 
     def _count_in_flight_steps(self, conn: Any, run_id: UUID) -> int:
         row = conn.execute(
@@ -316,24 +379,31 @@ class WorkflowsMixin:
         release_in_flight: bool,
         reason: str,
         now: Any,
+        only_directions: tuple[str, ...] | None = None,
     ) -> tuple[int, int, int]:
         """Cancel pending step jobs; optionally release leased ones.
 
         Returns ``(cancelled_pending, released_in_flight, left_in_flight)``.
         """
+        dir_sql = ""
+        params: list[Any] = [
+            run["id"],
+            WorkflowStepStatus.PENDING.value,
+            WorkflowStepStatus.RUNNING.value,
+        ]
+        if only_directions:
+            dir_sql = "AND direction = ANY(%s)"
+            params.append(list(only_directions))
         steps = conn.execute(
             f"""
             SELECT {_STEP_COLUMNS}
             FROM workflow_step_runs
             WHERE run_id = %s
               AND status IN (%s, %s)
+              {dir_sql}
             FOR UPDATE
             """,
-            (
-                run["id"],
-                WorkflowStepStatus.PENDING.value,
-                WorkflowStepStatus.RUNNING.value,
-            ),
+            tuple(params),
         ).fetchall()
         cancelled_pending = 0
         released = 0
@@ -1216,6 +1286,7 @@ class WorkflowsMixin:
             to_compensate.append(i)
 
         if not to_compensate:
+            done_status = self._compensate_done_status(run)
             conn.execute(
                 """
                 UPDATE workflow_runs
@@ -1224,7 +1295,7 @@ class WorkflowsMixin:
                   AND status = %s
                 """,
                 (
-                    WorkflowRunStatus.FAILED.value,
+                    done_status,
                     now,
                     now,
                     run["id"],
@@ -1484,13 +1555,26 @@ class WorkflowsMixin:
             (run["id"],),
         ).fetchone()
         if remaining is None:
+            # Prefer freshest fail_reason (cancel may have rewritten it).
+            fresh = conn.execute(
+                f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
+                (run["id"],),
+            ).fetchone()
+            done_status = self._compensate_done_status(fresh or run)
             conn.execute(
                 """
                 UPDATE workflow_runs
                 SET status = %s, completed_at = %s, updated_at = %s
                 WHERE id = %s
+                  AND status = %s
                 """,
-                (WorkflowRunStatus.FAILED.value, now, now, run["id"]),
+                (
+                    done_status,
+                    now,
+                    now,
+                    run["id"],
+                    WorkflowRunStatus.COMPENSATING.value,
+                ),
             )
 
     def _ensure_compensate_progress(
@@ -1563,6 +1647,7 @@ class WorkflowsMixin:
             (run["id"],),
         ).fetchone()
         if stuck is None:
+            done_status = self._compensate_done_status(run)
             conn.execute(
                 """
                 UPDATE workflow_runs
@@ -1570,7 +1655,7 @@ class WorkflowsMixin:
                 WHERE id = %s AND status = %s
                 """,
                 (
-                    WorkflowRunStatus.FAILED.value,
+                    done_status,
                     now,
                     now,
                     run["id"],
