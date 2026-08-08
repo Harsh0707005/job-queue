@@ -321,6 +321,10 @@ class DependencyError(Exception):
     """Raised when job dependency setup is invalid."""
 
 
+class RestoreError(Exception):
+    """Raised when tenant export/restore cannot proceed."""
+
+
 class MergeError(Exception):
     """Raised when a tenant ownership transfer cannot complete."""
 

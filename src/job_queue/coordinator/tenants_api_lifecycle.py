@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from uuid import UUID
+
 from job_queue.codec import (
     audit_consistency_report_to_dict,
     job_audit_event_to_dict,
@@ -11,7 +13,10 @@ from job_queue.codec import (
     tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
     tenant_payload_key_to_dict,
+    tenant_restore_to_dict,
+    tenant_snapshot_to_dict,
 )
+from job_queue.queue import RestoreError
 
 
 class TenantsApiLifecycleMixin:
@@ -119,6 +124,105 @@ class TenantsApiLifecycleMixin:
             "source_empty": result.source_empty,
             "jobs_moved": result.jobs_moved,
             "jobs_leased_moved": result.jobs_leased_moved,
+        }
+
+    def _export_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / export
+        if len(parts) != 4:
+            return 400, {"error": "invalid export path"}
+        tenant_id = parts[2]
+        try:
+            snap = self.queue.export_tenant(tenant_id)
+        except RestoreError as exc:
+            return 409, {"error": str(exc), "code": "export_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"snapshot": tenant_snapshot_to_dict(snap)}
+
+    def _get_snapshot(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / snapshots / {id}
+        if len(parts) != 3:
+            return 400, {"error": "invalid snapshot path"}
+        try:
+            sid = UUID(parts[2])
+        except ValueError:
+            return 400, {"error": "invalid snapshot id"}
+        snap = self.queue.get_tenant_snapshot(sid)
+        if snap is None:
+            return 404, {"error": "snapshot not found"}
+        return 200, {"snapshot": tenant_snapshot_to_dict(snap)}
+
+    def _restore_tenant(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / restore
+        if len(parts) != 4:
+            return 400, {"error": "invalid restore path"}
+        target = parts[2]
+        raw = body.get("snapshot_id")
+        if not raw:
+            return 400, {"error": "snapshot_id is required"}
+        try:
+            sid = UUID(str(raw))
+        except ValueError:
+            return 400, {"error": "invalid snapshot_id"}
+        try:
+            rst = self.queue.restore_tenant(
+                target,
+                snapshot_id=sid,
+                batch_size=int(body.get("batch_size") or 100),
+                run_until_complete=bool(body.get("run_until_complete") or False),
+            )
+        except RestoreError as exc:
+            return 409, {"error": str(exc), "code": "restore_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"restore": tenant_restore_to_dict(rst)}
+
+    def _advance_tenant_restore(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / restore / advance
+        if len(parts) != 5:
+            return 400, {"error": "invalid restore advance path"}
+        target = parts[2]
+        try:
+            rst = self.queue.advance_tenant_restore(
+                target, batch_size=int(body.get("batch_size") or 100)
+            )
+        except RestoreError as exc:
+            return 409, {"error": str(exc), "code": "restore_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"restore": tenant_restore_to_dict(rst)}
+
+    def _get_tenant_restore(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / restore
+        if len(parts) != 4:
+            return 400, {"error": "invalid restore path"}
+        rst = self.queue.get_tenant_restore(parts[2])
+        if rst is None:
+            return 404, {"error": "restore not found"}
+        return 200, {"restore": tenant_restore_to_dict(rst)}
+
+    def _advance_all_restores(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            rots = self.queue.process_tenant_restores(
+                limit=int(body.get("limit") or 20),
+                batch_size=int(body.get("batch_size") or 100),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(rots),
+            "restores": [tenant_restore_to_dict(r) for r in rots],
         }
 
     def _list_tenant_payload_keys(

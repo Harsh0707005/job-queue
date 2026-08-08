@@ -1014,4 +1014,69 @@ CREATE INDEX IF NOT EXISTS idx_workflow_runs_payload_key
     ON workflow_runs (tenant_id, payload_key_id)
     WHERE payload_key_id IS NOT NULL;
 
+-- Live tenant export / restore (crash-safe, source keeps running).
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS restoring BOOLEAN;
+UPDATE tenant_settings SET restoring = FALSE WHERE restoring IS NULL;
+ALTER TABLE tenant_settings ALTER COLUMN restoring SET DEFAULT FALSE;
+ALTER TABLE tenant_settings ALTER COLUMN restoring SET NOT NULL;
+
+CREATE TABLE IF NOT EXISTS tenant_snapshots (
+    id                  UUID PRIMARY KEY,
+    source_tenant_id    TEXT NOT NULL,
+    format_version      INTEGER NOT NULL DEFAULT 1,
+    status              TEXT NOT NULL,
+    counts              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    CONSTRAINT tenant_snapshots_status_check CHECK (
+        status IN ('capturing', 'ready', 'failed')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_snapshots_source
+    ON tenant_snapshots (source_tenant_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS tenant_snapshot_blobs (
+    snapshot_id     UUID NOT NULL REFERENCES tenant_snapshots(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    rows            JSONB NOT NULL,
+    PRIMARY KEY (snapshot_id, kind, seq),
+    CONSTRAINT tenant_snapshot_blobs_seq_check CHECK (seq >= 0),
+    CONSTRAINT tenant_snapshot_blobs_row_count_check CHECK (row_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_restores (
+    id                  UUID PRIMARY KEY,
+    snapshot_id         UUID NOT NULL REFERENCES tenant_snapshots(id),
+    target_tenant_id    TEXT NOT NULL,
+    source_tenant_id    TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    kind_index          INTEGER NOT NULL DEFAULT 0,
+    blob_seq            INTEGER NOT NULL DEFAULT 0,
+    blob_offset         INTEGER NOT NULL DEFAULT 0,
+    applied             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    id_map              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    exported_settings   JSONB,
+    error               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    CONSTRAINT tenant_restores_status_check CHECK (
+        status IN ('restoring', 'complete', 'failed', 'aborted')
+    ),
+    CONSTRAINT tenant_restores_kind_index_check CHECK (kind_index >= 0),
+    CONSTRAINT tenant_restores_blob_seq_check CHECK (blob_seq >= 0),
+    CONSTRAINT tenant_restores_blob_offset_check CHECK (blob_offset >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_restores_one_active_target
+    ON tenant_restores (target_tenant_id)
+    WHERE status = 'restoring';
+
+CREATE INDEX IF NOT EXISTS idx_tenant_restores_target
+    ON tenant_restores (target_tenant_id, created_at DESC);
+
 """

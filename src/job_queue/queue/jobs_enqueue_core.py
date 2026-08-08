@@ -129,6 +129,10 @@ class JobsEnqueueCoreMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
                 )
+            if self._is_tenant_restoring(conn, tenant_id):
+                raise ValueError(
+                    f"tenant {tenant_id!r} is restoring; enqueue is rejected"
+                )
             if dep_ids:
                 self._validate_dependencies(
                     conn, tenant_id=tenant_id, depends_on=dep_ids

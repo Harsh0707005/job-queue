@@ -306,6 +306,34 @@ class RoutingMixin:
         ):
             return self._merge_tenant(path, body)
         if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/export")
+        ):
+            return self._export_tenant(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/restore/advance")
+        ):
+            return self._advance_tenant_restore(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/restore")
+        ):
+            return self._restore_tenant(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/restore")
+        ):
+            return self._get_tenant_restore(path)
+        if method == "GET" and path.startswith("/v1/snapshots/"):
+            return self._get_snapshot(path)
+        if method == "POST" and path == "/v1/admin/restores/advance":
+            return self._advance_all_restores(body)
+        if (
             method == "GET"
             and path.startswith("/v1/tenants/")
             and path.endswith("/payload-keys")

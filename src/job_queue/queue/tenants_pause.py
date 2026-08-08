@@ -56,6 +56,10 @@ class TenantsPauseMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is offboarding and cannot be resumed"
                 )
+            if self._is_tenant_restoring(conn, tenant_id):
+                raise ValueError(
+                    f"tenant {tenant_id!r} is restoring and cannot be resumed"
+                )
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
@@ -110,6 +114,17 @@ class TenantsPauseMixin:
         if row is None:
             return False
         return bool(row["paused"])
+
+    @staticmethod
+    def _is_tenant_restoring(conn: Any, tenant_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT restoring FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return bool(row and row.get("restoring"))
 
     @staticmethod
     def _is_tenant_offboarding(conn: Any, tenant_id: str) -> bool:

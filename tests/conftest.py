@@ -85,6 +85,8 @@ def queue(postgres_url: str):
         conn.execute("TRUNCATE tenant_payload_keys")
         conn.execute("TRUNCATE workflow_step_runs CASCADE")
         conn.execute("TRUNCATE workflow_runs CASCADE")
+        conn.execute("TRUNCATE tenant_restores CASCADE")
+        conn.execute("TRUNCATE tenant_snapshots CASCADE")
         conn.execute(
             """
             UPDATE queue_settings

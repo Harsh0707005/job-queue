@@ -360,6 +360,37 @@ class PayloadKeyRotation:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantSnapshot:
+    """Durable export of one tenant's queue state (ciphertext preserved)."""
+
+    id: UUID
+    source_tenant_id: str
+    status: str
+    counts: dict[str, int]
+    created_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
+    format_version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class TenantRestore:
+    """Resumable restore of a snapshot into an empty target tenant."""
+
+    id: UUID
+    snapshot_id: UUID
+    target_tenant_id: str
+    source_tenant_id: str
+    status: str
+    kind_index: int
+    applied: dict[str, int]
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PreemptResult:
     """One preemption: urgent pending gained a slot by parking a leased job."""
 

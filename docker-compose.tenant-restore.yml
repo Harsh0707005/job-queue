@@ -1,0 +1,74 @@
+# Tenant export/restore under load + coordinator kill mid-restore.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tenant-restore.yml \
+#     up --build --abort-on-container-exit --exit-code-from tenant-restore-soak \
+#     tenant-restore-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  restore-chaos:
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      COMPOSE_PROJECT_NAME: job-queue
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "restore-chaos: wait for restore to start"
+        sleep 8
+        for i in 1 2 3; do
+          echo "restore-chaos round $$i: kill coordinator-1"
+          docker kill job-queue-coordinator-1-1 2>/dev/null \
+            || docker kill $$(docker ps -q -f name=coordinator-1) || true
+          sleep 6
+          echo "restore-chaos round $$i: start coordinator-1"
+          docker start job-queue-coordinator-1-1 2>/dev/null \
+            || docker start $$(docker ps -aq -f name=coordinator-1 | head -1) || true
+          sleep 10
+        done
+        echo "restore-chaos finished"
+        sleep 3600
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  tenant-restore-soak:
+    build: .
+    command: ["python", "scripts/tenant_restore_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+      WEBHOOK_URL: http://webhook-sink:8090/hook
+      LOAD_TENANTS: "4"
+      JOBS_PER_LOAD: "20"
+      SRC_JOBS: "16"
+      MAX_WALL_SECONDS: "240"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      webhook-sink:
+        condition: service_healthy
+      restore-chaos:
+        condition: service_started

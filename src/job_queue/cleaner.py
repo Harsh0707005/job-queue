@@ -52,6 +52,12 @@ class RetentionCleaner:
             )
         except Exception:  # noqa: BLE001
             logger.exception("payload key rotation advance failed")
+        try:
+            self.queue.process_tenant_restores(
+                limit=20, batch_size=min(self.batch_limit, 200)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("tenant restore advance failed")
         result = self.queue.purge_expired_jobs(
             limit=self.batch_limit,
             tenant_id=self.tenant_id,

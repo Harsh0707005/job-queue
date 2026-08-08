@@ -103,6 +103,58 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def export_tenant(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/export", {})
+        assert payload is not None
+        return payload
+
+    def restore_tenant(
+        self,
+        target_tenant_id: str,
+        *,
+        snapshot_id: str | UUID,
+        batch_size: int = 100,
+        run_until_complete: bool = False,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{target_tenant_id}/restore",
+            {
+                "snapshot_id": str(snapshot_id),
+                "batch_size": batch_size,
+                "run_until_complete": run_until_complete,
+            },
+        )
+        assert payload is not None
+        return payload
+
+    def advance_tenant_restore(
+        self, target_tenant_id: str, *, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{target_tenant_id}/restore/advance",
+            {"batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_restore(self, target_tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{target_tenant_id}/restore")
+        assert payload is not None
+        return payload
+
+    def process_tenant_restores(
+        self, *, limit: int = 20, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            "/v1/admin/restores/advance",
+            {"limit": limit, "batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
     def process_payload_key_rotations(
         self,
         *,

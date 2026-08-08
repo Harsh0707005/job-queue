@@ -23,6 +23,8 @@ from job_queue.models import (
     TenantMergeResult,
     TenantOffboardResult,
     TenantPayloadKey,
+    TenantRestore,
+    TenantSnapshot,
     TenantStats,
     WebhookDelivery,
     WebhookEndpoint,
@@ -419,6 +421,35 @@ def tenant_merge_result_to_dict(result: TenantMergeResult) -> dict[str, Any]:
         "dedupe_keys_cleared": result.dedupe_keys_cleared,
         "schedule_names_renamed": result.schedule_names_renamed,
         "source_empty": result.source_empty,
+    }
+
+
+def tenant_snapshot_to_dict(snap: TenantSnapshot) -> dict[str, Any]:
+    return {
+        "id": str(snap.id),
+        "source_tenant_id": snap.source_tenant_id,
+        "status": snap.status,
+        "counts": dict(snap.counts),
+        "created_at": _dt(snap.created_at),
+        "completed_at": _dt(snap.completed_at),
+        "error": snap.error,
+        "format_version": snap.format_version,
+    }
+
+
+def tenant_restore_to_dict(rst: TenantRestore) -> dict[str, Any]:
+    return {
+        "id": str(rst.id),
+        "snapshot_id": str(rst.snapshot_id),
+        "target_tenant_id": rst.target_tenant_id,
+        "source_tenant_id": rst.source_tenant_id,
+        "status": rst.status,
+        "kind_index": rst.kind_index,
+        "applied": dict(rst.applied),
+        "created_at": _dt(rst.created_at),
+        "updated_at": _dt(rst.updated_at),
+        "completed_at": _dt(rst.completed_at),
+        "error": rst.error,
     }
 
 
