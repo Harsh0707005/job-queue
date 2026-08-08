@@ -1004,4 +1004,14 @@ CREATE INDEX IF NOT EXISTS idx_schedules_payload_key
     ON schedules (tenant_id, payload_key_id)
     WHERE payload_key_id IS NOT NULL;
 
+ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS payload_key_id UUID;
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payload_key
+    ON webhook_deliveries (tenant_id, payload_key_id)
+    WHERE payload_key_id IS NOT NULL;
+
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS payload_key_id UUID;
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_payload_key
+    ON workflow_runs (tenant_id, payload_key_id)
+    WHERE payload_key_id IS NOT NULL;
+
 """

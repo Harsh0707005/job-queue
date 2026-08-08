@@ -1068,18 +1068,26 @@ class AlertsMixin:
                     payload["resolved_by"] = resolved_by
                     payload["resolution_note"] = resolution_note
                     payload["status"] = "resolved"
+                from job_queue.crypto import delivery_aad
+
+                sealed, payload_key_id = self._seal_dict(
+                    conn,
+                    tenant_id=str(tid),
+                    plaintext=payload,
+                    aad=delivery_aad(delivery_id),
+                )
                 conn.execute(
                     f"""
                     INSERT INTO webhook_deliveries (
                         id, endpoint_id, tenant_id, job_id, event, payload,
                         status, attempts, max_attempts, backoff_base_seconds,
                         backoff_max_seconds, next_attempt_at, signing_secret,
-                        created_at, updated_at
+                        created_at, updated_at, payload_key_id
                     ) VALUES (
                         %s, %s, %s, NULL, %s, %s,
                         'pending', 0, %s, %s,
                         %s, %s, %s,
-                        %s, %s
+                        %s, %s, %s
                     )
                     """,
                     (
@@ -1087,7 +1095,7 @@ class AlertsMixin:
                         ep["id"],
                         tid,
                         event,
-                        Jsonb(payload),
+                        Jsonb(sealed),
                         ep["max_attempts"],
                         ep["backoff_base_seconds"],
                         ep["backoff_max_seconds"],
@@ -1095,6 +1103,7 @@ class AlertsMixin:
                         ep.get("secret"),
                         schedule_at,
                         schedule_at,
+                        payload_key_id,
                     ),
                 )
 

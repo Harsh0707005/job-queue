@@ -7,7 +7,14 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
-from job_queue.crypto import encrypt_json, is_envelope, job_aad, schedule_aad
+from job_queue.crypto import (
+    delivery_aad,
+    encrypt_json,
+    job_aad,
+    result_aad,
+    schedule_aad,
+    workflow_steps_aad,
+)
 from job_queue.db import transaction
 from job_queue.models import PayloadKeyRotation, TenantPayloadKey
 from job_queue.queue._common import _utcnow
@@ -239,6 +246,18 @@ class PayloadKeysMixin:
                         to_key_id=active["key_id"],
                         limit=batch_size,
                     )
+                    self._reencrypt_deliveries_batch(
+                        conn,
+                        tenant_id=tenant_id,
+                        to_key_id=active["key_id"],
+                        limit=batch_size,
+                    )
+                    self._reencrypt_workflow_runs_batch(
+                        conn,
+                        tenant_id=tenant_id,
+                        to_key_id=active["key_id"],
+                        limit=batch_size,
+                    )
                     self._retire_unreferenced_keys(conn, tenant_id=tenant_id)
                     synthetic = {
                         "id": uuid4(),
@@ -267,6 +286,18 @@ class PayloadKeysMixin:
                 limit=batch_size,
             )
             sched_n = self._reencrypt_schedules_batch(
+                conn,
+                tenant_id=tenant_id,
+                to_key_id=to_key_id,
+                limit=batch_size,
+            )
+            self._reencrypt_deliveries_batch(
+                conn,
+                tenant_id=tenant_id,
+                to_key_id=to_key_id,
+                limit=batch_size,
+            )
+            self._reencrypt_workflow_runs_batch(
                 conn,
                 tenant_id=tenant_id,
                 to_key_id=to_key_id,
@@ -339,25 +370,24 @@ class PayloadKeysMixin:
         return out
 
     def _count_unsealed(self, conn: Any, tenant_id: str, active_key_id: UUID) -> int:
-        jobs = conn.execute(
-            """
-            SELECT COUNT(*)::int AS n
-            FROM jobs
-            WHERE tenant_id = %s
-              AND (payload_key_id IS DISTINCT FROM %s)
-            """,
-            (tenant_id, active_key_id),
-        ).fetchone()
-        sched = conn.execute(
-            """
-            SELECT COUNT(*)::int AS n
-            FROM schedules
-            WHERE tenant_id = %s
-              AND (payload_key_id IS DISTINCT FROM %s)
-            """,
-            (tenant_id, active_key_id),
-        ).fetchone()
-        return int(jobs["n"] if jobs else 0) + int(sched["n"] if sched else 0)
+        total = 0
+        for table in (
+            "jobs",
+            "schedules",
+            "webhook_deliveries",
+            "workflow_runs",
+        ):
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)::int AS n
+                FROM {table}
+                WHERE tenant_id = %s
+                  AND (payload_key_id IS DISTINCT FROM %s)
+                """,
+                (tenant_id, active_key_id),
+            ).fetchone()
+            total += int(row["n"] if row else 0)
+        return total
 
     def _reencrypt_jobs_batch(
         self,
@@ -373,7 +403,7 @@ class PayloadKeysMixin:
             to_key_id = rec.key_id
         rows = conn.execute(
             """
-            SELECT id, payload, payload_key_id
+            SELECT id, payload, result, payload_key_id
             FROM jobs
             WHERE tenant_id = %s
               AND (payload_key_id IS DISTINCT FROM %s)
@@ -397,15 +427,36 @@ class PayloadKeysMixin:
                 plaintext=plain,
                 aad=job_aad(row["id"]),
             )
+            result_env = row.get("result")
+            if result_env is not None:
+                opened_result = self._open_json_value(
+                    result_env,
+                    tenant_id=tenant_id,
+                    aad=result_aad(row["id"]),
+                    conn=conn,
+                )
+                result_env, _ = self._seal_json_value(
+                    conn,
+                    tenant_id=tenant_id,
+                    value=opened_result,
+                    aad=result_aad(row["id"]),
+                )
             conn.execute(
                 """
                 UPDATE jobs
                 SET payload = %s,
+                    result = %s,
                     payload_key_id = %s,
                     updated_at = NOW()
                 WHERE id = %s AND tenant_id = %s
                 """,
-                (Jsonb(env), rec.key_id, row["id"], tenant_id),
+                (
+                    Jsonb(env),
+                    None if result_env is None else Jsonb(result_env),
+                    rec.key_id,
+                    row["id"],
+                    tenant_id,
+                ),
             )
             n += 1
         return n
@@ -456,6 +507,101 @@ class PayloadKeysMixin:
                 WHERE id = %s AND tenant_id = %s
                 """,
                 (Jsonb(env), rec.key_id, row["id"], tenant_id),
+            )
+            n += 1
+        return n
+
+    def _reencrypt_deliveries_batch(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        to_key_id: UUID,
+        limit: int,
+    ) -> int:
+        rec = self._ensure_active_key(conn, tenant_id)
+        if rec.key_id != to_key_id:
+            to_key_id = rec.key_id
+        rows = conn.execute(
+            """
+            SELECT id, payload, payload_key_id
+            FROM webhook_deliveries
+            WHERE tenant_id = %s
+              AND (payload_key_id IS DISTINCT FROM %s)
+            ORDER BY created_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (tenant_id, to_key_id, limit),
+        ).fetchall()
+        n = 0
+        for row in rows:
+            plain = self._open_dict(
+                row["payload"],
+                tenant_id=tenant_id,
+                aad=delivery_aad(row["id"]),
+                conn=conn,
+            )
+            env = encrypt_json(
+                rec.dek,
+                key_id=rec.key_id,
+                plaintext=plain,
+                aad=delivery_aad(row["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET payload = %s,
+                    payload_key_id = %s,
+                    updated_at = NOW()
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (Jsonb(env), rec.key_id, row["id"], tenant_id),
+            )
+            n += 1
+        return n
+
+    def _reencrypt_workflow_runs_batch(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        to_key_id: UUID,
+        limit: int,
+    ) -> int:
+        rec = self._ensure_active_key(conn, tenant_id)
+        if rec.key_id != to_key_id:
+            to_key_id = rec.key_id
+        rows = conn.execute(
+            """
+            SELECT id, tenant_id, steps_def, payload_key_id
+            FROM workflow_runs
+            WHERE tenant_id = %s
+              AND (payload_key_id IS DISTINCT FROM %s)
+            ORDER BY created_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (tenant_id, to_key_id, limit),
+        ).fetchall()
+        n = 0
+        for row in rows:
+            steps = self._parse_steps_def(row, conn)
+            env, kid = self._seal_dict(
+                conn,
+                tenant_id=tenant_id,
+                plaintext={"steps": steps},
+                aad=workflow_steps_aad(row["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET steps_def = %s,
+                    payload_key_id = %s,
+                    updated_at = NOW()
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (Jsonb(env), kid, row["id"], tenant_id),
             )
             n += 1
         return n
@@ -526,6 +672,26 @@ class PayloadKeysMixin:
                 (tenant_id, str(kid)),
             ).fetchone()
             if env_sched is not None:
+                continue
+            deliv_ref = conn.execute(
+                """
+                SELECT 1 FROM webhook_deliveries
+                WHERE tenant_id = %s AND payload_key_id = %s
+                LIMIT 1
+                """,
+                (tenant_id, kid),
+            ).fetchone()
+            if deliv_ref is not None:
+                continue
+            wf_ref = conn.execute(
+                """
+                SELECT 1 FROM workflow_runs
+                WHERE tenant_id = %s AND payload_key_id = %s
+                LIMIT 1
+                """,
+                (tenant_id, kid),
+            ).fetchone()
+            if wf_ref is not None:
                 continue
             conn.execute(
                 """

@@ -284,6 +284,131 @@ def test_rebuild_from_audit_keeps_ciphertext(queue: JobQueue):
     assert stored["payload"][ENVELOPE_MARKER] == 1
 
 
+def test_webhook_delivery_does_not_store_plaintext_payload(queue: JobQueue):
+    """Realistic complete → outbox → POST: secrets stay sealed in Postgres."""
+    from job_queue import WebhookEvent
+    from tests.helpers_queue import _WebhookCapture
+
+    secret = "wh-delivery-secret-xyz"
+    result_secret = "wh-result-secret-xyz"
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="wh-enc",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="hook-sign",
+        )
+        job = queue.enqueue(
+            tenant_id="wh-enc",
+            payload={"token": secret, "email": "a@example.com"},
+        )
+        leased = queue.lease(tenant_id="wh-enc", worker_id="w1")
+        assert leased is not None
+        _ack(queue, leased, "w1", result={"receipt": result_secret})
+
+        pending = queue.list_webhook_deliveries(tenant_id="wh-enc", status="pending")
+        assert len(pending) == 1
+        # Library inspect decrypts so operators/tests still see the POST body.
+        assert pending[0].payload["payload"]["token"] == secret
+        assert pending[0].payload["result"]["receipt"] == result_secret
+
+        with queue._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT payload::text AS t, result::text AS r FROM jobs WHERE id = %s",
+                (job.id,),
+            ).fetchone()
+            stored = conn.execute(
+                "SELECT payload::text AS t FROM webhook_deliveries WHERE tenant_id = %s",
+                ("wh-enc",),
+            ).fetchone()
+        assert secret not in row["t"]
+        assert result_secret not in (row["r"] or "")
+        assert secret not in stored["t"]
+        assert result_secret not in stored["t"]
+        assert "_jq_enc" in stored["t"]
+
+        results = queue.process_webhook_deliveries(limit=10)
+        assert len(results) == 1 and results[0].success is True
+        assert len(capture.received) == 1
+        body = capture.received[0]["body"]
+        assert body["payload"]["token"] == secret
+        assert body["result"]["receipt"] == result_secret
+        assert queue.get_result(job.id, tenant_id="wh-enc") == {
+            "receipt": result_secret
+        }
+    finally:
+        capture.stop()
+
+
+def test_workflow_steps_def_not_plaintext_in_postgres(queue: JobQueue):
+    secret = "wf-step-secret-abc"
+    run = queue.start_workflow(
+        tenant_id="wf-enc",
+        name="pay",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "charge",
+                "payload": {"card": secret},
+                "compensate": {"payload": {"undo": secret}},
+            }
+        ],
+    )
+    assert run.steps_def[0]["payload"]["card"] == secret
+    with queue._pool.connection() as conn:
+        txt = conn.execute(
+            "SELECT steps_def::text AS t FROM workflow_runs WHERE id = %s",
+            (run.id,),
+        ).fetchone()["t"]
+    assert secret not in txt
+    assert "_jq_enc" in txt
+
+    leased = queue.lease(tenant_id="wf-enc", worker_id="w")
+    assert leased is not None
+    assert leased.payload["step"]["payload"]["card"] == secret
+    _ack(queue, leased, "w", result={"ok": True})
+    done = queue.get_workflow(run.id, tenant_id="wf-enc")
+    assert done is not None and done.status == JobStatus.COMPLETED.value
+
+
+def test_http_webhook_claim_has_plaintext_list_redacts(
+    queue: JobQueue, coordinator_url: str, monkeypatch
+):
+    monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
+    client = CoordinatorClient(coordinator_url)
+    secret = "http-wh-secret"
+    client.register_webhook(
+        tenant_id="http-wh",
+        url="http://127.0.0.1:9/hook",
+        events=["job.completed"],
+        secret="s",
+    )
+    client.enqueue(tenant_id="http-wh", payload={"pin": secret})
+    leased = client.lease(worker_id="w", tenant_id="http-wh")
+    assert leased is not None
+    client.ack(
+        leased.id,
+        tenant_id="http-wh",
+        worker_id="w",
+        lease_token=leased.lease_token,
+        result={"pin": secret},
+    )
+    claimed = client.claim_webhooks(limit=10)
+    rows = claimed.get("claimed") or []
+    assert rows
+    body = rows[0]["delivery"]["payload"]
+    assert body["payload"]["pin"] == secret
+    # Wire list/finalize style serialization redacts.
+    from job_queue.codec import webhook_delivery_to_dict
+
+    d = queue.list_webhook_deliveries(tenant_id="http-wh")[0]
+    redacted = webhook_delivery_to_dict(d)
+    dumped = json.dumps(redacted)
+    assert secret not in dumped
+    assert redacted["payload"] == {"_encrypted": True}
+
+
 def test_rotation_type_roundtrip(queue: JobQueue):
     queue.enqueue(tenant_id="typ", payload={"a": 1})
     rot = queue.rotate_tenant_payload_key("typ")

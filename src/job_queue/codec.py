@@ -452,12 +452,17 @@ def webhook_delivery_to_dict(
     d: WebhookDelivery,
     *,
     include_signing_secret: bool = False,
+    include_payload: bool = False,
 ) -> dict[str, Any]:
     """Serialize a webhook delivery.
 
     ``signing_secret`` is redacted by default. Claim responses expose the
     secret once at the top level of :func:`claimed_webhook_to_dict` for the
     agent that must sign the POST — not nested on every delivery echo.
+
+    Delivery ``payload`` (the POST body) is redacted by default so list/get
+    cannot dump tenant job secrets. Pass ``include_payload=True`` only on
+    claim (the agent that will POST).
     """
     out: dict[str, Any] = {
         "id": str(d.id),
@@ -465,7 +470,7 @@ def webhook_delivery_to_dict(
         "tenant_id": d.tenant_id,
         "job_id": str(d.job_id) if d.job_id is not None else None,
         "event": d.event,
-        "payload": d.payload,
+        "payload": d.payload if include_payload else redact_payload(d.payload),
         "status": d.status,
         "attempts": d.attempts,
         "max_attempts": d.max_attempts,
@@ -488,7 +493,9 @@ def claimed_webhook_to_dict(c: ClaimedWebhook) -> dict[str, Any]:
     # Nested delivery is redacted; top-level secret is the claim handoff
     # for the agent that will POST and sign.
     return {
-        "delivery": webhook_delivery_to_dict(c.delivery, include_signing_secret=False),
+        "delivery": webhook_delivery_to_dict(
+            c.delivery, include_signing_secret=False, include_payload=True
+        ),
         "url": c.url,
         "secret": c.secret,
         "endpoint_enabled": c.endpoint_enabled,

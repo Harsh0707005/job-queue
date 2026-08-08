@@ -62,6 +62,14 @@ class WebhooksEnqueueMixin:
                 ),
                 "timestamp": now.isoformat(),
             }
+            from job_queue.crypto import delivery_aad
+
+            sealed, payload_key_id = self._seal_dict(
+                conn,
+                tenant_id=job.tenant_id,
+                plaintext=payload,
+                aad=delivery_aad(delivery_id),
+            )
             # Freeze signing secret at enqueue so rotation mid-retry is safe.
             signing_secret = ep.get("secret")
             conn.execute(
@@ -70,12 +78,12 @@ class WebhooksEnqueueMixin:
                     id, endpoint_id, tenant_id, job_id, event, payload,
                     status, attempts, max_attempts, backoff_base_seconds,
                     backoff_max_seconds, next_attempt_at, signing_secret,
-                    created_at, updated_at
+                    created_at, updated_at, payload_key_id
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     'pending', 0, %s, %s,
                     %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 """,
                 (
@@ -84,7 +92,7 @@ class WebhooksEnqueueMixin:
                     job.tenant_id,
                     job.id,
                     event.value,
-                    Jsonb(payload),
+                    Jsonb(sealed),
                     ep["max_attempts"],
                     ep["backoff_base_seconds"],
                     ep["backoff_max_seconds"],
@@ -92,6 +100,7 @@ class WebhooksEnqueueMixin:
                     signing_secret,
                     now,
                     now,
+                    payload_key_id,
                 ),
             )
 

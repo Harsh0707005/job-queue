@@ -37,7 +37,6 @@ class LeaseAckMixin:
         or ``lease_tenant_id`` (pre-merge claim tenant).
         """
         now = _utcnow()
-        result_json = Jsonb(result) if result is not None else None
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
@@ -50,6 +49,18 @@ class LeaseAckMixin:
             else:
                 runtime_exceeded = False
                 self._assert_lease_not_expired(row, now)
+
+                result_json = None
+                if result is not None:
+                    from job_queue.crypto import result_aad
+
+                    sealed_result, _kid = self._seal_json_value(
+                        conn,
+                        tenant_id=str(row["tenant_id"]),
+                        value=result,
+                        aad=result_aad(job_id),
+                    )
+                    result_json = Jsonb(sealed_result)
 
                 updated = conn.execute(
                     f"""

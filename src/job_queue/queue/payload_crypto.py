@@ -14,7 +14,9 @@ from job_queue.crypto import (
     encrypt_json,
     is_envelope,
     job_aad,
+    result_aad,
     schedule_aad,
+    workflow_steps_aad,
 )
 from job_queue.models import Job, Schedule
 from job_queue.queue._common import _row_to_job, _row_to_schedule
@@ -122,6 +124,47 @@ class PayloadCryptoMixin:
         with self._pool.connection() as c:  # type: ignore[attr-defined]
             return _fetch(c)
 
+    def _seal_dict(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        plaintext: dict[str, Any],
+        aad: bytes,
+    ) -> tuple[dict[str, Any], UUID]:
+        if not isinstance(plaintext, dict):
+            raise ValueError("plaintext must be a dict")
+        if is_envelope(plaintext):
+            return plaintext, UUID(str(plaintext["kid"]))
+        rec = self._ensure_active_key(conn, tenant_id)
+        env = encrypt_json(
+            rec.dek,
+            key_id=rec.key_id,
+            plaintext=plaintext,
+            aad=aad,
+        )
+        return env, rec.key_id
+
+    def _open_dict(
+        self,
+        payload: Any,
+        *,
+        tenant_id: str,
+        aad: bytes,
+        conn: Any | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return {}
+        if not isinstance(payload, dict):
+            return {}
+        if not is_envelope(payload):
+            return payload
+        dek = self._load_dek(conn, tenant_id, UUID(str(payload["kid"])))
+        return decrypt_json(dek, payload, aad=aad)
+
     def _seal_job_payload(
         self,
         conn: Any,
@@ -130,18 +173,9 @@ class PayloadCryptoMixin:
         job_id: UUID,
         payload: dict[str, Any],
     ) -> tuple[dict[str, Any], UUID]:
-        if not isinstance(payload, dict):
-            raise ValueError("payload must be a dict")
-        if is_envelope(payload):
-            return payload, UUID(str(payload["kid"]))
-        rec = self._ensure_active_key(conn, tenant_id)
-        env = encrypt_json(
-            rec.dek,
-            key_id=rec.key_id,
-            plaintext=payload,
-            aad=job_aad(job_id),
+        return self._seal_dict(
+            conn, tenant_id=tenant_id, plaintext=payload, aad=job_aad(job_id)
         )
-        return env, rec.key_id
 
     def _seal_schedule_payload(
         self,
@@ -151,18 +185,12 @@ class PayloadCryptoMixin:
         schedule_id: UUID,
         payload: dict[str, Any],
     ) -> tuple[dict[str, Any], UUID]:
-        if not isinstance(payload, dict):
-            raise ValueError("payload must be a dict")
-        if is_envelope(payload):
-            return payload, UUID(str(payload["kid"]))
-        rec = self._ensure_active_key(conn, tenant_id)
-        env = encrypt_json(
-            rec.dek,
-            key_id=rec.key_id,
+        return self._seal_dict(
+            conn,
+            tenant_id=tenant_id,
             plaintext=payload,
             aad=schedule_aad(schedule_id),
         )
-        return env, rec.key_id
 
     def _open_job_payload(
         self,
@@ -172,17 +200,9 @@ class PayloadCryptoMixin:
         job_id: UUID,
         conn: Any | None = None,
     ) -> dict[str, Any]:
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                return {}
-        if not isinstance(payload, dict):
-            return {}
-        if not is_envelope(payload):
-            return payload
-        dek = self._load_dek(conn, tenant_id, UUID(str(payload["kid"])))
-        return decrypt_json(dek, payload, aad=job_aad(job_id))
+        return self._open_dict(
+            payload, tenant_id=tenant_id, aad=job_aad(job_id), conn=conn
+        )
 
     def _open_schedule_payload(
         self,
@@ -192,17 +212,75 @@ class PayloadCryptoMixin:
         schedule_id: UUID,
         conn: Any | None = None,
     ) -> dict[str, Any]:
+        return self._open_dict(
+            payload,
+            tenant_id=tenant_id,
+            aad=schedule_aad(schedule_id),
+            conn=conn,
+        )
+
+    def _seal_json_value(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        value: Any,
+        aad: bytes,
+    ) -> tuple[dict[str, Any], UUID]:
+        return self._seal_dict(
+            conn,
+            tenant_id=tenant_id,
+            plaintext={"_jq_val": value},
+            aad=aad,
+        )
+
+    def _open_json_value(
+        self,
+        payload: Any,
+        *,
+        tenant_id: str,
+        aad: bytes,
+        conn: Any | None = None,
+    ) -> Any:
+        if payload is None:
+            return None
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
             except json.JSONDecodeError:
-                return {}
-        if not isinstance(payload, dict):
-            return {}
+                return payload
         if not is_envelope(payload):
             return payload
-        dek = self._load_dek(conn, tenant_id, UUID(str(payload["kid"])))
-        return decrypt_json(dek, payload, aad=schedule_aad(schedule_id))
+        opened = self._open_dict(
+            payload, tenant_id=tenant_id, aad=aad, conn=conn
+        )
+        if isinstance(opened, dict) and "_jq_val" in opened and set(opened) == {"_jq_val"}:
+            return opened["_jq_val"]
+        return opened
+
+    def _parse_steps_def(
+        self, run_row: dict[str, Any], conn: Any | None = None
+    ) -> list[dict[str, Any]]:
+        raw = run_row.get("steps_def")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
+        if isinstance(raw, list):
+            return [dict(x) for x in raw if isinstance(x, dict)]
+        if not isinstance(raw, dict):
+            return []
+        opened = self._open_dict(
+            raw,
+            tenant_id=str(run_row["tenant_id"]),
+            aad=workflow_steps_aad(run_row["id"]),
+            conn=conn,
+        )
+        steps = opened.get("steps") if isinstance(opened, dict) else None
+        if isinstance(steps, list):
+            return [dict(x) for x in steps if isinstance(x, dict)]
+        return []
 
     def _job(
         self,
@@ -213,13 +291,22 @@ class PayloadCryptoMixin:
     ) -> Job:
         data = dict(row)
         payload = data.get("payload")
+        tenant_id = str(data["tenant_id"])
+        job_id = data["id"]
         if decrypt:
             data["payload"] = self._open_job_payload(
                 payload,
-                tenant_id=str(data["tenant_id"]),
-                job_id=data["id"],
+                tenant_id=tenant_id,
+                job_id=job_id,
                 conn=conn,
             )
+            if data.get("result") is not None:
+                data["result"] = self._open_json_value(
+                    data.get("result"),
+                    tenant_id=tenant_id,
+                    aad=result_aad(job_id),
+                    conn=conn,
+                )
         else:
             if isinstance(payload, str):
                 try:

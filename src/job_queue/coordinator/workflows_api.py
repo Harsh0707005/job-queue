@@ -5,8 +5,25 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+from job_queue.crypto import redact_payload
 from job_queue.models import WorkflowRun, WorkflowStepRun
 from job_queue.queue._common import CancelError
+
+
+def _redact_steps_def(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for raw in steps:
+        step = dict(raw)
+        if "payload" in step:
+            step["payload"] = redact_payload(step.get("payload"))
+        comp = step.get("compensate")
+        if isinstance(comp, dict):
+            c = dict(comp)
+            if "payload" in c:
+                c["payload"] = redact_payload(c.get("payload"))
+            step["compensate"] = c
+        out.append(step)
+    return out
 
 
 def _run_to_dict(r: WorkflowRun) -> dict[str, Any]:
@@ -15,7 +32,7 @@ def _run_to_dict(r: WorkflowRun) -> dict[str, Any]:
         "tenant_id": r.tenant_id,
         "name": r.name,
         "status": r.status,
-        "steps_def": r.steps_def,
+        "steps_def": _redact_steps_def(list(r.steps_def or [])),
         "current_index": r.current_index,
         "fail_step_index": r.fail_step_index,
         "fail_reason": r.fail_reason,

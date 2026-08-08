@@ -208,18 +208,32 @@ class WebhooksRegistryMixin:
             updated_at=row["updated_at"],
         )
 
-    @staticmethod
-    def _row_to_webhook_delivery(row: dict[str, Any]) -> WebhookDelivery:
+    def _row_to_webhook_delivery(
+        self,
+        row: dict[str, Any],
+        *,
+        decrypt: bool = True,
+        conn: Any | None = None,
+    ) -> WebhookDelivery:
         payload = row["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if decrypt and isinstance(payload, dict):
+            from job_queue.crypto import delivery_aad
+
+            payload = self._open_dict(
+                payload,
+                tenant_id=str(row["tenant_id"]),
+                aad=delivery_aad(row["id"]),
+                conn=conn,
+            )
         return WebhookDelivery(
             id=row["id"],
             endpoint_id=row["endpoint_id"],
             tenant_id=row["tenant_id"],
             job_id=row["job_id"],
             event=row["event"],
-            payload=payload,
+            payload=payload if isinstance(payload, dict) else {},
             status=row["status"],
             attempts=int(row["attempts"]),
             max_attempts=int(row["max_attempts"]),

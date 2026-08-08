@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from job_queue.crypto import workflow_steps_aad
 from job_queue.db import transaction
 from job_queue.models import (
     JobStatus,
@@ -35,7 +36,7 @@ WORKFLOW_STEP_KIND = "workflow.step"
 _RUN_COLUMNS = """
     id, tenant_id, name, status, steps_def, current_index,
     fail_step_index, fail_reason, max_compensate_retries,
-    created_at, updated_at, completed_at
+    created_at, updated_at, completed_at, payload_key_id
 """
 
 _STEP_COLUMNS = """
@@ -73,16 +74,22 @@ class WorkflowsMixin:
         now = _utcnow()
         rid = run_id or uuid4()
         with transaction(self._pool) as conn:
+            sealed_steps, steps_key_id = self._seal_dict(
+                conn,
+                tenant_id=tenant_id,
+                plaintext={"steps": normalized},
+                aad=workflow_steps_aad(rid),
+            )
             conn.execute(
                 f"""
                 INSERT INTO workflow_runs (
                     id, tenant_id, name, status, steps_def, current_index,
                     fail_step_index, fail_reason, max_compensate_retries,
-                    created_at, updated_at, completed_at
+                    created_at, updated_at, completed_at, payload_key_id
                 ) VALUES (
                     %s, %s, %s, %s, %s, 0,
                     NULL, NULL, %s,
-                    %s, %s, NULL
+                    %s, %s, NULL, %s
                 )
                 """,
                 (
@@ -90,10 +97,11 @@ class WorkflowsMixin:
                     tenant_id,
                     str(name).strip() if name else None,
                     WorkflowRunStatus.RUNNING.value,
-                    Jsonb(normalized),
+                    Jsonb(sealed_steps),
                     int(max_compensate_retries),
                     now,
                     now,
+                    steps_key_id,
                 ),
             )
             # Fan-out: enqueue every root step (empty depends_on).
@@ -286,11 +294,7 @@ class WorkflowsMixin:
             )
 
             if want_compensate:
-                steps_def = run["steps_def"]
-                if isinstance(steps_def, str):
-                    import json
-
-                    steps_def = json.loads(steps_def)
+                steps_def = self._parse_steps_def(run, conn)
                 self._try_start_compensate_if_settled(
                     conn,
                     run=run,
@@ -855,11 +859,7 @@ class WorkflowsMixin:
                 step["id"],
             ),
         )
-        steps_def = run["steps_def"]
-        if isinstance(steps_def, str):
-            import json
-
-            steps_def = json.loads(steps_def)
+        steps_def = self._parse_steps_def(run, conn)
         idx = int(step["step_index"])
         conn.execute(
             """
@@ -962,11 +962,7 @@ class WorkflowsMixin:
             ),
         )
         fail_idx = int(step["step_index"])
-        steps_def = run["steps_def"]
-        if isinstance(steps_def, str):
-            import json
-
-            steps_def = json.loads(steps_def)
+        steps_def = self._parse_steps_def(run, conn)
 
         job = conn.execute(
             f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
@@ -1420,11 +1416,7 @@ class WorkflowsMixin:
             ).fetchone()
             if updated is None:
                 return
-            steps_def = run["steps_def"]
-            if isinstance(steps_def, str):
-                import json
-
-                steps_def = json.loads(steps_def)
+            steps_def = self._parse_steps_def(run, conn)
             self._enqueue_job_for_step(
                 conn,
                 run_id=run["id"],
@@ -1524,11 +1516,7 @@ class WorkflowsMixin:
             """,
             (run["id"], after_step_index),
         ).fetchone()
-        steps_def = run["steps_def"]
-        if isinstance(steps_def, str):
-            import json
-
-            steps_def = json.loads(steps_def)
+        steps_def = self._parse_steps_def(run, conn)
         if nxt is not None:
             self._enqueue_job_for_step(
                 conn,
@@ -1600,11 +1588,7 @@ class WorkflowsMixin:
             (run["id"],),
         ).fetchone()
         if any_comp is None:
-            steps_def = run["steps_def"]
-            if isinstance(steps_def, str):
-                import json
-
-                steps_def = json.loads(steps_def)
+            steps_def = self._parse_steps_def(run, conn)
             return self._try_start_compensate_if_settled(
                 conn,
                 run=run,
@@ -1687,11 +1671,7 @@ class WorkflowsMixin:
             )
             return True
         # pending without job — enqueue first time only.
-        steps_def = run["steps_def"]
-        if isinstance(steps_def, str):
-            import json
-
-            steps_def = json.loads(steps_def)
+        steps_def = self._parse_steps_def(run, conn)
         self._enqueue_job_for_step(
             conn,
             run_id=run["id"],
@@ -2161,13 +2141,10 @@ class WorkflowsMixin:
         """Backward-compatible single-leaf normalizer."""
         return WorkflowsMixin._normalize_leaf_step(raw, index)
 
-    @staticmethod
-    def _row_to_workflow_run(row: dict[str, Any]) -> WorkflowRun:
-        steps = row.get("steps_def") or []
-        if isinstance(steps, str):
-            import json
-
-            steps = json.loads(steps)
+    def _row_to_workflow_run(
+        self, row: dict[str, Any], *, conn: Any | None = None
+    ) -> WorkflowRun:
+        steps = self._parse_steps_def(row, conn)
         return WorkflowRun(
             id=row["id"],
             tenant_id=row["tenant_id"],

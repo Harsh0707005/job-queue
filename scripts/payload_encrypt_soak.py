@@ -96,13 +96,22 @@ def postgres_secret_hits(secrets: list[str]) -> list[str]:
 
     hits: list[str] = []
     with psycopg.connect(DSN, row_factory=dict_row) as conn:
-        job_txt = conn.execute("SELECT payload::text AS t FROM jobs").fetchall()
+        job_txt = conn.execute(
+            "SELECT payload::text AS t FROM jobs UNION ALL SELECT result::text FROM jobs WHERE result IS NOT NULL"
+        ).fetchall()
         sched_txt = conn.execute("SELECT payload::text AS t FROM schedules").fetchall()
+        deliv_txt = conn.execute(
+            "SELECT payload::text AS t FROM webhook_deliveries"
+        ).fetchall()
+        wf_txt = conn.execute(
+            "SELECT steps_def::text AS t FROM workflow_runs"
+        ).fetchall()
         wrap = conn.execute(
             "SELECT encode(wrapped_dek, 'escape') AS t FROM tenant_payload_keys"
         ).fetchall()
         blob = "\n".join(
-            (r["t"] or "") for r in job_txt + sched_txt + wrap
+            (r["t"] or "")
+            for r in job_txt + sched_txt + deliv_txt + wf_txt + wrap
         )
     for s in secrets:
         if s in blob:

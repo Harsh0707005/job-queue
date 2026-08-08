@@ -110,6 +110,18 @@ def schedule_aad(schedule_id: UUID | str) -> bytes:
     return f"job-queue:v1:schedule:{schedule_id}".encode()
 
 
+def delivery_aad(delivery_id: UUID | str) -> bytes:
+    return f"job-queue:v1:webhook-delivery:{delivery_id}".encode()
+
+
+def workflow_steps_aad(run_id: UUID | str) -> bytes:
+    return f"job-queue:v1:workflow-steps:{run_id}".encode()
+
+
+def result_aad(job_id: UUID | str) -> bytes:
+    return f"job-queue:v1:job-result:{job_id}".encode()
+
+
 def dek_aad(*, tenant_id: str, key_id: UUID | str) -> bytes:
     # Bind wrap to key_id only. tenant_id is intentionally omitted so
     # merge_tenant can move key rows without re-wrapping (live, no stop).

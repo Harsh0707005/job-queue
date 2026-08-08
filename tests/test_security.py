@@ -199,8 +199,12 @@ def test_webhook_delivery_dict_redacts_signing_secret():
     out = webhook_delivery_to_dict(d)
     assert out["signing_secret"] is None
     assert out["has_signing_secret"] is True
-    full = webhook_delivery_to_dict(d, include_signing_secret=True)
+    assert out["payload"] == {"_encrypted": True}
+    full = webhook_delivery_to_dict(
+        d, include_signing_secret=True, include_payload=True
+    )
     assert full["signing_secret"] == "frozen-secret"
+    assert full["payload"] == {}
 
 
 def test_claim_exposes_top_level_secret_not_nested(
