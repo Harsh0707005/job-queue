@@ -12,7 +12,6 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _JOB_COLUMNS,
-    _row_to_job,
     _utcnow,
 )
 
@@ -145,5 +144,5 @@ class ApprovalTimeoutsMixin:
                 reason=f"parent job {row['id']} approval timed out",
                 now=now,
             )
-            cancelled.append(_row_to_job(updated))
+            cancelled.append(self._job(updated))
         return cancelled

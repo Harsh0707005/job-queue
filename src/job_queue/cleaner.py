@@ -44,6 +44,14 @@ class RetentionCleaner:
 
     def run_once(self) -> RetentionPurgeResult:
         """One purge pass (up to *batch_limit* jobs)."""
+        try:
+            self.queue.process_payload_key_rotations(
+                limit=20,
+                batch_size=min(self.batch_limit, 500),
+                tenant_id=self.tenant_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("payload key rotation advance failed")
         result = self.queue.purge_expired_jobs(
             limit=self.batch_limit,
             tenant_id=self.tenant_id,

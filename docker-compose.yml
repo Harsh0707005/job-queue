@@ -43,6 +43,8 @@ services:
       LOG_LEVEL: INFO
       # Fleet soak posts to in-network sinks (docker private DNS).
       JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,6 +71,8 @@ services:
       COORDINATOR_NODE: coordinator-2
       LOG_LEVEL: INFO
       JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
     depends_on:
       postgres:
         condition: service_healthy

@@ -15,7 +15,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     LeaseError,
-    _row_to_job,
     _utcnow,
 )
 
@@ -67,7 +66,7 @@ class LeaseCheckpointMixin:
             ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during checkpoint")
-            job = _row_to_job(updated)
+            job = self._job(updated)
             self._append_job_audit(
                 conn,
                 job_row=updated,

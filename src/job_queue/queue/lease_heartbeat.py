@@ -14,7 +14,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     LeaseError,
-    _row_to_job,
     _utcnow,
 )
 
@@ -80,7 +79,7 @@ class LeaseHeartbeatMixin:
                 ).fetchone()
                 if updated is None:
                     raise LeaseError(f"job {job_id} lease lost during heartbeat")
-                return _row_to_job(updated)
+                return self._job(updated)
 
         if runtime_exceeded:
             raise LeaseError(
@@ -118,7 +117,7 @@ class LeaseHeartbeatMixin:
             else:
                 runtime_exceeded = False
                 self._assert_lease_not_expired(row, now)
-                return _row_to_job(row)
+                return self._job(row)
         if runtime_exceeded:
             raise LeaseError(
                 f"job {job_id} max runtime exceeded "

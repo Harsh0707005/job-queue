@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 from uuid import uuid4
 
 from psycopg.errors import UniqueViolation
@@ -17,8 +15,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     _SCHEDULE_COLUMNS,
-    _row_to_job,
-    _row_to_schedule,
     _utcnow,
 )
 
@@ -159,9 +155,12 @@ class SchedulesProcessMixin:
                     )
                     continue
                 job_id = uuid4()
-                payload = sched_row["payload"]
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
+                payload = self._open_schedule_payload(
+                    sched_row["payload"],
+                    tenant_id=str(sched_row["tenant_id"]),
+                    schedule_id=sched_row["id"],
+                    conn=conn,
+                )
 
                 try:
                     with conn.transaction():
@@ -177,6 +176,12 @@ class SchedulesProcessMixin:
                             if hasattr(self, "_compute_partition_id")
                             else 0
                         )
+                        sealed, payload_key_id = self._seal_job_payload(
+                            conn,
+                            tenant_id=str(sched_row["tenant_id"]),
+                            job_id=job_id,
+                            payload=payload,
+                        )
                         job_row = conn.execute(
                             f"""
                             INSERT INTO jobs (
@@ -186,7 +191,7 @@ class SchedulesProcessMixin:
                                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
                                 labels,
-                                created_at, updated_at, partition_id
+                                created_at, updated_at, partition_id, payload_key_id
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
                                 0, %s, %s,
@@ -194,7 +199,7 @@ class SchedulesProcessMixin:
                                 1, 300,
                                 %s, NULL, %s, %s,
                                 %s,
-                                %s, %s, %s
+                                %s, %s, %s, %s
                             )
                             RETURNING {_JOB_COLUMNS}
                             """,
@@ -202,7 +207,7 @@ class SchedulesProcessMixin:
                                 job_id,
                                 sched_row["tenant_id"],
                                 sched_row["queue_name"],
-                                Jsonb(payload),
+                                Jsonb(sealed),
                                 JobStatus.PENDING.value,
                                 sched_row["priority"],
                                 sched_row["max_attempts"],
@@ -214,6 +219,7 @@ class SchedulesProcessMixin:
                                 now,
                                 now,
                                 part_id,
+                                payload_key_id,
                             ),
                         ).fetchone()
                         if job_row is not None:
@@ -249,8 +255,8 @@ class SchedulesProcessMixin:
                 assert updated is not None
                 fires.append(
                     ScheduleFire(
-                        schedule=_row_to_schedule(updated),
-                        job=_row_to_job(job_row),
+                        schedule=self._schedule(updated),
+                        job=self._job(job_row),
                     )
                 )
                 self._record_metric(

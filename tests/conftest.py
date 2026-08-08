@@ -7,6 +7,7 @@ Ryuk is disabled; we own lifecycle cleanup ourselves.
 
 from __future__ import annotations
 
+import base64
 import os
 
 import pytest
@@ -16,6 +17,12 @@ os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
 # Unit/soak tests deliver webhooks to local HTTP sinks (127.0.0.1). Production
 # defaults block private destinations; tests opt in explicitly.
 os.environ.setdefault("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
+# Per-tenant payload encryption KEK (32 bytes). Shared by all tests / reconnects.
+os.environ.setdefault(
+    "JOB_QUEUE_PAYLOAD_KEK",
+    base64.b64encode(b"0123456789abcdef0123456789abcdef").decode(),
+)
+os.environ.setdefault("JOB_QUEUE_PAYLOAD_KEK_ID", "test")
 
 from testcontainers.postgres import PostgresContainer  # noqa: E402
 
@@ -74,6 +81,10 @@ def queue(postgres_url: str):
         # Partition ownership must not leak across tests.
         conn.execute("TRUNCATE partition_assignments")
         conn.execute("TRUNCATE worker_nodes")
+        conn.execute("TRUNCATE payload_key_rotations")
+        conn.execute("TRUNCATE tenant_payload_keys")
+        conn.execute("TRUNCATE workflow_step_runs CASCADE")
+        conn.execute("TRUNCATE workflow_runs CASCADE")
         conn.execute(
             """
             UPDATE queue_settings

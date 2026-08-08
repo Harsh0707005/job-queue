@@ -27,7 +27,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     CancelError,
     _JOB_COLUMNS,
-    _row_to_job,
     _utcnow,
 )
 
@@ -574,13 +573,12 @@ class WorkflowsMixin:
 
         Must run inside the caller's transaction (ack/nack).
         """
-        payload = job_row.get("payload") or {}
-        if isinstance(payload, str):
-            import json
-
-            payload = json.loads(payload)
-        if not isinstance(payload, dict):
-            return
+        payload = self._open_job_payload(
+            job_row.get("payload"),
+            tenant_id=str(job_row["tenant_id"]),
+            job_id=job_row["id"],
+            conn=conn,
+        )
         if payload.get("kind") != WORKFLOW_STEP_KIND:
             return
         ts = now or _utcnow()
@@ -1868,6 +1866,9 @@ class WorkflowsMixin:
         dedupe = f"wf:{run_id}:{idx}:{direction}"
         if dedupe_suffix:
             dedupe = f"{dedupe}:{dedupe_suffix}"
+        sealed, payload_key_id = self._seal_job_payload(
+            conn, tenant_id=tenant_id, job_id=job_id, payload=payload
+        )
         conn.execute(
             f"""
             INSERT INTO jobs (
@@ -1878,7 +1879,7 @@ class WorkflowsMixin:
                 available_at, dedupe_key, schedule_id, depends_on,
                 labels,
                 deadline_at, estimated_duration_seconds, preemptible,
-                created_at, updated_at, partition_id
+                created_at, updated_at, partition_id, payload_key_id
             ) VALUES (
                 %s, %s, %s, %s, %s, 0,
                 0, %s, %s,
@@ -1887,14 +1888,14 @@ class WorkflowsMixin:
                 %s, %s, NULL, %s,
                 %s,
                 NULL, NULL, TRUE,
-                %s, %s, %s
+                %s, %s, %s, %s
             )
             """,
             (
                 job_id,
                 tenant_id,
                 queue_name,
-                Jsonb(payload),
+                Jsonb(sealed),
                 JobStatus.PENDING.value,
                 max_attempts,
                 visibility_timeout_seconds,
@@ -1911,6 +1912,7 @@ class WorkflowsMixin:
                     if hasattr(self, "_compute_partition_id")
                     else 0
                 ),
+                payload_key_id,
             ),
         )
         # Keep step status pending until a worker actually leases the job.
@@ -1961,12 +1963,13 @@ class WorkflowsMixin:
         self, conn: Any, job_row: dict[str, Any], *, now: Any = None
     ) -> None:
         """Flip step_run pending→running when its job is actually leased."""
-        payload = job_row.get("payload") or {}
-        if isinstance(payload, str):
-            import json
-
-            payload = json.loads(payload)
-        if not isinstance(payload, dict) or payload.get("kind") != WORKFLOW_STEP_KIND:
+        payload = self._open_job_payload(
+            job_row.get("payload"),
+            tenant_id=str(job_row["tenant_id"]),
+            job_id=job_row["id"],
+            conn=conn,
+        )
+        if payload.get("kind") != WORKFLOW_STEP_KIND:
             return
         ts = now or _utcnow()
         conn.execute(

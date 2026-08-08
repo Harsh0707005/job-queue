@@ -14,7 +14,6 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _normalize_labels,
     _normalize_status_filter,
-    _row_to_job,
 )
 
 
@@ -67,7 +66,7 @@ class JobsQueryMixin:
                 """,
                 tuple(params),
             ).fetchall()
-            return [_row_to_job(r) for r in rows]
+            return [self._job(r) for r in rows]
 
     def get(self, job_id: UUID, *, tenant_id: str) -> Job | None:
         """Fetch a job by id for *tenant_id* only (cross-tenant → None)."""
@@ -82,7 +81,7 @@ class JobsQueryMixin:
                 """,
                 (job_id, tenant_id),
             ).fetchone()
-            return _row_to_job(row) if row else None
+            return self._job(row) if row else None
 
     def get_result(self, job_id: UUID, *, tenant_id: str) -> Any | None:
         """Return the stashed ack *result* for a job, or None if missing/unset.

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 from datetime import datetime
 from typing import Any
 
@@ -71,12 +69,7 @@ class LeaseEstimatesMixin:
     ) -> float:
         if row.get("estimated_duration_seconds") is not None:
             return float(row["estimated_duration_seconds"])
-        payload = row.get("payload")
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                payload = {}
+        payload = self._row_plaintext_payload(row, conn=conn)
         kind = self._payload_kind(payload)
         ewma = self._lookup_ewma_seconds(
             conn,

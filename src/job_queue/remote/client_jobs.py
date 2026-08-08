@@ -10,6 +10,11 @@ from job_queue.models import BulkCancelResult, Job
 
 
 class ClientJobsMixin:
+    def enqueue(self, **kwargs: Any) -> Job:
+        payload = self._request("POST", "/v1/jobs", kwargs)
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
     def get_job(self, job_id: UUID | str, *, tenant_id: str) -> Job | None:
         payload = self._request(
             "GET",

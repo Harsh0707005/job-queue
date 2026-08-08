@@ -676,7 +676,12 @@ def test_alerts_http_api(postgres_url: str):
 
     from job_queue.coordinator.app import Coordinator, _make_handler
 
-    q = JobQueue.connect(postgres_url, min_size=1, max_size=4)
+    q = JobQueue.connect(
+        postgres_url,
+        min_size=1,
+        max_size=4,
+        require_worker_registration=False,
+    )
     try:
         with q._pool.connection() as conn:
             conn.execute("TRUNCATE jobs CASCADE")

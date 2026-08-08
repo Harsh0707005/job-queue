@@ -12,7 +12,6 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _JOB_COLUMNS,
-    _row_to_job,
     _utcnow,
 )
 
@@ -106,7 +105,7 @@ class SpawnQueryMixin:
                     offset,
                 ),
             ).fetchall()
-            return [_row_to_job(r) for r in rows]
+            return [self._job(r) for r in rows]
 
     def _list_children_locked(
         self,
@@ -127,4 +126,4 @@ class SpawnQueryMixin:
             """,
             (tenant_id, parent_id, limit),
         ).fetchall()
-        return [_row_to_job(r) for r in rows]
+        return [self._job(r) for r in rows]

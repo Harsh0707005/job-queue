@@ -12,7 +12,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     _as_utc,
-    _row_to_job,
     compute_retry_backoff_seconds,
 )
 
@@ -120,7 +119,7 @@ class LeaseMaxRuntimeMixin:
             if dead_row is not None and terminal == JobStatus.DEAD.value:
                 self._enqueue_job_webhooks(
                     conn,
-                    job=_row_to_job(dead_row),
+                    job=self._job(dead_row),
                     event=WebhookEvent.JOB_DEAD,
                     now=now,
                 )
@@ -295,7 +294,7 @@ class LeaseMaxRuntimeMixin:
                 )
                 self._enqueue_job_webhooks(
                     conn,
-                    job=_row_to_job(full),
+                    job=self._job(full),
                     event=WebhookEvent.JOB_DEAD,
                     now=now,
                 )

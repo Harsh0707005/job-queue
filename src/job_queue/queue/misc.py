@@ -15,6 +15,8 @@ class MiscMixin:
     def _payload_kind(payload: Any) -> str:
         if not isinstance(payload, dict):
             return ""
+        if payload.get("_jq_enc") == 1 or payload.get("_encrypted") is True:
+            return ""
         for key in ("kind", "job_type", "type"):
             val = payload.get(key)
             if val is not None and str(val):

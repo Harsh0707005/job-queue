@@ -15,7 +15,6 @@ from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
     _JOB_COLUMNS,
     LeaseError,
-    _row_to_job,
     _utcnow,
 )
 
@@ -299,7 +298,7 @@ class LeaseClaimTenantMixin:
                 f"job {candidate['id']} claim race "
                 f"(status changed under lock for tenant {candidate['tenant_id']!r})"
             )
-        job = _row_to_job(row)
+        job = self._job(row)
         self._append_job_audit(
             conn,
             job_row=row,

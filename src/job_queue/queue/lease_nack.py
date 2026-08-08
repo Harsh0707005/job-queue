@@ -14,7 +14,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     LeaseError,
-    _row_to_job,
     _utcnow,
     compute_retry_backoff_seconds,
 )
@@ -150,7 +149,7 @@ class LeaseNackMixin:
                     ),
                     now=now,
                 )
-            job = _row_to_job(updated)
+            job = self._job(updated)
             if new_status == JobStatus.DEAD.value:
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_DEAD, now=now

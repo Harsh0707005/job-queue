@@ -12,7 +12,6 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     ApprovalError,
-    _row_to_job,
     _utcnow,
 )
 
@@ -46,7 +45,7 @@ class ApprovalDecideMixin:
             ).fetchone()
             if row is None:
                 raise ApprovalError(f"job {job_id} not found for tenant {tenant_id!r}")
-            job = _row_to_job(row)
+            job = self._job(row)
             status = job.status
 
             if status == JobStatus.AWAITING_APPROVAL:
@@ -80,7 +79,7 @@ class ApprovalDecideMixin:
                         f"job {job_id} approval race",
                         job=job,
                     )
-                out = _row_to_job(updated)
+                out = self._job(updated)
                 self._append_job_audit(
                     conn,
                     job_row=updated,
@@ -154,7 +153,7 @@ class ApprovalDecideMixin:
             ).fetchone()
             if row is None:
                 raise ApprovalError(f"job {job_id} not found for tenant {tenant_id!r}")
-            job = _row_to_job(row)
+            job = self._job(row)
 
             if job.status == JobStatus.AWAITING_APPROVAL:
                 updated = conn.execute(
@@ -199,7 +198,7 @@ class ApprovalDecideMixin:
                     reason=f"parent job {job_id} rejected",
                     now=now,
                 )
-                return _row_to_job(updated)
+                return self._job(updated)
 
             # Idempotent reject after timeout/reject.
             if job.status == JobStatus.CANCELLED and job.approval_outcome in (
@@ -247,4 +246,4 @@ class ApprovalDecideMixin:
                     offset,
                 ),
             ).fetchall()
-            return [_row_to_job(r) for r in rows]
+            return [self._job(r) for r in rows]

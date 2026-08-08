@@ -232,6 +232,18 @@ class TenantsOffboardMixin:
         ).fetchone()
         if settings is not None:
             return False
+        keys = conn.execute(
+            "SELECT 1 FROM tenant_payload_keys WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if keys is not None:
+            return False
+        rots = conn.execute(
+            "SELECT 1 FROM payload_key_rotations WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if rots is not None:
+            return False
         return True
 
     def _finalize_offboard_locked(
@@ -277,6 +289,17 @@ class TenantsOffboardMixin:
             "DELETE FROM tenant_fairness WHERE tenant_id = %s",
             (tenant_id,),
         )
+        conn.execute(
+            "DELETE FROM payload_key_rotations WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM tenant_payload_keys WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        crypto = getattr(self, "_crypto", None)
+        if crypto is not None:
+            crypto.drop_tenant(tenant_id)
         # *now* reserved for future audit rows; keep signature stable.
         _ = now
 

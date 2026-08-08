@@ -948,4 +948,60 @@ CREATE INDEX IF NOT EXISTS idx_workflow_runs_compensating
     ON workflow_runs (status, updated_at)
     WHERE status = 'compensating';
 
+-- Per-tenant envelope encryption keys (DEK wrapped by external KEK).
+CREATE TABLE IF NOT EXISTS tenant_payload_keys (
+    tenant_id       TEXT NOT NULL,
+    key_id          UUID NOT NULL,
+    wrapped_dek     BYTEA NOT NULL,
+    wrap_nonce      BYTEA NOT NULL,
+    kek_id          TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_at      TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, key_id),
+    CONSTRAINT tenant_payload_keys_status_check CHECK (
+        status IN ('active', 'decrypt_only', 'retired')
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_payload_keys_one_active
+    ON tenant_payload_keys (tenant_id)
+    WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_tenant_payload_keys_status
+    ON tenant_payload_keys (tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS payload_key_rotations (
+    id                      UUID PRIMARY KEY,
+    tenant_id               TEXT NOT NULL,
+    from_key_id             UUID,
+    to_key_id               UUID NOT NULL,
+    status                  TEXT NOT NULL,
+    jobs_rewrapped          INTEGER NOT NULL DEFAULT 0,
+    schedules_rewrapped     INTEGER NOT NULL DEFAULT 0,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at            TIMESTAMPTZ,
+    CONSTRAINT payload_key_rotations_status_check CHECK (
+        status IN ('reencrypting', 'complete', 'aborted')
+    ),
+    CONSTRAINT payload_key_rotations_jobs_check CHECK (jobs_rewrapped >= 0),
+    CONSTRAINT payload_key_rotations_schedules_check CHECK (
+        schedules_rewrapped >= 0
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_payload_key_rotations_tenant_status
+    ON payload_key_rotations (tenant_id, status, created_at);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS payload_key_id UUID;
+CREATE INDEX IF NOT EXISTS idx_jobs_payload_key
+    ON jobs (tenant_id, payload_key_id)
+    WHERE payload_key_id IS NOT NULL;
+
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS payload_key_id UUID;
+CREATE INDEX IF NOT EXISTS idx_schedules_payload_key
+    ON schedules (tenant_id, payload_key_id)
+    WHERE payload_key_id IS NOT NULL;
+
 """

@@ -51,6 +51,8 @@ services:
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
       JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
       TENANTS: "10"
       JOBS_PER_TENANT: "30"
       DELETE_FRACTION: "0.6"

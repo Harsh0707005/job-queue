@@ -14,7 +14,6 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _JOB_COLUMNS,
-    _row_to_job,
 )
 
 
@@ -306,5 +305,5 @@ class SpawnJoinMixin:
                 (row["id"],),
             ).fetchone()
             if refreshed is not None:
-                out.append(_row_to_job(refreshed))
+                out.append(self._job(refreshed))
         return out

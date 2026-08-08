@@ -18,7 +18,6 @@ from job_queue.queue._common import (
     RateLimitError,
     ReplayError,
     _as_utc,
-    _row_to_job,
     _utcnow,
 )
 
@@ -62,7 +61,7 @@ class DeadLettersMixin:
                 """,
                 params,
             ).fetchall()
-            return [_row_to_job(r) for r in rows]
+            return [self._job(r) for r in rows]
 
     def replay_dead_letter(
         self,
@@ -128,7 +127,7 @@ class DeadLettersMixin:
             if row is None:
                 raise ReplayError(f"job {job_id} not found for tenant {tenant_id!r}")
 
-            job = _row_to_job(row)
+            job = self._job(row)
             if job.status != JobStatus.DEAD:
                 raise ReplayError(
                     f"job {job_id} is not dead-lettered (status={job.status.value})",
@@ -217,7 +216,7 @@ class DeadLettersMixin:
                     f"job {job_id} could not be replayed (status changed)",
                     job=job,
                 )
-            out = _row_to_job(updated)
+            out = self._job(updated)
             self._append_job_audit(
                 conn,
                 job_row=updated,

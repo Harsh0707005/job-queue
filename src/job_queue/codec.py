@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from job_queue.crypto import redact_payload
 from job_queue.models import (
     AuditConsistencyReport,
     BulkCancelResult,
@@ -15,11 +16,13 @@ from job_queue.models import (
     JobProgressEvent,
     JobSideEffect,
     JobStatus,
+    PayloadKeyRotation,
     PreemptResult,
     Schedule,
     SpawnChildrenResult,
     TenantMergeResult,
     TenantOffboardResult,
+    TenantPayloadKey,
     TenantStats,
     WebhookDelivery,
     WebhookEndpoint,
@@ -38,6 +41,7 @@ def job_to_dict(
     job: Job,
     *,
     include_lease_token: bool = False,
+    include_payload: bool = False,
 ) -> dict[str, Any]:
     """Serialize a job for HTTP.
 
@@ -45,12 +49,16 @@ def job_to_dict(
     heartbeat as the worker. Default is **redacted** (``null``) so list/get
     cannot hijack in-flight leases. Pass ``include_lease_token=True`` only on
     lease (and similar) responses that mint a token for the caller.
+
+    ``payload`` is ciphertext at rest. Default is a redacted placeholder so
+    inspect/list cannot read tenant secrets. Pass ``include_payload=True``
+    only on lease (workers) and enqueue (caller already knows the body).
     """
     return {
         "id": str(job.id),
         "tenant_id": job.tenant_id,
         "queue_name": job.queue_name,
-        "payload": job.payload,
+        "payload": job.payload if include_payload else redact_payload(job.payload),
         "status": job.status.value,
         "priority": job.priority,
         "attempts": job.attempts,
@@ -274,13 +282,19 @@ def job_side_effect_to_dict(eff: JobSideEffect) -> dict[str, Any]:
     }
 
 
-def schedule_to_dict(sched: Schedule) -> dict[str, Any]:
+def schedule_to_dict(
+    sched: Schedule,
+    *,
+    include_payload: bool = False,
+) -> dict[str, Any]:
     return {
         "id": str(sched.id),
         "tenant_id": sched.tenant_id,
         "name": sched.name,
         "queue_name": sched.queue_name,
-        "payload": sched.payload,
+        "payload": (
+            sched.payload if include_payload else redact_payload(sched.payload)
+        ),
         "interval_seconds": sched.interval_seconds,
         "cron_expr": sched.cron_expr,
         "timezone": sched.timezone,
@@ -405,6 +419,32 @@ def tenant_merge_result_to_dict(result: TenantMergeResult) -> dict[str, Any]:
         "dedupe_keys_cleared": result.dedupe_keys_cleared,
         "schedule_names_renamed": result.schedule_names_renamed,
         "source_empty": result.source_empty,
+    }
+
+
+def tenant_payload_key_to_dict(key: TenantPayloadKey) -> dict[str, Any]:
+    return {
+        "tenant_id": key.tenant_id,
+        "key_id": str(key.key_id),
+        "kek_id": key.kek_id,
+        "status": key.status,
+        "created_at": _dt(key.created_at),
+        "retired_at": _dt(key.retired_at),
+    }
+
+
+def payload_key_rotation_to_dict(rot: PayloadKeyRotation) -> dict[str, Any]:
+    return {
+        "id": str(rot.id),
+        "tenant_id": rot.tenant_id,
+        "from_key_id": _uuid(rot.from_key_id),
+        "to_key_id": str(rot.to_key_id),
+        "status": rot.status,
+        "jobs_rewrapped": rot.jobs_rewrapped,
+        "schedules_rewrapped": rot.schedules_rewrapped,
+        "created_at": _dt(rot.created_at),
+        "updated_at": _dt(rot.updated_at),
+        "completed_at": _dt(rot.completed_at),
     }
 
 

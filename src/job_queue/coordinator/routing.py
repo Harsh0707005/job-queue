@@ -305,6 +305,26 @@ class RoutingMixin:
             and path.endswith("/merge")
         ):
             return self._merge_tenant(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/payload-keys")
+        ):
+            return self._list_tenant_payload_keys(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/payload-keys/rotate")
+        ):
+            return self._rotate_tenant_payload_key(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/payload-keys/advance")
+        ):
+            return self._advance_tenant_payload_key(path, body)
+        if method == "POST" and path == "/v1/admin/payload-keys/advance":
+            return self._advance_all_payload_keys(body)
 
         if method == "POST" and path == "/v1/admin/retention":
             return self._set_retention(body)

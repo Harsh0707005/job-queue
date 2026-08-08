@@ -116,6 +116,7 @@ class AuditAppendMixin:
             "approval_outcome": row.get("approval_outcome"),
             "approval_resolved_at": _dt(row.get("approval_resolved_at")),
             "last_error": row.get("last_error"),
+            "payload_key_id": _uuid(row.get("payload_key_id")),
         }
 
     def _append_job_audit(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from job_queue.crypto import PayloadCrypto
 from job_queue.db import init_schema
 from job_queue.queue._common import (
     _SIDE_EFFECT_SELECT,
@@ -31,6 +32,7 @@ class BaseMixin:
         # only from partitions they own. Unit tests may set False so legacy
         # suites that never join membership still lease freely.
         self.require_worker_registration = True
+        self._crypto = PayloadCrypto.from_env()
 
     @classmethod
     def connect(

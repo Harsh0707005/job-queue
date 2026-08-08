@@ -128,6 +128,34 @@ class TenantsMergeMixin:
                 (now, source, target),
             ).fetchall()
 
+            # Payload keys: keep old DEKs decrypt_only under the target so
+            # in-flight ciphertext stays open. Demote source active first so
+            # the one-active-key unique index still holds after the move.
+            conn.execute(
+                """
+                UPDATE tenant_payload_keys
+                SET status = 'decrypt_only'
+                WHERE tenant_id = %s AND status = 'active'
+                """,
+                (source,),
+            )
+            conn.execute(
+                """
+                UPDATE tenant_payload_keys
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (target, source),
+            )
+            conn.execute(
+                """
+                UPDATE payload_key_rotations
+                SET tenant_id = %s, updated_at = %s
+                WHERE tenant_id = %s
+                """,
+                (target, now, source),
+            )
+
             # Resolve schedule name collisions (unique per tenant when set).
             names_renamed = conn.execute(
                 """

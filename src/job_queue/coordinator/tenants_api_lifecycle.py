@@ -7,8 +7,10 @@ from typing import Any
 from job_queue.codec import (
     audit_consistency_report_to_dict,
     job_audit_event_to_dict,
+    payload_key_rotation_to_dict,
     tenant_merge_result_to_dict,
     tenant_offboard_result_to_dict,
+    tenant_payload_key_to_dict,
 )
 
 
@@ -117,6 +119,77 @@ class TenantsApiLifecycleMixin:
             "source_empty": result.source_empty,
             "jobs_moved": result.jobs_moved,
             "jobs_leased_moved": result.jobs_leased_moved,
+        }
+
+    def _list_tenant_payload_keys(
+        self, path: str
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / payload-keys
+        if len(parts) != 4:
+            return 400, {"error": "invalid payload-keys path"}
+        tenant_id = parts[2]
+        try:
+            keys = self.queue.list_tenant_payload_keys(tenant_id)
+            rot = self.queue.get_payload_key_rotation(tenant_id)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "tenant_id": tenant_id,
+            "keys": [tenant_payload_key_to_dict(k) for k in keys],
+            "rotation": (
+                None if rot is None else payload_key_rotation_to_dict(rot)
+            ),
+        }
+
+    def _rotate_tenant_payload_key(
+        self, path: str
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / payload-keys / rotate
+        if len(parts) != 5:
+            return 400, {"error": "invalid payload-keys rotate path"}
+        tenant_id = parts[2]
+        try:
+            rot = self.queue.rotate_tenant_payload_key(tenant_id)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"rotation": payload_key_rotation_to_dict(rot)}
+
+    def _advance_tenant_payload_key(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / payload-keys / advance
+        if len(parts) != 5:
+            return 400, {"error": "invalid payload-keys advance path"}
+        tenant_id = parts[2]
+        try:
+            batch = int(body.get("batch_size") or 200)
+            rot = self.queue.advance_payload_key_rotation(
+                tenant_id, batch_size=batch
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"rotation": payload_key_rotation_to_dict(rot)}
+
+    def _advance_all_payload_keys(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            limit = int(body.get("limit") or 20)
+            batch = int(body.get("batch_size") or 200)
+            tenant_id = body.get("tenant_id")
+            rots = self.queue.process_payload_key_rotations(
+                limit=limit,
+                batch_size=batch,
+                tenant_id=str(tenant_id) if tenant_id else None,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(rots),
+            "rotations": [payload_key_rotation_to_dict(r) for r in rots],
         }
 
     def _tenant_residue(

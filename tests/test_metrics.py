@@ -137,7 +137,12 @@ def test_metrics_http_coordinator(postgres_url: str):
     import threading
     import urllib.request
 
-    q = JobQueue.connect(postgres_url, min_size=1, max_size=4)
+    q = JobQueue.connect(
+        postgres_url,
+        min_size=1,
+        max_size=4,
+        require_worker_registration=False,
+    )
     try:
         with q._pool.connection() as conn:
             conn.execute("TRUNCATE jobs CASCADE")
@@ -317,7 +322,12 @@ def test_remote_client_metrics(postgres_url: str):
     from http.server import ThreadingHTTPServer
     import threading
 
-    q = JobQueue.connect(postgres_url, min_size=1, max_size=4)
+    q = JobQueue.connect(
+        postgres_url,
+        min_size=1,
+        max_size=4,
+        require_worker_registration=False,
+    )
     try:
         with q._pool.connection() as conn:
             conn.execute("TRUNCATE jobs CASCADE")

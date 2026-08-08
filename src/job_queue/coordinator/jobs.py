@@ -75,7 +75,7 @@ class JobsApiMixin:
             return 429, payload
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
-        return 201, {"job": job_to_dict(job)}
+        return 201, {"job": job_to_dict(job, include_payload=True)}
 
     def _process_deadlines(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
@@ -114,7 +114,10 @@ class JobsApiMixin:
         if not jobs:
             return 204, {}
         # Lease responses are the only place that must return fencing tokens.
-        jobs_out = [job_to_dict(j, include_lease_token=True) for j in jobs]
+        jobs_out = [
+            job_to_dict(j, include_lease_token=True, include_payload=True)
+            for j in jobs
+        ]
         payload: dict[str, Any] = {
             "jobs": jobs_out,
             "count": len(jobs_out),

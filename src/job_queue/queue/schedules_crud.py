@@ -19,7 +19,6 @@ from job_queue.queue._common import (
     ScheduleError,
     _as_utc,
     _normalize_labels,
-    _row_to_schedule,
     _utcnow,
 )
 
@@ -105,6 +104,12 @@ class SchedulesCrudMixin:
                     "schedule registration is rejected"
                 )
             try:
+                sealed, payload_key_id = self._seal_schedule_payload(
+                    conn,
+                    tenant_id=tenant_id,
+                    schedule_id=sid,
+                    payload=payload,
+                )
                 row = conn.execute(
                     f"""
                     INSERT INTO schedules (
@@ -112,13 +117,13 @@ class SchedulesCrudMixin:
                         interval_seconds, cron_expr, timezone,
                         priority, max_attempts,
                         visibility_timeout_seconds, enabled, next_run_at,
-                        labels, created_at, updated_at
+                        labels, created_at, updated_at, payload_key_id
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -127,7 +132,7 @@ class SchedulesCrudMixin:
                         tenant_id,
                         name,
                         queue_name,
-                        Jsonb(payload),
+                        Jsonb(sealed),
                         interval_seconds,
                         cron_expr,
                         tz_name,
@@ -139,6 +144,7 @@ class SchedulesCrudMixin:
                         label_list,
                         now,
                         now,
+                        payload_key_id,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:
@@ -146,7 +152,7 @@ class SchedulesCrudMixin:
                     f"schedule name {name!r} already exists for tenant {tenant_id!r}"
                 ) from exc
             assert row is not None
-            return _row_to_schedule(row)
+            return self._schedule(row)
 
     def get_schedule(self, schedule_id: UUID, *, tenant_id: str) -> Schedule | None:
         """Fetch a schedule by id for *tenant_id* (cross-tenant → None)."""
@@ -161,7 +167,7 @@ class SchedulesCrudMixin:
                 """,
                 (schedule_id, tenant_id),
             ).fetchone()
-            return _row_to_schedule(row) if row else None
+            return self._schedule(row) if row else None
 
     def list_schedules(
         self,
@@ -196,7 +202,7 @@ class SchedulesCrudMixin:
                 """,
                 params,
             ).fetchall()
-            return [_row_to_schedule(r) for r in rows]
+            return [self._schedule(r) for r in rows]
 
     def pause_schedule(self, schedule_id: UUID, *, tenant_id: str) -> Schedule:
         """Stop a schedule from firing (keeps the row; use resume to re-enable)."""
@@ -236,7 +242,7 @@ class SchedulesCrudMixin:
                 raise ScheduleError(
                     f"schedule {schedule_id} not found for tenant {tenant_id!r}"
                 )
-            return _row_to_schedule(row)
+            return self._schedule(row)
 
     def delete_schedule(self, schedule_id: UUID, *, tenant_id: str) -> bool:
         """Permanently remove a schedule. Returns True if a row was deleted."""
@@ -278,7 +284,7 @@ class SchedulesCrudMixin:
                 raise ScheduleError(
                     f"schedule {schedule_id} not found for tenant {tenant_id!r}"
                 )
-            return _row_to_schedule(row)
+            return self._schedule(row)
 
     @staticmethod
     def _schedule_next_run(sched_row: dict[str, Any], *, now: datetime) -> datetime:

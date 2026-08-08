@@ -15,7 +15,6 @@ from job_queue.queue._common import (
     _CANCELABLE_STATUSES,
     _JOB_COLUMNS,
     CancelError,
-    _row_to_job,
     _utcnow,
 )
 
@@ -53,7 +52,7 @@ class JobsCancelOneMixin:
             if row is None:
                 raise CancelError(f"job {job_id} not found for tenant {tenant_id!r}")
 
-            job = _row_to_job(row)
+            job = self._job(row)
             if job.status not in (
                 JobStatus.PENDING,
                 JobStatus.LEASED,
@@ -128,7 +127,7 @@ class JobsCancelOneMixin:
                     f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s AND tenant_id = %s",
                     (job_id, tenant_id),
                 ).fetchone()
-                current_job = _row_to_job(current) if current else None
+                current_job = self._job(current) if current else None
                 raise CancelError(
                     f"job {job_id} cannot be cancelled (status changed during cancel)",
                     job=current_job,
@@ -161,7 +160,7 @@ class JobsCancelOneMixin:
                     now=now,
                 )
             self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
-            return _row_to_job(updated)
+            return self._job(updated)
 
     def _cancel_locked_row(
         self,
@@ -258,4 +257,4 @@ class JobsCancelOneMixin:
                 tenant_id=tenant_id,
                 now=now,
             )
-        return _row_to_job(updated)
+        return self._job(updated)

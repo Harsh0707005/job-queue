@@ -36,25 +36,30 @@ def coordinator_url(queue):
 # ---------------------------------------------------------------------------
 
 
-def test_http_get_and_list_redact_lease_token(queue: JobQueue, coordinator_url):
+def test_http_get_and_list_redact_payload_and_lease_token(
+    queue: JobQueue, coordinator_url
+):
     client = CoordinatorClient(coordinator_url)
     # Enqueue via library; lease via HTTP so we know the token was minted.
-    j = queue.enqueue(tenant_id="t-sec", payload={"x": 1})
+    j = queue.enqueue(tenant_id="t-sec", payload={"x": 1, "secret": "s3cr3t-payload"})
     leased = client.lease(worker_id="w1", tenant_id="t-sec")
     assert leased is not None and leased.id == j.id
     assert leased.lease_token is not None
+    assert leased.payload["secret"] == "s3cr3t-payload"
     token_str = str(leased.lease_token)
 
-    # Wire-level GET must not contain the token.
+    # Wire-level GET must not contain the token or plaintext payload.
     q = urlencode({"tenant_id": "t-sec"})
     with urllib.request.urlopen(
         f"{coordinator_url}/v1/jobs/{j.id}?{q}", timeout=5
     ) as resp:
         raw = resp.read()
     assert token_str.encode() not in raw
+    assert b"s3cr3t-payload" not in raw
     body = json.loads(raw)
     assert body["job"]["lease_token"] is None
     assert body["job"]["status"] == "leased"
+    assert body["job"]["payload"] == {"_encrypted": True}
 
     with urllib.request.urlopen(
         f"{coordinator_url}/v1/jobs?{urlencode({'tenant_id': 't-sec'})}",
@@ -62,8 +67,10 @@ def test_http_get_and_list_redact_lease_token(queue: JobQueue, coordinator_url):
     ) as resp:
         list_raw = resp.read()
     assert token_str.encode() not in list_raw
+    assert b"s3cr3t-payload" not in list_raw
     listed = json.loads(list_raw)
     assert all(row.get("lease_token") is None for row in listed["jobs"])
+    assert all(row.get("payload") == {"_encrypted": True} for row in listed["jobs"])
 
 
 def test_http_lease_returns_lease_token(queue: JobQueue, coordinator_url):
@@ -88,13 +95,15 @@ def test_cross_tenant_get_is_not_found(queue: JobQueue, coordinator_url):
 
 
 def test_job_to_dict_default_redacts_lease_token(queue: JobQueue):
-    queue.enqueue(tenant_id="t1", payload={})
+    queue.enqueue(tenant_id="t1", payload={"secret": "nope"})
     leased = queue.lease(tenant_id="t1", worker_id="w")
     assert leased is not None and leased.lease_token is not None
     d = job_to_dict(leased)
     assert d["lease_token"] is None
-    d2 = job_to_dict(leased, include_lease_token=True)
+    assert d["payload"] == {"_encrypted": True}
+    d2 = job_to_dict(leased, include_lease_token=True, include_payload=True)
     assert d2["lease_token"] == str(leased.lease_token)
+    assert d2["payload"] == {"secret": "nope"}
 
 
 # ---------------------------------------------------------------------------

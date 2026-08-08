@@ -17,7 +17,6 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     ApprovalError,
     LeaseError,
-    _row_to_job,
     _utcnow,
 )
 
@@ -66,7 +65,7 @@ class ApprovalRequestMixin:
                     raise ApprovalError(
                         f"job {job_id} not found for tenant {tenant_id!r}"
                     )
-                return _row_to_job(row)
+                return self._job(row)
 
             self._assert_lease_tenant(row, tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
@@ -143,7 +142,7 @@ class ApprovalRequestMixin:
                 ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during request_approval")
-            job = _row_to_job(updated)
+            job = self._job(updated)
             self._append_job_audit(
                 conn,
                 job_row=updated,

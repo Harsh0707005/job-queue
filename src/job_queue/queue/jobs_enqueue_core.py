@@ -19,7 +19,6 @@ from job_queue.queue._common import (
     DependencyError,
     _as_utc,
     _normalize_labels,
-    _row_to_job,
     _utcnow,
 )
 
@@ -152,7 +151,7 @@ class JobsEnqueueCoreMixin:
                     dedupe_key=dedupe_key,
                 )
                 if existing is not None:
-                    return _row_to_job(existing)
+                    return self._job(existing, conn=conn)
 
                 # New pending row: enforce per-tenant pending cap + rate.
                 self._assert_pending_capacity(conn, tenant_id)
@@ -160,6 +159,9 @@ class JobsEnqueueCoreMixin:
 
                 part_id = self._compute_partition_id(
                     conn, tenant_id=tenant_id, job_id=jid
+                )
+                sealed, payload_key_id = self._seal_job_payload(
+                    conn, tenant_id=tenant_id, job_id=jid, payload=payload
                 )
                 # ON CONFLICT remains a safety net for any missed paths.
                 row = conn.execute(
@@ -172,7 +174,7 @@ class JobsEnqueueCoreMixin:
                         available_at, dedupe_key, schedule_id, depends_on,
                         labels,
                         deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id
+                        created_at, updated_at, partition_id, payload_key_id
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -181,7 +183,7 @@ class JobsEnqueueCoreMixin:
                         %s, %s, NULL, %s,
                         %s,
                         %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                     ON CONFLICT (tenant_id, queue_name, dedupe_key)
                         WHERE dedupe_key IS NOT NULL
@@ -196,7 +198,7 @@ class JobsEnqueueCoreMixin:
                         jid,
                         tenant_id,
                         queue_name,
-                        Jsonb(payload),
+                        Jsonb(sealed),
                         JobStatus.PENDING.value,
                         priority,
                         max_attempts,
@@ -214,6 +216,7 @@ class JobsEnqueueCoreMixin:
                         now,
                         now,
                         part_id,
+                        payload_key_id,
                     ),
                 ).fetchone()
 
@@ -229,8 +232,8 @@ class JobsEnqueueCoreMixin:
                             f"dedupe race for key {dedupe_key!r}: "
                             "conflict without an active row"
                         )
-                    return _row_to_job(existing)
-                job = _row_to_job(row)
+                    return self._job(existing, conn=conn)
+                job = self._job(row, conn=conn)
                 self._append_job_audit(
                     conn,
                     job_row=row,
@@ -251,6 +254,9 @@ class JobsEnqueueCoreMixin:
             part_id = self._compute_partition_id(
                 conn, tenant_id=tenant_id, job_id=jid
             )
+            sealed, payload_key_id = self._seal_job_payload(
+                conn, tenant_id=tenant_id, job_id=jid, payload=payload
+            )
 
             row = conn.execute(
                 f"""
@@ -262,7 +268,7 @@ class JobsEnqueueCoreMixin:
                     available_at, dedupe_key, schedule_id, depends_on,
                     labels,
                     deadline_at, estimated_duration_seconds, preemptible,
-                    created_at, updated_at, partition_id
+                    created_at, updated_at, partition_id, payload_key_id
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     0, %s, %s,
@@ -271,7 +277,7 @@ class JobsEnqueueCoreMixin:
                     %s, NULL, NULL, %s,
                     %s,
                     %s, %s, %s,
-                    %s, %s, %s
+                    %s, %s, %s, %s
                 )
                 RETURNING {_JOB_COLUMNS}
                 """,
@@ -279,7 +285,7 @@ class JobsEnqueueCoreMixin:
                     jid,
                     tenant_id,
                     queue_name,
-                    Jsonb(payload),
+                    Jsonb(sealed),
                     JobStatus.PENDING.value,
                     priority,
                     max_attempts,
@@ -296,10 +302,11 @@ class JobsEnqueueCoreMixin:
                     now,
                     now,
                     part_id,
+                    payload_key_id,
                 ),
             ).fetchone()
             assert row is not None
-            job = _row_to_job(row)
+            job = self._job(row, conn=conn)
             self._append_job_audit(
                 conn,
                 job_row=row,

@@ -18,7 +18,6 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     RebuildError,
     _as_utc,
-    _row_to_job,
     _utcnow,
 )
 
@@ -99,7 +98,7 @@ class AuditRebuildOneMixin:
                 detail={"source": "audit_rebuild", "events": len(events)},
                 now=now,
             )
-            return _row_to_job(inserted)
+            return self._job(inserted)
 
     def rebuild_jobs_from_audit(
         self,
@@ -298,6 +297,8 @@ class AuditRebuildOneMixin:
         labels_raw = snap.get("labels") or []
         labels = [str(x) for x in labels_raw]
         payload = snap["payload"]
+        if not isinstance(payload, dict):
+            payload = {"_value": payload}
         result = snap.get("result")
         checkpoint = snap.get("checkpoint")
 
@@ -311,6 +312,9 @@ class AuditRebuildOneMixin:
             )
         else:
             part_id = 0
+        sealed, payload_key_id = self._seal_job_payload(
+            conn, tenant_id=tenant, job_id=job_uuid, payload=payload
+        )
         conn.execute(
             """
             INSERT INTO jobs (
@@ -330,7 +334,7 @@ class AuditRebuildOneMixin:
                 approval_message, approval_outcome, approval_resolved_at,
                 await_children_started_at, await_children_deadline_at,
                 await_children_outcome, await_children_resolved_at,
-                last_error, partition_id
+                last_error, partition_id, payload_key_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
@@ -348,14 +352,14 @@ class AuditRebuildOneMixin:
                 %s, %s, %s,
                 %s, %s,
                 %s, %s,
-                %s, %s
+                %s, %s, %s
             )
             """,
             (
                 job_uuid,
                 tenant,
                 snap["queue_name"],
-                Jsonb(payload),
+                Jsonb(sealed),
                 snap["status"],
                 int(snap.get("priority") or 0),
                 int(snap.get("attempts") or 0),
@@ -402,5 +406,6 @@ class AuditRebuildOneMixin:
                 _parse_dt("await_children_resolved_at"),
                 snap.get("last_error"),
                 part_id,
+                payload_key_id,
             ),
         )

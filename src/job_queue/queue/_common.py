@@ -43,7 +43,7 @@ _JOB_COLUMNS = """
     approval_deadline_at, approval_message, approval_outcome,
     approval_resolved_at, await_children_started_at,
     await_children_deadline_at, await_children_outcome,
-    await_children_resolved_at, last_error, partition_id
+    await_children_resolved_at, last_error, partition_id, payload_key_id
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -80,7 +80,8 @@ _DEPS_SATISFIED_SQL = """
 _SCHEDULE_COLUMNS = """
     id, tenant_id, name, queue_name, payload, interval_seconds, cron_expr,
     timezone, priority, max_attempts, visibility_timeout_seconds, enabled,
-    next_run_at, last_enqueued_at, created_at, updated_at, labels
+    next_run_at, last_enqueued_at, created_at, updated_at, labels,
+    payload_key_id
 """
 
 _CANCEL_MATCHING_BATCH_DEFAULT = 500

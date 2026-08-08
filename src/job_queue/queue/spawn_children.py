@@ -20,7 +20,6 @@ from job_queue.queue._common import (
     LeaseError,
     SpawnError,
     _normalize_labels,
-    _row_to_job,
     _utcnow,
 )
 
@@ -92,7 +91,7 @@ class SpawnChildrenMixin:
             if row["status"] == JobStatus.AWAITING_CHILDREN.value:
                 if row["tenant_id"] != tenant_id:
                     raise SpawnError(f"job {job_id} not found for tenant {tenant_id!r}")
-                parent = _row_to_job(row)
+                parent = self._job(row)
                 kids = self._list_children_locked(
                     conn, parent_id=job_id, tenant_id=tenant_id
                 )
@@ -114,7 +113,7 @@ class SpawnChildrenMixin:
             if self._is_tenant_offboarding(conn, tenant_id):
                 raise SpawnError(
                     f"tenant {tenant_id!r} is offboarding; spawn rejected",
-                    job=_row_to_job(row),
+                    job=self._job(row),
                 )
 
             for i, spec in enumerate(specs):
@@ -173,13 +172,16 @@ class SpawnChildrenMixin:
                     if existing is not None:
                         raise SpawnError(
                             f"children[{i}] dedupe_key {dedupe_key!r} already active",
-                            job=_row_to_job(row),
+                            job=self._job(row),
                         )
 
                 part_id = (
                     self._compute_partition_id(conn, tenant_id=tenant_id, job_id=cid)
                     if hasattr(self, "_compute_partition_id")
                     else 0
+                )
+                sealed, payload_key_id = self._seal_job_payload(
+                    conn, tenant_id=tenant_id, job_id=cid, payload=payload
                 )
                 crow = conn.execute(
                     f"""
@@ -191,7 +193,7 @@ class SpawnChildrenMixin:
                         available_at, dedupe_key, schedule_id, depends_on,
                         parent_job_id, waiting_on, labels,
                         deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id
+                        created_at, updated_at, partition_id, payload_key_id
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -200,7 +202,7 @@ class SpawnChildrenMixin:
                         %s, %s, NULL, '{{}}'::uuid[],
                         %s, '{{}}'::uuid[], %s,
                         NULL, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                     RETURNING {_JOB_COLUMNS}
                     """,
@@ -208,7 +210,7 @@ class SpawnChildrenMixin:
                         cid,
                         tenant_id,
                         qname,
-                        Jsonb(payload),
+                        Jsonb(sealed),
                         JobStatus.PENDING.value,
                         priority,
                         max_attempts,
@@ -225,10 +227,11 @@ class SpawnChildrenMixin:
                         now,
                         now,
                         part_id,
+                        payload_key_id,
                     ),
                 ).fetchone()
                 assert crow is not None
-                child = _row_to_job(crow)
+                child = self._job(crow)
                 child_jobs.append(child)
                 child_ids.append(child.id)
                 self._append_job_audit(
@@ -247,7 +250,7 @@ class SpawnChildrenMixin:
 
             if not wait:
                 return SpawnChildrenResult(
-                    parent=_row_to_job(row),
+                    parent=self._job(row),
                     children=tuple(child_jobs),
                 )
 
@@ -318,7 +321,7 @@ class SpawnChildrenMixin:
             ).fetchone()
             if updated is None:
                 raise LeaseError(f"job {job_id} lease lost during spawn_children")
-            parent = _row_to_job(updated)
+            parent = self._job(updated)
             self._append_job_audit(
                 conn,
                 job_row=updated,
@@ -343,6 +346,6 @@ class SpawnChildrenMixin:
             ).fetchone()
             assert parent_row is not None
             return SpawnChildrenResult(
-                parent=_row_to_job(parent_row),
+                parent=self._job(parent_row),
                 children=tuple(child_jobs),
             )

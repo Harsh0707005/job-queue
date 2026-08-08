@@ -67,6 +67,8 @@ services:
     command: ["python", "scripts/init_schema.py"]
     environment:
       JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
     depends_on:
       postgres:
         condition: service_healthy

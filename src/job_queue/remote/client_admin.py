@@ -80,6 +80,43 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def list_tenant_payload_keys(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/payload-keys")
+        assert payload is not None
+        return payload
+
+    def rotate_tenant_payload_key(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/payload-keys/rotate", {}
+        )
+        assert payload is not None
+        return payload
+
+    def advance_tenant_payload_key(
+        self, tenant_id: str, *, batch_size: int = 200
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/payload-keys/advance",
+            {"batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
+    def process_payload_key_rotations(
+        self,
+        *,
+        limit: int = 20,
+        batch_size: int = 200,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit, "batch_size": batch_size}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/admin/payload-keys/advance", body)
+        assert payload is not None
+        return payload
+
     def create_schedule(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/schedules", kwargs)
         assert payload is not None

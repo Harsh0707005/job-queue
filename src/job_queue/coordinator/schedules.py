@@ -42,7 +42,7 @@ class SchedulesApiMixin:
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}
-        return 201, {"schedule": schedule_to_dict(sched)}
+        return 201, {"schedule": schedule_to_dict(sched, include_payload=True)}
 
     def _pause_schedule(
         self, path: str, body: dict[str, Any]

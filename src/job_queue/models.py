@@ -326,6 +326,40 @@ class TenantMergeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantPayloadKey:
+    """Per-tenant wrapped DEK used to seal job / schedule payloads."""
+
+    tenant_id: str
+    key_id: UUID
+    kek_id: str
+    status: str
+    created_at: datetime
+    retired_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PayloadKeyRotation:
+    """Live DEK rotation for one tenant.
+
+    Minting a new active key never stops the fleet: old keys stay
+    ``decrypt_only`` so pending / in-flight jobs keep opening. Advance
+    re-seals ciphertext onto the active key in crash-safe batches and only
+    zeroizes wrapped DEK material after zero remaining references.
+    """
+
+    id: UUID
+    tenant_id: str
+    from_key_id: UUID | None
+    to_key_id: UUID
+    status: str
+    jobs_rewrapped: int
+    schedules_rewrapped: int
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PreemptResult:
     """One preemption: urgent pending gained a slot by parking a leased job."""
 

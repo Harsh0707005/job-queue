@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from job_queue.queue.base import BaseMixin
+from job_queue.queue.payload_crypto import PayloadCryptoMixin
+from job_queue.queue.payload_keys import PayloadKeysMixin
 from job_queue.queue.jobs import JobsMixin
 from job_queue.queue.lease import LeaseMixin
 from job_queue.queue.tenants import TenantsMixin
@@ -21,6 +23,8 @@ from job_queue.queue.misc import MiscMixin
 
 class JobQueue(
     BaseMixin,
+    PayloadCryptoMixin,
+    PayloadKeysMixin,
     JobsMixin,
     LeaseMixin,
     TenantsMixin,
