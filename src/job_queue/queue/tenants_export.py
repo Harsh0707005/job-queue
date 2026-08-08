@@ -134,6 +134,30 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     ),
 }
 
+# Restore must find these empty on the dest. tenant_settings is exempt:
+# empty dests commonly already have limits/pause rows, and restore itself
+# writes paused+restoring before applying snapshot blobs.
+RESTORE_RESIDUE_TABLES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        table
+        for kind, (_cols, table) in _KIND_SQL.items()
+        if kind != "tenant_settings"
+    )
+)
+
+
+def tenant_residue_tables(conn: Any, tenant_id: str) -> list[str]:
+    """Return snapshot tables that still have rows for *tenant_id*."""
+    leftover: list[str] = []
+    for table in RESTORE_RESIDUE_TABLES:
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if row is not None:
+            leftover.append(table)
+    return leftover
+
 
 def _jsonable(value: Any) -> Any:
     if value is None:

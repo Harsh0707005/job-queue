@@ -20,8 +20,8 @@ services:
     command:
       - |
         set -eu
-        echo "restore-chaos: wait for restore to start"
-        sleep 8
+        echo "restore-chaos: wait for leftover-refuse + restore to start"
+        sleep 12
         for i in 1 2 3; do
           echo "restore-chaos round $$i: kill coordinator-1"
           docker kill job-queue-coordinator-1-1 2>/dev/null \
@@ -53,7 +53,7 @@ services:
       LOAD_TENANTS: "4"
       JOBS_PER_LOAD: "20"
       SRC_JOBS: "16"
-      MAX_WALL_SECONDS: "240"
+      MAX_WALL_SECONDS: "300"
       LOG_LEVEL: INFO
     depends_on:
       coordinator-1:

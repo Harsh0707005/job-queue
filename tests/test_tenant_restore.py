@@ -67,6 +67,130 @@ def test_restore_rejects_non_empty_target(queue: JobQueue):
         queue.restore_tenant("t1", snapshot_id=snap.id)
 
 
+def test_restore_rejects_leftover_alerts_and_metrics(queue: JobQueue):
+    """Dest with no jobs still cannot restore over leftover alerts/metrics."""
+    queue.enqueue(tenant_id="src-residue", payload={"secret": "keep-me"})
+    queue.create_alert_rule(
+        name="src-residue-alert",
+        metric="dead_count",
+        threshold=5,
+        scope="tenant",
+        tenant_id="src-residue",
+    )
+    snap = queue.export_tenant("src-residue")
+
+    queue.create_alert_rule(
+        name="dst-junk-leftover",
+        metric="dead_count",
+        threshold=99,
+        scope="tenant",
+        tenant_id="dst-residue",
+    )
+    queue.sample_metrics(tenant_id="dst-residue")
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO queue_metric_buckets
+                (bucket_start, tenant_id, metric, count, sum_ms)
+            VALUES (NOW(), 'dst-residue', 'junk_ack', 7, 42)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO duration_estimates
+                (tenant_id, queue_name, kind, ewma_seconds, samples, updated_at)
+            VALUES ('dst-residue', 'default', 'old-kind', 9.5, 3, NOW())
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO tenant_fairness (tenant_id, last_lease_at)
+            VALUES ('dst-residue', NOW())
+            """
+        )
+        conn.commit()
+
+    with pytest.raises(RestoreError, match="leftover:") as excinfo:
+        queue.restore_tenant("dst-residue", snapshot_id=snap.id)
+    msg = str(excinfo.value)
+    assert "alert_rules" in msg
+    assert "queue_metric_buckets" in msg
+    assert "queue_metric_snapshots" in msg
+    assert "duration_estimates" in msg
+    assert "tenant_fairness" in msg
+    assert queue.count(tenant_id="dst-residue") == 0
+    leftover_names = {r.name for r in queue.list_alert_rules()}
+    assert "dst-junk-leftover" in leftover_names
+    assert "src-residue-alert" in leftover_names
+
+    with queue._pool.connection() as conn:
+        conn.execute("DELETE FROM alert_events WHERE tenant_id = %s", ("dst-residue",))
+        conn.execute("DELETE FROM alert_rules WHERE tenant_id = %s", ("dst-residue",))
+        conn.execute(
+            "DELETE FROM queue_metric_buckets WHERE tenant_id = %s", ("dst-residue",)
+        )
+        conn.execute(
+            "DELETE FROM queue_metric_snapshots WHERE tenant_id = %s",
+            ("dst-residue",),
+        )
+        conn.execute(
+            "DELETE FROM duration_estimates WHERE tenant_id = %s", ("dst-residue",)
+        )
+        conn.execute(
+            "DELETE FROM tenant_fairness WHERE tenant_id = %s", ("dst-residue",)
+        )
+        conn.commit()
+
+    rst = queue.restore_tenant(
+        "dst-residue", snapshot_id=snap.id, batch_size=50, run_until_complete=True
+    )
+    assert rst.status == "complete"
+    assert queue.count(tenant_id="dst-residue") >= 1
+    dst_names = {
+        r.name
+        for r in queue.list_alert_rules()
+        if r.tenant_id == "dst-residue"
+    }
+    assert "dst-junk-leftover" not in dst_names
+    assert any("src-residue-alert" in n for n in dst_names)
+    with queue._pool.connection() as conn:
+        junk = conn.execute(
+            """
+            SELECT 1 FROM queue_metric_buckets
+            WHERE tenant_id = %s AND metric = 'junk_ack'
+            """,
+            ("dst-residue",),
+        ).fetchone()
+        old_est = conn.execute(
+            """
+            SELECT 1 FROM duration_estimates
+            WHERE tenant_id = %s AND kind = 'old-kind'
+            """,
+            ("dst-residue",),
+        ).fetchone()
+    assert junk is None
+    assert old_est is None
+
+
+def test_restore_rejects_leftover_orphan_audit(queue: JobQueue):
+    queue.enqueue(tenant_id="src-audit", payload={"a": 1})
+    snap = queue.export_tenant("src-audit")
+    from uuid import uuid4
+
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO job_audit_events (
+                event_id, tenant_id, job_id, seq, event_type, detail
+            ) VALUES (%s, %s, %s, 1, 'enqueued', '{}'::jsonb)
+            """,
+            (uuid4(), "dst-audit", uuid4()),
+        )
+        conn.commit()
+    with pytest.raises(RestoreError, match="job_audit_events"):
+        queue.restore_tenant("dst-audit", snapshot_id=snap.id)
+
+
 def test_restore_resumes_after_crash_mid_batch(queue: JobQueue):
     for i in range(12):
         queue.enqueue(tenant_id="crash-src", payload={"i": i, "secret": f"s-{i}"})
@@ -167,6 +291,17 @@ def test_http_export_restore_roundtrip(queue: JobQueue):
         leased = client.lease(worker_id="w", tenant_id="http-dst")
         assert leased is not None
         assert leased.payload == {"k": "v"}
+
+        client.create_alert_rule(
+            name="http-dst-junk",
+            metric="dead_count",
+            threshold=1,
+            scope="tenant",
+            tenant_id="http-dst-junk",
+        )
+        client.metrics_sample(tenant_id="http-dst-junk")
+        with pytest.raises(RuntimeError, match="leftover"):
+            client.restore_tenant("http-dst-junk", snapshot_id=sid)
     finally:
         server.shutdown()
         t.join(timeout=5)

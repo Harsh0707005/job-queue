@@ -20,7 +20,11 @@ from job_queue.crypto import (
 from job_queue.db import transaction
 from job_queue.models import TenantRestore
 from job_queue.queue._common import RestoreError, _as_utc, _utcnow
-from job_queue.queue.tenants_export import SNAPSHOT_KINDS, snapshot_from_row
+from job_queue.queue.tenants_export import (
+    SNAPSHOT_KINDS,
+    snapshot_from_row,
+    tenant_residue_tables,
+)
 
 
 def restore_from_row(row: dict[str, Any]) -> TenantRestore:
@@ -357,9 +361,11 @@ class TenantsRestoreMixin:
             if existing is not None and existing["status"] == "complete":
                 if existing["snapshot_id"] == snapshot_id:
                     return restore_from_row(existing)
-            if not self._target_accepts_restore(conn, target_tenant_id):
+            leftover = tenant_residue_tables(conn, target_tenant_id)
+            if leftover:
                 raise RestoreError(
-                    f"tenant {target_tenant_id!r} is not empty; restore refused"
+                    f"tenant {target_tenant_id!r} is not empty; leftover: "
+                    + ", ".join(leftover)
                 )
             settings_blob = conn.execute(
                 """
@@ -418,17 +424,7 @@ class TenantsRestoreMixin:
             return restore_from_row(row)
 
     def _target_accepts_restore(self, conn: Any, tenant_id: str) -> bool:
-        for sql in (
-            "SELECT 1 FROM jobs WHERE tenant_id = %s LIMIT 1",
-            "SELECT 1 FROM schedules WHERE tenant_id = %s LIMIT 1",
-            "SELECT 1 FROM webhook_endpoints WHERE tenant_id = %s LIMIT 1",
-            "SELECT 1 FROM webhook_deliveries WHERE tenant_id = %s LIMIT 1",
-            "SELECT 1 FROM workflow_runs WHERE tenant_id = %s LIMIT 1",
-            "SELECT 1 FROM tenant_payload_keys WHERE tenant_id = %s LIMIT 1",
-        ):
-            if conn.execute(sql, (tenant_id,)).fetchone() is not None:
-                return False
-        return True
+        return not tenant_residue_tables(conn, tenant_id)
 
     def _map_id(
         self, id_map: dict[str, dict[str, str]], kind: str, old: Any

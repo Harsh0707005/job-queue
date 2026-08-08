@@ -76,6 +76,7 @@ def queue(postgres_url: str):
         conn.execute("TRUNCATE webhook_endpoints CASCADE")
         conn.execute("TRUNCATE queue_metric_buckets")
         conn.execute("TRUNCATE queue_metric_snapshots")
+        conn.execute("TRUNCATE duration_estimates")
         conn.execute("TRUNCATE alert_events CASCADE")
         conn.execute("TRUNCATE alert_rules CASCADE")
         # Partition ownership must not leak across tests.
