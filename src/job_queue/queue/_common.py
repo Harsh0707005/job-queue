@@ -43,7 +43,8 @@ _JOB_COLUMNS = """
     approval_deadline_at, approval_message, approval_outcome,
     approval_resolved_at, await_children_started_at,
     await_children_deadline_at, await_children_outcome,
-    await_children_resolved_at, last_error, partition_id, payload_key_id
+    await_children_resolved_at, last_error, partition_id, payload_key_id,
+    required_skills
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -81,7 +82,7 @@ _SCHEDULE_COLUMNS = """
     id, tenant_id, name, queue_name, payload, interval_seconds, cron_expr,
     timezone, priority, max_attempts, visibility_timeout_seconds, enabled,
     next_run_at, last_enqueued_at, created_at, updated_at, labels,
-    payload_key_id
+    payload_key_id, required_skills
 """
 
 _CANCEL_MATCHING_BATCH_DEFAULT = 500
@@ -89,34 +90,74 @@ _CANCEL_MATCHING_BATCH_DEFAULT = 500
 _CANCEL_MATCHING_RETURN_CAP = 200
 
 
-def _normalize_labels(labels: Sequence[str] | str | None) -> list[str]:
-    """Strip, dedupe, sort labels. Empty input → []."""
-    if labels is None:
+def _normalize_tag_list(
+    values: Sequence[str] | str | None,
+    *,
+    noun: str,
+    max_n: int = _MAX_LABELS,
+    max_len: int = _MAX_LABEL_LEN,
+) -> list[str]:
+    """Strip, dedupe, sort a free-form tag list. Empty input → []."""
+    if values is None:
         return []
-    if isinstance(labels, str):
-        raw = [labels]
+    if isinstance(values, str):
+        raw = [values]
     else:
-        raw = list(labels)
+        raw = list(values)
     out: list[str] = []
     seen: set[str] = set()
     for item in raw:
         if not isinstance(item, str):
-            raise ValueError("labels must be strings")
+            raise ValueError(f"{noun}s must be strings")
         lab = item.strip()
         if not lab:
-            raise ValueError("labels must be non-empty after strip")
-        if len(lab) > _MAX_LABEL_LEN:
+            raise ValueError(f"{noun}s must be non-empty after strip")
+        if len(lab) > max_len:
             raise ValueError(
-                f"label longer than {_MAX_LABEL_LEN} characters: {lab[:32]!r}..."
+                f"{noun} longer than {max_len} characters: {lab[:32]!r}..."
             )
         if lab in seen:
             continue
         seen.add(lab)
         out.append(lab)
-    if len(out) > _MAX_LABELS:
-        raise ValueError(f"at most {_MAX_LABELS} labels allowed")
+    if len(out) > max_n:
+        raise ValueError(f"at most {max_n} {noun}s allowed")
     out.sort()
     return out
+
+
+def _normalize_labels(labels: Sequence[str] | str | None) -> list[str]:
+    """Strip, dedupe, sort labels. Empty input → []."""
+    return _normalize_tag_list(labels, noun="label")
+
+
+def _normalize_skills(skills: Sequence[str] | str | None) -> list[str]:
+    """Strip, dedupe, sort worker/job skills. Empty input → []."""
+    return _normalize_tag_list(skills, noun="skill")
+
+
+def _skill_claim_sql(jobs_alias: str = "jobs") -> str:
+    """SQL AND-clause: job skills empty or subset of the worker's skills.
+
+    Binds one ``%s`` placeholder (worker_id). Unregistered workers have no
+    ``worker_nodes`` row so skills are treated as empty — they may only
+    claim jobs that require nothing.
+    """
+    return f"""
+              AND (
+                    COALESCE({jobs_alias}.required_skills, '{{}}'::text[])
+                        = '{{}}'::text[]
+                    OR COALESCE({jobs_alias}.required_skills, '{{}}'::text[])
+                        <@ COALESCE(
+                            (
+                                SELECT COALESCE(wn.skills, '{{}}'::text[])
+                                FROM worker_nodes wn
+                                WHERE wn.worker_id = %s
+                            ),
+                            '{{}}'::text[]
+                        )
+              )
+    """
 
 
 def _normalize_status_filter(
@@ -151,6 +192,9 @@ def _row_to_job(row: dict[str, Any]) -> Job:
     labs = row.get("labels") or []
     if isinstance(labs, str):
         labs = []
+    skills = row.get("required_skills") or []
+    if isinstance(skills, str):
+        skills = []
     return Job(
         id=row["id"],
         tenant_id=row["tenant_id"],
@@ -216,6 +260,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         await_children_resolved_at=row.get("await_children_resolved_at"),
         last_error=row["last_error"],
         partition_id=int(row["partition_id"]) if row.get("partition_id") is not None else 0,
+        required_skills=tuple(skills),
     )
 
 
@@ -259,6 +304,9 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
     labs = row.get("labels") or []
     if isinstance(labs, str):
         labs = []
+    skills = row.get("required_skills") or []
+    if isinstance(skills, str):
+        skills = []
     return Schedule(
         id=row["id"],
         tenant_id=row["tenant_id"],
@@ -277,6 +325,7 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         labels=tuple(labs),
+        required_skills=tuple(skills),
     )
 
 

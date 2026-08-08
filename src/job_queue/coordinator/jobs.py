@@ -62,6 +62,7 @@ class JobsApiMixin:
                 estimated_duration_seconds=(None if est is None else int(est)),
                 preemptible=bool(body.get("preemptible", True)),
                 labels=labels,
+                required_skills=body.get("required_skills"),
             )
         except RateLimitError as exc:
             payload: dict[str, Any] = {

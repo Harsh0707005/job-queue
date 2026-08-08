@@ -229,6 +229,11 @@ def worker_main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="job-queue-worker-agent")
     p.add_argument("--coordinator", default=_coord_url())
     p.add_argument("--worker-id", default=_env("WORKER_ID"))
+    p.add_argument(
+        "--skills",
+        default=_env("WORKER_SKILLS", ""),
+        help="Comma-separated worker capabilities (or WORKER_SKILLS env)",
+    )
     p.add_argument("--tenant-id", default=_env("TENANT_ID"))  # empty => fair
     p.add_argument(
         "--poll", type=float, default=float(_env("POLL_INTERVAL", "0.5") or "0.5")
@@ -257,6 +262,11 @@ def worker_main(argv: list[str] | None = None) -> int:
     tenant = args.tenant_id or None
     if tenant == "":
         tenant = None
+    skills = [
+        p.strip()
+        for p in str(args.skills or "").split(",")
+        if p.strip()
+    ]
     agent = RemoteWorkerAgent(
         client,
         worker_id=args.worker_id,
@@ -265,6 +275,7 @@ def worker_main(argv: list[str] | None = None) -> int:
         poll_interval_seconds=args.poll,
         visibility_timeout_seconds=args.visibility_timeout,
         drain_timeout_seconds=args.drain_timeout,
+        skills=skills,
     )
     draining = {"done": False}
 

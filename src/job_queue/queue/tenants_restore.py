@@ -586,12 +586,13 @@ class TenantsRestoreMixin:
                 id, tenant_id, name, queue_name, payload, interval_seconds,
                 cron_expr, timezone, priority, max_attempts,
                 visibility_timeout_seconds, enabled, next_run_at,
-                last_enqueued_at, created_at, updated_at, labels, payload_key_id
+                last_enqueued_at, created_at, updated_at, labels, payload_key_id,
+                required_skills
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -614,6 +615,7 @@ class TenantsRestoreMixin:
                 _parse_dt(raw.get("updated_at")) or _utcnow(),
                 list(raw.get("labels") or []),
                 kid,
+                list(raw.get("required_skills") or []),
             ),
         )
 
@@ -733,7 +735,7 @@ class TenantsRestoreMixin:
                 max_attempts, visibility_timeout_seconds, max_runtime_seconds,
                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                 available_at, dedupe_key, schedule_id, depends_on,
-                parent_job_id, waiting_on, labels,
+                parent_job_id, waiting_on, labels, required_skills,
                 leased_by, lease_token, lease_tenant_id, lease_expires_at,
                 lease_started_at, created_at, updated_at, completed_at, result,
                 checkpoint, checkpointed_at, deadline_at,
@@ -748,7 +750,7 @@ class TenantsRestoreMixin:
                 %s, %s, %s,
                 %s, %s,
                 %s, %s, %s, %s,
-                %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s,
@@ -781,6 +783,7 @@ class TenantsRestoreMixin:
                 parent,
                 list(waiting),
                 list(raw.get("labels") or []),
+                list(raw.get("required_skills") or []),
                 leased_by,
                 lease_token,
                 lease_tenant_id,

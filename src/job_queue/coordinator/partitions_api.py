@@ -13,6 +13,7 @@ class PartitionsApiMixin:
         try:
             out = self.queue.register_worker(
                 str(wid),
+                skills=body.get("skills"),
                 heartbeat_ttl_seconds=(
                     int(body["heartbeat_ttl_seconds"])
                     if body.get("heartbeat_ttl_seconds") is not None
@@ -30,6 +31,7 @@ class PartitionsApiMixin:
         try:
             out = self.queue.worker_heartbeat(
                 str(wid),
+                skills=body.get("skills"),
                 heartbeat_ttl_seconds=(
                     int(body["heartbeat_ttl_seconds"])
                     if body.get("heartbeat_ttl_seconds") is not None

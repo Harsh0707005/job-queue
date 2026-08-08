@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from job_queue.models import DrainResult, Job
@@ -34,6 +34,7 @@ class WorkerLoopMixin:
         visibility_timeout_seconds: int | None = None,
         batch_size: int = 1,
         drain_timeout_seconds: float = 60.0,
+        skills: Sequence[str] | None = None,
     ) -> None:
         self.queue = queue
         self.tenant_id = tenant_id  # None → fair lease across tenants
@@ -47,6 +48,7 @@ class WorkerLoopMixin:
             raise ValueError("batch_size must be >= 1")
         self.batch_size = batch_size
         self.drain_timeout_seconds = float(drain_timeout_seconds)
+        self.skills = list(skills or [])
         self._handler: Handler | None = None
         self._stop = threading.Event()
         self._draining = threading.Event()
@@ -208,6 +210,15 @@ class WorkerLoopMixin:
         propagate to the caller.
         """
         processed = 0
+        if self.skills and hasattr(self.queue, "register_worker"):
+            try:
+                self.queue.register_worker(self.worker_id, skills=self.skills)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "worker %s failed to register skills=%s",
+                    self.worker_id,
+                    self.skills,
+                )
         while not self._stop.is_set() and not self._draining.is_set():
             remaining = None
             if max_jobs is not None:

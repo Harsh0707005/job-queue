@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from job_queue.models import DrainResult, Job
@@ -29,6 +30,7 @@ class RemoteWorkerLoopMixin:
         visibility_timeout_seconds: int = 30,
         batch_size: int = 1,
         drain_timeout_seconds: float = 60.0,
+        skills: Sequence[str] | None = None,
     ) -> None:
         self.client = client
         self.worker_id = (
@@ -42,6 +44,7 @@ class RemoteWorkerLoopMixin:
             raise ValueError("batch_size must be >= 1")
         self.batch_size = batch_size
         self.drain_timeout_seconds = float(drain_timeout_seconds)
+        self.skills = list(skills or [])
         self._stop = threading.Event()
         self._draining = threading.Event()
         self._active: dict[Any, _ActiveRemoteJob] = {}
@@ -54,7 +57,9 @@ class RemoteWorkerLoopMixin:
     def _register_partitions(self) -> None:
         """Register with coordinator for partition ownership (best-effort)."""
         try:
-            out = self.client.register_worker(self.worker_id)
+            out = self.client.register_worker(
+                self.worker_id, skills=self.skills or None
+            )
             self._partitions = list(out.get("partitions") or [])
             self._partitioned = True
             logger.info(
@@ -71,7 +76,9 @@ class RemoteWorkerLoopMixin:
         if not self._partitioned:
             return
         try:
-            out = self.client.worker_heartbeat(self.worker_id)
+            out = self.client.worker_heartbeat(
+                self.worker_id, skills=self.skills or None
+            )
             self._partitions = list(out.get("partitions") or [])
         except Exception:  # noqa: BLE001
             logger.warning(

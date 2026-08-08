@@ -513,9 +513,15 @@ class ClientAdminMixin:
         return payload
 
     def register_worker(
-        self, worker_id: str, *, heartbeat_ttl_seconds: int | None = None
+        self,
+        worker_id: str,
+        *,
+        skills: list[str] | None = None,
+        heartbeat_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"worker_id": worker_id}
+        if skills is not None:
+            body["skills"] = skills
         if heartbeat_ttl_seconds is not None:
             body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
         payload = self._request("POST", "/v1/workers/register", body)
@@ -523,9 +529,15 @@ class ClientAdminMixin:
         return payload
 
     def worker_heartbeat(
-        self, worker_id: str, *, heartbeat_ttl_seconds: int | None = None
+        self,
+        worker_id: str,
+        *,
+        skills: list[str] | None = None,
+        heartbeat_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"worker_id": worker_id}
+        if skills is not None:
+            body["skills"] = skills
         if heartbeat_ttl_seconds is not None:
             body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
         payload = self._request("POST", "/v1/workers/heartbeat", body)

@@ -88,6 +88,8 @@ class AuditAppendMixin:
             "dedupe_key": row.get("dedupe_key"),
             "schedule_id": _uuid(row.get("schedule_id")),
             "depends_on": dep_out,
+            "labels": list(row.get("labels") or []),
+            "required_skills": list(row.get("required_skills") or []),
             "leased_by": row.get("leased_by"),
             "lease_token": _uuid(row.get("lease_token")),
             "lease_tenant_id": row.get("lease_tenant_id"),

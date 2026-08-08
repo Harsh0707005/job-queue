@@ -39,6 +39,7 @@ class SchedulesApiMixin:
                 ),
                 enabled=bool(body.get("enabled", True)),
                 labels=body.get("labels"),
+                required_skills=body.get("required_skills"),
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}

@@ -20,6 +20,7 @@ from job_queue.queue._common import (
     LeaseError,
     SpawnError,
     _normalize_labels,
+    _normalize_skills,
     _utcnow,
 )
 
@@ -102,6 +103,7 @@ class SpawnChildrenMixin:
 
             parent_queue = row["queue_name"]
             parent_labels = list(row.get("labels") or [])
+            parent_skills = list(row.get("required_skills") or [])
             child_jobs: list[Job] = []
             child_ids: list[UUID] = []
 
@@ -155,6 +157,10 @@ class SpawnChildrenMixin:
                     )
                 else:
                     child_labels = list(parent_labels)
+                if "required_skills" in spec:
+                    child_skills = _normalize_skills(spec.get("required_skills"))
+                else:
+                    child_skills = list(parent_skills)
                 cid = uuid4()
                 if dedupe_key is not None:
                     self._lock_dedupe_key(
@@ -191,7 +197,7 @@ class SpawnChildrenMixin:
                         max_runtime_seconds,
                         retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
-                        parent_job_id, waiting_on, labels,
+                        parent_job_id, waiting_on, labels, required_skills,
                         deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at, partition_id, payload_key_id
                     ) VALUES (
@@ -200,7 +206,7 @@ class SpawnChildrenMixin:
                         %s,
                         %s, %s,
                         %s, %s, NULL, '{{}}'::uuid[],
-                        %s, '{{}}'::uuid[], %s,
+                        %s, '{{}}'::uuid[], %s, %s,
                         NULL, %s, %s,
                         %s, %s, %s, %s
                     )
@@ -222,6 +228,7 @@ class SpawnChildrenMixin:
                         dedupe_key,
                         job_id,
                         child_labels,
+                        child_skills,
                         est,
                         preemptible,
                         now,

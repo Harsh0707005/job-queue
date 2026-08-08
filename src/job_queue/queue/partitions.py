@@ -11,6 +11,7 @@ range so work is never stranded on deleted shards.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -20,6 +21,7 @@ from job_queue.models import JobStatus
 from job_queue.queue._common import (
     DEFAULT_PARTITION_COUNT,
     WORKER_HEARTBEAT_TTL_SECONDS,
+    _normalize_skills,
     _utcnow,
 )
 
@@ -65,12 +67,19 @@ class PartitionsMixin:
         self,
         worker_id: str,
         *,
+        skills: Sequence[str] | str | None = None,
         heartbeat_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
-        """Register or revive a worker and return its owned partitions."""
+        """Register or revive a worker and return its owned partitions.
+
+        *skills* is the worker's capability set. Jobs listing
+        ``required_skills`` are only claimable when that set is a subset.
+        Re-registering replaces the advertised skills.
+        """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
         wid = str(worker_id).strip()
+        skill_list = _normalize_skills(skills) if skills is not None else None
         now = _utcnow()
         ttl = (
             int(heartbeat_ttl_seconds)
@@ -78,25 +87,49 @@ class PartitionsMixin:
             else WORKER_HEARTBEAT_TTL_SECONDS
         )
         with transaction(self._pool) as conn:
-            conn.execute(
-                """
-                INSERT INTO worker_nodes (worker_id, status, last_seen_at, created_at, updated_at)
-                VALUES (%s, 'active', %s, %s, %s)
-                ON CONFLICT (worker_id) DO UPDATE
-                SET status = 'active',
-                    last_seen_at = EXCLUDED.last_seen_at,
-                    updated_at = EXCLUDED.updated_at
-                """,
-                (wid, now, now, now),
-            )
+            if skill_list is None:
+                row = conn.execute(
+                    """
+                    INSERT INTO worker_nodes (
+                        worker_id, status, last_seen_at, created_at, updated_at,
+                        skills
+                    )
+                    VALUES (%s, 'active', %s, %s, %s, '{}'::text[])
+                    ON CONFLICT (worker_id) DO UPDATE
+                    SET status = 'active',
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        updated_at = EXCLUDED.updated_at
+                    RETURNING skills
+                    """,
+                    (wid, now, now, now),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    INSERT INTO worker_nodes (
+                        worker_id, status, last_seen_at, created_at, updated_at,
+                        skills
+                    )
+                    VALUES (%s, 'active', %s, %s, %s, %s)
+                    ON CONFLICT (worker_id) DO UPDATE
+                    SET status = 'active',
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        updated_at = EXCLUDED.updated_at,
+                        skills = EXCLUDED.skills
+                    RETURNING skills
+                    """,
+                    (wid, now, now, now, skill_list),
+                ).fetchone()
             self._expire_stale_workers_locked(conn, now=now, ttl_seconds=ttl)
             n = self._partition_count(conn)
             self._ensure_partition_rows(conn, n, now=now)
             self._rebalance_partitions_locked(conn, now=now)
             parts = self._owned_partitions_locked(conn, wid)
+        skills_out = list((row or {}).get("skills") or skill_list or [])
         return {
             "worker_id": wid,
             "status": "active",
+            "skills": skills_out,
             "partitions": parts,
             "partition_count": self.get_partition_count(),
             "generation": self._max_generation(),
@@ -106,12 +139,20 @@ class PartitionsMixin:
         self,
         worker_id: str,
         *,
+        skills: Sequence[str] | str | None = None,
         heartbeat_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
-        """Refresh liveness and return current partition ownership."""
+        """Refresh liveness and return current partition ownership.
+
+        Pass *skills* to update advertised capabilities without a full
+        re-register. Omit to keep the last declared set.
+        """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
         wid = str(worker_id).strip()
+        skill_list = (
+            _normalize_skills(skills) if skills is not None else None
+        )
         now = _utcnow()
         ttl = (
             int(heartbeat_ttl_seconds)
@@ -119,26 +160,45 @@ class PartitionsMixin:
             else WORKER_HEARTBEAT_TTL_SECONDS
         )
         with transaction(self._pool) as conn:
-            row = conn.execute(
-                """
-                UPDATE worker_nodes
-                SET last_seen_at = %s,
-                    status = 'active',
-                    updated_at = %s
-                WHERE worker_id = %s
-                RETURNING worker_id
-                """,
-                (now, now, wid),
-            ).fetchone()
+            if skill_list is not None:
+                row = conn.execute(
+                    """
+                    UPDATE worker_nodes
+                    SET last_seen_at = %s,
+                        status = 'active',
+                        updated_at = %s,
+                        skills = %s
+                    WHERE worker_id = %s
+                    RETURNING worker_id, skills
+                    """,
+                    (now, now, skill_list, wid),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    UPDATE worker_nodes
+                    SET last_seen_at = %s,
+                        status = 'active',
+                        updated_at = %s
+                    WHERE worker_id = %s
+                    RETURNING worker_id, skills
+                    """,
+                    (now, now, wid),
+                ).fetchone()
             if row is None:
                 # Auto-register on first heartbeat.
-                conn.execute(
+                inserted = conn.execute(
                     """
-                    INSERT INTO worker_nodes (worker_id, status, last_seen_at, created_at, updated_at)
-                    VALUES (%s, 'active', %s, %s, %s)
+                    INSERT INTO worker_nodes (
+                        worker_id, status, last_seen_at, created_at, updated_at,
+                        skills
+                    )
+                    VALUES (%s, 'active', %s, %s, %s, %s)
+                    RETURNING worker_id, skills
                     """,
-                    (wid, now, now, now),
-                )
+                    (wid, now, now, now, skill_list or []),
+                ).fetchone()
+                row = inserted
             self._expire_stale_workers_locked(conn, now=now, ttl_seconds=ttl)
             n = self._partition_count(conn)
             self._ensure_partition_rows(conn, n, now=now)
@@ -147,9 +207,11 @@ class PartitionsMixin:
             gen = conn.execute(
                 "SELECT COALESCE(MAX(generation), 0)::bigint AS g FROM partition_assignments"
             ).fetchone()
+        skills_out = list((row or {}).get("skills") or skill_list or [])
         return {
             "worker_id": wid,
             "status": "active",
+            "skills": skills_out,
             "partitions": parts,
             "partition_count": n,
             "generation": int(gen["g"] if gen else 0),
@@ -386,6 +448,8 @@ class PartitionsMixin:
         because this snapshot can go stale across rebalance.
         """
         require = bool(getattr(self, "require_worker_registration", True))
+        if not require:
+            return None
         reg = conn.execute(
             """
             SELECT status FROM worker_nodes

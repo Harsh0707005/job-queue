@@ -19,6 +19,7 @@ from job_queue.queue._common import (
     ScheduleError,
     _as_utc,
     _normalize_labels,
+    _normalize_skills,
     _utcnow,
 )
 
@@ -41,6 +42,7 @@ class SchedulesCrudMixin:
         enabled: bool = True,
         schedule_id: UUID | None = None,
         labels: Sequence[str] | str | None = None,
+        required_skills: Sequence[str] | str | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -86,6 +88,7 @@ class SchedulesCrudMixin:
         cron_expr = validate_cron(cron) if cron is not None else None
         tz_name = validate_timezone(timezone)
         label_list = _normalize_labels(labels)
+        skill_list = _normalize_skills(required_skills)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -117,13 +120,14 @@ class SchedulesCrudMixin:
                         interval_seconds, cron_expr, timezone,
                         priority, max_attempts,
                         visibility_timeout_seconds, enabled, next_run_at,
-                        labels, created_at, updated_at, payload_key_id
+                        labels, created_at, updated_at, payload_key_id,
+                        required_skills
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -145,6 +149,7 @@ class SchedulesCrudMixin:
                         now,
                         now,
                         payload_key_id,
+                        skill_list,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:

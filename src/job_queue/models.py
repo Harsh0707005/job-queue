@@ -85,6 +85,10 @@ class Job:
     ``parent_job_id`` links a spawned subtask back to its parent job.
     ``waiting_on`` lists child ids a parked parent is joining on.
     ``labels`` is a sorted set of free-form string tags for list / bulk cancel.
+    ``required_skills`` is the set of worker capabilities this job needs
+    (AND). Empty means any worker may claim it. A worker may lease the job
+    only when ``required_skills`` is a subset of the worker's advertised
+    ``skills``; fairness, partitions, and concurrency still apply.
     """
 
     id: UUID
@@ -133,6 +137,7 @@ class Job:
     await_children_resolved_at: datetime | None
     last_error: str | None
     partition_id: int = 0
+    required_skills: tuple[str, ...] = ()
 
     @property
     def is_leased(self) -> bool:
@@ -187,6 +192,7 @@ class Schedule:
     ``\"0 9 * * 1-5\"`` (weekdays 09:00) or ``\"0 0 1 * *\"`` (1st of month).
     ``interval_seconds`` remains for simple fixed delays.
     ``labels`` are copied onto every job this schedule enqueues.
+    ``required_skills`` are copied onto every job this schedule enqueues.
     """
 
     id: UUID
@@ -206,6 +212,7 @@ class Schedule:
     created_at: datetime
     updated_at: datetime
     labels: tuple[str, ...] = ()
+    required_skills: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

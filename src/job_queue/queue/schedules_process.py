@@ -167,6 +167,7 @@ class SchedulesProcessMixin:
                         # Intentionally no pending-cap / enqueue-rate checks:
                         # schedule materialization is system-timed work.
                         sched_labels = list(sched_row.get("labels") or [])
+                        sched_skills = list(sched_row.get("required_skills") or [])
                         part_id = (
                             self._compute_partition_id(
                                 conn,
@@ -190,7 +191,7 @@ class SchedulesProcessMixin:
                                 max_runtime_seconds,
                                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
-                                labels,
+                                labels, required_skills,
                                 created_at, updated_at, partition_id, payload_key_id
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
@@ -198,7 +199,7 @@ class SchedulesProcessMixin:
                                 3600,
                                 1, 300,
                                 %s, NULL, %s, %s,
-                                %s,
+                                %s, %s,
                                 %s, %s, %s, %s
                             )
                             RETURNING {_JOB_COLUMNS}
@@ -216,6 +217,7 @@ class SchedulesProcessMixin:
                                 sched_row["id"],
                                 [],
                                 sched_labels,
+                                sched_skills,
                                 now,
                                 now,
                                 part_id,

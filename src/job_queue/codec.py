@@ -76,6 +76,7 @@ def job_to_dict(
         "parent_job_id": _uuid(job.parent_job_id),
         "waiting_on": [str(x) for x in job.waiting_on],
         "labels": list(job.labels),
+        "required_skills": list(job.required_skills),
         "leased_by": job.leased_by,
         "lease_token": (_uuid(job.lease_token) if include_lease_token else None),
         "lease_tenant_id": job.lease_tenant_id,
@@ -122,6 +123,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
     depends = data.get("depends_on") or []
     waiting = data.get("waiting_on") or []
     labels = data.get("labels") or []
+    required_skills = data.get("required_skills") or []
     return Job(
         id=UUID(str(data["id"])),
         tenant_id=str(data["tenant_id"]),
@@ -176,6 +178,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         await_children_resolved_at=parse_dt("await_children_resolved_at"),
         last_error=data.get("last_error"),
         partition_id=int(data.get("partition_id") or 0),
+        required_skills=tuple(str(x) for x in required_skills),
     )
 
 
@@ -309,6 +312,7 @@ def schedule_to_dict(
         "created_at": _dt(sched.created_at),
         "updated_at": _dt(sched.updated_at),
         "labels": list(sched.labels),
+        "required_skills": list(sched.required_skills),
     }
 
 

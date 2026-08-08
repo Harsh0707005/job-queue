@@ -296,6 +296,8 @@ class AuditRebuildOneMixin:
         waiting = [UUID(str(d)) for d in waiting_raw]
         labels_raw = snap.get("labels") or []
         labels = [str(x) for x in labels_raw]
+        skills_raw = snap.get("required_skills") or []
+        required_skills = [str(x) for x in skills_raw]
         payload = snap["payload"]
         if not isinstance(payload, dict):
             payload = {"_value": payload}
@@ -323,7 +325,7 @@ class AuditRebuildOneMixin:
                 max_runtime_seconds,
                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                 available_at, dedupe_key, schedule_id, depends_on,
-                parent_job_id, waiting_on, labels,
+                parent_job_id, waiting_on, labels, required_skills,
                 leased_by, lease_token, lease_tenant_id,
                 lease_expires_at, lease_started_at,
                 created_at, updated_at, completed_at, result,
@@ -341,7 +343,7 @@ class AuditRebuildOneMixin:
                 %s,
                 %s, %s,
                 %s, %s, %s, %s,
-                %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s,
                 %s, %s, %s, %s,
@@ -375,6 +377,7 @@ class AuditRebuildOneMixin:
                 _parse_uuid("parent_job_id"),
                 waiting,
                 labels,
+                required_skills,
                 snap.get("leased_by"),
                 _parse_uuid("lease_token"),
                 snap.get("lease_tenant_id"),

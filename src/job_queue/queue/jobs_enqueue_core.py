@@ -19,6 +19,7 @@ from job_queue.queue._common import (
     DependencyError,
     _as_utc,
     _normalize_labels,
+    _normalize_skills,
     _utcnow,
 )
 
@@ -45,6 +46,7 @@ class JobsEnqueueCoreMixin:
         estimated_duration_seconds: int | None = None,
         preemptible: bool = True,
         labels: Sequence[str] | str | None = None,
+        required_skills: Sequence[str] | str | None = None,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -81,6 +83,11 @@ class JobsEnqueueCoreMixin:
             queue uses learned EWMAs (by payload kind) or a default.
         preemptible:
             If False this job will not be chosen as a preemption victim.
+        required_skills:
+            Worker capabilities this job needs (AND). Empty (default) means
+            any worker may claim it. A worker leases the job only when it
+            advertised every listed skill; partitions, fairness, and
+            concurrency still apply.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -105,6 +112,7 @@ class JobsEnqueueCoreMixin:
 
         dep_ids = self._normalize_depends_on(depends_on)
         label_list = _normalize_labels(labels)
+        skill_list = _normalize_skills(required_skills)
 
         now = _utcnow()
         if available_at is not None:
@@ -176,7 +184,7 @@ class JobsEnqueueCoreMixin:
                         max_runtime_seconds,
                         retry_backoff_base_seconds, retry_backoff_max_seconds,
                         available_at, dedupe_key, schedule_id, depends_on,
-                        labels,
+                        labels, required_skills,
                         deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at, partition_id, payload_key_id
                     ) VALUES (
@@ -185,7 +193,7 @@ class JobsEnqueueCoreMixin:
                         %s,
                         %s, %s,
                         %s, %s, NULL, %s,
-                        %s,
+                        %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s
                     )
@@ -214,6 +222,7 @@ class JobsEnqueueCoreMixin:
                         dedupe_key,
                         dep_ids,
                         label_list,
+                        skill_list,
                         deadline,
                         estimated_duration_seconds,
                         bool(preemptible),
@@ -270,7 +279,7 @@ class JobsEnqueueCoreMixin:
                     max_runtime_seconds,
                     retry_backoff_base_seconds, retry_backoff_max_seconds,
                     available_at, dedupe_key, schedule_id, depends_on,
-                    labels,
+                    labels, required_skills,
                     deadline_at, estimated_duration_seconds, preemptible,
                     created_at, updated_at, partition_id, payload_key_id
                 ) VALUES (
@@ -279,7 +288,7 @@ class JobsEnqueueCoreMixin:
                     %s,
                     %s, %s,
                     %s, NULL, NULL, %s,
-                    %s,
+                    %s, %s,
                     %s, %s, %s,
                     %s, %s, %s, %s
                 )
@@ -300,6 +309,7 @@ class JobsEnqueueCoreMixin:
                     run_at,
                     dep_ids,
                     label_list,
+                    skill_list,
                     deadline,
                     estimated_duration_seconds,
                     bool(preemptible),

@@ -16,6 +16,7 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     LeaseError,
     _SkipLeaseCandidate,
+    _skill_claim_sql,
     _utcnow,
 )
 
@@ -148,6 +149,8 @@ class LeaseClaimFairMixin:
         elif partitions is not None:
             part_sql = "AND jobs.partition_id = ANY(%s)"
             params.append(list(partitions))
+        skill_sql = _skill_claim_sql("jobs")
+        params.append(worker_id)
         params.extend(
             [
                 JobStatus.PENDING.value,
@@ -166,6 +169,7 @@ class LeaseClaimFairMixin:
             WHERE queue_name = %s
               {exclude_sql}
               {part_sql}
+              {skill_sql}
               AND NOT EXISTS (
                     SELECT 1
                     FROM tenant_settings ts

@@ -116,6 +116,15 @@ ALTER TABLE jobs ALTER COLUMN labels SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_labels_gin
     ON jobs USING GIN (labels);
 
+-- Required worker capabilities (AND). Empty = any worker may claim.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS required_skills TEXT[];
+UPDATE jobs SET required_skills = '{}' WHERE required_skills IS NULL;
+ALTER TABLE jobs ALTER COLUMN required_skills SET DEFAULT '{}';
+ALTER TABLE jobs ALTER COLUMN required_skills SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_required_skills_gin
+    ON jobs USING GIN (required_skills);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status_created
     ON jobs (tenant_id, status, created_at DESC);
 
@@ -318,6 +327,13 @@ CREATE TABLE IF NOT EXISTS worker_nodes (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT worker_nodes_status_check CHECK (status IN ('active', 'dead'))
 );
+
+-- Capabilities advertised by the worker. Lease requires
+-- jobs.required_skills <@ worker_nodes.skills (empty job skills = any worker).
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS skills TEXT[];
+UPDATE worker_nodes SET skills = '{}' WHERE skills IS NULL;
+ALTER TABLE worker_nodes ALTER COLUMN skills SET DEFAULT '{}';
+ALTER TABLE worker_nodes ALTER COLUMN skills SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_worker_nodes_active_seen
     ON worker_nodes (status, last_seen_at DESC);
@@ -544,6 +560,11 @@ ALTER TABLE schedules ADD COLUMN IF NOT EXISTS labels TEXT[];
 UPDATE schedules SET labels = '{}' WHERE labels IS NULL;
 ALTER TABLE schedules ALTER COLUMN labels SET DEFAULT '{}';
 ALTER TABLE schedules ALTER COLUMN labels SET NOT NULL;
+
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS required_skills TEXT[];
+UPDATE schedules SET required_skills = '{}' WHERE required_skills IS NULL;
+ALTER TABLE schedules ALTER COLUMN required_skills SET DEFAULT '{}';
+ALTER TABLE schedules ALTER COLUMN required_skills SET NOT NULL;
 
 -- HTTP webhooks: endpoints + durable delivery outbox.
 CREATE TABLE IF NOT EXISTS webhook_endpoints (

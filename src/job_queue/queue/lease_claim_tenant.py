@@ -15,6 +15,7 @@ from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
     _JOB_COLUMNS,
     LeaseError,
+    _skill_claim_sql,
     _utcnow,
 )
 
@@ -108,6 +109,9 @@ class LeaseClaimTenantMixin:
                 part_sql = "AND partition_id = ANY(%s)"
                 part_params = [list(owned_parts)]
 
+            skill_sql = _skill_claim_sql("jobs")
+            skill_params: list[Any] = [worker_id]
+
             if conc_limit is not None and leased_count >= conc_limit:
                 # Only reclaim expired leases (does not increase concurrent
                 # holders beyond the cap in steady state).
@@ -118,6 +122,7 @@ class LeaseClaimTenantMixin:
                     WHERE tenant_id = %s
                       AND queue_name = %s
                       {part_sql}
+                      {skill_sql}
                       AND status = %s
                       AND lease_expires_at < %s
                       AND attempts < max_attempts
@@ -131,6 +136,7 @@ class LeaseClaimTenantMixin:
                     tuple(
                         [tenant_id, queue_name]
                         + part_params
+                        + skill_params
                         + [
                             JobStatus.LEASED.value,
                             now,
@@ -154,6 +160,7 @@ class LeaseClaimTenantMixin:
                     WHERE tenant_id = %s
                       AND queue_name = %s
                       {part_sql}
+                      {skill_sql}
                       AND (
                             (
                                 status = %s
@@ -177,6 +184,7 @@ class LeaseClaimTenantMixin:
                     tuple(
                         [tenant_id, queue_name]
                         + part_params
+                        + skill_params
                         + [
                             JobStatus.PENDING.value,
                             now,
@@ -273,6 +281,7 @@ class LeaseClaimTenantMixin:
                         AND attempts < max_attempts
                     )
               )
+              {_skill_claim_sql("jobs")}
             RETURNING {_JOB_COLUMNS}
             """,
             (
@@ -291,6 +300,7 @@ class LeaseClaimTenantMixin:
                 now,
                 JobStatus.LEASED.value,
                 now,
+                worker_id,
             ),
         ).fetchone()
         if row is None:
