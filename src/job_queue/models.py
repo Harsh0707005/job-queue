@@ -88,7 +88,10 @@ class Job:
     ``required_skills`` is the set of worker capabilities this job needs
     (AND). Empty means any worker may claim it. A worker may lease the job
     only when ``required_skills`` is a subset of the worker's advertised
-    ``skills``; fairness, partitions, and concurrency still apply.
+    ``skills``. Unskilled jobs stay pinned to the worker's owned partitions;
+    skilled jobs may be claimed by any capable registered worker so they
+    cannot stall on a shard whose owner lacks the hardware. Fairness and
+    concurrency still apply.
     """
 
     id: UUID

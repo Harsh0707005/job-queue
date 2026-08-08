@@ -136,6 +136,23 @@ def _normalize_skills(skills: Sequence[str] | str | None) -> list[str]:
     return _normalize_tag_list(skills, noun="skill")
 
 
+def _row_has_required_skills(row: Any) -> bool:
+    """True when a job row declares a non-empty required_skills set."""
+    raw = None
+    if isinstance(row, dict):
+        raw = row.get("required_skills")
+    elif row is not None:
+        raw = getattr(row, "required_skills", None)
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        return bool(raw.strip().strip("{}").strip())
+    try:
+        return len(list(raw)) > 0
+    except TypeError:
+        return False
+
+
 def _skill_claim_sql(jobs_alias: str = "jobs") -> str:
     """SQL AND-clause: job skills empty or subset of the worker's skills.
 

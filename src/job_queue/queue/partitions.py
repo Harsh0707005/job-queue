@@ -435,13 +435,16 @@ class PartitionsMixin:
     ) -> list[int] | None:
         """Return owned partitions for lease claim filtering.
 
-        * ``[]`` — unregistered, or registered but dead/inactive: lease nothing.
-        * non-empty list — active owner: lease only those partitions.
+        * ``[]`` — unregistered, or registered but currently owns no shard.
+          Unskilled claim is denied; skilled jobs may still match via
+          :meth:`_partition_claim_predicate`.
+        * non-empty list — active owner: unskilled jobs only from those
+          partitions; skilled jobs may cross shards.
         * ``None`` — only when ``require_worker_registration`` is False (unit
           tests that never join membership): lease any partition.
 
         Production default requires registration so a free-for-all worker cannot
-        steal shards from a partitioned fleet.
+        steal *unskilled* shards from a partitioned fleet.
 
         Callers must still enforce live ownership inside the claim transaction
         (see :meth:`_partition_claim_predicate` / :meth:`_guard_partition_claim`)
@@ -474,27 +477,54 @@ class PartitionsMixin:
         """SQL fragment that enforces *live* ownership at claim time.
 
         When *owned_parts* is ``None`` (open/unpartitioned test mode) no filter
-        is applied. Otherwise claims must join ``partition_assignments`` so a
-        worker cannot use a stale partition list after rebalance reassigned the
-        shard (generation bump + owner change).
+        is applied.
+
+        Unskilled jobs (empty ``required_skills``) stay pinned to shards this
+        worker currently owns. Skilled jobs may be claimed by any *active
+        registered* worker that has the skills — otherwise a GPU job hashed
+        onto a CPU-owned partition would sit pending forever. Unregistered
+        workers still match nothing.
         """
         if owned_parts is None:
             return "", []
-        if not owned_parts:
-            return "AND FALSE", []
-        # Prefer index-friendly partition set AND live owner match. The EXISTS
-        # is the generation/ownership guardrail: even if *owned_parts* is stale
-        # and still lists a lost shard, the join rejects the claim.
-        sql = f"""
-              AND {jobs_alias}.partition_id = ANY(%s)
-              AND EXISTS (
+        skills_arr = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
+        unskilled = f"{skills_arr} = '{{}}'::text[]"
+        skilled = f"{skills_arr} <> '{{}}'::text[]"
+        active = """
+              EXISTS (
                     SELECT 1
-                    FROM partition_assignments pa
-                    WHERE pa.partition_id = {jobs_alias}.partition_id
-                      AND pa.worker_id = %s
+                    FROM worker_nodes wn
+                    WHERE wn.worker_id = %s
+                      AND wn.status = 'active'
               )
         """
-        return sql, [list(owned_parts), worker_id]
+        if not owned_parts:
+            # Active but currently owns no shard (more workers than
+            # partitions): still eligible for skilled work only.
+            sql = f"""
+              AND {skilled}
+              AND {active}
+            """
+            return sql, [worker_id]
+        sql = f"""
+              AND (
+                    (
+                        {unskilled}
+                        AND {jobs_alias}.partition_id = ANY(%s)
+                        AND EXISTS (
+                            SELECT 1
+                            FROM partition_assignments pa
+                            WHERE pa.partition_id = {jobs_alias}.partition_id
+                              AND pa.worker_id = %s
+                        )
+                    )
+                 OR (
+                        {skilled}
+                        AND {active}
+                    )
+              )
+        """
+        return sql, [list(owned_parts), worker_id, worker_id]
 
     def _guard_partition_claim(
         self,

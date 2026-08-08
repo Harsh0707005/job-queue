@@ -15,6 +15,7 @@ from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
     _JOB_COLUMNS,
     LeaseError,
+    _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
 )
@@ -67,9 +68,6 @@ class LeaseClaimTenantMixin:
                         part_gens = self._owned_partition_generations_locked(
                             conn, worker_id
                         )
-            if owned_parts is not None and not owned_parts:
-                return []
-
         with transaction(self._pool) as conn:
             # Serialize lease decisions for this tenant so concurrency caps
             # cannot be exceeded by racing workers.
@@ -198,8 +196,13 @@ class LeaseClaimTenantMixin:
                 ).fetchall()
 
             for candidate in candidates:
-                # Rebalance fence before claim: lost ownership / generation bump.
-                if owned_parts is not None and hasattr(self, "_guard_partition_claim"):
+                # Rebalance fence for unskilled work only. Skilled jobs may
+                # cross shards so they do not stall on an incapable owner.
+                if (
+                    owned_parts is not None
+                    and not _row_has_required_skills(candidate)
+                    and hasattr(self, "_guard_partition_claim")
+                ):
                     exp = None
                     if part_gens is not None:
                         exp = part_gens.get(int(candidate["partition_id"]))

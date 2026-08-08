@@ -16,6 +16,7 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     LeaseError,
     _SkipLeaseCandidate,
+    _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
 )
@@ -68,7 +69,8 @@ class LeaseClaimFairMixin:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Resolve partition filter once ([] = no claim; None = open/all).
+        # Resolve partition filter once ([] = no unskilled claim; None = open).
+        # Active workers with no shards can still claim skilled jobs.
         # Snapshot generations for the rebalance fence inside each claim txn.
         owned_parts: list[int] | None = None
         part_gens: dict[int, int] | None = None
@@ -80,8 +82,6 @@ class LeaseClaimFairMixin:
                         part_gens = self._owned_partition_generations_locked(
                             conn, worker_id
                         )
-            if owned_parts is not None and not owned_parts:
-                return []
 
         # One transaction per claim so per-tenant advisory locks cannot invert
         # across tenants inside a multi-claim batch (was a multi-worker deadlock
@@ -229,8 +229,14 @@ class LeaseClaimFairMixin:
         if candidate is None:
             return None
 
-        # Rebalance fence: ownership/generation must still match under lock.
-        if partitions is not None and hasattr(self, "_guard_partition_claim"):
+        # Rebalance fence: unskilled jobs stay on owned shards. Skilled jobs
+        # are allowed to cross partitions so they cannot stick on a worker
+        # that cannot run them.
+        if (
+            partitions is not None
+            and not _row_has_required_skills(candidate)
+            and hasattr(self, "_guard_partition_claim")
+        ):
             exp = None
             if partition_generations is not None:
                 exp = partition_generations.get(int(candidate["partition_id"]))

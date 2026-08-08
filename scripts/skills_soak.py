@@ -205,16 +205,14 @@ def main() -> int:
                 "load_pending=%d skills=%s", load_pending, skill_stats
             )
             last_log = now
-        # Unskilled load + any + at least one of each skilled kind completed.
-        # Remaining skilled pending is allowed when the owning partition
-        # worker lacks the skill (fairness + shards still bind).
+        # Skilled jobs must fully drain even when hashed onto a worker that
+        # cannot run them (cross-shard claim by capable peers).
         if (
             load_pending == 0
-            and skill_stats["any"]["pending"] == 0
-            and skill_stats["any"]["completed"] >= expected["any"]
-            and skill_stats["gpu"]["completed"] >= 1
-            and skill_stats["cpu"]["completed"] >= 1
-            and skill_stats["cuda"]["completed"] >= 1
+            and all(skill_stats[k]["pending"] == 0 for k in expected)
+            and all(
+                skill_stats[k]["completed"] >= expected[k] for k in expected
+            )
         ):
             logger.info("skills soak progressing to final assertions")
             break
@@ -248,6 +246,15 @@ def main() -> int:
                 cpu_by.add(str(by))
             elif not skills:
                 any_done += 1
+    remaining = []
+    for i in range(SKILL_TENANTS):
+        for j in list_jobs(f"skill-{i:02d}"):
+            if j.get("status") in ("pending", "leased"):
+                remaining.append(
+                    (j.get("id"), j.get("required_skills"), j.get("status"))
+                )
+    if remaining:
+        raise RuntimeError(f"skilled jobs still pending: {remaining[:8]}")
     if any_done < expected["any"]:
         raise RuntimeError(f"unskilled skill-tenant jobs incomplete {any_done}")
     if not cuda_by or not gpu_by or not cpu_by:
