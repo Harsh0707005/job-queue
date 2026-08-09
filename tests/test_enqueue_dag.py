@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from uuid import uuid4
 
 import pytest
 from psycopg.errors import UniqueViolation
 
-from job_queue import DependencyError, JobQueue, RateLimitError
+from job_queue import CancelError, DependencyError, JobQueue, JobStatus, RateLimitError
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack
@@ -203,6 +204,139 @@ def test_enqueue_dag_atomic_on_pending_cap(queue: JobQueue):
     jobs = queue.list_jobs(tenant_id="dag-cap")
     assert len(jobs) == 1
     assert jobs[0].payload.get("keep") is True
+
+
+def test_enqueue_dag_parent_cancel_during_insert_cascades(queue: JobQueue):
+    """Cancel of an external parent overlapping enqueue must not orphan children.
+
+    The enqueue txn locks the parent after validating it. Cancel blocks on
+    that row, then cascades once the DAG commits — children must end
+    cancelled, never pending forever.
+    """
+    parent = queue.enqueue(tenant_id="dag-race", payload={"p": 1})
+    orig = queue._validate_dependencies
+    cancel_thread: threading.Thread | None = None
+
+    def validate_then_cancel(conn, *, tenant_id, depends_on):
+        nonlocal cancel_thread
+        orig(conn, tenant_id=tenant_id, depends_on=depends_on)
+        started = threading.Event()
+
+        def cancel_parent() -> None:
+            started.set()
+            queue.cancel(parent.id, tenant_id=tenant_id)
+
+        cancel_thread = threading.Thread(target=cancel_parent, name="cancel-parent")
+        cancel_thread.start()
+        assert started.wait(timeout=5)
+        # Cancel must stay blocked on the parent row held by this txn.
+        # On the old unlocked SELECT it would have committed already and
+        # cascade would miss the children inserted below.
+        time.sleep(0.15)
+        assert cancel_thread is not None and cancel_thread.is_alive(), (
+            "parent cancel finished while enqueue still held the row; "
+            "children would have been invisible to cascade"
+        )
+
+    queue._validate_dependencies = validate_then_cancel  # type: ignore[method-assign]
+    try:
+        out = queue.enqueue_dag(
+            tenant_id="dag-race",
+            batch_key="race-1",
+            jobs=[
+                {
+                    "ref": "c",
+                    "payload": {"c": 1},
+                    "depends_on": [str(parent.id)],
+                },
+                {"ref": "d", "payload": {"d": 1}, "depends_on": ["c"]},
+            ],
+        )
+    finally:
+        queue._validate_dependencies = orig  # type: ignore[method-assign]
+
+    assert cancel_thread is not None
+    cancel_thread.join(timeout=10)
+    assert not cancel_thread.is_alive()
+
+    parent_after = queue.get(parent.id, tenant_id="dag-race")
+    assert parent_after is not None
+    assert parent_after.status == JobStatus.CANCELLED
+    for job in out.jobs:
+        got = queue.get(job.id, tenant_id="dag-race")
+        assert got is not None
+        assert got.status == JobStatus.CANCELLED
+    assert queue.lease(tenant_id="dag-race", worker_id="w") is None
+
+
+def test_enqueue_dag_parent_cancel_race_no_orphan(queue: JobQueue):
+    """Hammer enqueue_dag vs cancel: never leave a child pending on a dead parent."""
+    for i in range(16):
+        tid = f"dag-rr-{i}"
+        parent = queue.enqueue(tenant_id=tid, payload={"p": i})
+        created: list = []
+        rejected: list[BaseException] = []
+
+        def enq(parent_id=parent.id, tenant=tid) -> None:
+            try:
+                created.append(
+                    queue.enqueue_dag(
+                        tenant_id=tenant,
+                        batch_key="k",
+                        jobs=[
+                            {
+                                "ref": "c",
+                                "payload": {"c": 1},
+                                "depends_on": [str(parent_id)],
+                            },
+                            {
+                                "ref": "d",
+                                "payload": {"d": 1},
+                                "depends_on": ["c"],
+                            },
+                        ],
+                    )
+                )
+            except DependencyError as exc:
+                rejected.append(exc)
+
+        def cancel(parent_id=parent.id, tenant=tid) -> None:
+            try:
+                queue.cancel(parent_id, tenant_id=tenant)
+            except CancelError:
+                pass
+
+        workers = [threading.Thread(target=enq), threading.Thread(target=cancel)]
+        if i % 2:
+            workers.reverse()
+        for t in workers:
+            t.start()
+        for t in workers:
+            t.join(timeout=15)
+            assert not t.is_alive()
+
+        parent_after = queue.get(parent.id, tenant_id=tid)
+        assert parent_after is not None
+        kids = [j for j in queue.list_jobs(tenant_id=tid) if j.id != parent.id]
+        terminal = {
+            JobStatus.CANCELLED,
+            JobStatus.DEAD,
+            JobStatus.FAILED,
+        }
+        if rejected:
+            assert created == []
+            assert kids == []
+        else:
+            assert len(created) == 1
+            assert len(kids) == 2
+        if parent_after.status in terminal:
+            assert all(k.status == JobStatus.CANCELLED for k in kids)
+        assert all(
+            not (
+                k.status == JobStatus.PENDING and parent_after.status in terminal
+            )
+            for k in kids
+        )
 
 
 def test_enqueue_dag_failed_parent_rolls_back(queue: JobQueue):

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from job_queue import Job, JobQueue, JobStatus, Worker
@@ -122,6 +125,46 @@ def test_parent_cancel_cascades_to_children(queue: JobQueue):
     child_after = queue.get(child.id, tenant_id="t1")
     assert child_after is not None
     assert child_after.status == JobStatus.CANCELLED
+
+
+def test_enqueue_parent_cancel_during_insert_cascades(queue: JobQueue):
+    """Cancel overlapping a depends_on enqueue must not leave a pending child."""
+    parent = queue.enqueue(tenant_id="dep-race", payload={"p": 1})
+    orig = queue._validate_dependencies
+    cancel_thread: threading.Thread | None = None
+
+    def validate_then_cancel(conn, *, tenant_id, depends_on):
+        nonlocal cancel_thread
+        orig(conn, tenant_id=tenant_id, depends_on=depends_on)
+        started = threading.Event()
+
+        def cancel_parent() -> None:
+            started.set()
+            queue.cancel(parent.id, tenant_id=tenant_id)
+
+        cancel_thread = threading.Thread(target=cancel_parent)
+        cancel_thread.start()
+        assert started.wait(timeout=5)
+        time.sleep(0.15)
+        assert cancel_thread is not None and cancel_thread.is_alive()
+
+    queue._validate_dependencies = validate_then_cancel  # type: ignore[method-assign]
+    try:
+        child = queue.enqueue(
+            tenant_id="dep-race",
+            payload={"c": 1},
+            depends_on=parent.id,
+        )
+    finally:
+        queue._validate_dependencies = orig  # type: ignore[method-assign]
+
+    assert cancel_thread is not None
+    cancel_thread.join(timeout=10)
+    assert not cancel_thread.is_alive()
+    parent_after = queue.get(parent.id, tenant_id="dep-race")
+    child_after = queue.get(child.id, tenant_id="dep-race")
+    assert parent_after is not None and parent_after.status == JobStatus.CANCELLED
+    assert child_after is not None and child_after.status == JobStatus.CANCELLED
 
 
 def test_enqueue_rejects_missing_or_failed_dependency(queue: JobQueue):

@@ -62,18 +62,26 @@ class JobsEnqueueHelpersMixin:
         tenant_id: str,
         depends_on: list[UUID],
     ) -> None:
-        """Ensure parents exist for this tenant and are not already terminal-failed."""
+        """Ensure parents exist, are runnable, and stay that way until commit.
+
+        Parents are locked ``FOR UPDATE`` (stable id order) so a concurrent
+        cancel / dead-letter cannot commit between this check and the child
+        insert. Without the lock, cascade would miss the not-yet-visible
+        children and leave them pending forever.
+        """
         terminal_fail = {
             JobStatus.FAILED.value,
             JobStatus.DEAD.value,
             JobStatus.CANCELLED.value,
         }
-        for parent_id in depends_on:
+        # Lock order must be stable vs other multi-parent enqueue/cancel paths.
+        for parent_id in sorted(depends_on, key=lambda u: u.int):
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}
                 FROM jobs
                 WHERE id = %s AND tenant_id = %s
+                FOR UPDATE
                 """,
                 (parent_id, tenant_id),
             ).fetchone()
