@@ -44,7 +44,7 @@ class ApprovalTimeoutsMixin:
         tenant_id: str | None = None,
         limit: int = 200,
     ) -> list[Job]:
-        """Reap approval and await-children deadlines (used by the lease path)."""
+        """Reap approval, await-children, and awaiting-skills deadlines."""
         expired = self._expire_approval_timeouts_locked(
             conn, now=now, tenant_id=tenant_id, limit=limit
         )
@@ -53,6 +53,14 @@ class ApprovalTimeoutsMixin:
                 conn, now=now, tenant_id=tenant_id, limit=limit
             )
         )
+        if hasattr(self, "_expire_awaiting_skills_deadlines_locked"):
+            expired.extend(
+                self._expire_awaiting_skills_deadlines_locked(
+                    conn, now=now, tenant_id=tenant_id, limit=limit
+                )
+            )
+        if hasattr(self, "_sync_skills_wait_locked"):
+            self._sync_skills_wait_locked(conn, now=now, limit=limit)
         return expired
 
     def _expire_approval_timeouts_locked(

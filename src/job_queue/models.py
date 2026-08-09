@@ -14,6 +14,7 @@ class JobStatus(str, Enum):
     LEASED = "leased"
     AWAITING_APPROVAL = "awaiting_approval"
     AWAITING_CHILDREN = "awaiting_children"
+    AWAITING_SKILLS = "awaiting_skills"
     COMPLETED = "completed"
     FAILED = "failed"
     DEAD = "dead"
@@ -158,6 +159,10 @@ class Job:
     def is_awaiting_children(self) -> bool:
         return self.status == JobStatus.AWAITING_CHILDREN
 
+    @property
+    def is_awaiting_skills(self) -> bool:
+        return self.status == JobStatus.AWAITING_SKILLS
+
 
 @dataclass(frozen=True, slots=True)
 class SpawnChildrenResult:
@@ -247,6 +252,7 @@ class TenantStats:
     total: int
     # Ready to lease right now (pending, due, deps met); 0 when paused.
     claimable: int
+    awaiting_skills: int = 0
 
 
 @dataclass(frozen=True, slots=True)

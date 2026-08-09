@@ -135,4 +135,5 @@ class TenantsStatsMixin:
             cancelled=counts[JobStatus.CANCELLED.value],
             total=total,
             claimable=claimable,
+            awaiting_skills=int(counts.get(JobStatus.AWAITING_SKILLS.value) or 0),
         )

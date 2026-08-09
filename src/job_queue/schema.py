@@ -61,6 +61,7 @@ ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
     status IN (
         'pending', 'leased', 'awaiting_approval', 'awaiting_children',
+        'awaiting_skills',
         'completed', 'failed', 'dead', 'cancelled'
     )
 );
@@ -229,7 +230,8 @@ CREATE UNIQUE INDEX idx_jobs_dedupe_active
     ON jobs (tenant_id, queue_name, dedupe_key)
     WHERE dedupe_key IS NOT NULL
       AND status IN (
-          'pending', 'leased', 'awaiting_approval', 'awaiting_children'
+          'pending', 'leased', 'awaiting_approval', 'awaiting_children',
+          'awaiting_skills'
       );
 
 -- At most one in-flight job per recurring schedule (no overlapping runs).
@@ -238,7 +240,8 @@ CREATE UNIQUE INDEX idx_jobs_schedule_active
     ON jobs (schedule_id)
     WHERE schedule_id IS NOT NULL
       AND status IN (
-          'pending', 'leased', 'awaiting_approval', 'awaiting_children'
+          'pending', 'leased', 'awaiting_approval', 'awaiting_children',
+          'awaiting_skills'
       );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_parent
@@ -260,6 +263,18 @@ CREATE INDEX IF NOT EXISTS idx_jobs_approval_deadline
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_awaiting_approval
     ON jobs (tenant_id, approval_deadline_at ASC)
     WHERE status = 'awaiting_approval';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_awaiting_skills
+    ON jobs (tenant_id, created_at ASC)
+    WHERE status = 'awaiting_skills';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_pending_skilled
+    ON jobs (created_at ASC)
+    WHERE status = 'pending' AND required_skills <> '{}';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_awaiting_skills_deadline
+    ON jobs (deadline_at ASC)
+    WHERE status = 'awaiting_skills' AND deadline_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_schedule_id
     ON jobs (schedule_id)

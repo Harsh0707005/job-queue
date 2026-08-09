@@ -168,6 +168,11 @@ class SchedulesProcessMixin:
                         # schedule materialization is system-timed work.
                         sched_labels = list(sched_row.get("labels") or [])
                         sched_skills = list(sched_row.get("required_skills") or [])
+                        job_status = (
+                            self._enqueue_status_for_skills(conn, sched_skills)
+                            if hasattr(self, "_enqueue_status_for_skills")
+                            else JobStatus.PENDING.value
+                        )
                         part_id = (
                             self._compute_partition_id(
                                 conn,
@@ -209,7 +214,7 @@ class SchedulesProcessMixin:
                                 sched_row["tenant_id"],
                                 sched_row["queue_name"],
                                 Jsonb(sealed),
-                                JobStatus.PENDING.value,
+                                job_status,
                                 sched_row["priority"],
                                 sched_row["max_attempts"],
                                 sched_row["visibility_timeout_seconds"],

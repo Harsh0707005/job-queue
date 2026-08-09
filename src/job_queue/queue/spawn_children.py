@@ -189,6 +189,11 @@ class SpawnChildrenMixin:
                 sealed, payload_key_id = self._seal_job_payload(
                     conn, tenant_id=tenant_id, job_id=cid, payload=payload
                 )
+                child_status = (
+                    self._enqueue_status_for_skills(conn, child_skills)
+                    if hasattr(self, "_enqueue_status_for_skills")
+                    else JobStatus.PENDING.value
+                )
                 crow = conn.execute(
                     f"""
                     INSERT INTO jobs (
@@ -217,7 +222,7 @@ class SpawnChildrenMixin:
                         tenant_id,
                         qname,
                         Jsonb(sealed),
-                        JobStatus.PENDING.value,
+                        child_status,
                         priority,
                         max_attempts,
                         vt,

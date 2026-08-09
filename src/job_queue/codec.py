@@ -366,6 +366,7 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "cancelled": stats.cancelled,
         "total": stats.total,
         "claimable": stats.claimable,
+        "awaiting_skills": int(getattr(stats, "awaiting_skills", 0) or 0),
     }
 
 

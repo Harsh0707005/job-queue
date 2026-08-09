@@ -66,8 +66,11 @@ class MiscMixin:
             SELECT COUNT(*)::int AS n
             FROM jobs
             WHERE tenant_id = %s
-              AND status = %s
+              AND status = ANY(%s)
             """,
-            (tenant_id, JobStatus.PENDING.value),
+            (
+                tenant_id,
+                [JobStatus.PENDING.value, JobStatus.AWAITING_SKILLS.value],
+            ),
         ).fetchone()
         return int(row["n"]) if row else 0

@@ -6,7 +6,7 @@ import threading
 from http.server import ThreadingHTTPServer
 from uuid import uuid4
 
-from job_queue import JobQueue
+from job_queue import JobQueue, JobStatus
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack
@@ -413,3 +413,128 @@ def test_load_mixed_skills_and_tenants_no_starvation(queue: JobQueue):
     assert not errors
     assert set(seen_gpu) == gpu_ids
     assert set(seen_cpu) == cpu_ids
+
+
+def test_unfulfillable_skills_park_until_worker_joins(queue: JobQueue):
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "tpu"},
+        required_skills=["tpu"],
+    )
+    assert j.status == JobStatus.AWAITING_SKILLS
+    assert queue.lease(tenant_id="t1", worker_id="anyone") is None
+    parked = queue.list_awaiting_skills(tenant_id="t1")
+    assert [p.id for p in parked] == [j.id]
+
+    queue.register_worker("tpu-w", skills=["tpu"])
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="tpu-w")
+    assert leased is not None and leased.id == j.id
+    _ack(queue, leased, "tpu-w")
+
+
+def test_last_capable_worker_leaving_repark_jobs(queue: JobQueue):
+    queue.register_worker("tpu-w", skills=["tpu"])
+    j = queue.enqueue(
+        tenant_id="t1", payload={"need": "tpu"}, required_skills=["tpu"]
+    )
+    assert j.status == JobStatus.PENDING
+    queue.deregister_worker("tpu-w")
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.AWAITING_SKILLS
+    assert queue.lease(tenant_id="t1", worker_id="cpu") is None
+
+
+def test_awaiting_skills_deadline_dead_letters(queue: JobQueue):
+    from datetime import timedelta
+
+    from job_queue.queue._common import _utcnow
+
+    past = _utcnow() - timedelta(seconds=5)
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "tpu"},
+        required_skills=["tpu"],
+        deadline_at=past,
+    )
+    assert j.status == JobStatus.AWAITING_SKILLS
+    out = queue.process_awaiting_skills()
+    assert out["dead"] >= 1
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.DEAD
+    assert "required skills" in (got.last_error or "")
+
+
+def test_concurrent_parked_jobs_drain_when_capable_workers_join(queue: JobQueue):
+    queue.require_worker_registration = True
+    queue.set_partition_count(8)
+    queue.register_worker("cpu-w", skills=["cpu"])
+    tenants = [f"park-{i}" for i in range(4)]
+    tpu_ids: set = set()
+    cpu_ids: set = set()
+    for tid in tenants:
+        for i in range(6):
+            t = queue.enqueue(
+                tenant_id=tid,
+                payload={"kind": "tpu", "i": i},
+                required_skills=["tpu"],
+            )
+            c = queue.enqueue(
+                tenant_id=tid,
+                payload={"kind": "cpu", "i": i},
+                required_skills=["cpu"],
+            )
+            assert t.status == JobStatus.AWAITING_SKILLS
+            assert c.status == JobStatus.PENDING
+            tpu_ids.add(t.id)
+            cpu_ids.add(c.id)
+
+    # CPU work still drains while TPU jobs stay parked.
+    drained_cpu = 0
+    while True:
+        job = queue.lease(worker_id="cpu-w")
+        if job is None:
+            break
+        assert job.id in cpu_ids
+        _ack(queue, job, "cpu-w")
+        drained_cpu += 1
+    assert drained_cpu == len(cpu_ids)
+    still = []
+    for tid in tenants:
+        still.extend(queue.list_awaiting_skills(tenant_id=tid))
+    assert {j.id for j in still} == tpu_ids
+
+    queue.register_worker("tpu-a", skills=["tpu"])
+    queue.register_worker("tpu-b", skills=["tpu"])
+    claimed: list[object] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def drain(wid: str) -> None:
+        try:
+            idle = 0
+            while idle < 10:
+                job = queue.lease(worker_id=wid)
+                if job is None:
+                    idle += 1
+                    continue
+                idle = 0
+                assert job.id in tpu_ids
+                _ack(queue, job, wid)
+                with lock:
+                    claimed.append(job.id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=drain, args=("tpu-a",)),
+        threading.Thread(target=drain, args=("tpu-b",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive()
+    assert not errors
+    assert set(claimed) == tpu_ids

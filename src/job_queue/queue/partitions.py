@@ -24,6 +24,7 @@ from job_queue.queue._common import (
     _normalize_skills,
     _utcnow,
 )
+from job_queue.queue.skills_wait import SkillsWaitMixin
 
 # Statuses that can still be claimed / reclaimed / resumed — must stay inside
 # the live partition range after shrink.
@@ -32,11 +33,12 @@ _REMAP_STATUSES = (
     JobStatus.LEASED.value,
     JobStatus.AWAITING_APPROVAL.value,
     JobStatus.AWAITING_CHILDREN.value,
+    JobStatus.AWAITING_SKILLS.value,
     JobStatus.FAILED.value,
 )
 
 
-class PartitionsMixin:
+class PartitionsMixin(SkillsWaitMixin):
     def get_partition_count(self) -> int:
         with self._pool.connection() as conn:
             return self._partition_count(conn)
@@ -125,7 +127,10 @@ class PartitionsMixin:
             self._ensure_partition_rows(conn, n, now=now)
             self._rebalance_partitions_locked(conn, now=now)
             parts = self._owned_partitions_locked(conn, wid)
-        skills_out = list((row or {}).get("skills") or skill_list or [])
+            skills_out = list((row or {}).get("skills") or skill_list or [])
+            self._sync_skills_wait_locked(
+                conn, now=now, worker_skills=skills_out
+            )
         return {
             "worker_id": wid,
             "status": "active",
@@ -207,7 +212,10 @@ class PartitionsMixin:
             gen = conn.execute(
                 "SELECT COALESCE(MAX(generation), 0)::bigint AS g FROM partition_assignments"
             ).fetchone()
-        skills_out = list((row or {}).get("skills") or skill_list or [])
+            skills_out = list((row or {}).get("skills") or skill_list or [])
+            self._sync_skills_wait_locked(
+                conn, now=now, worker_skills=skills_out
+            )
         return {
             "worker_id": wid,
             "status": "active",
@@ -233,6 +241,7 @@ class PartitionsMixin:
                 (now, wid),
             )
             self._rebalance_partitions_locked(conn, now=now)
+            self._sync_skills_wait_locked(conn, now=now)
         return {"worker_id": wid, "status": "dead"}
 
     def list_worker_partitions(self, worker_id: str) -> list[int]:
@@ -274,6 +283,7 @@ class PartitionsMixin:
             n = self._expire_stale_workers_locked(conn, now=now, ttl_seconds=ttl)
             if n:
                 self._rebalance_partitions_locked(conn, now=now)
+                self._sync_skills_wait_locked(conn, now=now)
             return n
 
     # --- internals ---

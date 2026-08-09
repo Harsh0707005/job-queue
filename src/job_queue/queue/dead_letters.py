@@ -193,7 +193,13 @@ class DeadLettersMixin:
                         RETURNING {_JOB_COLUMNS}
                         """,
                         (
-                            JobStatus.PENDING.value,
+                            (
+                                self._enqueue_status_for_skills(
+                                    conn, list(job.required_skills or ())
+                                )
+                                if hasattr(self, "_enqueue_status_for_skills")
+                                else JobStatus.PENDING.value
+                            ),
                             new_attempts,
                             new_max,
                             run_at,

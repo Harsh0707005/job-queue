@@ -238,6 +238,7 @@ class AuditRebuildOneMixin:
         elif status in (
             JobStatus.PENDING.value,
             JobStatus.AWAITING_APPROVAL.value,
+            JobStatus.AWAITING_SKILLS.value,
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.DEAD.value,

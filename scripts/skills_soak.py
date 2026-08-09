@@ -6,6 +6,8 @@
   * GPU workers (worker-1, worker-2) must never complete cpu-only jobs.
   * CPU workers (worker-3, worker-4) must never complete gpu jobs.
   * gpu+cuda jobs may only complete on worker-1.
+  * Jobs requiring a skill nobody has (tpu) park as awaiting_skills.
+  * After a late tpu worker registers, parked jobs become claimable and drain.
   * Fair multi-tenant leasing and partitions stay in effect.
 """
 
@@ -37,6 +39,7 @@ LOAD_TENANTS = int(os.environ.get("LOAD_TENANTS", "3") or "3")
 JOBS_PER_LOAD = int(os.environ.get("JOBS_PER_LOAD", "12") or "12")
 SKILL_TENANTS = int(os.environ.get("SKILL_TENANTS", "3") or "3")
 JOBS_PER_SKILL = int(os.environ.get("JOBS_PER_SKILL", "8") or "8")
+TPU_JOBS_PER_TENANT = int(os.environ.get("TPU_JOBS_PER_TENANT", "6") or "6")
 MAX_WALL = int(os.environ.get("MAX_WALL_SECONDS", "180") or "180")
 _rr = 0
 
@@ -169,7 +172,41 @@ def main() -> int:
             )
             expected["any"] += 1
 
-    logger.info("enqueued skill mix %s", expected)
+    expect_tpu = 0
+    for i in range(SKILL_TENANTS):
+        tid = f"skill-{i:02d}"
+        for n in range(TPU_JOBS_PER_TENANT):
+            http_json(
+                "POST",
+                "/v1/jobs",
+                {
+                    "tenant_id": tid,
+                    "payload": {"kind": "tpu", "n": n, "ms": 15},
+                    "required_skills": ["tpu"],
+                },
+            )
+            expect_tpu += 1
+
+    logger.info("enqueued skill mix %s tpu=%d", expected, expect_tpu)
+    tpu_parked = 0
+    for i in range(SKILL_TENANTS):
+        parked = http_json(
+            "GET",
+            f"/v1/jobs?tenant_id=skill-{i:02d}&status=awaiting_skills&limit=500",
+        ).get("jobs") or []
+        tpu_parked += len(parked)
+        stolen = [
+            j
+            for j in parked
+            if set(j.get("required_skills") or []) != {"tpu"}
+        ]
+        if stolen:
+            raise RuntimeError(f"non-tpu parked as awaiting_skills: {stolen[:3]}")
+    logger.info("tpu awaiting_skills=%d expected=%d", tpu_parked, expect_tpu)
+    if tpu_parked < expect_tpu:
+        raise RuntimeError(
+            f"tpu jobs not parked: got {tpu_parked} want {expect_tpu}"
+        )
     deadline = time.time() + MAX_WALL
     last_log = 0.0
     while time.time() < deadline:
@@ -247,14 +284,98 @@ def main() -> int:
             elif not skills:
                 any_done += 1
     remaining = []
+    tpu_waiting = 0
     for i in range(SKILL_TENANTS):
         for j in list_jobs(f"skill-{i:02d}"):
-            if j.get("status") in ("pending", "leased"):
+            skills = set(j.get("required_skills") or [])
+            if skills == {"tpu"}:
+                if j.get("status") == "awaiting_skills":
+                    tpu_waiting += 1
+                elif j.get("status") not in ("pending", "leased", "completed"):
+                    remaining.append(
+                        (j.get("id"), skills, j.get("status"))
+                    )
+            elif j.get("status") in ("pending", "leased"):
                 remaining.append(
                     (j.get("id"), j.get("required_skills"), j.get("status"))
                 )
     if remaining:
         raise RuntimeError(f"skilled jobs still pending: {remaining[:8]}")
+    if tpu_waiting < expect_tpu:
+        raise RuntimeError(
+            f"tpu jobs escaped park before late worker: {tpu_waiting}/{expect_tpu}"
+        )
+
+    logger.info("registering late tpu worker to revive parked jobs")
+    http_json(
+        "POST",
+        "/v1/workers/register",
+        {"worker_id": "worker-tpu", "skills": ["tpu"]},
+    )
+    tpu_deadline = time.time() + min(60, MAX_WALL)
+    tpu_done = 0
+    while time.time() < tpu_deadline:
+        body = http_json(
+            "POST",
+            "/v1/lease",
+            {
+                "worker_id": "worker-tpu",
+                "limit": 8,
+                "visibility_timeout_seconds": 30,
+            },
+        )
+        jobs = body.get("jobs") or []
+        if not jobs:
+            parked_left = 0
+            for i in range(SKILL_TENANTS):
+                parked_left += len(
+                    http_json(
+                        "GET",
+                        f"/v1/jobs?tenant_id=skill-{i:02d}"
+                        "&status=awaiting_skills&limit=500",
+                    ).get("jobs")
+                    or []
+                )
+            if parked_left == 0:
+                break
+            time.sleep(0.2)
+            continue
+        for j in jobs:
+            skills = set(j.get("required_skills") or [])
+            if skills != {"tpu"}:
+                raise RuntimeError(
+                    f"tpu worker leased non-tpu job {j.get('id')} {skills}"
+                )
+            http_json(
+                "POST",
+                f"/v1/jobs/{j['id']}/ack",
+                {
+                    "tenant_id": j["tenant_id"],
+                    "worker_id": "worker-tpu",
+                    "lease_token": j["lease_token"],
+                    "result": {"ok": True},
+                },
+            )
+            tpu_done += 1
+    else:
+        raise RuntimeError("late tpu worker did not drain parked jobs")
+
+    tpu_completed = 0
+    for i in range(SKILL_TENANTS):
+        for j in list_jobs(f"skill-{i:02d}"):
+            if set(j.get("required_skills") or []) != {"tpu"}:
+                continue
+            if j.get("status") != "completed":
+                raise RuntimeError(
+                    f"tpu job {j.get('id')} status={j.get('status')}"
+                )
+            by = completed_by(f"skill-{i:02d}", str(j.get("id")))
+            if by != "worker-tpu":
+                raise RuntimeError(f"tpu job completed by {by}")
+            tpu_completed += 1
+    if tpu_completed < expect_tpu:
+        raise RuntimeError(f"tpu completed {tpu_completed} want {expect_tpu}")
+    logger.info("tpu parked-then-revived completed=%d by worker-tpu", tpu_completed)
     if any_done < expected["any"]:
         raise RuntimeError(f"unskilled skill-tenant jobs incomplete {any_done}")
     if not cuda_by or not gpu_by or not cpu_by:

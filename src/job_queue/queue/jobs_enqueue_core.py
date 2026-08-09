@@ -175,6 +175,7 @@ class JobsEnqueueCoreMixin:
                 sealed, payload_key_id = self._seal_job_payload(
                     conn, tenant_id=tenant_id, job_id=jid, payload=payload
                 )
+                status = self._enqueue_status_for_skills(conn, skill_list)
                 # ON CONFLICT remains a safety net for any missed paths.
                 row = conn.execute(
                     f"""
@@ -201,7 +202,8 @@ class JobsEnqueueCoreMixin:
                         WHERE dedupe_key IS NOT NULL
                           AND status IN (
                               'pending', 'leased',
-                              'awaiting_approval', 'awaiting_children'
+                              'awaiting_approval', 'awaiting_children',
+                              'awaiting_skills'
                           )
                     DO NOTHING
                     RETURNING {_JOB_COLUMNS}
@@ -211,7 +213,7 @@ class JobsEnqueueCoreMixin:
                         tenant_id,
                         queue_name,
                         Jsonb(sealed),
-                        JobStatus.PENDING.value,
+                        status,
                         priority,
                         max_attempts,
                         visibility_timeout_seconds,
@@ -270,6 +272,7 @@ class JobsEnqueueCoreMixin:
             sealed, payload_key_id = self._seal_job_payload(
                 conn, tenant_id=tenant_id, job_id=jid, payload=payload
             )
+            status = self._enqueue_status_for_skills(conn, skill_list)
 
             row = conn.execute(
                 f"""
@@ -299,7 +302,7 @@ class JobsEnqueueCoreMixin:
                     tenant_id,
                     queue_name,
                     Jsonb(sealed),
-                    JobStatus.PENDING.value,
+                    status,
                     priority,
                     max_attempts,
                     visibility_timeout_seconds,

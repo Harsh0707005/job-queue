@@ -58,11 +58,13 @@ class JobsCancelOneMixin:
                 JobStatus.LEASED,
                 JobStatus.AWAITING_APPROVAL,
                 JobStatus.AWAITING_CHILDREN,
+                JobStatus.AWAITING_SKILLS,
             ):
                 raise CancelError(
                     f"job {job_id} cannot be cancelled "
                     f"(status={job.status.value}; only pending, leased, "
-                    f"awaiting_approval, or awaiting_children jobs cancel)",
+                    f"awaiting_approval, awaiting_children, or "
+                    f"awaiting_skills jobs cancel)",
                     job=job,
                 )
 
