@@ -104,6 +104,35 @@ def test_cancel_and_release_usage(queue: JobQueue):
     assert usage.enqueues == 2
 
 
+def test_expired_lease_without_retries_bills_runtime(queue: JobQueue):
+    """Worker death + timeout + no retries left must still record runtime."""
+    job = queue.enqueue(
+        tenant_id="bill-exp",
+        payload={"die": True},
+        visibility_timeout_seconds=1,
+        max_attempts=1,
+        retry_backoff_base_seconds=0,
+    )
+    leased = queue.lease(
+        tenant_id="bill-exp",
+        worker_id="dead-w",
+        visibility_timeout_seconds=1,
+    )
+    assert leased is not None and leased.id == job.id
+    time.sleep(1.2)
+    claimed = queue.lease(
+        tenant_id="bill-exp", worker_id="w2", visibility_timeout_seconds=30
+    )
+    assert claimed is None
+    got = queue.get(job.id, tenant_id="bill-exp")
+    assert got is not None and got.status == JobStatus.DEAD
+    usage = queue.get_tenant_usage("bill-exp")
+    assert usage.dead_letters == 1
+    assert usage.acks == 0
+    # Visibility was 1s; billed held time must be the lease, not zero.
+    assert usage.runtime_ms >= 900
+
+
 def test_runtime_accumulates_on_ack(queue: JobQueue):
     queue.enqueue(tenant_id="bill-rt", payload={})
     leased = queue.lease(tenant_id="bill-rt", worker_id="w")

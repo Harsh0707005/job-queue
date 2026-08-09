@@ -210,66 +210,46 @@ class LeaseMaxRuntimeMixin:
         tenant_id: str | None,
     ) -> None:
         """Mark expired leases that exhausted attempts as dead; cascade children."""
+        tenant_sql = ""
+        params: list[Any] = [JobStatus.LEASED.value, now]
         if tenant_id is not None:
-            dead_rows = conn.execute(
-                """
-                UPDATE jobs
-                SET status = %s,
-                    leased_by = NULL,
-                    lease_token = NULL,
-                    lease_tenant_id = NULL,
-                    lease_expires_at = NULL,
-                    lease_started_at = NULL,
-                    last_error = COALESCE(
-                        last_error,
-                        'exceeded max_attempts after lease expiry'
-                    ),
-                    completed_at = COALESCE(completed_at, %s),
-                    updated_at = %s
-                WHERE tenant_id = %s
-                  AND status = %s
-                  AND lease_expires_at < %s
-                  AND attempts >= max_attempts
-                RETURNING id, tenant_id
-                """,
-                (
-                    JobStatus.DEAD.value,
-                    now,
-                    now,
-                    tenant_id,
-                    JobStatus.LEASED.value,
-                    now,
-                ),
-            ).fetchall()
-        else:
-            dead_rows = conn.execute(
-                """
-                UPDATE jobs
-                SET status = %s,
-                    leased_by = NULL,
-                    lease_token = NULL,
-                    lease_tenant_id = NULL,
-                    lease_expires_at = NULL,
-                    lease_started_at = NULL,
-                    last_error = COALESCE(
-                        last_error,
-                        'exceeded max_attempts after lease expiry'
-                    ),
-                    completed_at = COALESCE(completed_at, %s),
-                    updated_at = %s
+            tenant_sql = "AND tenant_id = %s"
+            params.append(tenant_id)
+        params.extend((JobStatus.DEAD.value, now, now))
+        # Capture lease_started_at / lease_expires_at *before* they are
+        # cleared so billing runtime is not lost on this path.
+        dead_rows = conn.execute(
+            f"""
+            WITH expired AS (
+                SELECT id, tenant_id, lease_started_at, lease_expires_at
+                FROM jobs
                 WHERE status = %s
                   AND lease_expires_at < %s
                   AND attempts >= max_attempts
-                RETURNING id, tenant_id
-                """,
-                (
-                    JobStatus.DEAD.value,
-                    now,
-                    now,
-                    JobStatus.LEASED.value,
-                    now,
+                  {tenant_sql}
+                FOR UPDATE
+            )
+            UPDATE jobs j
+            SET status = %s,
+                leased_by = NULL,
+                lease_token = NULL,
+                lease_tenant_id = NULL,
+                lease_expires_at = NULL,
+                lease_started_at = NULL,
+                last_error = COALESCE(
+                    last_error,
+                    'exceeded max_attempts after lease expiry'
                 ),
-            ).fetchall()
+                completed_at = COALESCE(completed_at, %s),
+                updated_at = %s
+            FROM expired
+            WHERE j.id = expired.id
+            RETURNING j.id, j.tenant_id,
+                      expired.lease_started_at,
+                      expired.lease_expires_at
+            """,
+            tuple(params),
+        ).fetchall()
 
         tenants: set[str] = set()
         for dead in dead_rows:
@@ -330,5 +310,7 @@ class LeaseMaxRuntimeMixin:
                 count=1,
                 now=now,
             )
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(conn, dead, now=now)
         for tid in tenants:
             self._maybe_finalize_offboard(conn, tenant_id=tid, now=now)

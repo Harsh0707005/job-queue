@@ -223,6 +223,8 @@ class LeaseReapMixin:
             if updated is None:
                 continue
             tenants.add(tid)
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(conn, row, now=now, cancels=1)
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=row["id"],

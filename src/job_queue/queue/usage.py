@@ -84,7 +84,11 @@ def _parse_usage_dt(
 
 
 def usage_runtime_ms(row: dict[str, Any] | None, now: datetime) -> int:
-    """Elapsed lease time from *row* (must be the pre-update leased row)."""
+    """Elapsed lease time from *row* (must be the pre-update leased row).
+
+    Caps at ``lease_expires_at`` when the worker died and the lease timed
+    out, so we bill held time rather than idle time after expiry.
+    """
     if not row:
         return 0
     started = row.get("lease_started_at")
@@ -92,7 +96,14 @@ def usage_runtime_ms(row: dict[str, Any] | None, now: datetime) -> int:
         return 0
     if getattr(started, "tzinfo", None) is None:
         started = started.replace(tzinfo=timezone.utc)
-    ms = int((now - started).total_seconds() * 1000.0)
+    end = now
+    expires = row.get("lease_expires_at")
+    if expires is not None:
+        if getattr(expires, "tzinfo", None) is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires < end:
+            end = expires
+    ms = int((end - started).total_seconds() * 1000.0)
     return max(0, ms)
 
 
