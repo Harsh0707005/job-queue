@@ -102,7 +102,7 @@ class JobsCancelOneMixin:
                     updated_at = %s
                 WHERE id = %s
                   AND tenant_id = %s
-                  AND status IN (%s, %s, %s, %s)
+                  AND status IN (%s, %s, %s, %s, %s)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 (
@@ -121,6 +121,7 @@ class JobsCancelOneMixin:
                     JobStatus.LEASED.value,
                     JobStatus.AWAITING_APPROVAL.value,
                     JobStatus.AWAITING_CHILDREN.value,
+                    JobStatus.AWAITING_SKILLS.value,
                 ),
             ).fetchone()
             if updated is None:
@@ -212,7 +213,7 @@ class JobsCancelOneMixin:
                 updated_at = %s
             WHERE id = %s
               AND tenant_id = %s
-              AND status IN (%s, %s, %s, %s)
+              AND status IN (%s, %s, %s, %s, %s)
             RETURNING {_JOB_COLUMNS}
             """,
             (
@@ -229,6 +230,7 @@ class JobsCancelOneMixin:
                 JobStatus.LEASED.value,
                 JobStatus.AWAITING_APPROVAL.value,
                 JobStatus.AWAITING_CHILDREN.value,
+                JobStatus.AWAITING_SKILLS.value,
             ),
         ).fetchone()
         if updated is None:

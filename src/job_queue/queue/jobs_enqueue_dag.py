@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
-from job_queue.models import DagEnqueueResult, Job, JobStatus
+from job_queue.models import DagEnqueueResult, Job
 from job_queue.queue._common import (
     _DAG_BATCH_LOCK_CLASS,
     _JOB_COLUMNS,
@@ -105,6 +105,7 @@ class JobsEnqueueDagMixin:
                 )
 
             ref_to_id = {spec["ref"]: spec["job_id"] for spec in specs}
+            in_batch_ids = {spec["job_id"] for spec in specs}
             for spec in specs:
                 dep_ids: list[UUID] = []
                 for raw in spec["depends_on_raw"]:
@@ -124,11 +125,13 @@ class JobsEnqueueDagMixin:
                     )
                 spec["dep_ids"] = self._normalize_depends_on(dep_ids)
 
+            # Cycle check uses resolved UUIDs so A↔B via explicit job_ids
+            # (not just in-batch refs) cannot deadlock after commit.
             self._assert_dag_acyclic(specs)
             external = []
             for spec in specs:
                 for pid in spec["dep_ids"]:
-                    if pid not in ref_to_id.values():
+                    if pid not in in_batch_ids:
                         external.append(pid)
             if external:
                 self._validate_dependencies(
@@ -376,15 +379,15 @@ class JobsEnqueueDagMixin:
 
     @staticmethod
     def _assert_dag_acyclic(specs: list[dict[str, Any]]) -> None:
-        refs = {s["ref"] for s in specs}
-        incoming = {s["ref"]: 0 for s in specs}
-        adj: dict[str, list[str]] = {s["ref"]: [] for s in specs}
+        ids = {s["job_id"] for s in specs}
+        incoming = {s["job_id"]: 0 for s in specs}
+        adj: dict[UUID, list[UUID]] = {s["job_id"]: [] for s in specs}
         for spec in specs:
-            for raw in spec["depends_on_raw"]:
-                if raw in refs:
-                    adj[raw].append(spec["ref"])
-                    incoming[spec["ref"]] += 1
-        ready = [r for r, c in incoming.items() if c == 0]
+            for pid in spec.get("dep_ids") or ():
+                if pid in ids:
+                    adj[pid].append(spec["job_id"])
+                    incoming[spec["job_id"]] += 1
+        ready = [jid for jid, c in incoming.items() if c == 0]
         seen = 0
         while ready:
             node = ready.pop()
@@ -401,6 +404,7 @@ class JobsEnqueueDagMixin:
     ) -> list[dict[str, Any]]:
         specs: list[dict[str, Any]] = []
         seen_refs: set[str] = set()
+        seen_ids: set[UUID] = set()
         seen_dedupe: set[str] = set()
         now = _utcnow()
         for i, raw in enumerate(jobs):
@@ -436,6 +440,9 @@ class JobsEnqueueDagMixin:
             else:
                 jid = jid_raw if isinstance(jid_raw, UUID) else UUID(str(jid_raw))
                 explicit = True
+            if jid in seen_ids:
+                raise ValueError(f"duplicate job_id {jid} in DAG")
+            seen_ids.add(jid)
             dedupe_key = raw.get("dedupe_key")
             if dedupe_key is not None:
                 dedupe_key = str(dedupe_key)

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import threading
-import pytest
+from uuid import uuid4
 
-from job_queue import DependencyError, JobQueue, JobStatus
+import pytest
+from psycopg.errors import UniqueViolation
+
+from job_queue import DependencyError, JobQueue, RateLimitError
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack
@@ -94,6 +97,88 @@ def test_enqueue_dag_cycle_rejected(queue: JobQueue):
     assert queue.list_jobs(tenant_id="dag-cyc") == []
 
 
+def test_enqueue_dag_cycle_via_explicit_ids_rejected(queue: JobQueue):
+    id_a, id_b = uuid4(), uuid4()
+    with pytest.raises(DependencyError, match="cycle"):
+        queue.enqueue_dag(
+            tenant_id="dag-cyc-id",
+            batch_key="cyc-id",
+            jobs=[
+                {
+                    "ref": "a",
+                    "job_id": str(id_a),
+                    "payload": {"n": 1},
+                    "depends_on": [str(id_b)],
+                },
+                {
+                    "ref": "b",
+                    "job_id": str(id_b),
+                    "payload": {"n": 2},
+                    "depends_on": [str(id_a)],
+                },
+            ],
+        )
+    assert queue.list_jobs(tenant_id="dag-cyc-id") == []
+
+
+def test_enqueue_dag_duplicate_job_id_rejected(queue: JobQueue):
+    shared = uuid4()
+    with pytest.raises(ValueError, match="duplicate job_id"):
+        queue.enqueue_dag(
+            tenant_id="dag-dup-id",
+            batch_key="dup-id",
+            jobs=[
+                {"ref": "a", "job_id": str(shared), "payload": {"n": 1}},
+                {"ref": "b", "job_id": str(shared), "payload": {"n": 2}},
+            ],
+        )
+    assert queue.list_jobs(tenant_id="dag-dup-id") == []
+
+
+def test_enqueue_dag_depends_on_sibling_uuid(queue: JobQueue):
+    id_a = uuid4()
+    out = queue.enqueue_dag(
+        tenant_id="dag-sid",
+        batch_key="sid",
+        jobs=[
+            {"ref": "a", "job_id": id_a, "payload": {"n": 1}},
+            {"ref": "b", "payload": {"n": 2}, "depends_on": [str(id_a)]},
+        ],
+    )
+    assert out.by_ref["b"].depends_on == (id_a,)
+    first = queue.lease(tenant_id="dag-sid", worker_id="w")
+    assert first is not None and first.id == id_a
+    assert queue.lease(tenant_id="dag-sid", worker_id="w2") is None
+    _ack(queue, first, "w")
+    second = queue.lease(tenant_id="dag-sid", worker_id="w")
+    assert second is not None and second.payload["n"] == 2
+
+
+def test_enqueue_dag_merge_renames_colliding_batch_key(queue: JobQueue):
+    src = queue.enqueue_dag(
+        tenant_id="dag-ms",
+        batch_key="same",
+        jobs=[{"ref": "a", "payload": {"n": 1}}],
+    )
+    dst = queue.enqueue_dag(
+        tenant_id="dag-md",
+        batch_key="same",
+        jobs=[{"ref": "a", "payload": {"n": 2}}],
+    )
+    result = queue.merge_tenant("dag-ms", "dag-md")
+    assert result.source_empty is True
+    jobs = queue.list_jobs(tenant_id="dag-md")
+    assert {j.id for j in jobs} == {src.jobs[0].id, dst.jobs[0].id}
+    # Retrying either original key still returns a committed graph.
+    again_dst = queue.enqueue_dag(
+        tenant_id="dag-md",
+        batch_key="same",
+        jobs=[{"ref": "a", "payload": {"n": 2}}],
+    )
+    assert again_dst.created is False
+    assert again_dst.jobs[0].id == dst.jobs[0].id
+
+
 def test_enqueue_dag_unknown_ref_rejected(queue: JobQueue):
     with pytest.raises(DependencyError, match="unknown"):
         queue.enqueue_dag(
@@ -157,6 +242,48 @@ def test_enqueue_dag_idempotent_retry(queue: JobQueue):
     assert second.created is False
     assert [j.id for j in first.jobs] == [j.id for j in second.jobs]
     assert len(queue.list_jobs(tenant_id="dag-id")) == 4
+    # Crash-retry must not double-bill enqueue meters.
+    assert queue.get_tenant_usage("dag-id").enqueues == 4
+
+
+def test_enqueue_dag_pk_conflict_rolls_back_whole_graph(queue: JobQueue):
+    keep = queue.enqueue(tenant_id="dag-pk", payload={"keep": True})
+    with pytest.raises(UniqueViolation):
+        queue.enqueue_dag(
+            tenant_id="dag-pk",
+            batch_key="pk-boom",
+            jobs=[
+                {"ref": "a", "payload": {"n": 1}},
+                {
+                    "ref": "b",
+                    "payload": {"n": 2},
+                    "depends_on": ["a"],
+                    "job_id": str(keep.id),
+                },
+                {
+                    "ref": "c",
+                    "payload": {"n": 3},
+                    "depends_on": ["b"],
+                },
+            ],
+        )
+    leftover = queue.list_jobs(tenant_id="dag-pk")
+    assert len(leftover) == 1
+    assert leftover[0].id == keep.id
+    assert leftover[0].payload.get("keep") is True
+    assert queue.get_tenant_usage("dag-pk").enqueues == 1
+
+
+def test_enqueue_dag_rate_limit_rolls_back_whole_graph(queue: JobQueue):
+    queue.set_enqueue_rate_limit("dag-rate", 1.0, burst=2)
+    with pytest.raises(RateLimitError, match="enqueue rate limit"):
+        queue.enqueue_dag(
+            tenant_id="dag-rate",
+            batch_key="rate-boom",
+            jobs=_diamond("r"),
+        )
+    assert queue.list_jobs(tenant_id="dag-rate") == []
+    assert queue.get_tenant_usage("dag-rate").enqueues == 0
 
 
 def test_enqueue_dag_idempotent_mismatch_rejected(queue: JobQueue):

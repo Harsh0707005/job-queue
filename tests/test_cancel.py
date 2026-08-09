@@ -29,6 +29,18 @@ def test_cancel_pending_job(queue: JobQueue):
     assert got.status == JobStatus.CANCELLED
 
 
+def test_cancel_awaiting_skills_job(queue: JobQueue):
+    job = queue.enqueue(
+        tenant_id="t-as",
+        payload={"x": 1},
+        required_skills=["no-worker-has-this"],
+    )
+    assert job.status == JobStatus.AWAITING_SKILLS
+    cancelled = queue.cancel(job.id, tenant_id="t-as")
+    assert cancelled.status == JobStatus.CANCELLED
+    assert queue.list_jobs(tenant_id="t-as")[0].status == JobStatus.CANCELLED
+
+
 def test_cancel_leased_job_stops_worker_finish(queue: JobQueue):
     """Cancelling a running job invalidates the fence; old worker cannot ack."""
     from job_queue import LeaseError
