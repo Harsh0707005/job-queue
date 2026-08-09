@@ -14,31 +14,95 @@ _SKILLS_WAIT_MSG = "waiting for worker skills"
 
 
 class SkillsWaitMixin:
-    def process_awaiting_skills(self, *, limit: int = 200) -> dict[str, int]:
+    def process_awaiting_skills(
+        self, *, limit: int = 200, max_passes: int = 32
+    ) -> dict[str, int]:
         """Park unfulfillable skilled jobs, revive those now coverable, expire.
 
-        Safe under load (``FOR UPDATE SKIP LOCKED``, bounded *limit*). Lease
-        and cleaner loops call this so a missing-skill flood cannot stall the
-        claim path, and a newly joined capable worker unblocks the parked set.
+        Safe under load (``FOR UPDATE SKIP LOCKED``, bounded *limit*). Repeats
+        until a pass is idle (or *max_passes*) so a late worker join or a
+        TOCTOU enqueue cannot leave a backlog waiting for the next poll.
+        Lease, cleaner, and post-enqueue/register paths call this.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
-        now = _utcnow()
-        with transaction(self._pool) as conn:
-            dead = self._expire_awaiting_skills_deadlines_locked(
-                conn, now=now, limit=limit
+        if max_passes < 1:
+            raise ValueError("max_passes must be >= 1")
+        totals = {"dead": 0, "parked": 0, "revived": 0}
+        for _ in range(int(max_passes)):
+            now = _utcnow()
+            with transaction(self._pool) as conn:
+                dead = self._expire_awaiting_skills_deadlines_locked(
+                    conn, now=now, limit=limit
+                )
+                parked = self._park_unfulfillable_skills_locked(
+                    conn, now=now, limit=limit
+                )
+                revived = self._revive_awaiting_skills_for_fleet_locked(
+                    conn, now=now, limit=limit
+                )
+            totals["dead"] += len(dead)
+            totals["parked"] += parked
+            totals["revived"] += revived
+            if not dead and parked == 0 and revived == 0:
+                break
+        return totals
+
+    def _rescan_awaiting_skills_after_commit(self, *, limit: int = 500) -> None:
+        """Post-commit scan so enqueue/register TOCTOU cannot leave stragglers."""
+        try:
+            self.process_awaiting_skills(limit=limit)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "post-commit awaiting_skills rescan failed"
             )
-            parked = self._park_unfulfillable_skills_locked(
-                conn, now=now, limit=limit
+
+    def _recheck_awaiting_skills_row_locked(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """If a capable worker appeared after we chose awaiting_skills, flip now."""
+        if row is None:
+            return row
+        if str(row.get("status") or "") != JobStatus.AWAITING_SKILLS.value:
+            return row
+        skills = [str(s) for s in (row.get("required_skills") or [])]
+        if not skills or not self._skills_are_covered(conn, skills):
+            return row
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                last_error = NULL,
+                updated_at = %s
+            WHERE id = %s AND status = %s
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.PENDING.value,
+                now,
+                row["id"],
+                JobStatus.AWAITING_SKILLS.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return row
+        if hasattr(self, "_append_job_audit"):
+            self._append_job_audit(
+                conn,
+                job_row=updated,
+                event_type="skills_available",
+                from_status=JobStatus.AWAITING_SKILLS.value,
+                actor=None,
+                detail={"revived": True, "source": "enqueue_recheck"},
+                now=now,
             )
-            revived = self._revive_awaiting_skills_for_fleet_locked(
-                conn, now=now, limit=limit
-            )
-        return {
-            "dead": len(dead),
-            "parked": parked,
-            "revived": revived,
-        }
+        return updated
 
     def list_awaiting_skills(
         self,

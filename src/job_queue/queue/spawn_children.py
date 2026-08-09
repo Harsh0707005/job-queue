@@ -82,6 +82,7 @@ class SpawnChildrenMixin:
             else None
         )
 
+        result: SpawnChildrenResult | None = None
         with transaction(self._pool) as conn:
             self._expire_await_children_timeouts_locked(
                 conn, now=now, tenant_id=tenant_id
@@ -96,268 +97,283 @@ class SpawnChildrenMixin:
                 kids = self._list_children_locked(
                     conn, parent_id=job_id, tenant_id=tenant_id
                 )
-                return SpawnChildrenResult(parent=parent, children=tuple(kids))
+                result = SpawnChildrenResult(parent=parent, children=tuple(kids))
 
-            self._assert_lease_tenant(row, tenant_id)
-            self._assert_active_lease(row, worker_id, lease_token, now)
+            if result is None:
+                self._assert_lease_tenant(row, tenant_id)
+                self._assert_active_lease(row, worker_id, lease_token, now)
 
-            parent_queue = row["queue_name"]
-            parent_labels = list(row.get("labels") or [])
-            parent_skills = list(row.get("required_skills") or [])
-            child_jobs: list[Job] = []
-            child_ids: list[UUID] = []
+                parent_queue = row["queue_name"]
+                parent_labels = list(row.get("labels") or [])
+                parent_skills = list(row.get("required_skills") or [])
+                child_jobs: list[Job] = []
+                child_ids: list[UUID] = []
 
-            # Serialize pending-cap with other enqueues for this tenant.
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (tenant_id,),
-            )
-            if self._is_tenant_offboarding(conn, tenant_id):
-                raise SpawnError(
-                    f"tenant {tenant_id!r} is offboarding; spawn rejected",
-                    job=self._job(row),
+                # Serialize pending-cap with other enqueues for this tenant.
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (tenant_id,),
                 )
-
-            for i, spec in enumerate(specs):
-                self._assert_pending_capacity(conn, tenant_id)
-                # Spawn under parent lease: still consumes enqueue rate so a
-                # fan-out storm cannot bypass tenant throttles.
-                self._consume_enqueue_rate(conn, tenant_id, now=now)
-
-                payload = spec["payload"]
-                qname = str(spec.get("queue_name") or parent_queue)
-                priority = int(spec.get("priority") or row["priority"])
-                max_attempts = int(spec.get("max_attempts") or row["max_attempts"])
-                vt = int(
-                    spec.get("visibility_timeout_seconds")
-                    or row["visibility_timeout_seconds"]
-                )
-                max_rt = int(
-                    spec.get("max_runtime_seconds") or row["max_runtime_seconds"]
-                )
-                dedupe_key = spec.get("dedupe_key")
-                if dedupe_key is not None and dedupe_key == "":
-                    raise ValueError(
-                        f"children[{i}].dedupe_key must be non-empty when set"
+                if self._is_tenant_offboarding(conn, tenant_id):
+                    raise SpawnError(
+                        f"tenant {tenant_id!r} is offboarding; spawn rejected",
+                        job=self._job(row),
                     )
-                est = spec.get("estimated_duration_seconds")
-                if est is not None:
-                    est = int(est)
-                    if est < 1:
+
+                for i, spec in enumerate(specs):
+                    self._assert_pending_capacity(conn, tenant_id)
+                    # Spawn under parent lease: still consumes enqueue rate so a
+                    # fan-out storm cannot bypass tenant throttles.
+                    self._consume_enqueue_rate(conn, tenant_id, now=now)
+
+                    payload = spec["payload"]
+                    qname = str(spec.get("queue_name") or parent_queue)
+                    priority = int(spec.get("priority") or row["priority"])
+                    max_attempts = int(spec.get("max_attempts") or row["max_attempts"])
+                    vt = int(
+                        spec.get("visibility_timeout_seconds")
+                        or row["visibility_timeout_seconds"]
+                    )
+                    max_rt = int(
+                        spec.get("max_runtime_seconds") or row["max_runtime_seconds"]
+                    )
+                    dedupe_key = spec.get("dedupe_key")
+                    if dedupe_key is not None and dedupe_key == "":
                         raise ValueError(
-                            f"children[{i}].estimated_duration_seconds must be >= 1"
+                            f"children[{i}].dedupe_key must be non-empty when set"
                         )
-                preemptible = (
-                    bool(spec["preemptible"]) if "preemptible" in spec else True
-                )
-                # Labels: inherit parent, then merge any child-specific labels.
-                if "labels" in spec:
-                    child_labels = _normalize_labels(
-                        list(parent_labels) + list(spec.get("labels") or [])
+                    est = spec.get("estimated_duration_seconds")
+                    if est is not None:
+                        est = int(est)
+                        if est < 1:
+                            raise ValueError(
+                                f"children[{i}].estimated_duration_seconds must be >= 1"
+                            )
+                    preemptible = (
+                        bool(spec["preemptible"]) if "preemptible" in spec else True
                     )
-                else:
-                    child_labels = list(parent_labels)
-                if "required_skills" in spec:
-                    child_skills = _normalize_skills(spec.get("required_skills"))
-                else:
-                    child_skills = list(parent_skills)
-                cid = uuid4()
-                if dedupe_key is not None:
-                    self._lock_dedupe_key(
-                        conn,
-                        tenant_id=tenant_id,
-                        queue_name=qname,
-                        dedupe_key=str(dedupe_key),
-                    )
-                    existing = self._find_active_dedupe(
-                        conn,
-                        tenant_id=tenant_id,
-                        queue_name=qname,
-                        dedupe_key=str(dedupe_key),
-                    )
-                    if existing is not None:
-                        raise SpawnError(
-                            f"children[{i}] dedupe_key {dedupe_key!r} already active",
-                            job=self._job(row),
+                    # Labels: inherit parent, then merge any child-specific labels.
+                    if "labels" in spec:
+                        child_labels = _normalize_labels(
+                            list(parent_labels) + list(spec.get("labels") or [])
                         )
+                    else:
+                        child_labels = list(parent_labels)
+                    if "required_skills" in spec:
+                        child_skills = _normalize_skills(spec.get("required_skills"))
+                    else:
+                        child_skills = list(parent_skills)
+                    cid = uuid4()
+                    if dedupe_key is not None:
+                        self._lock_dedupe_key(
+                            conn,
+                            tenant_id=tenant_id,
+                            queue_name=qname,
+                            dedupe_key=str(dedupe_key),
+                        )
+                        existing = self._find_active_dedupe(
+                            conn,
+                            tenant_id=tenant_id,
+                            queue_name=qname,
+                            dedupe_key=str(dedupe_key),
+                        )
+                        if existing is not None:
+                            raise SpawnError(
+                                f"children[{i}] dedupe_key {dedupe_key!r} already active",
+                                job=self._job(row),
+                            )
 
-                part_id = (
-                    self._compute_partition_id(conn, tenant_id=tenant_id, job_id=cid)
-                    if hasattr(self, "_compute_partition_id")
-                    else 0
-                )
-                sealed, payload_key_id = self._seal_job_payload(
-                    conn, tenant_id=tenant_id, job_id=cid, payload=payload
-                )
-                child_status = (
-                    self._enqueue_status_for_skills(conn, child_skills)
-                    if hasattr(self, "_enqueue_status_for_skills")
-                    else JobStatus.PENDING.value
-                )
-                crow = conn.execute(
-                    f"""
-                    INSERT INTO jobs (
-                        id, tenant_id, queue_name, payload, status, priority,
-                        attempts, max_attempts, visibility_timeout_seconds,
-                        max_runtime_seconds,
-                        retry_backoff_base_seconds, retry_backoff_max_seconds,
-                        available_at, dedupe_key, schedule_id, depends_on,
-                        parent_job_id, waiting_on, labels, required_skills,
-                        deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id, payload_key_id
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        0, %s, %s,
-                        %s,
-                        %s, %s,
-                        %s, %s, NULL, '{{}}'::uuid[],
-                        %s, '{{}}'::uuid[], %s, %s,
-                        NULL, %s, %s,
-                        %s, %s, %s, %s
+                    part_id = (
+                        self._compute_partition_id(conn, tenant_id=tenant_id, job_id=cid)
+                        if hasattr(self, "_compute_partition_id")
+                        else 0
                     )
-                    RETURNING {_JOB_COLUMNS}
-                    """,
-                    (
-                        cid,
-                        tenant_id,
-                        qname,
-                        Jsonb(sealed),
-                        child_status,
-                        priority,
-                        max_attempts,
-                        vt,
-                        max_rt,
-                        int(row.get("retry_backoff_base_seconds") or 1),
-                        int(row.get("retry_backoff_max_seconds") or 300),
-                        now,
-                        dedupe_key,
-                        job_id,
-                        child_labels,
-                        child_skills,
-                        est,
-                        preemptible,
-                        now,
-                        now,
-                        part_id,
-                        payload_key_id,
-                    ),
-                ).fetchone()
-                assert crow is not None
-                child = self._job(crow)
-                child_jobs.append(child)
-                child_ids.append(child.id)
-                self._append_job_audit(
-                    conn,
-                    job_row=crow,
-                    event_type="enqueued",
-                    from_status=None,
-                    actor=worker_id,
-                    detail={
-                        "parent_job_id": str(job_id),
-                        "spawned": True,
-                        "queue_name": qname,
-                    },
-                    now=now,
-                )
+                    sealed, payload_key_id = self._seal_job_payload(
+                        conn, tenant_id=tenant_id, job_id=cid, payload=payload
+                    )
+                    child_status = (
+                        self._enqueue_status_for_skills(conn, child_skills)
+                        if hasattr(self, "_enqueue_status_for_skills")
+                        else JobStatus.PENDING.value
+                    )
+                    crow = conn.execute(
+                        f"""
+                        INSERT INTO jobs (
+                            id, tenant_id, queue_name, payload, status, priority,
+                            attempts, max_attempts, visibility_timeout_seconds,
+                            max_runtime_seconds,
+                            retry_backoff_base_seconds, retry_backoff_max_seconds,
+                            available_at, dedupe_key, schedule_id, depends_on,
+                            parent_job_id, waiting_on, labels, required_skills,
+                            deadline_at, estimated_duration_seconds, preemptible,
+                            created_at, updated_at, partition_id, payload_key_id
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s,
+                            0, %s, %s,
+                            %s,
+                            %s, %s,
+                            %s, %s, NULL, '{{}}'::uuid[],
+                            %s, '{{}}'::uuid[], %s, %s,
+                            NULL, %s, %s,
+                            %s, %s, %s, %s
+                        )
+                        RETURNING {_JOB_COLUMNS}
+                        """,
+                        (
+                            cid,
+                            tenant_id,
+                            qname,
+                            Jsonb(sealed),
+                            child_status,
+                            priority,
+                            max_attempts,
+                            vt,
+                            max_rt,
+                            int(row.get("retry_backoff_base_seconds") or 1),
+                            int(row.get("retry_backoff_max_seconds") or 300),
+                            now,
+                            dedupe_key,
+                            job_id,
+                            child_labels,
+                            child_skills,
+                            est,
+                            preemptible,
+                            now,
+                            now,
+                            part_id,
+                            payload_key_id,
+                        ),
+                    ).fetchone()
+                    assert crow is not None
+                    if hasattr(self, "_recheck_awaiting_skills_row_locked"):
+                        crow = self._recheck_awaiting_skills_row_locked(
+                            conn, crow, now=now
+                        )
+                    child = self._job(crow)
+                    child_jobs.append(child)
+                    child_ids.append(child.id)
+                    self._append_job_audit(
+                        conn,
+                        job_row=crow,
+                        event_type="enqueued",
+                        from_status=None,
+                        actor=worker_id,
+                        detail={
+                            "parent_job_id": str(job_id),
+                            "spawned": True,
+                            "queue_name": qname,
+                        },
+                        now=now,
+                    )
 
-            if not wait:
-                return SpawnChildrenResult(
-                    parent=self._job(row),
-                    children=tuple(child_jobs),
-                )
-
-            # Park parent: free lease / concurrency, keep checkpoint.
-            cp_sql = ""
-            cp_params: list[Any] = []
-            if progress is not None:
-                # Merge child ids into checkpoint for resume handlers.
-                progress_out = progress
-                if isinstance(progress, dict):
-                    progress_out = {
-                        **progress,
-                        "waiting_on": [str(x) for x in child_ids],
-                        "phase": "awaiting_children",
-                    }
-                cp_sql = ", checkpoint = %s, checkpointed_at = %s"
-                cp_params = [Jsonb(progress_out), now]
-            else:
-                # Still stamp a minimal join checkpoint if none provided.
-                existing_cp = row.get("checkpoint")
-                if isinstance(existing_cp, dict):
-                    progress_out = {
-                        **existing_cp,
-                        "waiting_on": [str(x) for x in child_ids],
-                        "phase": "awaiting_children",
-                    }
+                if not wait:
+                    result = SpawnChildrenResult(
+                        parent=self._job(row),
+                        children=tuple(child_jobs),
+                    )
                 else:
-                    progress_out = {
-                        "waiting_on": [str(x) for x in child_ids],
-                        "phase": "awaiting_children",
-                    }
-                cp_sql = ", checkpoint = %s, checkpointed_at = %s"
-                cp_params = [Jsonb(progress_out), now]
+                    # Park parent: free lease / concurrency, keep checkpoint.
+                    cp_sql = ""
+                    cp_params: list[Any] = []
+                    if progress is not None:
+                        # Merge child ids into checkpoint for resume handlers.
+                        progress_out = progress
+                        if isinstance(progress, dict):
+                            progress_out = {
+                                **progress,
+                                "waiting_on": [str(x) for x in child_ids],
+                                "phase": "awaiting_children",
+                            }
+                        cp_sql = ", checkpoint = %s, checkpointed_at = %s"
+                        cp_params = [Jsonb(progress_out), now]
+                    else:
+                        # Still stamp a minimal join checkpoint if none provided.
+                        existing_cp = row.get("checkpoint")
+                        if isinstance(existing_cp, dict):
+                            progress_out = {
+                                **existing_cp,
+                                "waiting_on": [str(x) for x in child_ids],
+                                "phase": "awaiting_children",
+                            }
+                        else:
+                            progress_out = {
+                                "waiting_on": [str(x) for x in child_ids],
+                                "phase": "awaiting_children",
+                            }
+                        cp_sql = ", checkpoint = %s, checkpointed_at = %s"
+                        cp_params = [Jsonb(progress_out), now]
 
-            updated = conn.execute(
-                f"""
-                UPDATE jobs
-                SET status = %s,
-                    leased_by = NULL,
-                    lease_token = NULL,
-                    lease_tenant_id = NULL,
-                    lease_expires_at = NULL,
-                    lease_started_at = NULL,
-                    waiting_on = %s,
-                    await_children_started_at = %s,
-                    await_children_deadline_at = %s,
-                    await_children_outcome = NULL,
-                    await_children_resolved_at = NULL,
-                    last_error = NULL,
-                    updated_at = %s
-                    {cp_sql}
-                WHERE id = %s
-                  AND lease_token = %s
-                  AND status = %s
-                RETURNING {_JOB_COLUMNS}
-                """,
-                (
-                    JobStatus.AWAITING_CHILDREN.value,
-                    child_ids,
-                    now,
-                    deadline,
-                    now,
-                    *cp_params,
-                    job_id,
-                    lease_token,
-                    JobStatus.LEASED.value,
-                ),
-            ).fetchone()
-            if updated is None:
-                raise LeaseError(f"job {job_id} lease lost during spawn_children")
-            parent = self._job(updated)
-            self._append_job_audit(
-                conn,
-                job_row=updated,
-                event_type="children_awaited",
-                from_status=JobStatus.LEASED.value,
-                actor=worker_id,
-                detail={
-                    "child_ids": [str(x) for x in child_ids],
-                    "timeout_seconds": (
-                        float(timeout_seconds) if timeout_seconds is not None else None
-                    ),
-                },
-                now=now,
-            )
-            # Children may already be terminal if something weird happens; wake.
-            self._maybe_wake_parent_on_join_locked(
-                conn, parent_id=job_id, tenant_id=tenant_id, now=now
-            )
-            parent_row = conn.execute(
-                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-                (job_id,),
-            ).fetchone()
-            assert parent_row is not None
-            return SpawnChildrenResult(
-                parent=self._job(parent_row),
-                children=tuple(child_jobs),
-            )
+                    updated = conn.execute(
+                        f"""
+                        UPDATE jobs
+                        SET status = %s,
+                            leased_by = NULL,
+                            lease_token = NULL,
+                            lease_tenant_id = NULL,
+                            lease_expires_at = NULL,
+                            lease_started_at = NULL,
+                            waiting_on = %s,
+                            await_children_started_at = %s,
+                            await_children_deadline_at = %s,
+                            await_children_outcome = NULL,
+                            await_children_resolved_at = NULL,
+                            last_error = NULL,
+                            updated_at = %s
+                            {cp_sql}
+                        WHERE id = %s
+                          AND lease_token = %s
+                          AND status = %s
+                        RETURNING {_JOB_COLUMNS}
+                        """,
+                        (
+                            JobStatus.AWAITING_CHILDREN.value,
+                            child_ids,
+                            now,
+                            deadline,
+                            now,
+                            *cp_params,
+                            job_id,
+                            lease_token,
+                            JobStatus.LEASED.value,
+                        ),
+                    ).fetchone()
+                    if updated is None:
+                        raise LeaseError(
+                            f"job {job_id} lease lost during spawn_children"
+                        )
+                    parent = self._job(updated)
+                    self._append_job_audit(
+                        conn,
+                        job_row=updated,
+                        event_type="children_awaited",
+                        from_status=JobStatus.LEASED.value,
+                        actor=worker_id,
+                        detail={
+                            "child_ids": [str(x) for x in child_ids],
+                            "timeout_seconds": (
+                                float(timeout_seconds)
+                                if timeout_seconds is not None
+                                else None
+                            ),
+                        },
+                        now=now,
+                    )
+                    # Children may already be terminal if something weird happens; wake.
+                    self._maybe_wake_parent_on_join_locked(
+                        conn, parent_id=job_id, tenant_id=tenant_id, now=now
+                    )
+                    parent_row = conn.execute(
+                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                        (job_id,),
+                    ).fetchone()
+                    assert parent_row is not None
+                    result = SpawnChildrenResult(
+                        parent=self._job(parent_row),
+                        children=tuple(child_jobs),
+                    )
+
+        assert result is not None
+        if hasattr(self, "_rescan_awaiting_skills_after_commit"):
+            if any(c.required_skills for c in result.children):
+                self._rescan_awaiting_skills_after_commit()
+        return result

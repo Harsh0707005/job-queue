@@ -131,6 +131,7 @@ class PartitionsMixin(SkillsWaitMixin):
             self._sync_skills_wait_locked(
                 conn, now=now, worker_skills=skills_out
             )
+        self._rescan_awaiting_skills_after_commit()
         return {
             "worker_id": wid,
             "status": "active",
@@ -216,6 +217,7 @@ class PartitionsMixin(SkillsWaitMixin):
             self._sync_skills_wait_locked(
                 conn, now=now, worker_skills=skills_out
             )
+        self._rescan_awaiting_skills_after_commit()
         return {
             "worker_id": wid,
             "status": "active",
@@ -242,6 +244,7 @@ class PartitionsMixin(SkillsWaitMixin):
             )
             self._rebalance_partitions_locked(conn, now=now)
             self._sync_skills_wait_locked(conn, now=now)
+        self._rescan_awaiting_skills_after_commit()
         return {"worker_id": wid, "status": "dead"}
 
     def list_worker_partitions(self, worker_id: str) -> list[int]:

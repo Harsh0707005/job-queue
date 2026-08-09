@@ -55,11 +55,13 @@ services:
     command: ["python", "scripts/skills_soak.py"]
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
-      LOAD_TENANTS: "3"
-      JOBS_PER_LOAD: "12"
-      SKILL_TENANTS: "3"
-      JOBS_PER_SKILL: "8"
-      MAX_WALL_SECONDS: "180"
+      LOAD_TENANTS: "4"
+      JOBS_PER_LOAD: "16"
+      SKILL_TENANTS: "4"
+      JOBS_PER_SKILL: "10"
+      TPU_JOBS_PER_TENANT: "8"
+      RACE_JOBS: "40"
+      MAX_WALL_SECONDS: "240"
       LOG_LEVEL: INFO
     depends_on:
       coordinator-1:

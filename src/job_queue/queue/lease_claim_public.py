@@ -69,6 +69,42 @@ class LeaseClaimPublicMixin:
         if limit > 500:
             raise ValueError("limit must be <= 500")
 
+        jobs = self._lease_batch_once(
+            worker_id=worker_id,
+            limit=limit,
+            tenant_id=tenant_id,
+            queue_name=queue_name,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+        )
+        # Empty pull: revive any awaiting_skills that landed after the
+        # in-txn park/revive pass (enqueue vs register TOCTOU) and retry.
+        if jobs or not hasattr(self, "process_awaiting_skills"):
+            return jobs
+        try:
+            totals = self.process_awaiting_skills(
+                limit=max(50, limit * 8), max_passes=8
+            )
+        except Exception:  # noqa: BLE001
+            return jobs
+        if not totals.get("revived"):
+            return jobs
+        return self._lease_batch_once(
+            worker_id=worker_id,
+            limit=limit,
+            tenant_id=tenant_id,
+            queue_name=queue_name,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+        )
+
+    def _lease_batch_once(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        tenant_id: str | None,
+        queue_name: str,
+        visibility_timeout_seconds: int | None,
+    ) -> list[Job]:
         if tenant_id is None:
             return self._lease_fair_batch(
                 worker_id=worker_id,

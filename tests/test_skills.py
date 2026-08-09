@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from uuid import uuid4
 
@@ -458,12 +459,13 @@ def test_awaiting_skills_deadline_dead_letters(queue: JobQueue):
         required_skills=["tpu"],
         deadline_at=past,
     )
-    assert j.status == JobStatus.AWAITING_SKILLS
+    # Post-commit rescan dead-letters overdue parked jobs immediately.
+    assert j.status == JobStatus.DEAD
+    assert "required skills" in (j.last_error or "")
     out = queue.process_awaiting_skills()
-    assert out["dead"] >= 1
+    assert out["dead"] == 0
     got = queue.get(j.id, tenant_id="t1")
     assert got is not None and got.status == JobStatus.DEAD
-    assert "required skills" in (got.last_error or "")
 
 
 def test_concurrent_parked_jobs_drain_when_capable_workers_join(queue: JobQueue):
@@ -538,3 +540,176 @@ def test_concurrent_parked_jobs_drain_when_capable_workers_join(queue: JobQueue)
         assert not t.is_alive()
     assert not errors
     assert set(claimed) == tpu_ids
+
+
+def test_enqueue_with_live_worker_never_stuck_awaiting(queue: JobQueue):
+    """Post-insert recheck + post-commit rescan close the coverage TOCTOU."""
+    queue.require_worker_registration = True
+    queue.set_partition_count(8)
+    queue.register_worker("gpu-live", skills=["gpu"])
+    n = 96
+    errors: list[BaseException] = []
+    jobs: list = []
+    lock = threading.Lock()
+
+    def go(i: int) -> None:
+        try:
+            j = queue.enqueue(
+                tenant_id=f"live-{i % 6}",
+                payload={"i": i},
+                required_skills=["gpu"],
+            )
+            with lock:
+                jobs.append(j)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive()
+    assert not errors
+    assert len(jobs) == n
+    stuck = [j.id for j in jobs if j.status == JobStatus.AWAITING_SKILLS]
+    assert not stuck
+    parked = []
+    for i in range(6):
+        parked.extend(queue.list_awaiting_skills(tenant_id=f"live-{i}"))
+    assert parked == []
+
+
+def test_enqueue_vs_register_lease_race_drains_under_load(queue: JobQueue):
+    """Jobs must not sit awaiting_skills after a capable worker is live.
+
+    Reproduces: enqueue chooses awaiting (no worker yet), worker registers and
+    leases an empty queue, then the insert commits. Post-commit / lease rescan
+    must revive and drain every row.
+    """
+    queue.require_worker_registration = True
+    queue.set_partition_count(16)
+    n_tenants = 6
+    n_enqueuers = 8
+    jobs_per = 30
+    expected = n_enqueuers * jobs_per
+    tenants = [f"race-{i}" for i in range(n_tenants)]
+    wids = ["gpu-a", "gpu-b", "gpu-c", "gpu-d"]
+    ids: list = []
+    claimed: list = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    start = threading.Barrier(n_enqueuers + 1 + len(wids))
+    stop = threading.Event()
+
+    def enqueue(idx: int) -> None:
+        try:
+            start.wait(timeout=15)
+            for i in range(jobs_per):
+                j = queue.enqueue(
+                    tenant_id=tenants[(idx + i) % n_tenants],
+                    payload={"i": i, "w": idx},
+                    required_skills=["gpu"],
+                )
+                with lock:
+                    ids.append(j.id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def registerer() -> None:
+        try:
+            start.wait(timeout=15)
+            # Land in the window after some enqueues chose awaiting_skills.
+            time.sleep(0.005)
+            for wid in wids:
+                queue.register_worker(wid, skills=["gpu"])
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def leaser(wid: str) -> None:
+        try:
+            start.wait(timeout=15)
+            idle = 0
+            while not stop.is_set() or idle < 20:
+                job = queue.lease(worker_id=wid)
+                if job is None:
+                    idle += 1
+                    time.sleep(0.005)
+                    continue
+                idle = 0
+                assert job.id is not None
+                assert "gpu" in job.required_skills
+                _ack(queue, job, wid)
+                with lock:
+                    claimed.append(job.id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=enqueue, args=(i,)) for i in range(n_enqueuers)]
+    threads.append(threading.Thread(target=registerer))
+    threads.extend(threading.Thread(target=leaser, args=(w,)) for w in wids)
+    for t in threads:
+        t.start()
+    for t in threads[: n_enqueuers + 1]:
+        t.join(timeout=60)
+        assert not t.is_alive(), "enqueuer/register hung"
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        with lock:
+            if len(claimed) >= expected and len(ids) >= expected:
+                break
+        time.sleep(0.05)
+    stop.set()
+    for t in threads[n_enqueuers + 1 :]:
+        t.join(timeout=30)
+        assert not t.is_alive(), "leaser hung"
+    assert not errors, errors
+    assert len(ids) == expected
+    parked = []
+    for tid in tenants:
+        parked.extend(queue.list_awaiting_skills(tenant_id=tid))
+    assert parked == [], [(p.id, p.status) for p in parked[:8]]
+    assert set(claimed) == set(ids)
+
+
+def test_process_awaiting_skills_multipass_clears_large_backlog(queue: JobQueue):
+    queue.require_worker_registration = True
+    n = 80
+    for i in range(n):
+        j = queue.enqueue(
+            tenant_id=f"mp-{i % 4}",
+            payload={"i": i},
+            required_skills=["tpu"],
+        )
+        assert j.status == JobStatus.AWAITING_SKILLS
+    queue.register_worker("tpu-w", skills=["tpu"])
+    parked = []
+    for i in range(4):
+        parked.extend(queue.list_awaiting_skills(tenant_id=f"mp-{i}"))
+    assert parked == []
+    # Insert a capable worker without register()'s rescan so the backlog
+    # stays awaiting; tiny per-pass limit must still drain via max_passes.
+    extra_n = 40
+    for i in range(extra_n):
+        j = queue.enqueue(
+            tenant_id="mp-0",
+            payload={"late": i},
+            required_skills=["missing"],
+        )
+        assert j.status == JobStatus.AWAITING_SKILLS
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO worker_nodes (
+                worker_id, status, last_seen_at, created_at, updated_at, skills
+            )
+            VALUES ('miss-w', 'active', NOW(), NOW(), NOW(), %s)
+            """,
+            (["missing"],),
+        )
+        conn.commit()
+    still = queue.list_awaiting_skills(tenant_id="mp-0", limit=500)
+    assert len(still) == extra_n
+    out = queue.process_awaiting_skills(limit=3, max_passes=32)
+    assert out["revived"] >= extra_n
+    assert queue.list_awaiting_skills(tenant_id="mp-0") == []

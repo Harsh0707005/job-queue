@@ -230,6 +230,10 @@ class SchedulesProcessMixin:
                             ),
                         ).fetchone()
                         if job_row is not None:
+                            if hasattr(self, "_recheck_awaiting_skills_row_locked"):
+                                job_row = self._recheck_awaiting_skills_row_locked(
+                                    conn, job_row, now=now
+                                )
                             self._append_job_audit(
                                 conn,
                                 job_row=job_row,
@@ -274,4 +278,7 @@ class SchedulesProcessMixin:
                     now=now,
                 )
 
+        if fires and hasattr(self, "_rescan_awaiting_skills_after_commit"):
+            if any(f.job.required_skills for f in fires):
+                self._rescan_awaiting_skills_after_commit()
         return fires

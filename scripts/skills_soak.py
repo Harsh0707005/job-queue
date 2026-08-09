@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.request
 from typing import Any
@@ -39,8 +40,9 @@ LOAD_TENANTS = int(os.environ.get("LOAD_TENANTS", "3") or "3")
 JOBS_PER_LOAD = int(os.environ.get("JOBS_PER_LOAD", "12") or "12")
 SKILL_TENANTS = int(os.environ.get("SKILL_TENANTS", "3") or "3")
 JOBS_PER_SKILL = int(os.environ.get("JOBS_PER_SKILL", "8") or "8")
-TPU_JOBS_PER_TENANT = int(os.environ.get("TPU_JOBS_PER_TENANT", "6") or "6")
-MAX_WALL = int(os.environ.get("MAX_WALL_SECONDS", "180") or "180")
+TPU_JOBS_PER_TENANT = int(os.environ.get("TPU_JOBS_PER_TENANT", "8") or "8")
+RACE_JOBS = int(os.environ.get("RACE_JOBS", "40") or "40")
+MAX_WALL = int(os.environ.get("MAX_WALL_SECONDS", "240") or "240")
 _rr = 0
 
 GPU_WORKERS = {"worker-1", "worker-2"}
@@ -376,6 +378,239 @@ def main() -> int:
     if tpu_completed < expect_tpu:
         raise RuntimeError(f"tpu completed {tpu_completed} want {expect_tpu}")
     logger.info("tpu parked-then-revived completed=%d by worker-tpu", tpu_completed)
+
+    # Race: enqueue skilled work while the capable worker is already polling.
+    # Jobs that would have parked as awaiting_skills must revive and drain.
+    race_ids: list[str] = []
+    race_err: list[str] = []
+
+    def _enqueue_race(kind: str, skill: str, n: int, prefix: str) -> None:
+        try:
+            for i in range(n):
+                body = http_json(
+                    "POST",
+                    "/v1/jobs",
+                    {
+                        "tenant_id": f"{prefix}-{i % SKILL_TENANTS:02d}",
+                        "payload": {"kind": kind, "race": i, "ms": 10},
+                        "required_skills": [skill],
+                    },
+                )
+                job = body.get("job") or {}
+                jid = str(job.get("id") or "")
+                if not jid:
+                    raise RuntimeError(f"race enqueue missing id {body}")
+                race_ids.append(jid)
+        except Exception as exc:  # noqa: BLE001
+            race_err.append(str(exc))
+
+    def _drain_worker(wid: str, skill: str, stop: threading.Event) -> int:
+        done = 0
+        idle = 0
+        while not stop.is_set() or idle < 15:
+            try:
+                body = http_json(
+                    "POST",
+                    "/v1/lease",
+                    {
+                        "worker_id": wid,
+                        "limit": 8,
+                        "visibility_timeout_seconds": 30,
+                    },
+                )
+            except Exception:
+                idle += 1
+                time.sleep(0.05)
+                continue
+            jobs = body.get("jobs") or []
+            if not jobs:
+                idle += 1
+                time.sleep(0.05)
+                continue
+            idle = 0
+            for j in jobs:
+                skills = set(j.get("required_skills") or [])
+                if skills != {skill}:
+                    race_err.append(
+                        f"{wid} leased {j.get('id')} skills={skills}"
+                    )
+                    continue
+                http_json(
+                    "POST",
+                    f"/v1/jobs/{j['id']}/ack",
+                    {
+                        "tenant_id": j["tenant_id"],
+                        "worker_id": wid,
+                        "lease_token": j["lease_token"],
+                        "result": {"ok": True},
+                    },
+                )
+                done += 1
+        return done
+
+    logger.info("race burst tpu=%d while worker-tpu is live", RACE_JOBS)
+    stop_tpu = threading.Event()
+    tpu_done_holder = {"n": 0}
+
+    def _tpu_drain() -> None:
+        tpu_done_holder["n"] = _drain_worker("worker-tpu", "tpu", stop_tpu)
+
+    tpu_thr = threading.Thread(target=_tpu_drain)
+    tpu_thr.start()
+    enq_threads = [
+        threading.Thread(
+            target=_enqueue_race, args=("tpu", "tpu", RACE_JOBS // 4, "skill")
+        )
+        for _ in range(4)
+    ]
+    for t in enq_threads:
+        t.start()
+    for t in enq_threads:
+        t.join(timeout=60)
+    stop_tpu.set()
+    tpu_thr.join(timeout=60)
+    if race_err:
+        raise RuntimeError(f"tpu race errors: {race_err[:4]}")
+    parked_left = 0
+    for i in range(SKILL_TENANTS):
+        parked_left += len(
+            http_json(
+                "GET",
+                f"/v1/jobs?tenant_id=skill-{i:02d}"
+                "&status=awaiting_skills&limit=500",
+            ).get("jobs")
+            or []
+        )
+    if parked_left:
+        raise RuntimeError(
+            f"tpu race left {parked_left} awaiting_skills after live worker"
+        )
+    logger.info(
+        "tpu live-worker race enqueued=%d drained=%d",
+        len(race_ids),
+        tpu_done_holder["n"],
+    )
+
+    # Register vs enqueue TOCTOU for a brand-new skill nobody has yet.
+    expect_fpga = RACE_JOBS
+    fpga_ids: list[str] = []
+    fpga_lock = threading.Lock()
+    stop_fpga = threading.Event()
+    fpga_done_holder = {"n": 0}
+
+    def _enqueue_fpga() -> None:
+        try:
+            for i in range(expect_fpga):
+                body = http_json(
+                    "POST",
+                    "/v1/jobs",
+                    {
+                        "tenant_id": f"fpga-{i % 4:02d}",
+                        "payload": {"kind": "fpga", "i": i, "ms": 10},
+                        "required_skills": ["fpga"],
+                    },
+                )
+                job = body.get("job") or {}
+                with fpga_lock:
+                    fpga_ids.append(str(job.get("id")))
+        except Exception as exc:  # noqa: BLE001
+            race_err.append(str(exc))
+
+    def _register_and_drain_fpga() -> None:
+        time.sleep(0.05)
+        http_json(
+            "POST",
+            "/v1/workers/register",
+            {"worker_id": "worker-fpga", "skills": ["fpga"]},
+        )
+        fpga_done_holder["n"] = _drain_worker(
+            "worker-fpga", "fpga", stop_fpga
+        )
+
+    logger.info("fpga enqueue-vs-register race n=%d", expect_fpga)
+    fpga_enq = [threading.Thread(target=_enqueue_fpga)]
+    fpga_reg = threading.Thread(target=_register_and_drain_fpga)
+    for t in fpga_enq:
+        t.start()
+    fpga_reg.start()
+    for t in fpga_enq:
+        t.join(timeout=60)
+    stop_fpga.set()
+    fpga_reg.join(timeout=60)
+    if race_err:
+        raise RuntimeError(f"fpga race errors: {race_err[:4]}")
+    fpga_waiting = 0
+    fpga_done = 0
+    for i in range(4):
+        for j in list_jobs(f"fpga-{i:02d}"):
+            if set(j.get("required_skills") or []) != {"fpga"}:
+                continue
+            st = j.get("status")
+            if st == "completed":
+                fpga_done += 1
+            elif st == "awaiting_skills":
+                fpga_waiting += 1
+            elif st in ("pending", "leased"):
+                # One more lease pass for stragglers the drain thread missed.
+                pass
+    # Drain any leftover pending/leased fpga jobs.
+    leftover_deadline = time.time() + 30
+    while time.time() < leftover_deadline:
+        still = 0
+        for i in range(4):
+            for j in list_jobs(f"fpga-{i:02d}"):
+                if set(j.get("required_skills") or []) != {"fpga"}:
+                    continue
+                if j.get("status") in ("pending", "leased", "awaiting_skills"):
+                    still += 1
+        if still == 0:
+            break
+        body = http_json(
+            "POST",
+            "/v1/lease",
+            {
+                "worker_id": "worker-fpga",
+                "limit": 8,
+                "visibility_timeout_seconds": 30,
+            },
+        )
+        jobs = body.get("jobs") or []
+        if not jobs:
+            time.sleep(0.1)
+            continue
+        for j in jobs:
+            http_json(
+                "POST",
+                f"/v1/jobs/{j['id']}/ack",
+                {
+                    "tenant_id": j["tenant_id"],
+                    "worker_id": "worker-fpga",
+                    "lease_token": j["lease_token"],
+                    "result": {"ok": True},
+                },
+            )
+    fpga_done = 0
+    fpga_waiting = 0
+    for i in range(4):
+        for j in list_jobs(f"fpga-{i:02d}"):
+            if set(j.get("required_skills") or []) != {"fpga"}:
+                continue
+            if j.get("status") == "completed":
+                fpga_done += 1
+            elif j.get("status") == "awaiting_skills":
+                fpga_waiting += 1
+            else:
+                raise RuntimeError(
+                    f"fpga job {j.get('id')} stuck status={j.get('status')}"
+                )
+    if fpga_waiting:
+        raise RuntimeError(
+            f"fpga jobs still awaiting_skills after race: {fpga_waiting}"
+        )
+    if fpga_done < expect_fpga:
+        raise RuntimeError(f"fpga completed {fpga_done} want {expect_fpga}")
+    logger.info("fpga enqueue-vs-register race completed=%d", fpga_done)
+
     if any_done < expected["any"]:
         raise RuntimeError(f"unskilled skill-tenant jobs incomplete {any_done}")
     if not cuda_by or not gpu_by or not cpu_by:

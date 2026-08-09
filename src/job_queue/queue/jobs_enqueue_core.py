@@ -248,6 +248,10 @@ class JobsEnqueueCoreMixin:
                             "conflict without an active row"
                         )
                     return self._job(existing, conn=conn)
+                if hasattr(self, "_recheck_awaiting_skills_row_locked"):
+                    row = self._recheck_awaiting_skills_row_locked(
+                        conn, row, now=now
+                    )
                 job = self._job(row, conn=conn)
                 self._append_job_audit(
                     conn,
@@ -259,82 +263,101 @@ class JobsEnqueueCoreMixin:
                         "queue_name": queue_name,
                         "priority": priority,
                         "dedupe_key": dedupe_key,
+                        "required_skills": skill_list,
+                        "status": job.status.value,
                     },
                     now=now,
                 )
-                return job
-
-            self._assert_pending_capacity(conn, tenant_id)
-            self._consume_enqueue_rate(conn, tenant_id, now=now)
-            part_id = self._compute_partition_id(
-                conn, tenant_id=tenant_id, job_id=jid
-            )
-            sealed, payload_key_id = self._seal_job_payload(
-                conn, tenant_id=tenant_id, job_id=jid, payload=payload
-            )
-            status = self._enqueue_status_for_skills(conn, skill_list)
-
-            row = conn.execute(
-                f"""
-                INSERT INTO jobs (
-                    id, tenant_id, queue_name, payload, status, priority,
-                    attempts, max_attempts, visibility_timeout_seconds,
-                    max_runtime_seconds,
-                    retry_backoff_base_seconds, retry_backoff_max_seconds,
-                    available_at, dedupe_key, schedule_id, depends_on,
-                    labels, required_skills,
-                    deadline_at, estimated_duration_seconds, preemptible,
-                    created_at, updated_at, partition_id, payload_key_id
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s,
-                    0, %s, %s,
-                    %s,
-                    %s, %s,
-                    %s, NULL, NULL, %s,
-                    %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s, %s
+                out = job
+            else:
+                self._assert_pending_capacity(conn, tenant_id)
+                self._consume_enqueue_rate(conn, tenant_id, now=now)
+                part_id = self._compute_partition_id(
+                    conn, tenant_id=tenant_id, job_id=jid
                 )
-                RETURNING {_JOB_COLUMNS}
-                """,
-                (
-                    jid,
-                    tenant_id,
-                    queue_name,
-                    Jsonb(sealed),
-                    status,
-                    priority,
-                    max_attempts,
-                    visibility_timeout_seconds,
-                    max_runtime_seconds,
-                    retry_backoff_base_seconds,
-                    retry_backoff_max_seconds,
-                    run_at,
-                    dep_ids,
-                    label_list,
-                    skill_list,
-                    deadline,
-                    estimated_duration_seconds,
-                    bool(preemptible),
-                    now,
-                    now,
-                    part_id,
-                    payload_key_id,
-                ),
-            ).fetchone()
-            assert row is not None
-            job = self._job(row, conn=conn)
-            self._append_job_audit(
-                conn,
-                job_row=row,
-                event_type="enqueued",
-                from_status=None,
-                actor=None,
-                detail={
-                    "queue_name": queue_name,
-                    "priority": priority,
-                    "labels": label_list,
-                },
-                now=now,
-            )
-            return job
+                sealed, payload_key_id = self._seal_job_payload(
+                    conn, tenant_id=tenant_id, job_id=jid, payload=payload
+                )
+                status = self._enqueue_status_for_skills(conn, skill_list)
+
+                row = conn.execute(
+                    f"""
+                    INSERT INTO jobs (
+                        id, tenant_id, queue_name, payload, status, priority,
+                        attempts, max_attempts, visibility_timeout_seconds,
+                        max_runtime_seconds,
+                        retry_backoff_base_seconds, retry_backoff_max_seconds,
+                        available_at, dedupe_key, schedule_id, depends_on,
+                        labels, required_skills,
+                        deadline_at, estimated_duration_seconds, preemptible,
+                        created_at, updated_at, partition_id, payload_key_id
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        0, %s, %s,
+                        %s,
+                        %s, %s,
+                        %s, NULL, NULL, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    RETURNING {_JOB_COLUMNS}
+                    """,
+                    (
+                        jid,
+                        tenant_id,
+                        queue_name,
+                        Jsonb(sealed),
+                        status,
+                        priority,
+                        max_attempts,
+                        visibility_timeout_seconds,
+                        max_runtime_seconds,
+                        retry_backoff_base_seconds,
+                        retry_backoff_max_seconds,
+                        run_at,
+                        dep_ids,
+                        label_list,
+                        skill_list,
+                        deadline,
+                        estimated_duration_seconds,
+                        bool(preemptible),
+                        now,
+                        now,
+                        part_id,
+                        payload_key_id,
+                    ),
+                ).fetchone()
+                assert row is not None
+                if hasattr(self, "_recheck_awaiting_skills_row_locked"):
+                    row = self._recheck_awaiting_skills_row_locked(
+                        conn, row, now=now
+                    )
+                job = self._job(row, conn=conn)
+                self._append_job_audit(
+                    conn,
+                    job_row=row,
+                    event_type="enqueued",
+                    from_status=None,
+                    actor=None,
+                    detail={
+                        "queue_name": queue_name,
+                        "priority": priority,
+                        "labels": label_list,
+                        "required_skills": skill_list,
+                        "status": job.status.value,
+                    },
+                    now=now,
+                )
+                out = job
+
+        if (
+            skill_list
+            and out.status == JobStatus.AWAITING_SKILLS
+            and hasattr(self, "_rescan_awaiting_skills_after_commit")
+        ):
+            self._rescan_awaiting_skills_after_commit()
+            refreshed = self.get(out.id, tenant_id=out.tenant_id)
+            if refreshed is not None:
+                out = refreshed
+        return out
