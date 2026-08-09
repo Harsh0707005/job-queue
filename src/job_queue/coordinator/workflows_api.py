@@ -73,6 +73,18 @@ class WorkflowsApiMixin:
         if not isinstance(steps, list) or not steps:
             return 400, {"error": "steps must be a non-empty list"}
         try:
+            from datetime import datetime
+
+            expires_raw = body.get("expires_at")
+            expires_at = None
+            if expires_raw is not None:
+                if isinstance(expires_raw, str):
+                    expires_at = datetime.fromisoformat(
+                        expires_raw.replace("Z", "+00:00")
+                    )
+                else:
+                    return 400, {"error": "expires_at must be an ISO-8601 string"}
+            ttl_raw = body.get("ttl_seconds")
             run = self.queue.start_workflow(
                 tenant_id=str(tenant_id),
                 steps=steps,
@@ -87,6 +99,9 @@ class WorkflowsApiMixin:
                     if body.get("max_compensate_retries") is not None
                     else 5
                 ),
+                ttl_seconds=None if ttl_raw is None else float(ttl_raw),
+                expires_at=expires_at,
+                expiry_action=body.get("expiry_action"),
             )
         except (TypeError, ValueError) as exc:
             return 400, {"error": str(exc)}

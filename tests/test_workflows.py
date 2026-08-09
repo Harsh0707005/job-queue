@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from job_queue import JobQueue, JobStatus
@@ -1020,3 +1022,125 @@ def test_workflow_cancel_with_compensate_keeps_undo_chain(queue: JobQueue):
         and s.status == WorkflowStepStatus.COMPENSATED.value
     ]
     assert set(comps) == {"a", "b"}
+
+
+def test_workflow_step_inherits_tenant_default_ttl(queue: JobQueue):
+    queue.set_tenant_job_ttl("wf-ttl-def", 1, expiry_action="dead")
+    run = queue.start_workflow(
+        tenant_id="wf-ttl-def",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "stuck",
+                "payload": {"op": "need-tpu"},
+                "required_skills": ["tpu"],
+                "compensate": {"payload": {"op": "undo"}},
+            }
+        ],
+    )
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-ttl-def")
+    assert len(steps) == 1
+    job = queue.get(steps[0].job_id, tenant_id="wf-ttl-def")
+    assert job is not None
+    assert job.expires_at is not None
+    assert job.expiry_action == "dead"
+    assert job.status == JobStatus.AWAITING_SKILLS
+    time.sleep(1.1)
+    out = queue.process_expired_jobs(tenant_id="wf-ttl-def")
+    assert out["dead"] >= 1
+    job = queue.get(steps[0].job_id, tenant_id="wf-ttl-def")
+    assert job is not None and job.status == JobStatus.DEAD
+    done = queue.get_workflow(run.id, tenant_id="wf-ttl-def")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+    assert "ttl expired" in (done.fail_reason or "")
+
+
+def test_workflow_step_ttl_cancel_fails_run(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="wf-ttl-can",
+        max_attempts=1,
+        ttl_seconds=1,
+        expiry_action="cancel",
+        steps=[
+            {
+                "name": "orphan",
+                "payload": {"op": "x"},
+                "required_skills": ["missing"],
+            }
+        ],
+    )
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-ttl-can")
+    job = queue.get(steps[0].job_id, tenant_id="wf-ttl-can")
+    assert job is not None
+    assert job.expiry_action == "cancel"
+    time.sleep(1.1)
+    queue.process_expired_jobs(tenant_id="wf-ttl-can")
+    job = queue.get(steps[0].job_id, tenant_id="wf-ttl-can")
+    assert job is not None and job.status == JobStatus.CANCELLED
+    done = queue.get_workflow(run.id, tenant_id="wf-ttl-can")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+
+
+def test_workflow_step_override_beats_tenant_default(queue: JobQueue):
+    queue.set_tenant_job_ttl("wf-ttl-ov", 3600, expiry_action="cancel")
+    run = queue.start_workflow(
+        tenant_id="wf-ttl-ov",
+        steps=[
+            {
+                "name": "fast",
+                "payload": {"op": "x"},
+                "required_skills": ["gone"],
+                "ttl_seconds": 1,
+                "expiry_action": "dead",
+            }
+        ],
+    )
+    job = queue.get(
+        queue.list_workflow_steps(run.id, tenant_id="wf-ttl-ov")[0].job_id,
+        tenant_id="wf-ttl-ov",
+    )
+    assert job is not None
+    assert job.expiry_action == "dead"
+    time.sleep(1.1)
+    queue.process_expired_jobs(tenant_id="wf-ttl-ov")
+    got = queue.get(job.id, tenant_id="wf-ttl-ov")
+    assert got is not None and got.status == JobStatus.DEAD
+    done = queue.get_workflow(run.id, tenant_id="wf-ttl-ov")
+    assert done is not None and done.status == WorkflowRunStatus.FAILED.value
+
+
+def test_workflow_completed_steps_still_compensate_after_later_ttl(queue: JobQueue):
+    """First step completes; second parks until TTL then saga undoes the first."""
+    run = queue.start_workflow(
+        tenant_id="wf-ttl-comp",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "ok",
+                "payload": {"op": "ok"},
+                "compensate": {"payload": {"op": "undo_ok"}},
+            },
+            {
+                "name": "stuck",
+                "payload": {"op": "stuck"},
+                "required_skills": ["tpu"],
+                "ttl_seconds": 1,
+                "expiry_action": "dead",
+                "compensate": {"payload": {"op": "undo_stuck"}},
+            },
+        ],
+    )
+    _drive_step(queue, "wf-ttl-comp")
+    mid = queue.get_workflow(run.id, tenant_id="wf-ttl-comp")
+    assert mid is not None and mid.status == WorkflowRunStatus.RUNNING.value
+    time.sleep(1.1)
+    queue.process_expired_jobs(tenant_id="wf-ttl-comp")
+    j = queue.lease(tenant_id="wf-ttl-comp", worker_id="w")
+    assert j is not None
+    assert j.payload.get("direction") == "compensate"
+    _ack(queue, j, "w", result={"undid": True})
+    done = queue.get_workflow(run.id, tenant_id="wf-ttl-comp")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value

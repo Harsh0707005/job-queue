@@ -1,0 +1,20 @@
+# Workflow step jobs inherit tenant / per-step TTL on a live fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.workflow-ttl.yml \
+#     up --build --abort-on-container-exit --exit-code-from workflow-soak \
+#     workflow-soak
+
+services:
+  workflow-soak:
+    command: ["python", "scripts/workflow_ttl_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      TTL_SECONDS: "5"
+      DEAD_RUNS: "6"
+      CANCEL_RUNS: "4"
+      COMP_RUNS: "3"
+      HAPPY_RUNS: "4"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO

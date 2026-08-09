@@ -252,7 +252,9 @@ class JobsExpireMixin:
                 tenant_id=updated["tenant_id"],
                 now=now,
             )
-        if action == EXPIRY_DEAD and hasattr(self, "_on_workflow_step_terminal"):
+        if hasattr(self, "_on_workflow_step_terminal"):
+            # Cancel *or* dead — a cancelled step job must still fail the
+            # saga so the run cannot sit RUNNING forever.
             self._on_workflow_step_terminal(
                 conn,
                 updated,

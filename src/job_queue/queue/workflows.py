@@ -28,6 +28,8 @@ from job_queue.models import (
 from job_queue.queue._common import (
     CancelError,
     _JOB_COLUMNS,
+    _as_utc,
+    _normalize_skills,
     _utcnow,
 )
 
@@ -61,8 +63,16 @@ class WorkflowsMixin:
         visibility_timeout_seconds: int = 30,
         max_compensate_retries: int = DEFAULT_MAX_COMPENSATE_RETRIES,
         run_id: UUID | None = None,
+        ttl_seconds: float | int | None = None,
+        expires_at: Any = None,
+        expiry_action: str | None = None,
     ) -> WorkflowRun:
-        """Start a multi-step workflow and enqueue the first forward step job."""
+        """Start a multi-step workflow and enqueue the first forward step job.
+
+        *ttl_seconds* / *expires_at* / *expiry_action* apply to every step
+        job unless the step itself sets those fields. When omitted, the
+        tenant default job TTL is used so saga steps cannot sit forever.
+        """
         if not tenant_id or not str(tenant_id).strip():
             raise ValueError("tenant_id is required")
         tenant_id = str(tenant_id).strip()
@@ -71,6 +81,12 @@ class WorkflowsMixin:
         if int(max_compensate_retries) < 0:
             raise ValueError("max_compensate_retries must be >= 0")
         normalized = self._expand_and_normalize_steps(steps)
+        self._apply_workflow_ttl_defaults(
+            normalized,
+            ttl_seconds=ttl_seconds,
+            expires_at=expires_at,
+            expiry_action=expiry_action,
+        )
         now = _utcnow()
         rid = run_id or uuid4()
         with transaction(self._pool) as conn:
@@ -1191,7 +1207,10 @@ class WorkflowsMixin:
             WHERE s.run_id = %s
               AND s.direction = 'forward'
               AND s.status IN ('pending', 'running')
-              AND j.status IN ('pending', 'leased')
+              AND j.status IN (
+                    'pending', 'leased', 'awaiting_skills',
+                    'awaiting_approval', 'awaiting_children'
+                  )
             LIMIT 1
             """,
             (run_id,),
@@ -1607,7 +1626,10 @@ class WorkflowsMixin:
             WHERE s.run_id = %s
               AND s.direction = 'compensate'
               AND s.status IN ('pending', 'running')
-              AND j.status IN ('pending', 'leased')
+              AND j.status IN (
+                    'pending', 'leased', 'awaiting_skills',
+                    'awaiting_approval', 'awaiting_children'
+                  )
             LIMIT 1
             """,
             (run["id"],),
@@ -1849,6 +1871,15 @@ class WorkflowsMixin:
         sealed, payload_key_id = self._seal_job_payload(
             conn, tenant_id=tenant_id, job_id=job_id, payload=payload
         )
+        skills = _normalize_skills(sdef.get("required_skills"))
+        status = (
+            self._enqueue_status_for_skills(conn, skills)
+            if hasattr(self, "_enqueue_status_for_skills")
+            else JobStatus.PENDING.value
+        )
+        expires_at, expiry_action = self._workflow_step_expiry(
+            conn, tenant_id=tenant_id, step_def=sdef, now=now
+        )
         conn.execute(
             f"""
             INSERT INTO jobs (
@@ -1857,18 +1888,20 @@ class WorkflowsMixin:
                 max_runtime_seconds,
                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                 available_at, dedupe_key, schedule_id, depends_on,
-                labels,
+                labels, required_skills,
                 deadline_at, estimated_duration_seconds, preemptible,
-                created_at, updated_at, partition_id, payload_key_id
+                created_at, updated_at, partition_id, payload_key_id,
+                expires_at, expiry_action
             ) VALUES (
                 %s, %s, %s, %s, %s, 0,
                 0, %s, %s,
                 3600,
                 0, 30,
                 %s, %s, NULL, %s,
-                %s,
+                %s, %s,
                 NULL, NULL, TRUE,
-                %s, %s, %s, %s
+                %s, %s, %s, %s,
+                %s, %s
             )
             """,
             (
@@ -1876,13 +1909,14 @@ class WorkflowsMixin:
                 tenant_id,
                 queue_name,
                 Jsonb(sealed),
-                JobStatus.PENDING.value,
+                status,
                 max_attempts,
                 visibility_timeout_seconds,
                 now,
                 dedupe,
                 [],
                 labels,
+                skills,
                 now,
                 now,
                 (
@@ -1893,6 +1927,8 @@ class WorkflowsMixin:
                     else 0
                 ),
                 payload_key_id,
+                expires_at,
+                expiry_action,
             ),
         )
         # Keep step status pending until a worker actually leases the job.
@@ -1937,7 +1973,67 @@ class WorkflowsMixin:
                 detail={"workflow_run_id": str(run_id), "direction": direction},
                 now=now,
             )
+        if job_row is not None and hasattr(self, "_record_usage"):
+            self._record_usage(conn, tenant_id=tenant_id, now=now, enqueues=1)
+        if job_row is not None and hasattr(
+            self, "_recheck_awaiting_skills_row_locked"
+        ):
+            self._recheck_awaiting_skills_row_locked(conn, job_row, now=now)
         return updated
+
+    @staticmethod
+    def _apply_workflow_ttl_defaults(
+        steps: list[dict[str, Any]],
+        *,
+        ttl_seconds: float | int | None,
+        expires_at: Any,
+        expiry_action: str | None,
+    ) -> None:
+        if ttl_seconds is None and expires_at is None and not expiry_action:
+            return
+        exp_out = expires_at
+        if hasattr(expires_at, "isoformat"):
+            exp_out = expires_at.isoformat()
+        for step in steps:
+            if ttl_seconds is not None and step.get("ttl_seconds") is None:
+                step["ttl_seconds"] = ttl_seconds
+            if exp_out is not None and step.get("expires_at") is None:
+                step["expires_at"] = exp_out
+            if expiry_action and not step.get("expiry_action"):
+                step["expiry_action"] = expiry_action
+
+    def _workflow_step_expiry(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        step_def: dict[str, Any],
+        now: Any,
+    ) -> tuple[Any, str]:
+        ttl = step_def.get("ttl_seconds")
+        exp_raw = step_def.get("expires_at")
+        expires_at = None
+        if exp_raw is not None:
+            if hasattr(exp_raw, "isoformat"):
+                expires_at = _as_utc(exp_raw)
+            else:
+                s = str(exp_raw).strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                from datetime import datetime
+
+                expires_at = _as_utc(datetime.fromisoformat(s))
+        action = step_def.get("expiry_action")
+        if hasattr(self, "_resolve_job_expiry"):
+            return self._resolve_job_expiry(
+                conn,
+                tenant_id=tenant_id,
+                now=now,
+                ttl_seconds=ttl,
+                expires_at=expires_at,
+                expiry_action=action,
+            )
+        return None, "dead"
 
     def _mark_workflow_step_leased(
         self, conn: Any, job_row: dict[str, Any], *, now: Any = None
@@ -2134,6 +2230,16 @@ class WorkflowsMixin:
         # Preserve explicit name-based depends_on for post-pass resolution.
         if raw.get("depends_on") is not None:
             out["depends_on"] = raw["depends_on"]
+        if raw.get("required_skills") is not None:
+            out["required_skills"] = list(
+                _normalize_skills(raw.get("required_skills"))
+            )
+        if raw.get("ttl_seconds") is not None:
+            out["ttl_seconds"] = raw["ttl_seconds"]
+        if raw.get("expires_at") is not None:
+            out["expires_at"] = raw["expires_at"]
+        if raw.get("expiry_action") is not None:
+            out["expiry_action"] = raw["expiry_action"]
         return out
 
     @staticmethod
