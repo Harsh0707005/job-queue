@@ -145,6 +145,26 @@ CREATE INDEX IF NOT EXISTS idx_jobs_expires_at
           'awaiting_children', 'awaiting_skills'
       );
 
+-- Idempotent atomic DAG enqueue batches (retry after crash returns same jobs).
+CREATE TABLE IF NOT EXISTS job_dag_batches (
+    id              UUID PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    queue_name      TEXT NOT NULL DEFAULT 'default',
+    batch_key       TEXT NOT NULL,
+    job_ids         UUID[] NOT NULL,
+    refs            TEXT[] NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, queue_name, batch_key),
+    CONSTRAINT job_dag_batches_batch_key_check CHECK (batch_key <> ''),
+    CONSTRAINT job_dag_batches_len_check CHECK (
+        cardinality(job_ids) = cardinality(refs)
+        AND cardinality(job_ids) >= 1
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_dag_batches_tenant_created
+    ON job_dag_batches (tenant_id, created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status_created
     ON jobs (tenant_id, status, created_at DESC);
 

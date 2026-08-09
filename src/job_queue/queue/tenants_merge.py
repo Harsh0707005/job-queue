@@ -252,6 +252,29 @@ class TenantsMergeMixin:
                 (target, source),
             )
 
+            conn.execute(
+                """
+                UPDATE job_dag_batches s
+                SET batch_key = s.batch_key || %s
+                WHERE s.tenant_id = %s
+                  AND EXISTS (
+                        SELECT 1 FROM job_dag_batches t
+                        WHERE t.tenant_id = %s
+                          AND t.queue_name = s.queue_name
+                          AND t.batch_key = s.batch_key
+                  )
+                """,
+                (f"__from_{source}", source, target),
+            )
+            conn.execute(
+                """
+                UPDATE job_dag_batches
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (target, source),
+            )
+
             # Billing meters: add source hours into target (no double row).
             conn.execute(
                 """

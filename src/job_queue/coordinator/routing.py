@@ -45,6 +45,8 @@ class RoutingMixin:
 
         if method == "POST" and path == "/v1/jobs":
             return self._enqueue(body)
+        if method == "POST" and path == "/v1/jobs/dag":
+            return self._enqueue_dag(body)
         if method == "GET" and path == "/v1/jobs":
             return self._list_jobs(query)
         if method == "POST" and path == "/v1/jobs/cancel-matching":

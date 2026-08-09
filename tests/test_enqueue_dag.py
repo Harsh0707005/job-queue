@@ -1,0 +1,261 @@
+"""Atomic DAG enqueue: all-or-nothing, idempotent retry, no races."""
+
+from __future__ import annotations
+
+import threading
+import pytest
+
+from job_queue import DependencyError, JobQueue, JobStatus
+from job_queue.coordinator import Coordinator, _make_handler
+from job_queue.remote import CoordinatorClient
+from tests.helpers_queue import _ack
+
+
+def _diamond(prefix: str = "n") -> list[dict]:
+    return [
+        {"ref": f"{prefix}-a", "payload": {"step": "a", "p": prefix}},
+        {
+            "ref": f"{prefix}-b",
+            "payload": {"step": "b", "p": prefix},
+            "depends_on": [f"{prefix}-a"],
+        },
+        {
+            "ref": f"{prefix}-c",
+            "payload": {"step": "c", "p": prefix},
+            "depends_on": [f"{prefix}-a"],
+        },
+        {
+            "ref": f"{prefix}-d",
+            "payload": {"step": "d", "p": prefix},
+            "depends_on": [f"{prefix}-b", f"{prefix}-c"],
+        },
+    ]
+
+
+def test_enqueue_dag_linear_runs_in_order(queue: JobQueue):
+    out = queue.enqueue_dag(
+        tenant_id="dag-lin",
+        batch_key="lin-1",
+        jobs=[
+            {"ref": "a", "payload": {"n": 1}},
+            {"ref": "b", "payload": {"n": 2}, "depends_on": ["a"]},
+            {"ref": "c", "payload": {"n": 3}, "depends_on": ["b"]},
+        ],
+    )
+    assert out.created is True
+    assert [j.payload["n"] for j in out.jobs] == [1, 2, 3]
+    assert out.by_ref["b"].depends_on == (out.by_ref["a"].id,)
+    first = queue.lease(tenant_id="dag-lin", worker_id="w")
+    assert first is not None and first.payload["n"] == 1
+    assert queue.lease(tenant_id="dag-lin", worker_id="w2") is None
+    _ack(queue, first, "w")
+    second = queue.lease(tenant_id="dag-lin", worker_id="w")
+    assert second is not None and second.payload["n"] == 2
+    _ack(queue, second, "w")
+    third = queue.lease(tenant_id="dag-lin", worker_id="w")
+    assert third is not None and third.payload["n"] == 3
+    _ack(queue, third, "w")
+
+
+def test_enqueue_dag_diamond(queue: JobQueue):
+    out = queue.enqueue_dag(
+        tenant_id="dag-dia", batch_key="dia-1", jobs=_diamond()
+    )
+    a, b, c, d = out.jobs
+    assert set(d.depends_on) == {b.id, c.id}
+    la = queue.lease(tenant_id="dag-dia", worker_id="w")
+    assert la is not None and la.id == a.id
+    _ack(queue, la, "w")
+    mid = {queue.lease(tenant_id="dag-dia", worker_id="w1").id for _ in range(2)}
+    assert mid == {b.id, c.id}
+    for jid, wid in zip(mid, ("w1", "w2"), strict=True):
+        job = queue.get(jid, tenant_id="dag-dia")
+        assert job is not None and job.lease_token is not None
+        queue.ack(
+            job.id,
+            tenant_id="dag-dia",
+            worker_id=job.leased_by,
+            lease_token=job.lease_token,
+        )
+    last = queue.lease(tenant_id="dag-dia", worker_id="w")
+    assert last is not None and last.id == d.id
+
+
+def test_enqueue_dag_cycle_rejected(queue: JobQueue):
+    with pytest.raises(DependencyError, match="cycle"):
+        queue.enqueue_dag(
+            tenant_id="dag-cyc",
+            batch_key="cyc",
+            jobs=[
+                {"ref": "a", "payload": {"n": 1}, "depends_on": ["b"]},
+                {"ref": "b", "payload": {"n": 2}, "depends_on": ["a"]},
+            ],
+        )
+    assert queue.list_jobs(tenant_id="dag-cyc") == []
+
+
+def test_enqueue_dag_unknown_ref_rejected(queue: JobQueue):
+    with pytest.raises(DependencyError, match="unknown"):
+        queue.enqueue_dag(
+            tenant_id="dag-miss",
+            batch_key="miss",
+            jobs=[
+                {"ref": "a", "payload": {"n": 1}, "depends_on": ["nope"]},
+            ],
+        )
+    assert queue.list_jobs(tenant_id="dag-miss") == []
+
+
+def test_enqueue_dag_atomic_on_pending_cap(queue: JobQueue):
+    queue.set_pending_limit("dag-cap", 1)
+    queue.enqueue(tenant_id="dag-cap", payload={"keep": True})
+    with pytest.raises(ValueError, match="pending job cap"):
+        queue.enqueue_dag(
+            tenant_id="dag-cap",
+            batch_key="too-big",
+            jobs=_diamond("x"),
+        )
+    jobs = queue.list_jobs(tenant_id="dag-cap")
+    assert len(jobs) == 1
+    assert jobs[0].payload.get("keep") is True
+
+
+def test_enqueue_dag_failed_parent_rolls_back(queue: JobQueue):
+    dead = queue.enqueue(
+        tenant_id="dag-dead", payload={"x": 1}, max_attempts=1
+    )
+    leased = queue.lease(tenant_id="dag-dead", worker_id="w")
+    assert leased is not None
+    from tests.helpers_queue import _nack
+
+    _nack(queue, leased, "w", error="boom", requeue=True)
+    with pytest.raises(DependencyError, match="already dead"):
+        queue.enqueue_dag(
+            tenant_id="dag-dead",
+            batch_key="child",
+            jobs=[
+                {"ref": "c", "payload": {"c": 1}, "depends_on": [str(dead.id)]},
+                {"ref": "d", "payload": {"d": 1}, "depends_on": ["c"]},
+            ],
+        )
+    leftover = [
+        j
+        for j in queue.list_jobs(tenant_id="dag-dead")
+        if j.id != dead.id
+    ]
+    assert leftover == []
+
+
+def test_enqueue_dag_idempotent_retry(queue: JobQueue):
+    first = queue.enqueue_dag(
+        tenant_id="dag-id", batch_key="same", jobs=_diamond()
+    )
+    second = queue.enqueue_dag(
+        tenant_id="dag-id", batch_key="same", jobs=_diamond()
+    )
+    assert first.created is True
+    assert second.created is False
+    assert [j.id for j in first.jobs] == [j.id for j in second.jobs]
+    assert len(queue.list_jobs(tenant_id="dag-id")) == 4
+
+
+def test_enqueue_dag_idempotent_mismatch_rejected(queue: JobQueue):
+    queue.enqueue_dag(
+        tenant_id="dag-mm",
+        batch_key="mm",
+        jobs=[{"ref": "a", "payload": {"n": 1}}],
+    )
+    with pytest.raises(ValueError, match="different refs"):
+        queue.enqueue_dag(
+            tenant_id="dag-mm",
+            batch_key="mm",
+            jobs=[
+                {"ref": "a", "payload": {"n": 1}},
+                {"ref": "b", "payload": {"n": 2}, "depends_on": ["a"]},
+            ],
+        )
+
+
+def test_enqueue_dag_txn_crash_leaves_nothing(queue: JobQueue):
+    try:
+        with queue._pool.connection() as conn:
+            with conn.transaction():
+                queue._lock_dag_batch_key(
+                    conn,
+                    tenant_id="dag-cr",
+                    queue_name="default",
+                    batch_key="crash",
+                )
+                queue._record_usage(
+                    conn, tenant_id="dag-cr", now=__import__(
+                        "job_queue.queue._common", fromlist=["_utcnow"]
+                    )._utcnow(),
+                    enqueues=3,
+                )
+                raise RuntimeError("simulated crash")
+    except RuntimeError:
+        pass
+    assert queue.list_jobs(tenant_id="dag-cr") == []
+    assert queue.get_tenant_usage("dag-cr").enqueues == 0
+    out = queue.enqueue_dag(
+        tenant_id="dag-cr", batch_key="crash", jobs=_diamond("cr")
+    )
+    assert out.created is True
+    assert len(out.jobs) == 4
+
+
+def test_enqueue_dag_concurrent_same_key(queue: JobQueue):
+    results: list = []
+    errors: list[BaseException] = []
+
+    def go() -> None:
+        try:
+            results.append(
+                queue.enqueue_dag(
+                    tenant_id="dag-cc",
+                    batch_key="shared",
+                    jobs=_diamond("cc"),
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive()
+    assert not errors
+    assert len(results) == 8
+    ids = [tuple(j.id for j in r.jobs) for r in results]
+    assert len(set(ids)) == 1
+    assert sum(1 for r in results if r.created) == 1
+    assert len(queue.list_jobs(tenant_id="dag-cc")) == 4
+
+
+def test_enqueue_dag_http_roundtrip(queue: JobQueue):
+    coord = Coordinator(queue)
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = CoordinatorClient(f"http://127.0.0.1:{port}")
+        first = client.enqueue_dag(
+            tenant_id="http-dag",
+            batch_key="http-1",
+            jobs=_diamond("h"),
+        )
+        assert first.created is True
+        again = client.enqueue_dag(
+            tenant_id="http-dag",
+            batch_key="http-1",
+            jobs=_diamond("h"),
+        )
+        assert again.created is False
+        assert [j.id for j in first.jobs] == [j.id for j in again.jobs]
+    finally:
+        server.shutdown()

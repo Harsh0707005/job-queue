@@ -11,6 +11,7 @@ from job_queue.models import (
     AuditConsistencyReport,
     BulkCancelResult,
     ClaimedWebhook,
+    DagEnqueueResult,
     Job,
     JobAuditEvent,
     JobProgressEvent,
@@ -185,6 +186,16 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         expires_at=parse_dt("expires_at"),
         expiry_action=str(data.get("expiry_action") or "dead"),
     )
+
+
+def dag_enqueue_result_to_dict(result: DagEnqueueResult) -> dict[str, Any]:
+    return {
+        "batch_key": result.batch_key,
+        "batch_id": str(result.batch_id),
+        "created": result.created,
+        "refs": list(result.refs),
+        "jobs": [job_to_dict(j, include_payload=True) for j in result.jobs],
+    }
 
 
 def spawn_children_result_to_dict(result: SpawnChildrenResult) -> dict[str, Any]:

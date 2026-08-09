@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.codec import job_from_dict
-from job_queue.models import BulkCancelResult, Job
+from job_queue.models import BulkCancelResult, DagEnqueueResult, Job
 
 
 class ClientJobsMixin:
@@ -14,6 +14,34 @@ class ClientJobsMixin:
         payload = self._request("POST", "/v1/jobs", kwargs)
         assert payload is not None
         return job_from_dict(payload["job"])
+
+    def enqueue_dag(
+        self,
+        *,
+        tenant_id: str,
+        jobs: list[dict[str, Any]],
+        batch_key: str,
+        queue_name: str = "default",
+    ) -> DagEnqueueResult:
+        payload = self._request(
+            "POST",
+            "/v1/jobs/dag",
+            {
+                "tenant_id": tenant_id,
+                "jobs": jobs,
+                "batch_key": batch_key,
+                "queue_name": queue_name,
+            },
+        )
+        assert payload is not None
+        jobs_out = [job_from_dict(j) for j in (payload.get("jobs") or [])]
+        return DagEnqueueResult(
+            batch_key=str(payload.get("batch_key") or batch_key),
+            batch_id=UUID(str(payload["batch_id"])),
+            jobs=tuple(jobs_out),
+            refs=tuple(str(r) for r in (payload.get("refs") or [])),
+            created=bool(payload.get("created")),
+        )
 
     def get_job(self, job_id: UUID | str, *, tenant_id: str) -> Job | None:
         payload = self._request(

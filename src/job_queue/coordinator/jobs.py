@@ -11,12 +11,14 @@ from uuid import UUID
 
 from job_queue.codec import (
     bulk_cancel_result_to_dict,
+    dag_enqueue_result_to_dict,
     job_to_dict,
     schedule_to_dict,
     preempt_result_to_dict,
 )
 from job_queue.queue import (
     CancelError,
+    DependencyError,
     LeaseError,
     RateLimitError,
 )
@@ -91,6 +93,29 @@ class JobsApiMixin:
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job, include_payload=True)}
+
+    def _enqueue_dag(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        try:
+            result = self.queue.enqueue_dag(
+                tenant_id=str(body["tenant_id"]),
+                jobs=list(body.get("jobs") or []),
+                batch_key=str(body["batch_key"]),
+                queue_name=str(body.get("queue_name") or "default"),
+            )
+        except RateLimitError as exc:
+            payload: dict[str, Any] = {
+                "error": str(exc),
+                "code": "rate_limited",
+                "kind": exc.kind,
+                "tenant_id": exc.tenant_id,
+            }
+            if exc.retry_after_seconds is not None:
+                payload["retry_after_seconds"] = exc.retry_after_seconds
+            return 429, payload
+        except (KeyError, ValueError, TypeError, DependencyError) as exc:
+            return 400, {"error": str(exc)}
+        status = 201 if result.created else 200
+        return status, dag_enqueue_result_to_dict(result)
 
     def _process_deadlines(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:

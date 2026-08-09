@@ -34,6 +34,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "schedules",
     "workflow_runs",
     "jobs",
+    "job_dag_batches",
     "workflow_step_runs",
     "job_side_effects",
     "job_audit_events",
@@ -79,6 +80,10 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "workflow_runs",
     ),
     "jobs": (_JOB_COLUMNS.strip().replace("\n", " "), "jobs"),
+    "job_dag_batches": (
+        "id, tenant_id, queue_name, batch_key, job_ids, refs, created_at",
+        "job_dag_batches",
+    ),
     "workflow_step_runs": (
         "id, run_id, tenant_id, step_index, name, direction, status, job_id, "
         "result, error, idempotency_key, retry_count, started_at, completed_at, "
@@ -312,6 +317,7 @@ class TenantsExportMixin:
             "queue_metric_buckets": "bucket_start ASC, metric ASC",
             "queue_metric_snapshots": "sampled_at ASC",
             "tenant_usage_buckets": "bucket_start ASC",
+            "job_dag_batches": "created_at ASC, id ASC",
             "job_audit_events": "event_id ASC",
         }.get(kind, "id ASC")
         total = 0

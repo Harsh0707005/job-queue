@@ -817,6 +817,32 @@ class TenantsRestoreMixin:
             ),
         )
 
+    def _restore_job_dag_batches(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        new_id = self._map_id(id_map, "job_dag_batches", raw["id"])
+        job_ids = [
+            self._map_id(id_map, "jobs", x) for x in (raw.get("job_ids") or [])
+        ]
+        refs = [str(r) for r in (raw.get("refs") or [])]
+        conn.execute(
+            """
+            INSERT INTO job_dag_batches (
+                id, tenant_id, queue_name, batch_key, job_ids, refs, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                new_id,
+                target,
+                raw.get("queue_name") or "default",
+                raw.get("batch_key") or str(new_id),
+                job_ids,
+                refs,
+                _parse_dt(raw.get("created_at")) or _utcnow(),
+            ),
+        )
+
     def _restore_workflow_step_runs(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:

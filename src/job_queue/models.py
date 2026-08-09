@@ -231,6 +231,26 @@ class Schedule:
 
 
 @dataclass(frozen=True, slots=True)
+class DagEnqueueResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.enqueue_dag`.
+
+    *created* is False when *batch_key* matched a previously committed graph
+    (idempotent retry after a crash or duplicate client submit).
+    *refs* aligns with *jobs* (submission order).
+    """
+
+    batch_key: str
+    batch_id: UUID
+    jobs: tuple[Job, ...]
+    refs: tuple[str, ...]
+    created: bool
+
+    @property
+    def by_ref(self) -> dict[str, Job]:
+        return {ref: job for ref, job in zip(self.refs, self.jobs, strict=True)}
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduleFire:
     """Result of one schedule tick: the schedule state and the enqueued job."""
 

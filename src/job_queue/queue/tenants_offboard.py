@@ -208,6 +208,12 @@ class TenantsOffboardMixin:
         ).fetchone()
         if jobs is not None:
             return False
+        dags = conn.execute(
+            "SELECT 1 FROM job_dag_batches WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if dags is not None:
+            return False
         sched = conn.execute(
             "SELECT 1 FROM schedules WHERE tenant_id = %s LIMIT 1",
             (tenant_id,),
@@ -264,6 +270,10 @@ class TenantsOffboardMixin:
         if self._count_webhook_delivering(conn, tenant_id) > 0:
             return
 
+        conn.execute(
+            "DELETE FROM job_dag_batches WHERE tenant_id = %s",
+            (tenant_id,),
+        )
         conn.execute(
             "DELETE FROM jobs WHERE tenant_id = %s",
             (tenant_id,),
