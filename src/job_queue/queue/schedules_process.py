@@ -188,6 +188,18 @@ class SchedulesProcessMixin:
                             job_id=job_id,
                             payload=payload,
                         )
+                        expires, exp_action = (
+                            self._resolve_job_expiry(
+                                conn,
+                                tenant_id=str(sched_row["tenant_id"]),
+                                now=now,
+                                ttl_seconds=None,
+                                expires_at=None,
+                                expiry_action=None,
+                            )
+                            if hasattr(self, "_resolve_job_expiry")
+                            else (None, "dead")
+                        )
                         job_row = conn.execute(
                             f"""
                             INSERT INTO jobs (
@@ -197,7 +209,8 @@ class SchedulesProcessMixin:
                                 retry_backoff_base_seconds, retry_backoff_max_seconds,
                                 available_at, dedupe_key, schedule_id, depends_on,
                                 labels, required_skills,
-                                created_at, updated_at, partition_id, payload_key_id
+                                created_at, updated_at, partition_id, payload_key_id,
+                                expires_at, expiry_action
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s,
                                 0, %s, %s,
@@ -205,7 +218,8 @@ class SchedulesProcessMixin:
                                 1, 300,
                                 %s, NULL, %s, %s,
                                 %s, %s,
-                                %s, %s, %s, %s
+                                %s, %s, %s, %s,
+                                %s, %s
                             )
                             RETURNING {_JOB_COLUMNS}
                             """,
@@ -227,6 +241,8 @@ class SchedulesProcessMixin:
                                 now,
                                 part_id,
                                 payload_key_id,
+                                expires,
+                                exp_action,
                             ),
                         ).fetchone()
                         if job_row is not None:

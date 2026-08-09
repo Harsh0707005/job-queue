@@ -206,7 +206,8 @@ class SpawnChildrenMixin:
                             available_at, dedupe_key, schedule_id, depends_on,
                             parent_job_id, waiting_on, labels, required_skills,
                             deadline_at, estimated_duration_seconds, preemptible,
-                            created_at, updated_at, partition_id, payload_key_id
+                            created_at, updated_at, partition_id, payload_key_id,
+                            expires_at, expiry_action
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s,
                             0, %s, %s,
@@ -215,7 +216,8 @@ class SpawnChildrenMixin:
                             %s, %s, NULL, '{{}}'::uuid[],
                             %s, '{{}}'::uuid[], %s, %s,
                             NULL, %s, %s,
-                            %s, %s, %s, %s
+                            %s, %s, %s, %s,
+                            %s, %s
                         )
                         RETURNING {_JOB_COLUMNS}
                         """,
@@ -242,6 +244,8 @@ class SpawnChildrenMixin:
                             now,
                             part_id,
                             payload_key_id,
+                            row.get("expires_at"),
+                            str(row.get("expiry_action") or "dead"),
                         ),
                     ).fetchone()
                     assert crow is not None

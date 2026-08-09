@@ -47,6 +47,9 @@ class JobsEnqueueCoreMixin:
         preemptible: bool = True,
         labels: Sequence[str] | str | None = None,
         required_skills: Sequence[str] | str | None = None,
+        ttl_seconds: float | int | None = None,
+        expires_at: datetime | None = None,
+        expiry_action: str | None = None,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -88,6 +91,14 @@ class JobsEnqueueCoreMixin:
             any worker may claim it. A worker leases the job only when it
             advertised every listed skill; partitions, fairness, and
             concurrency still apply.
+        ttl_seconds / expires_at:
+            Hard finish-by. If the job is still unfinished after this,
+            ``process_expired_jobs`` (also run on lease/cleaner) terminates
+            it. Pass only one. When both omitted, the tenant default TTL
+            applies if configured.
+        expiry_action:
+            ``dead`` (default / dead-letter) or ``cancel`` when the TTL
+            fires. Falls back to the tenant default, then ``dead``.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -146,6 +157,15 @@ class JobsEnqueueCoreMixin:
                     conn, tenant_id=tenant_id, depends_on=dep_ids
                 )
 
+            expires, exp_action = self._resolve_job_expiry(
+                conn,
+                tenant_id=tenant_id,
+                now=now,
+                ttl_seconds=ttl_seconds,
+                expires_at=expires_at,
+                expiry_action=expiry_action,
+            )
+
             if dedupe_key is not None:
                 # Serialize with replay_dead_letter on the same key so a
                 # check-then-activate race cannot create two active rows or
@@ -187,7 +207,8 @@ class JobsEnqueueCoreMixin:
                         available_at, dedupe_key, schedule_id, depends_on,
                         labels, required_skills,
                         deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id, payload_key_id
+                        created_at, updated_at, partition_id, payload_key_id,
+                        expires_at, expiry_action
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -196,7 +217,8 @@ class JobsEnqueueCoreMixin:
                         %s, %s, NULL, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s,
+                        %s, %s
                     )
                     ON CONFLICT (tenant_id, queue_name, dedupe_key)
                         WHERE dedupe_key IS NOT NULL
@@ -232,6 +254,8 @@ class JobsEnqueueCoreMixin:
                         now,
                         part_id,
                         payload_key_id,
+                        expires,
+                        exp_action,
                     ),
                 ).fetchone()
 
@@ -294,7 +318,8 @@ class JobsEnqueueCoreMixin:
                         available_at, dedupe_key, schedule_id, depends_on,
                         labels, required_skills,
                         deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id, payload_key_id
+                        created_at, updated_at, partition_id, payload_key_id,
+                        expires_at, expiry_action
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -303,7 +328,8 @@ class JobsEnqueueCoreMixin:
                         %s, NULL, NULL, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s,
+                        %s, %s
                     )
                     RETURNING {_JOB_COLUMNS}
                     """,
@@ -330,6 +356,8 @@ class JobsEnqueueCoreMixin:
                         now,
                         part_id,
                         payload_key_id,
+                        expires,
+                        exp_action,
                     ),
                 ).fetchone()
                 assert row is not None

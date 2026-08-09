@@ -93,6 +93,11 @@ class Job:
     skilled jobs may be claimed by any capable registered worker so they
     cannot stall on a shard whose owner lacks the hardware. Fairness and
     concurrency still apply.
+
+    ``expires_at`` is an optional hard TTL. If the job is still unfinished
+    (pending, leased, or parked) after this instant it is terminated
+    according to ``expiry_action``: ``dead`` (dead-letter) or ``cancel``.
+    Per-job ``ttl_seconds`` / ``expires_at`` override a tenant default.
     """
 
     id: UUID
@@ -142,6 +147,8 @@ class Job:
     last_error: str | None
     partition_id: int = 0
     required_skills: tuple[str, ...] = ()
+    expires_at: datetime | None = None
+    expiry_action: str = "dead"
 
     @property
     def is_leased(self) -> bool:

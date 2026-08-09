@@ -53,6 +53,8 @@ class RoutingMixin:
             return self._lease(body)
         if method == "POST" and path == "/v1/deadlines/process":
             return self._process_deadlines(body)
+        if method == "POST" and path == "/v1/jobs/process-expired":
+            return self._process_expired_jobs(body)
         if (
             method == "POST"
             and path.startswith("/v1/jobs/")
@@ -287,6 +289,18 @@ class RoutingMixin:
             and path.endswith("/retention")
         ):
             return self._set_tenant_retention(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/job-ttl")
+        ):
+            return self._set_tenant_job_ttl(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/job-ttl")
+        ):
+            return self._get_tenant_job_ttl(path)
         if (
             method == "GET"
             and path.startswith("/v1/tenants/")

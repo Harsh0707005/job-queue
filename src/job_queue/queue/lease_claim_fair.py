@@ -14,6 +14,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
     _JOB_COLUMNS,
+    _NOT_TTL_EXPIRED_SQL,
     LeaseError,
     _SkipLeaseCandidate,
     _row_has_required_skills,
@@ -160,6 +161,7 @@ class LeaseClaimFairMixin:
                 now,
                 now,
                 now,
+                now,
             ]
         )
         candidate = conn.execute(
@@ -206,6 +208,7 @@ class LeaseClaimFairMixin:
                     AND attempts < max_attempts
                  )
               )
+              {_NOT_TTL_EXPIRED_SQL}
             ORDER BY
               priority DESC,
               CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,

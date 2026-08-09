@@ -14,6 +14,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
     _JOB_COLUMNS,
+    _NOT_TTL_EXPIRED_SQL,
     LeaseError,
     _row_has_required_skills,
     _skill_claim_sql,
@@ -124,6 +125,7 @@ class LeaseClaimTenantMixin:
                       AND status = %s
                       AND lease_expires_at < %s
                       AND attempts < max_attempts
+                      {_NOT_TTL_EXPIRED_SQL}
                     ORDER BY priority DESC,
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
@@ -137,6 +139,7 @@ class LeaseClaimTenantMixin:
                         + skill_params
                         + [
                             JobStatus.LEASED.value,
+                            now,
                             now,
                             now,
                             now,
@@ -171,6 +174,7 @@ class LeaseClaimTenantMixin:
                             AND attempts < max_attempts
                          )
                       )
+                      {_NOT_TTL_EXPIRED_SQL}
                     ORDER BY priority DESC,
                       CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
@@ -187,6 +191,7 @@ class LeaseClaimTenantMixin:
                             JobStatus.PENDING.value,
                             now,
                             JobStatus.LEASED.value,
+                            now,
                             now,
                             now,
                             now,
@@ -289,6 +294,7 @@ class LeaseClaimTenantMixin:
                         AND attempts < max_attempts
                     )
               )
+              {_NOT_TTL_EXPIRED_SQL}
               {_skill_claim_sql("jobs")}
             RETURNING {_JOB_COLUMNS}
             """,
@@ -307,6 +313,7 @@ class LeaseClaimTenantMixin:
                 JobStatus.PENDING.value,
                 now,
                 JobStatus.LEASED.value,
+                now,
                 now,
                 worker_id,
             ),

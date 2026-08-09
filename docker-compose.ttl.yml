@@ -1,0 +1,36 @@
+# Job TTL: unmatched work expires as cancel or dead-letter on a live fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ttl.yml \
+#     up --build --abort-on-container-exit --exit-code-from ttl-soak ttl-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  ttl-soak:
+    build: .
+    command: ["python", "scripts/ttl_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      DEAD_JOBS: "16"
+      CANCEL_JOBS: "16"
+      DEFAULT_JOBS: "12"
+      LOAD_JOBS: "20"
+      TTL_SECONDS: "4"
+      MAX_WALL_SECONDS: "120"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

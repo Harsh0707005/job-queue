@@ -169,6 +169,8 @@ class TenantsConcurrencyMixin:
               AND lease_rate_per_sec IS NULL
               AND completed_retention_seconds IS NULL
               AND dead_retention_seconds IS NULL
+              AND default_job_ttl_seconds IS NULL
+              AND default_expiry_action IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,

@@ -10,6 +10,38 @@ from job_queue.models import Job
 
 
 class ClientAdminMixin:
+    def process_expired_jobs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/jobs/process-expired", body)
+        assert payload is not None
+        return payload
+
+    def set_tenant_job_ttl(
+        self,
+        tenant_id: str,
+        ttl_seconds: int | None,
+        *,
+        expiry_action: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"ttl_seconds": ttl_seconds}
+        if expiry_action is not None:
+            body["expiry_action"] = expiry_action
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/job-ttl", body)
+        assert payload is not None
+        return payload
+
+    def get_tenant_job_ttl(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/job-ttl")
+        assert payload is not None
+        return payload
+
     def get_tenant_usage(
         self,
         tenant_id: str,

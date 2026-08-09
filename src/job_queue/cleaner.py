@@ -64,6 +64,13 @@ class RetentionCleaner:
             )
         except Exception:  # noqa: BLE001
             logger.exception("awaiting-skills park/revive failed")
+        try:
+            self.queue.process_expired_jobs(
+                limit=min(self.batch_limit, 200),
+                tenant_id=self.tenant_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("job ttl expiry failed")
         result = self.queue.purge_expired_jobs(
             limit=self.batch_limit,
             tenant_id=self.tenant_id,

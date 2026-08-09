@@ -34,17 +34,28 @@ class JobsApiMixin:
                     dep_ids = _UUID(str(deps))
                 else:
                     dep_ids = [_UUID(str(x)) for x in deps]
+            from datetime import datetime
+
             deadline_raw = body.get("deadline_at")
             deadline_at = None
             if deadline_raw is not None:
-                from datetime import datetime
-
                 if isinstance(deadline_raw, str):
                     deadline_at = datetime.fromisoformat(
                         deadline_raw.replace("Z", "+00:00")
                     )
                 else:
                     return 400, {"error": "deadline_at must be an ISO-8601 string"}
+            expires_raw = body.get("expires_at")
+            expires_at = None
+            if expires_raw is not None:
+                if isinstance(expires_raw, str):
+                    expires_at = datetime.fromisoformat(
+                        expires_raw.replace("Z", "+00:00")
+                    )
+                else:
+                    return 400, {"error": "expires_at must be an ISO-8601 string"}
+            ttl_raw = body.get("ttl_seconds")
+            ttl_seconds = None if ttl_raw is None else float(ttl_raw)
             est = body.get("estimated_duration_seconds")
             labels = body.get("labels")
             job = self.queue.enqueue(
@@ -63,6 +74,9 @@ class JobsApiMixin:
                 preemptible=bool(body.get("preemptible", True)),
                 labels=labels,
                 required_skills=body.get("required_skills"),
+                ttl_seconds=ttl_seconds,
+                expires_at=expires_at,
+                expiry_action=body.get("expiry_action"),
             )
         except RateLimitError as exc:
             payload: dict[str, Any] = {
@@ -91,6 +105,18 @@ class JobsApiMixin:
             "count": len(results),
             "preemptions": [preempt_result_to_dict(r) for r in results],
         }
+
+    def _process_expired_jobs(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            out = self.queue.process_expired_jobs(
+                tenant_id=(str(body["tenant_id"]) if body.get("tenant_id") else None),
+                limit=int(body.get("limit") or 200),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, out
 
     def _lease(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         worker_id = body.get("worker_id")

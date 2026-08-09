@@ -1249,6 +1249,8 @@ class TenantsRestoreMixin:
         lease_burst = None
         c_ret = None
         d_ret = None
+        def_ttl = None
+        def_exp = None
         if isinstance(exported_settings, dict):
             paused = bool(exported_settings.get("paused") or False)
             max_c = exported_settings.get("max_concurrent_leases")
@@ -1259,6 +1261,8 @@ class TenantsRestoreMixin:
             lease_burst = exported_settings.get("lease_burst")
             c_ret = exported_settings.get("completed_retention_seconds")
             d_ret = exported_settings.get("dead_retention_seconds")
+            def_ttl = exported_settings.get("default_job_ttl_seconds")
+            def_exp = exported_settings.get("default_expiry_action")
         conn.execute(
             """
             INSERT INTO tenant_settings (
@@ -1267,10 +1271,12 @@ class TenantsRestoreMixin:
                 enqueue_rate_per_sec, enqueue_burst,
                 lease_rate_per_sec, lease_burst,
                 completed_retention_seconds, dead_retention_seconds,
+                default_job_ttl_seconds, default_expiry_action,
                 updated_at
             ) VALUES (
                 %s, %s, %s,
                 %s, FALSE, FALSE,
+                %s, %s,
                 %s, %s,
                 %s, %s,
                 %s, %s,
@@ -1288,6 +1294,8 @@ class TenantsRestoreMixin:
                 lease_burst = EXCLUDED.lease_burst,
                 completed_retention_seconds = EXCLUDED.completed_retention_seconds,
                 dead_retention_seconds = EXCLUDED.dead_retention_seconds,
+                default_job_ttl_seconds = EXCLUDED.default_job_ttl_seconds,
+                default_expiry_action = EXCLUDED.default_expiry_action,
                 updated_at = EXCLUDED.updated_at
             """,
             (
@@ -1301,6 +1309,8 @@ class TenantsRestoreMixin:
                 lease_burst,
                 c_ret,
                 d_ret,
+                def_ttl,
+                def_exp,
                 now,
             ),
         )

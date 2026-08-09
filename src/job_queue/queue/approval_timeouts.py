@@ -61,6 +61,12 @@ class ApprovalTimeoutsMixin:
             )
         if hasattr(self, "_sync_skills_wait_locked"):
             self._sync_skills_wait_locked(conn, now=now, limit=limit)
+        if hasattr(self, "_expire_unfinished_jobs_locked"):
+            expired.extend(
+                self._expire_unfinished_jobs_locked(
+                    conn, now=now, tenant_id=tenant_id, limit=limit
+                )
+            )
         return expired
 
     def _expire_approval_timeouts_locked(

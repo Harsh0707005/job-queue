@@ -126,6 +126,25 @@ ALTER TABLE jobs ALTER COLUMN required_skills SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_required_skills_gin
     ON jobs USING GIN (required_skills);
 
+-- Hard TTL: unfinished jobs past expires_at are cancelled or dead-lettered.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expiry_action TEXT;
+UPDATE jobs SET expiry_action = 'dead' WHERE expiry_action IS NULL;
+ALTER TABLE jobs ALTER COLUMN expiry_action SET DEFAULT 'dead';
+ALTER TABLE jobs ALTER COLUMN expiry_action SET NOT NULL;
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_expiry_action_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_expiry_action_check CHECK (
+    expiry_action IN ('cancel', 'dead')
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_expires_at
+    ON jobs (expires_at ASC)
+    WHERE expires_at IS NOT NULL
+      AND status IN (
+          'pending', 'leased', 'awaiting_approval',
+          'awaiting_children', 'awaiting_skills'
+      );
+
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status_created
     ON jobs (tenant_id, status, created_at DESC);
 
@@ -473,6 +492,17 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_completed_ret_check C
 ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_dead_ret_check;
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_dead_ret_check CHECK (
     dead_retention_seconds IS NULL OR dead_retention_seconds >= -1
+);
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS default_job_ttl_seconds INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS default_expiry_action TEXT;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_default_ttl_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_default_ttl_check CHECK (
+    default_job_ttl_seconds IS NULL OR default_job_ttl_seconds >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_default_expiry_action_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_default_expiry_action_check CHECK (
+    default_expiry_action IS NULL OR default_expiry_action IN ('cancel', 'dead')
 );
 
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS enqueue_rate_per_sec DOUBLE PRECISION;

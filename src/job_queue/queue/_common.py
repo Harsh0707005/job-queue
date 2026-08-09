@@ -44,7 +44,7 @@ _JOB_COLUMNS = """
     approval_resolved_at, await_children_started_at,
     await_children_deadline_at, await_children_outcome,
     await_children_resolved_at, last_error, partition_id, payload_key_id,
-    required_skills
+    required_skills, expires_at, expiry_action
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -61,6 +61,8 @@ _CANCELABLE_STATUSES = (
     JobStatus.AWAITING_CHILDREN,
     JobStatus.AWAITING_SKILLS,
 )
+
+_NOT_TTL_EXPIRED_SQL = "AND (expires_at IS NULL OR expires_at > %s)"
 
 _DEPS_SATISFIED_SQL = """
 (
@@ -279,6 +281,8 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         last_error=row["last_error"],
         partition_id=int(row["partition_id"]) if row.get("partition_id") is not None else 0,
         required_skills=tuple(skills),
+        expires_at=row.get("expires_at"),
+        expiry_action=str(row.get("expiry_action") or "dead"),
     )
 
 

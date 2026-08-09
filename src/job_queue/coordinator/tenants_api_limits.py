@@ -52,6 +52,36 @@ class TenantsApiLimitsMixin:
             "max_pending_jobs": limit,
         }
 
+    def _set_tenant_job_ttl(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if "ttl_seconds" not in body and "seconds" not in body:
+            return 400, {"error": "ttl_seconds required (null clears the default)"}
+        raw = body.get("ttl_seconds", body.get("seconds"))
+        try:
+            ttl = None if raw is None else int(raw)
+            out = self.queue.set_tenant_job_ttl(
+                tenant_id,
+                ttl,
+                expiry_action=body.get("expiry_action"),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, out
+
+    def _get_tenant_job_ttl(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            return 200, self.queue.get_tenant_job_ttl(parts[2])
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
     def _set_rate_limits(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
