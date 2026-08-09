@@ -393,6 +393,12 @@ class RoutingMixin:
         if method == "POST" and path == "/v1/metrics/retention":
             return self._set_metrics_retention(body)
 
+        # Per-tenant billing usage (durable, same-txn increments).
+        if method == "GET" and path == "/v1/usage":
+            return self._usage_get(query)
+        if method == "GET" and path == "/v1/usage/buckets":
+            return self._usage_buckets(query)
+
         # Worker partition ownership / rebalance.
         if method == "POST" and path == "/v1/workers/register":
             return self._register_worker(body)

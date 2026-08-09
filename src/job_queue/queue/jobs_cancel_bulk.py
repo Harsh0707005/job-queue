@@ -330,4 +330,8 @@ class JobsCancelBulkMixin:
                         detail={"reason": err},
                         now=now,
                     )
+                    if hasattr(self, "_record_lease_end_usage"):
+                        self._record_lease_end_usage(
+                            conn, child, now=now, cancels=1
+                        )
                 frontier.append(child["id"])

@@ -255,6 +255,11 @@ class LeaseClaimTenantMixin:
             lease_expires = hard
 
         from_status = candidate["status"]
+        if from_status == JobStatus.LEASED.value and hasattr(
+            self, "_record_lease_end_usage"
+        ):
+            # Previous expired lease: bill its runtime before this reclaim.
+            self._record_lease_end_usage(conn, candidate, now=now)
         # Optimistic predicates: never claim a completed/cancelled/pending-not-ready
         # row even if a caller held a stale snapshot (defense in depth under load).
         row = conn.execute(

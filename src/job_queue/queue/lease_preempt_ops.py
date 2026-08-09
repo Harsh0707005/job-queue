@@ -68,6 +68,10 @@ class LeasePreemptOpsMixin:
                 detail={"reason": reason[:500]},
                 now=now,
             )
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(
+                    conn, victim, now=now, preemptions=1
+                )
         return updated
 
     def _try_preempt_for_tenant(

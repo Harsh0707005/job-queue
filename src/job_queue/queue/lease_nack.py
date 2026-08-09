@@ -137,6 +137,8 @@ class LeaseNackMixin:
                 increments=metric_increments,
                 now=now,
             )
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(conn, row, now=now)
 
             if new_status in (JobStatus.DEAD.value, JobStatus.FAILED.value):
                 self._cascade_cancel_dependents(

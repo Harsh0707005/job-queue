@@ -246,6 +246,13 @@ class SchedulesProcessMixin:
                                 },
                                 now=now,
                             )
+                            if hasattr(self, "_record_usage"):
+                                self._record_usage(
+                                    conn,
+                                    tenant_id=str(sched_row["tenant_id"]),
+                                    now=now,
+                                    enqueues=1,
+                                )
                 except UniqueViolation:
                     # Race: another ticker inserted an active job for this schedule.
                     continue

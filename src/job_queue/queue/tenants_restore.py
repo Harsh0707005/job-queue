@@ -1147,6 +1147,47 @@ class TenantsRestoreMixin:
             ),
         )
 
+    def _restore_tenant_usage_buckets(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO tenant_usage_buckets (
+                bucket_start, tenant_id,
+                enqueues, leases, acks, nacks, fails, dead_letters,
+                cancels, releases, preemptions, schedule_fires,
+                webhook_successes, webhook_failures, spawn_children,
+                runtime_ms, wait_ms
+            ) VALUES (
+                %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s
+            )
+            ON CONFLICT (bucket_start, tenant_id) DO NOTHING
+            """,
+            (
+                _parse_dt(raw.get("bucket_start")) or _utcnow(),
+                target,
+                int(raw.get("enqueues") or 0),
+                int(raw.get("leases") or 0),
+                int(raw.get("acks") or 0),
+                int(raw.get("nacks") or 0),
+                int(raw.get("fails") or 0),
+                int(raw.get("dead_letters") or 0),
+                int(raw.get("cancels") or 0),
+                int(raw.get("releases") or 0),
+                int(raw.get("preemptions") or 0),
+                int(raw.get("schedule_fires") or 0),
+                int(raw.get("webhook_successes") or 0),
+                int(raw.get("webhook_failures") or 0),
+                int(raw.get("spawn_children") or 0),
+                int(raw.get("runtime_ms") or 0),
+                int(raw.get("wait_ms") or 0),
+            ),
+        )
+
     def _restore_queue_metric_snapshots(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:

@@ -268,6 +268,10 @@ class JobsEnqueueCoreMixin:
                     },
                     now=now,
                 )
+                if hasattr(self, "_record_usage"):
+                    self._record_usage(
+                        conn, tenant_id=tenant_id, now=now, enqueues=1
+                    )
                 out = job
             else:
                 self._assert_pending_capacity(conn, tenant_id)
@@ -349,6 +353,10 @@ class JobsEnqueueCoreMixin:
                     },
                     now=now,
                 )
+                if hasattr(self, "_record_usage"):
+                    self._record_usage(
+                        conn, tenant_id=tenant_id, now=now, enqueues=1
+                    )
                 out = job
 
         if (

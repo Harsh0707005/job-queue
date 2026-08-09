@@ -1115,4 +1115,47 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_restores_one_active_target
 CREATE INDEX IF NOT EXISTS idx_tenant_restores_target
     ON tenant_restores (target_tenant_id, created_at DESC);
 
+-- Per-tenant billing meters. Hourly buckets; incremented in the same
+-- transaction as enqueue/lease/ack/nack/… so a crash cannot leave a job
+-- mutation without its usage increment (or vice versa). Independent of
+-- queue_metric_buckets retention so billing history is not purged.
+CREATE TABLE IF NOT EXISTS tenant_usage_buckets (
+    bucket_start            TIMESTAMPTZ NOT NULL,
+    tenant_id               TEXT NOT NULL,
+    enqueues                BIGINT NOT NULL DEFAULT 0,
+    leases                  BIGINT NOT NULL DEFAULT 0,
+    acks                    BIGINT NOT NULL DEFAULT 0,
+    nacks                   BIGINT NOT NULL DEFAULT 0,
+    fails                   BIGINT NOT NULL DEFAULT 0,
+    dead_letters            BIGINT NOT NULL DEFAULT 0,
+    cancels                 BIGINT NOT NULL DEFAULT 0,
+    releases                BIGINT NOT NULL DEFAULT 0,
+    preemptions             BIGINT NOT NULL DEFAULT 0,
+    schedule_fires          BIGINT NOT NULL DEFAULT 0,
+    webhook_successes       BIGINT NOT NULL DEFAULT 0,
+    webhook_failures        BIGINT NOT NULL DEFAULT 0,
+    spawn_children          BIGINT NOT NULL DEFAULT 0,
+    runtime_ms              BIGINT NOT NULL DEFAULT 0,
+    wait_ms                 BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_start, tenant_id),
+    CONSTRAINT tenant_usage_buckets_enqueues_check CHECK (enqueues >= 0),
+    CONSTRAINT tenant_usage_buckets_leases_check CHECK (leases >= 0),
+    CONSTRAINT tenant_usage_buckets_acks_check CHECK (acks >= 0),
+    CONSTRAINT tenant_usage_buckets_nacks_check CHECK (nacks >= 0),
+    CONSTRAINT tenant_usage_buckets_fails_check CHECK (fails >= 0),
+    CONSTRAINT tenant_usage_buckets_dead_letters_check CHECK (dead_letters >= 0),
+    CONSTRAINT tenant_usage_buckets_cancels_check CHECK (cancels >= 0),
+    CONSTRAINT tenant_usage_buckets_releases_check CHECK (releases >= 0),
+    CONSTRAINT tenant_usage_buckets_preemptions_check CHECK (preemptions >= 0),
+    CONSTRAINT tenant_usage_buckets_schedule_fires_check CHECK (schedule_fires >= 0),
+    CONSTRAINT tenant_usage_buckets_webhook_successes_check CHECK (webhook_successes >= 0),
+    CONSTRAINT tenant_usage_buckets_webhook_failures_check CHECK (webhook_failures >= 0),
+    CONSTRAINT tenant_usage_buckets_spawn_children_check CHECK (spawn_children >= 0),
+    CONSTRAINT tenant_usage_buckets_runtime_ms_check CHECK (runtime_ms >= 0),
+    CONSTRAINT tenant_usage_buckets_wait_ms_check CHECK (wait_ms >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_usage_buckets_tenant_time
+    ON tenant_usage_buckets (tenant_id, bucket_start DESC);
+
 """

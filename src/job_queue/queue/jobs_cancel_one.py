@@ -146,6 +146,8 @@ class JobsCancelOneMixin:
                 },
                 now=now,
             )
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(conn, row, now=now, cancels=1)
             self._cascade_cancel_dependents(
                 conn,
                 parent_id=job_id,
@@ -245,6 +247,8 @@ class JobsCancelOneMixin:
             },
             now=now,
         )
+        if hasattr(self, "_record_lease_end_usage"):
+            self._record_lease_end_usage(conn, row, now=now, cancels=1)
         self._cascade_cancel_dependents(
             conn,
             parent_id=job_id,

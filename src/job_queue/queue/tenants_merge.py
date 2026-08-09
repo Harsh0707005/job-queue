@@ -252,6 +252,55 @@ class TenantsMergeMixin:
                 (target, source),
             )
 
+            # Billing meters: add source hours into target (no double row).
+            conn.execute(
+                """
+                INSERT INTO tenant_usage_buckets (
+                    bucket_start, tenant_id,
+                    enqueues, leases, acks, nacks, fails, dead_letters,
+                    cancels, releases, preemptions, schedule_fires,
+                    webhook_successes, webhook_failures, spawn_children,
+                    runtime_ms, wait_ms
+                )
+                SELECT
+                    bucket_start, %s,
+                    enqueues, leases, acks, nacks, fails, dead_letters,
+                    cancels, releases, preemptions, schedule_fires,
+                    webhook_successes, webhook_failures, spawn_children,
+                    runtime_ms, wait_ms
+                FROM tenant_usage_buckets
+                WHERE tenant_id = %s
+                ON CONFLICT (bucket_start, tenant_id) DO UPDATE SET
+                    enqueues = tenant_usage_buckets.enqueues + EXCLUDED.enqueues,
+                    leases = tenant_usage_buckets.leases + EXCLUDED.leases,
+                    acks = tenant_usage_buckets.acks + EXCLUDED.acks,
+                    nacks = tenant_usage_buckets.nacks + EXCLUDED.nacks,
+                    fails = tenant_usage_buckets.fails + EXCLUDED.fails,
+                    dead_letters = tenant_usage_buckets.dead_letters
+                        + EXCLUDED.dead_letters,
+                    cancels = tenant_usage_buckets.cancels + EXCLUDED.cancels,
+                    releases = tenant_usage_buckets.releases + EXCLUDED.releases,
+                    preemptions = tenant_usage_buckets.preemptions
+                        + EXCLUDED.preemptions,
+                    schedule_fires = tenant_usage_buckets.schedule_fires
+                        + EXCLUDED.schedule_fires,
+                    webhook_successes = tenant_usage_buckets.webhook_successes
+                        + EXCLUDED.webhook_successes,
+                    webhook_failures = tenant_usage_buckets.webhook_failures
+                        + EXCLUDED.webhook_failures,
+                    spawn_children = tenant_usage_buckets.spawn_children
+                        + EXCLUDED.spawn_children,
+                    runtime_ms = tenant_usage_buckets.runtime_ms
+                        + EXCLUDED.runtime_ms,
+                    wait_ms = tenant_usage_buckets.wait_ms + EXCLUDED.wait_ms
+                """,
+                (target, source),
+            )
+            conn.execute(
+                "DELETE FROM tenant_usage_buckets WHERE tenant_id = %s",
+                (source,),
+            )
+
             # Drop source control-plane state (settings + fairness).
             conn.execute(
                 "DELETE FROM tenant_settings WHERE tenant_id = %s",

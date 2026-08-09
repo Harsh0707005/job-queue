@@ -15,6 +15,7 @@ from job_queue.queue.side_effects import SideEffectsMixin
 from job_queue.queue.approval_spawn import ApprovalSpawnMixin
 from job_queue.queue.dead_letters import DeadLettersMixin
 from job_queue.queue.metrics import MetricsMixin
+from job_queue.queue.usage import UsageMixin
 from job_queue.queue.alerts import AlertsMixin
 from job_queue.queue.workflows import WorkflowsMixin
 from job_queue.queue.partitions import PartitionsMixin
@@ -35,6 +36,7 @@ class JobQueue(
     ApprovalSpawnMixin,
     DeadLettersMixin,
     MetricsMixin,
+    UsageMixin,
     AlertsMixin,
     WorkflowsMixin,
     PartitionsMixin,

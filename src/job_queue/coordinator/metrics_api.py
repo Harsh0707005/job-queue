@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from job_queue.codec import tenant_usage_to_dict
+
 
 class MetricsApiMixin:
     def _metrics_snapshot(
@@ -108,3 +110,38 @@ class MetricsApiMixin:
         except (TypeError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 200, {"metrics_retention_seconds": applied}
+
+    def _usage_get(self, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+        tenant = (query.get("tenant_id") or query.get("tenant") or [None])[0]
+        start = (query.get("start") or [None])[0]
+        end = (query.get("end") or [None])[0]
+        try:
+            if tenant:
+                usage = self.queue.get_tenant_usage(
+                    str(tenant), start=start, end=end
+                )
+                return 200, {"usage": tenant_usage_to_dict(usage)}
+            rows = self.queue.list_tenant_usage(start=start, end=end)
+            return 200, {
+                "usage": [tenant_usage_to_dict(u) for u in rows],
+                "count": len(rows),
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
+    def _usage_buckets(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant = (query.get("tenant_id") or query.get("tenant") or [None])[0]
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        start = (query.get("start") or [None])[0]
+        end = (query.get("end") or [None])[0]
+        try:
+            limit = int((query.get("limit") or ["500"])[0])
+            buckets = self.queue.list_tenant_usage_buckets(
+                str(tenant), start=start, end=end, limit=limit
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"tenant_id": str(tenant), "buckets": buckets, "count": len(buckets)}

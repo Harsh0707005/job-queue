@@ -118,6 +118,15 @@ class MetricsMixin:
             """,
             (bucket, tenant_id, metric, int(count), float(sum_ms)),
         )
+        if hasattr(self, "_apply_usage_from_metric"):
+            self._apply_usage_from_metric(
+                conn,
+                tenant_id=tenant_id,
+                metric=metric,
+                count=int(count),
+                sum_ms=float(sum_ms),
+                now=ts,
+            )
 
     def _record_metrics_batch(
         self,

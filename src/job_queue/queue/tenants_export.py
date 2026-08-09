@@ -43,6 +43,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "alert_events",
     "queue_metric_buckets",
     "queue_metric_snapshots",
+    "tenant_usage_buckets",
 )
 
 _KIND_SQL: dict[str, tuple[str, str]] = {
@@ -131,6 +132,13 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "webhook_pending, webhook_delivering, webhook_succeeded, webhook_dead, "
         "schedules_enabled, schedules_due",
         "queue_metric_snapshots",
+    ),
+    "tenant_usage_buckets": (
+        "bucket_start, tenant_id, enqueues, leases, acks, nacks, fails, "
+        "dead_letters, cancels, releases, preemptions, schedule_fires, "
+        "webhook_successes, webhook_failures, spawn_children, runtime_ms, "
+        "wait_ms",
+        "tenant_usage_buckets",
     ),
 }
 
@@ -302,6 +310,7 @@ class TenantsExportMixin:
             "job_side_effects": "job_id ASC, effect_key ASC",
             "queue_metric_buckets": "bucket_start ASC, metric ASC",
             "queue_metric_snapshots": "sampled_at ASC",
+            "tenant_usage_buckets": "bucket_start ASC",
             "job_audit_events": "event_id ASC",
         }.get(kind, "id ASC")
         total = 0

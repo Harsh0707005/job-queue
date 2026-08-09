@@ -26,6 +26,7 @@ from job_queue.models import (
     TenantRestore,
     TenantSnapshot,
     TenantStats,
+    TenantUsage,
     WebhookDelivery,
     WebhookEndpoint,
 )
@@ -367,6 +368,31 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "total": stats.total,
         "claimable": stats.claimable,
         "awaiting_skills": int(getattr(stats, "awaiting_skills", 0) or 0),
+    }
+
+
+def tenant_usage_to_dict(usage: TenantUsage) -> dict[str, Any]:
+    return {
+        "tenant_id": usage.tenant_id,
+        "period_start": _dt(usage.period_start),
+        "period_end": _dt(usage.period_end),
+        "enqueues": usage.enqueues,
+        "leases": usage.leases,
+        "acks": usage.acks,
+        "nacks": usage.nacks,
+        "fails": usage.fails,
+        "dead_letters": usage.dead_letters,
+        "cancels": usage.cancels,
+        "releases": usage.releases,
+        "preemptions": usage.preemptions,
+        "schedule_fires": usage.schedule_fires,
+        "webhook_successes": usage.webhook_successes,
+        "webhook_failures": usage.webhook_failures,
+        "webhook_deliveries": usage.webhook_deliveries,
+        "spawn_children": usage.spawn_children,
+        "runtime_ms": usage.runtime_ms,
+        "runtime_seconds": usage.runtime_seconds,
+        "wait_ms": usage.wait_ms,
     }
 
 

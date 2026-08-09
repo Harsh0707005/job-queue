@@ -265,6 +265,14 @@ class SpawnChildrenMixin:
                         },
                         now=now,
                     )
+                    if hasattr(self, "_record_usage"):
+                        self._record_usage(
+                            conn,
+                            tenant_id=tenant_id,
+                            now=now,
+                            enqueues=1,
+                            spawn_children=1,
+                        )
 
                 if not wait:
                     result = SpawnChildrenResult(

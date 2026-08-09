@@ -10,6 +10,58 @@ from job_queue.models import Job
 
 
 class ClientAdminMixin:
+    def get_tenant_usage(
+        self,
+        tenant_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, Any]:
+        q = [f"tenant_id={tenant_id}"]
+        if start:
+            q.append(f"start={start}")
+        if end:
+            q.append(f"end={end}")
+        payload = self._request("GET", "/v1/usage?" + "&".join(q))
+        assert payload is not None
+        return payload.get("usage") or payload
+
+    def list_tenant_usage(
+        self,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        parts: list[str] = []
+        if tenant_id:
+            parts.append(f"tenant_id={tenant_id}")
+        if start:
+            parts.append(f"start={start}")
+        if end:
+            parts.append(f"end={end}")
+        path = "/v1/usage" + (("?" + "&".join(parts)) if parts else "")
+        payload = self._request("GET", path)
+        assert payload is not None
+        return payload
+
+    def list_tenant_usage_buckets(
+        self,
+        tenant_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        q = [f"tenant_id={tenant_id}", f"limit={int(limit)}"]
+        if start:
+            q.append(f"start={start}")
+        if end:
+            q.append(f"end={end}")
+        payload = self._request("GET", "/v1/usage/buckets?" + "&".join(q))
+        assert payload is not None
+        return payload
+
     def process_due_schedules(
         self, *, tenant_id: str | None = None, limit: int = 100
     ) -> int:

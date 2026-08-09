@@ -256,6 +256,38 @@ class TenantStats:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantUsage:
+    """Per-tenant billable usage for a time window (all counts are additive)."""
+
+    tenant_id: str
+    period_start: datetime | None
+    period_end: datetime | None
+    enqueues: int = 0
+    leases: int = 0
+    acks: int = 0
+    nacks: int = 0
+    fails: int = 0
+    dead_letters: int = 0
+    cancels: int = 0
+    releases: int = 0
+    preemptions: int = 0
+    schedule_fires: int = 0
+    webhook_successes: int = 0
+    webhook_failures: int = 0
+    spawn_children: int = 0
+    runtime_ms: int = 0
+    wait_ms: int = 0
+
+    @property
+    def runtime_seconds(self) -> float:
+        return self.runtime_ms / 1000.0
+
+    @property
+    def webhook_deliveries(self) -> int:
+        return self.webhook_successes + self.webhook_failures
+
+
+@dataclass(frozen=True, slots=True)
 class JobRetentionSettings:
     """How long terminal jobs are kept before the cleaner may delete them.
 

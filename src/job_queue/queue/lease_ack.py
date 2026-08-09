@@ -108,6 +108,8 @@ class LeaseAckMixin:
                     count=1,
                     now=now,
                 )
+                if hasattr(self, "_record_lease_end_usage"):
+                    self._record_lease_end_usage(conn, row, now=now)
                 self._record_job_duration(conn, job=job, now=now)
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
@@ -195,5 +197,7 @@ class LeaseAckMixin:
                 detail={"reason": reason or "drain"},
                 now=now,
             )
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(conn, row, now=now, releases=1)
             self._maybe_finalize_offboard(conn, tenant_id=updated["tenant_id"], now=now)
             return self._job(updated)

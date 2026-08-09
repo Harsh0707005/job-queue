@@ -1,0 +1,45 @@
+# Per-tenant billing usage under multi-tenant multi-worker load.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml \
+#     -f docker-compose.usage.yml \
+#     up --build --abort-on-container-exit --exit-code-from usage-soak \
+#     usage-soak
+
+services:
+  load-soak:
+    profiles: ["disabled"]
+  metrics-soak:
+    profiles: ["off"]
+
+  usage-soak:
+    build: .
+    command: ["python", "scripts/usage_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      TENANTS: "8"
+      JOBS_PER_TENANT: "40"
+      ENQUEUE_WORKERS: "16"
+      MAX_WALL_SECONDS: "240"
+      POLL_SECONDS: "1"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      worker-7:
+        condition: service_started
+      worker-8:
+        condition: service_started
