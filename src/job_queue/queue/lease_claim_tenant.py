@@ -81,10 +81,6 @@ class LeaseClaimTenantMixin:
             # still use heartbeat/ack/nack outside this path.
             if self._is_tenant_paused(conn, tenant_id):
                 return []
-            if hasattr(self, "_spend_runtime_exhausted") and self._spend_runtime_exhausted(
-                conn, tenant_id, now=now
-            ):
-                return []
 
             conc_limit = self._read_concurrency_limit(conn, tenant_id)
             leased_count = self._count_leased(conn, tenant_id)

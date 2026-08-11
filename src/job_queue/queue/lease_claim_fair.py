@@ -154,7 +154,6 @@ class LeaseClaimFairMixin:
         params.append(worker_id)
         params.extend(
             [
-                now,
                 JobStatus.PENDING.value,
                 now,
                 JobStatus.LEASED.value,
@@ -178,18 +177,6 @@ class LeaseClaimFairMixin:
                     FROM tenant_settings ts
                     WHERE ts.tenant_id = jobs.tenant_id
                       AND ts.paused = TRUE
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM tenant_settings ts
-                    WHERE ts.tenant_id = jobs.tenant_id
-                      AND ts.spend_runtime_ms_limit IS NOT NULL
-                      AND ts.spend_window_seconds IS NOT NULL
-                      AND ts.spend_window_start IS NOT NULL
-                      AND ts.spend_window_start
-                          + make_interval(secs => ts.spend_window_seconds)
-                          > %s
-                      AND ts.spend_runtime_ms >= ts.spend_runtime_ms_limit
               )
               AND (
                     (
@@ -270,13 +257,6 @@ class LeaseClaimFairMixin:
         )
         if self._is_tenant_paused(conn, candidate["tenant_id"]):
             raise _SkipLeaseCandidate("tenant paused", tenant_id=candidate["tenant_id"])
-        if hasattr(self, "_spend_runtime_exhausted") and self._spend_runtime_exhausted(
-            conn, candidate["tenant_id"], now=now
-        ):
-            raise _SkipLeaseCandidate(
-                "tenant spend runtime cap exhausted",
-                tenant_id=candidate["tenant_id"],
-            )
         if candidate["status"] == JobStatus.PENDING.value:
             limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
             leased_count = self._count_leased(conn, candidate["tenant_id"])

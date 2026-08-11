@@ -133,30 +133,46 @@ def test_spend_dag_is_atomic_against_cap(queue: JobQueue):
     assert queue.get_tenant_usage("cap-dag").enqueues == 1
 
 
-def test_spend_runtime_cap_blocks_new_lease_and_enqueue(queue: JobQueue):
+def test_spend_runtime_cap_refuses_new_enqueue_but_drains_accepted(queue: JobQueue):
+    """Runtime exhaustion must not park already-accepted jobs forever.
+
+    Those jobs were already counted. Only *new* enqueues are refused until
+    the window resets; pending work stays claimable.
+    """
     queue.set_tenant_spend_cap(
         "cap-rt", window_seconds=3600, max_runtime_ms=1
     )
-    job = queue.enqueue(tenant_id="cap-rt", payload={"kind": "work"})
+    first = queue.enqueue(tenant_id="cap-rt", payload={"n": 1})
+    second = queue.enqueue(tenant_id="cap-rt", payload={"n": 2})
+    third = queue.enqueue(tenant_id="cap-rt", payload={"n": 3})
+
     leased = queue.lease(tenant_id="cap-rt", worker_id="w")
-    assert leased is not None
+    assert leased is not None and leased.id == first.id
     time.sleep(0.02)
     _ack(queue, leased, "w")
-    usage = queue.get_tenant_usage("cap-rt")
-    assert usage.runtime_ms >= 1
+
     cap = queue.get_tenant_spend_cap("cap-rt")
     assert cap.runtime_ms >= 1
     assert cap.exhausted is True
     assert "runtime" in cap.exhausted_kinds
-    leftover = queue.enqueue(tenant_id="other-rt", payload={"x": 1})
-    assert leftover.tenant_id == "other-rt"
+
     with pytest.raises(SpendCapError, match="runtime cap"):
-        queue.enqueue(tenant_id="cap-rt", payload={"more": True})
-    # Extra job on same tenant from before refuse: none. The leftover enqueue
-    # above is a different tenant. Original job completed.
-    assert queue.lease(tenant_id="cap-rt", worker_id="w2") is None
-    got = queue.get(job.id, tenant_id="cap-rt")
-    assert got is not None and got.status == JobStatus.COMPLETED
+        queue.enqueue(tenant_id="cap-rt", payload={"n": 4})
+    assert queue.get(third.id, tenant_id="cap-rt") is not None
+    assert len(queue.list_jobs(tenant_id="cap-rt")) == 3
+
+    # Already-accepted leftover jobs must still lease (scoped and fair).
+    mid = queue.lease(tenant_id="cap-rt", worker_id="w2")
+    assert mid is not None and mid.id == second.id
+    _ack(queue, mid, "w2")
+    last = queue.lease(worker_id="w3")
+    assert last is not None and last.id == third.id
+    _ack(queue, last, "w3")
+    assert queue.lease(tenant_id="cap-rt", worker_id="w4") is None
+
+    for job_id in (first.id, second.id, third.id):
+        got = queue.get(job_id, tenant_id="cap-rt")
+        assert got is not None and got.status == JobStatus.COMPLETED
 
 
 def test_spend_clear_and_http_roundtrip(queue: JobQueue):

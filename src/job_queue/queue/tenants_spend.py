@@ -1,4 +1,8 @@
-"""Per-tenant spend caps: max enqueues / runtime in a tumbling window."""
+"""Per-tenant spend caps: max enqueues / runtime in a tumbling window.
+
+Runtime exhaustion refuses *new enqueues* only. Jobs already accepted stay
+claimable so they cannot sit pending until the window resets.
+"""
 
 from __future__ import annotations
 
@@ -390,20 +394,4 @@ class TenantsSpendMixin:
             (int(runtime_ms), now, tenant_id),
         )
 
-    def _spend_runtime_exhausted(
-        self, conn: Any, tenant_id: str, *, now: datetime
-    ) -> bool:
-        self._roll_spend_window(conn, tenant_id, now=now)
-        row = conn.execute(
-            """
-            SELECT spend_runtime_ms_limit, spend_runtime_ms
-            FROM tenant_settings
-            WHERE tenant_id = %s
-            """,
-            (tenant_id,),
-        ).fetchone()
-        if row is None or row["spend_runtime_ms_limit"] is None:
-            return False
-        return int(row["spend_runtime_ms"] or 0) >= int(
-            row["spend_runtime_ms_limit"]
-        )
+
