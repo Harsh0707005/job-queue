@@ -550,6 +550,31 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_lease_burst_check CHE
     lease_burst IS NULL OR lease_burst >= 1
 );
 
+-- Spend caps: tumbling window of billed enqueues / runtime. Counters are
+-- server-written only (never taken from a job payload).
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS spend_enqueue_limit BIGINT;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS spend_runtime_ms_limit BIGINT;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS spend_window_seconds INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS spend_window_start TIMESTAMPTZ;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS spend_enqueues BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS spend_runtime_ms BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_spend_enqueue_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_spend_enqueue_check CHECK (
+    spend_enqueue_limit IS NULL OR spend_enqueue_limit >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_spend_runtime_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_spend_runtime_check CHECK (
+    spend_runtime_ms_limit IS NULL OR spend_runtime_ms_limit >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_spend_window_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_spend_window_check CHECK (
+    spend_window_seconds IS NULL OR spend_window_seconds >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_spend_counters_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_spend_counters_check CHECK (
+    spend_enqueues >= 0 AND spend_runtime_ms >= 0
+);
+
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.
 CREATE TABLE IF NOT EXISTS tenant_fairness (
     tenant_id       TEXT PRIMARY KEY,

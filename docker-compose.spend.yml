@@ -1,0 +1,37 @@
+# Per-tenant spend caps under concurrent multi-tenant multi-worker load.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.spend.yml \
+#     up --build --abort-on-container-exit --exit-code-from spend-soak spend-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  spend-soak:
+    build: .
+    command: ["python", "scripts/spend_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      CAPPED_TENANTS: "6"
+      UNCAPPED_TENANTS: "2"
+      ENQUEUE_CAP: "20"
+      WINDOW_SECONDS: "120"
+      FLOOD_PER_TENANT: "80"
+      UNCAPPED_JOBS: "24"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

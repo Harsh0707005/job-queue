@@ -6,6 +6,7 @@ from typing import Any
 
 from job_queue.codec import (
     job_retention_to_dict,
+    tenant_spend_cap_to_dict,
 )
 
 
@@ -79,6 +80,43 @@ class TenantsApiLimitsMixin:
             return 400, {"error": "invalid tenant path"}
         try:
             return 200, self.queue.get_tenant_job_ttl(parts[2])
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
+    def _set_spend_cap(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        try:
+            if body.get("clear"):
+                cap = self.queue.set_tenant_spend_cap(tenant_id, clear=True)
+            else:
+                max_e = body.get("max_enqueues", body.get("enqueue_limit"))
+                max_r = body.get(
+                    "max_runtime_ms", body.get("runtime_ms_limit")
+                )
+                window = body.get("window_seconds", body.get("window"))
+                cap = self.queue.set_tenant_spend_cap(
+                    tenant_id,
+                    window_seconds=None if window is None else int(window),
+                    max_enqueues=None if max_e is None else int(max_e),
+                    max_runtime_ms=None if max_r is None else int(max_r),
+                )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, tenant_spend_cap_to_dict(cap)
+
+    def _get_spend_cap(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            return 200, tenant_spend_cap_to_dict(
+                self.queue.get_tenant_spend_cap(parts[2])
+            )
         except ValueError as exc:
             return 400, {"error": str(exc)}
 

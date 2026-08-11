@@ -26,6 +26,7 @@ from job_queue.models import (
     TenantPayloadKey,
     TenantRestore,
     TenantSnapshot,
+    TenantSpendCap,
     TenantStats,
     TenantUsage,
     WebhookDelivery,
@@ -383,6 +384,23 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "total": stats.total,
         "claimable": stats.claimable,
         "awaiting_skills": int(getattr(stats, "awaiting_skills", 0) or 0),
+    }
+
+
+def tenant_spend_cap_to_dict(cap: TenantSpendCap) -> dict[str, Any]:
+    return {
+        "tenant_id": cap.tenant_id,
+        "window_seconds": cap.window_seconds,
+        "window_start": _dt(cap.window_start),
+        "window_end": _dt(cap.window_end),
+        "max_enqueues": cap.max_enqueues,
+        "enqueues": cap.enqueues,
+        "max_runtime_ms": cap.max_runtime_ms,
+        "runtime_ms": cap.runtime_ms,
+        "enqueue_remaining": cap.enqueue_remaining,
+        "runtime_remaining_ms": cap.runtime_remaining_ms,
+        "exhausted": cap.exhausted,
+        "exhausted_kinds": list(cap.exhausted_kinds),
     }
 
 

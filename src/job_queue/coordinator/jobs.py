@@ -21,7 +21,22 @@ from job_queue.queue import (
     DependencyError,
     LeaseError,
     RateLimitError,
+    SpendCapError,
 )
+
+
+def _limit_error_response(exc: RateLimitError) -> tuple[int, dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "error": str(exc),
+        "code": (
+            "spend_capped" if isinstance(exc, SpendCapError) else "rate_limited"
+        ),
+        "kind": exc.kind,
+        "tenant_id": exc.tenant_id,
+    }
+    if exc.retry_after_seconds is not None:
+        payload["retry_after_seconds"] = exc.retry_after_seconds
+    return 429, payload
 
 
 class JobsApiMixin:
@@ -81,15 +96,7 @@ class JobsApiMixin:
                 expiry_action=body.get("expiry_action"),
             )
         except RateLimitError as exc:
-            payload: dict[str, Any] = {
-                "error": str(exc),
-                "code": "rate_limited",
-                "kind": exc.kind,
-                "tenant_id": exc.tenant_id,
-            }
-            if exc.retry_after_seconds is not None:
-                payload["retry_after_seconds"] = exc.retry_after_seconds
-            return 429, payload
+            return _limit_error_response(exc)
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job, include_payload=True)}
@@ -103,15 +110,7 @@ class JobsApiMixin:
                 queue_name=str(body.get("queue_name") or "default"),
             )
         except RateLimitError as exc:
-            payload: dict[str, Any] = {
-                "error": str(exc),
-                "code": "rate_limited",
-                "kind": exc.kind,
-                "tenant_id": exc.tenant_id,
-            }
-            if exc.retry_after_seconds is not None:
-                payload["retry_after_seconds"] = exc.retry_after_seconds
-            return 429, payload
+            return _limit_error_response(exc)
         except (KeyError, ValueError, TypeError, DependencyError) as exc:
             return 400, {"error": str(exc)}
         status = 201 if result.created else 200

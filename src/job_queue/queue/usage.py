@@ -211,6 +211,10 @@ class UsageMixin:
             inc["runtime_ms"] = inc.get("runtime_ms", 0) + ms
         if inc:
             self._record_usage(conn, tenant_id=tid, now=now, **inc)
+        if ms and hasattr(self, "_add_spend_runtime_ms"):
+            self._add_spend_runtime_ms(
+                conn, tid, runtime_ms=ms, now=now
+            )
 
     def get_tenant_usage(
         self,

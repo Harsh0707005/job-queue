@@ -7,7 +7,7 @@ from uuid import UUID
 
 from job_queue.crypto import redact_payload
 from job_queue.models import WorkflowRun, WorkflowStepRun
-from job_queue.queue._common import CancelError
+from job_queue.queue._common import CancelError, RateLimitError
 
 
 def _redact_steps_def(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -103,6 +103,10 @@ class WorkflowsApiMixin:
                 expires_at=expires_at,
                 expiry_action=body.get("expiry_action"),
             )
+        except RateLimitError as exc:
+            from job_queue.coordinator.jobs import _limit_error_response
+
+            return _limit_error_response(exc)
         except (TypeError, ValueError) as exc:
             return 400, {"error": str(exc)}
         steps_out = self.queue.list_workflow_steps(run.id, tenant_id=run.tenant_id)

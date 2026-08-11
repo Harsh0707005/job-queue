@@ -169,6 +169,10 @@ class JobsEnqueueDagMixin:
             )
             for _ in specs:
                 self._consume_enqueue_rate(conn, tenant_id, now=now)
+            if hasattr(self, "_consume_spend_enqueues"):
+                self._consume_spend_enqueues(
+                    conn, tenant_id, extra=len(specs), now=now
+                )
 
             inserted: list[Job] = []
             refs: list[str] = []

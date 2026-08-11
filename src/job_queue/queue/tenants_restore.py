@@ -1277,6 +1277,9 @@ class TenantsRestoreMixin:
         d_ret = None
         def_ttl = None
         def_exp = None
+        spend_e = None
+        spend_r = None
+        spend_w = None
         if isinstance(exported_settings, dict):
             paused = bool(exported_settings.get("paused") or False)
             max_c = exported_settings.get("max_concurrent_leases")
@@ -1289,6 +1292,9 @@ class TenantsRestoreMixin:
             d_ret = exported_settings.get("dead_retention_seconds")
             def_ttl = exported_settings.get("default_job_ttl_seconds")
             def_exp = exported_settings.get("default_expiry_action")
+            spend_e = exported_settings.get("spend_enqueue_limit")
+            spend_r = exported_settings.get("spend_runtime_ms_limit")
+            spend_w = exported_settings.get("spend_window_seconds")
         conn.execute(
             """
             INSERT INTO tenant_settings (
@@ -1298,6 +1304,9 @@ class TenantsRestoreMixin:
                 lease_rate_per_sec, lease_burst,
                 completed_retention_seconds, dead_retention_seconds,
                 default_job_ttl_seconds, default_expiry_action,
+                spend_enqueue_limit, spend_runtime_ms_limit,
+                spend_window_seconds, spend_window_start,
+                spend_enqueues, spend_runtime_ms,
                 updated_at
             ) VALUES (
                 %s, %s, %s,
@@ -1306,6 +1315,9 @@ class TenantsRestoreMixin:
                 %s, %s,
                 %s, %s,
                 %s, %s,
+                %s, %s,
+                %s, NULL,
+                0, 0,
                 %s
             )
             ON CONFLICT (tenant_id) DO UPDATE
@@ -1322,6 +1334,9 @@ class TenantsRestoreMixin:
                 dead_retention_seconds = EXCLUDED.dead_retention_seconds,
                 default_job_ttl_seconds = EXCLUDED.default_job_ttl_seconds,
                 default_expiry_action = EXCLUDED.default_expiry_action,
+                spend_enqueue_limit = EXCLUDED.spend_enqueue_limit,
+                spend_runtime_ms_limit = EXCLUDED.spend_runtime_ms_limit,
+                spend_window_seconds = EXCLUDED.spend_window_seconds,
                 updated_at = EXCLUDED.updated_at
             """,
             (
@@ -1337,6 +1352,9 @@ class TenantsRestoreMixin:
                 d_ret,
                 def_ttl,
                 def_exp,
+                spend_e,
+                spend_r,
+                spend_w,
                 now,
             ),
         )

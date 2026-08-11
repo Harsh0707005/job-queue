@@ -103,7 +103,7 @@ class WorkflowApiMixin:
     def _spawn_children(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
-        from job_queue.queue import LeaseError, SpawnError
+        from job_queue.queue import LeaseError, RateLimitError, SpawnError
 
         parts = path.strip("/").split("/")
         # /v1/jobs/{id}/spawn-children
@@ -140,6 +140,10 @@ class WorkflowApiMixin:
             return 409, {"error": str(exc), "code": "lease_error"}
         except SpawnError as exc:
             return 409, {"error": str(exc), "code": "spawn_error"}
+        except RateLimitError as exc:
+            from job_queue.coordinator.jobs import _limit_error_response
+
+            return _limit_error_response(exc)
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {

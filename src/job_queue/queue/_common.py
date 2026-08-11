@@ -373,6 +373,10 @@ class RateLimitError(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
+class SpendCapError(RateLimitError):
+    """Raised when a tenant's spend window (enqueues or runtime) is exhausted."""
+
+
 class CancelError(Exception):
     """Raised when a job cannot be cancelled (wrong state / tenant / missing)."""
 

@@ -109,6 +109,28 @@ class ClientCoreMixin:
                     raise RuntimeError(
                         f"coordinator unauthorized for {method} {path}: {payload}"
                     ) from exc
+                if exc.code == 429:
+                    from job_queue.queue import RateLimitError, SpendCapError
+
+                    kind = str(payload.get("kind") or "enqueue")
+                    retry = payload.get("retry_after_seconds")
+                    if payload.get("code") == "spend_capped":
+                        raise SpendCapError(
+                            payload.get("error") or "spend cap exhausted",
+                            tenant_id=str(payload.get("tenant_id") or ""),
+                            kind=kind,
+                            retry_after_seconds=(
+                                float(retry) if retry is not None else None
+                            ),
+                        ) from exc
+                    raise RateLimitError(
+                        payload.get("error") or "rate limited",
+                        tenant_id=str(payload.get("tenant_id") or ""),
+                        kind=kind,
+                        retry_after_seconds=(
+                            float(retry) if retry is not None else None
+                        ),
+                    ) from exc
                 if exc.code == 409 and payload.get("code") == "lease_error":
                     raise LeaseError(payload.get("error") or "lease error") from exc
                 if exc.code == 409 and payload.get("code") == "approval_error":

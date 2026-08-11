@@ -125,6 +125,10 @@ class SpawnChildrenMixin:
                     # Spawn under parent lease: still consumes enqueue rate so a
                     # fan-out storm cannot bypass tenant throttles.
                     self._consume_enqueue_rate(conn, tenant_id, now=now)
+                    if hasattr(self, "_consume_spend_enqueues"):
+                        self._consume_spend_enqueues(
+                            conn, tenant_id, extra=1, now=now
+                        )
 
                     payload = spec["payload"]
                     qname = str(spec.get("queue_name") or parent_queue)

@@ -137,6 +137,10 @@ class DeadLettersMixin:
             try:
                 self._assert_pending_capacity(conn, tenant_id)
                 self._consume_enqueue_rate(conn, tenant_id, now=now)
+                if hasattr(self, "_consume_spend_enqueues"):
+                    self._consume_spend_enqueues(
+                        conn, tenant_id, extra=1, now=now
+                    )
             except ValueError as exc:
                 raise ReplayError(str(exc), job=job) from exc
             except RateLimitError as exc:

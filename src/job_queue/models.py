@@ -283,6 +283,28 @@ class TenantStats:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantSpendCap:
+    """Current spend-window quota for one tenant.
+
+    Limits are operator-set. *enqueues* / *runtime_ms* are server-side
+    counters for the active window and cannot be written by job payloads.
+    """
+
+    tenant_id: str
+    window_seconds: int | None
+    window_start: datetime | None
+    window_end: datetime | None
+    max_enqueues: int | None
+    enqueues: int
+    max_runtime_ms: int | None
+    runtime_ms: int
+    enqueue_remaining: int | None
+    runtime_remaining_ms: int | None
+    exhausted: bool
+    exhausted_kinds: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class TenantUsage:
     """Per-tenant billable usage for a time window (all counts are additive)."""
 

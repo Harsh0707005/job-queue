@@ -171,6 +171,9 @@ class TenantsConcurrencyMixin:
               AND dead_retention_seconds IS NULL
               AND default_job_ttl_seconds IS NULL
               AND default_expiry_action IS NULL
+              AND spend_enqueue_limit IS NULL
+              AND spend_runtime_ms_limit IS NULL
+              AND spend_window_seconds IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,

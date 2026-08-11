@@ -42,6 +42,33 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def set_tenant_spend_cap(
+        self,
+        tenant_id: str,
+        *,
+        window_seconds: int | None = None,
+        max_enqueues: int | None = None,
+        max_runtime_ms: int | None = None,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"clear": clear}
+        if window_seconds is not None:
+            body["window_seconds"] = window_seconds
+        if max_enqueues is not None:
+            body["max_enqueues"] = max_enqueues
+        if max_runtime_ms is not None:
+            body["max_runtime_ms"] = max_runtime_ms
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/spend-cap", body
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_spend_cap(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/spend-cap")
+        assert payload is not None
+        return payload
+
     def get_tenant_usage(
         self,
         tenant_id: str,

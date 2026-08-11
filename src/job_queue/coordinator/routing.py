@@ -288,6 +288,18 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/spend-cap")
+        ):
+            return self._set_spend_cap(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/spend-cap")
+        ):
+            return self._get_spend_cap(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/retention")
         ):
             return self._set_tenant_retention(path, body)

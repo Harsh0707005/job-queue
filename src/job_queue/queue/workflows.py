@@ -1880,6 +1880,12 @@ class WorkflowsMixin:
         expires_at, expiry_action = self._workflow_step_expiry(
             conn, tenant_id=tenant_id, step_def=sdef, now=now
         )
+        # Compensation is cleanup, not new product work.
+        if (
+            direction != WorkflowStepDirection.COMPENSATE.value
+            and hasattr(self, "_consume_spend_enqueues")
+        ):
+            self._consume_spend_enqueues(conn, tenant_id, extra=1, now=now)
         conn.execute(
             f"""
             INSERT INTO jobs (

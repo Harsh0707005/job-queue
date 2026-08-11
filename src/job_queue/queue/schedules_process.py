@@ -15,6 +15,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     _SCHEDULE_COLUMNS,
+    SpendCapError,
     _utcnow,
 )
 
@@ -166,6 +167,15 @@ class SchedulesProcessMixin:
                     with conn.transaction():
                         # Intentionally no pending-cap / enqueue-rate checks:
                         # schedule materialization is system-timed work.
+                        # Spend caps still apply — scheduled jobs are billed
+                        # enqueues and must not bypass a tenant quota.
+                        if hasattr(self, "_consume_spend_enqueues"):
+                            self._consume_spend_enqueues(
+                                conn,
+                                str(sched_row["tenant_id"]),
+                                extra=1,
+                                now=now,
+                            )
                         sched_labels = list(sched_row.get("labels") or [])
                         sched_skills = list(sched_row.get("required_skills") or [])
                         job_status = (
@@ -271,6 +281,10 @@ class SchedulesProcessMixin:
                                 )
                 except UniqueViolation:
                     # Race: another ticker inserted an active job for this schedule.
+                    continue
+                except SpendCapError:
+                    # Tenant quota exhausted; leave next_run so it retries
+                    # after the window resets.
                     continue
 
                 assert job_row is not None
