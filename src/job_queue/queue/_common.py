@@ -45,7 +45,8 @@ _JOB_COLUMNS = """
     approval_resolved_at, await_children_started_at,
     await_children_deadline_at, await_children_outcome,
     await_children_resolved_at, last_error, partition_id, payload_key_id,
-    required_skills, expires_at, expiry_action
+    required_skills, expires_at, expiry_action,
+    failed_workers, max_worker_hops, quarantine_action
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -61,6 +62,7 @@ _CANCELABLE_STATUSES = (
     JobStatus.AWAITING_APPROVAL,
     JobStatus.AWAITING_CHILDREN,
     JobStatus.AWAITING_SKILLS,
+    JobStatus.QUARANTINED,
 )
 
 _NOT_TTL_EXPIRED_SQL = "AND (expires_at IS NULL OR expires_at > %s)"
@@ -284,6 +286,13 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         required_skills=tuple(skills),
         expires_at=row.get("expires_at"),
         expiry_action=str(row.get("expiry_action") or "dead"),
+        failed_workers=tuple(str(x) for x in (row.get("failed_workers") or [])),
+        max_worker_hops=(
+            None
+            if row.get("max_worker_hops") is None
+            else int(row["max_worker_hops"])
+        ),
+        quarantine_action=str(row.get("quarantine_action") or "dead"),
     )
 
 

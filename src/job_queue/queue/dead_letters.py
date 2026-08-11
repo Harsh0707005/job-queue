@@ -128,19 +128,22 @@ class DeadLettersMixin:
                 raise ReplayError(f"job {job_id} not found for tenant {tenant_id!r}")
 
             job = self._job(row)
-            if job.status != JobStatus.DEAD:
+            if job.status not in (JobStatus.DEAD, JobStatus.QUARANTINED):
                 raise ReplayError(
-                    f"job {job_id} is not dead-lettered (status={job.status.value})",
+                    f"job {job_id} is not dead-lettered or quarantined "
+                    f"(status={job.status.value})",
                     job=job,
                 )
 
             try:
                 self._assert_pending_capacity(conn, tenant_id)
-                self._consume_enqueue_rate(conn, tenant_id, now=now)
-                if hasattr(self, "_consume_spend_enqueues"):
-                    self._consume_spend_enqueues(
-                        conn, tenant_id, extra=1, now=now
-                    )
+                # Quarantined jobs were already accepted; do not re-bill.
+                if job.status == JobStatus.DEAD:
+                    self._consume_enqueue_rate(conn, tenant_id, now=now)
+                    if hasattr(self, "_consume_spend_enqueues"):
+                        self._consume_spend_enqueues(
+                            conn, tenant_id, extra=1, now=now
+                        )
             except ValueError as exc:
                 raise ReplayError(str(exc), job=job) from exc
             except RateLimitError as exc:
@@ -190,6 +193,7 @@ class DeadLettersMixin:
                             lease_expires_at = NULL,
                             completed_at = NULL,
                             last_error = %s,
+                            failed_workers = ARRAY[]::text[],
                             updated_at = %s
                         WHERE id = %s
                           AND tenant_id = %s
@@ -211,7 +215,7 @@ class DeadLettersMixin:
                             now,
                             job_id,
                             tenant_id,
-                            JobStatus.DEAD.value,
+                            job.status.value,
                         ),
                     ).fetchone()
             except UniqueViolation as exc:

@@ -174,6 +174,8 @@ class TenantsConcurrencyMixin:
               AND spend_enqueue_limit IS NULL
               AND spend_runtime_ms_limit IS NULL
               AND spend_window_seconds IS NULL
+              AND default_max_worker_hops IS NULL
+              AND default_quarantine_action IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,

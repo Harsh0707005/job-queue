@@ -85,6 +85,12 @@ class JobsApiMixin:
                     body.get("visibility_timeout_seconds") or 30
                 ),
                 max_runtime_seconds=int(body.get("max_runtime_seconds") or 3600),
+                retry_backoff_base_seconds=int(
+                    body.get("retry_backoff_base_seconds") or 1
+                ),
+                retry_backoff_max_seconds=int(
+                    body.get("retry_backoff_max_seconds") or 300
+                ),
                 depends_on=dep_ids,
                 deadline_at=deadline_at,
                 estimated_duration_seconds=(None if est is None else int(est)),
@@ -94,6 +100,12 @@ class JobsApiMixin:
                 ttl_seconds=ttl_seconds,
                 expires_at=expires_at,
                 expiry_action=body.get("expiry_action"),
+                max_worker_hops=(
+                    None
+                    if body.get("max_worker_hops") is None
+                    else int(body["max_worker_hops"])
+                ),
+                quarantine_action=body.get("quarantine_action"),
             )
         except RateLimitError as exc:
             return _limit_error_response(exc)

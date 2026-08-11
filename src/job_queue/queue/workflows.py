@@ -1981,6 +1981,10 @@ class WorkflowsMixin:
             )
         if job_row is not None and hasattr(self, "_record_usage"):
             self._record_usage(conn, tenant_id=tenant_id, now=now, enqueues=1)
+        if job_row is not None and hasattr(self, "_stamp_job_quarantine"):
+            self._stamp_job_quarantine(
+                conn, job_id=job_id, tenant_id=tenant_id
+            )
         if job_row is not None and hasattr(
             self, "_recheck_awaiting_skills_row_locked"
         ):

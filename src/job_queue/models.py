@@ -15,6 +15,7 @@ class JobStatus(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     AWAITING_CHILDREN = "awaiting_children"
     AWAITING_SKILLS = "awaiting_skills"
+    QUARANTINED = "quarantined"
     COMPLETED = "completed"
     FAILED = "failed"
     DEAD = "dead"
@@ -149,6 +150,9 @@ class Job:
     required_skills: tuple[str, ...] = ()
     expires_at: datetime | None = None
     expiry_action: str = "dead"
+    failed_workers: tuple[str, ...] = ()
+    max_worker_hops: int | None = None
+    quarantine_action: str = "dead"
 
     @property
     def is_leased(self) -> bool:
@@ -169,6 +173,10 @@ class Job:
     @property
     def is_awaiting_skills(self) -> bool:
         return self.status == JobStatus.AWAITING_SKILLS
+
+    @property
+    def is_quarantined(self) -> bool:
+        return self.status == JobStatus.QUARANTINED
 
 
 @dataclass(frozen=True, slots=True)

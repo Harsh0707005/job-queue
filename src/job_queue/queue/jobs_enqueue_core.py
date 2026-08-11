@@ -50,6 +50,8 @@ class JobsEnqueueCoreMixin:
         ttl_seconds: float | int | None = None,
         expires_at: datetime | None = None,
         expiry_action: str | None = None,
+        max_worker_hops: int | None = None,
+        quarantine_action: str | None = None,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -229,7 +231,7 @@ class JobsEnqueueCoreMixin:
                           AND status IN (
                               'pending', 'leased',
                               'awaiting_approval', 'awaiting_children',
-                              'awaiting_skills'
+                              'awaiting_skills', 'quarantined'
                           )
                     DO NOTHING
                     RETURNING {_JOB_COLUMNS}
@@ -300,6 +302,20 @@ class JobsEnqueueCoreMixin:
                     self._record_usage(
                         conn, tenant_id=tenant_id, now=now, enqueues=1
                     )
+                if hasattr(self, "_stamp_job_quarantine"):
+                    self._stamp_job_quarantine(
+                        conn,
+                        job_id=job.id,
+                        tenant_id=tenant_id,
+                        max_worker_hops=max_worker_hops,
+                        quarantine_action=quarantine_action,
+                    )
+                    stamped = conn.execute(
+                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                        (job.id,),
+                    ).fetchone()
+                    if stamped is not None:
+                        job = self._job(stamped, conn=conn)
                 out = job
             else:
                 self._assert_pending_capacity(conn, tenant_id)
@@ -393,6 +409,20 @@ class JobsEnqueueCoreMixin:
                     self._record_usage(
                         conn, tenant_id=tenant_id, now=now, enqueues=1
                     )
+                if hasattr(self, "_stamp_job_quarantine"):
+                    self._stamp_job_quarantine(
+                        conn,
+                        job_id=job.id,
+                        tenant_id=tenant_id,
+                        max_worker_hops=max_worker_hops,
+                        quarantine_action=quarantine_action,
+                    )
+                    stamped = conn.execute(
+                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                        (job.id,),
+                    ).fetchone()
+                    if stamped is not None:
+                        job = self._job(stamped, conn=conn)
                 out = job
 
         if (

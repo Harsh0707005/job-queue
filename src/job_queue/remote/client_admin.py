@@ -42,6 +42,27 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def set_tenant_quarantine(
+        self,
+        tenant_id: str,
+        max_worker_hops: int | None,
+        *,
+        action: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"max_worker_hops": max_worker_hops}
+        if action is not None:
+            body["action"] = action
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/quarantine", body
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_quarantine(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/quarantine")
+        assert payload is not None
+        return payload
+
     def set_tenant_spend_cap(
         self,
         tenant_id: str,

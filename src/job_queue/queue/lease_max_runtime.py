@@ -141,6 +141,20 @@ class LeaseMaxRuntimeMixin:
                     )
             self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
         else:
+            from job_queue.queue.lease_quarantine import _failed_workers_plus
+
+            workers = _failed_workers_plus(row.get("failed_workers"), row.get("leased_by"))
+            if hasattr(self, "_quarantine_job_if_due"):
+                qrow = self._quarantine_job_if_due(
+                    conn,
+                    row,
+                    workers=workers,
+                    worker_id=row.get("leased_by"),
+                    reason=error,
+                    now=now,
+                )
+                if qrow is not None:
+                    return
             base = row.get("retry_backoff_base_seconds")
             cap = row.get("retry_backoff_max_seconds")
             backoff = compute_retry_backoff_seconds(
@@ -159,6 +173,7 @@ class LeaseMaxRuntimeMixin:
                     lease_expires_at = NULL,
                     lease_started_at = NULL,
                     last_error = %s,
+                    failed_workers = %s,
                     available_at = %s,
                     updated_at = %s
                 WHERE id = %s
@@ -169,6 +184,7 @@ class LeaseMaxRuntimeMixin:
                 (
                     JobStatus.PENDING.value,
                     error,
+                    workers,
                     next_available,
                     now,
                     row["id"],

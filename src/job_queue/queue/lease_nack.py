@@ -17,6 +17,7 @@ from job_queue.queue._common import (
     _utcnow,
     compute_retry_backoff_seconds,
 )
+from job_queue.queue.lease_quarantine import _failed_workers_plus
 
 
 class LeaseNackMixin:
@@ -50,6 +51,23 @@ class LeaseNackMixin:
             attempts = row["attempts"]
             max_attempts = row["max_attempts"]
             owner_tenant = row["tenant_id"]
+
+            workers = _failed_workers_plus(row.get("failed_workers"), worker_id)
+            if (
+                requeue
+                and attempts < max_attempts
+                and hasattr(self, "_quarantine_job_if_due")
+            ):
+                qrow = self._quarantine_job_if_due(
+                    conn,
+                    row,
+                    workers=workers,
+                    worker_id=worker_id,
+                    reason=error or "nack",
+                    now=now,
+                )
+                if qrow is not None:
+                    return self._job(qrow)
 
             if requeue and attempts < max_attempts:
                 new_status = JobStatus.PENDING.value
@@ -89,6 +107,7 @@ class LeaseNackMixin:
                     lease_started_at = NULL,
                     available_at = %s,
                     last_error = %s,
+                    failed_workers = %s,
                     completed_at = COALESCE(%s, completed_at),
                     updated_at = %s
                 WHERE id = %s
@@ -100,6 +119,7 @@ class LeaseNackMixin:
                     new_status,
                     next_available,
                     error,
+                    workers,
                     terminal_at,
                     now,
                     job_id,

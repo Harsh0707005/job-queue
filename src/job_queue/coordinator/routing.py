@@ -288,6 +288,18 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/quarantine")
+        ):
+            return self._set_quarantine(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/quarantine")
+        ):
+            return self._get_quarantine(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/spend-cap")
         ):
             return self._set_spend_cap(path, body)

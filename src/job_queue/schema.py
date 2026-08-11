@@ -61,7 +61,7 @@ ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
     status IN (
         'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-        'awaiting_skills',
+        'awaiting_skills', 'quarantined',
         'completed', 'failed', 'dead', 'cancelled'
     )
 );
@@ -142,8 +142,21 @@ CREATE INDEX IF NOT EXISTS idx_jobs_expires_at
     WHERE expires_at IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval',
-          'awaiting_children', 'awaiting_skills'
+          'awaiting_children', 'awaiting_skills', 'quarantined'
       );
+
+-- Poison-job quarantine: unique workers that killed this job.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS failed_workers TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS max_worker_hops INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS quarantine_action TEXT NOT NULL DEFAULT 'dead';
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_max_worker_hops_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_max_worker_hops_check CHECK (
+    max_worker_hops IS NULL OR max_worker_hops >= 1
+);
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_quarantine_action_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_quarantine_action_check CHECK (
+    quarantine_action IN ('dead', 'release')
+);
 
 -- Idempotent atomic DAG enqueue batches (retry after crash returns same jobs).
 CREATE TABLE IF NOT EXISTS job_dag_batches (
@@ -270,7 +283,7 @@ CREATE UNIQUE INDEX idx_jobs_dedupe_active
     WHERE dedupe_key IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-          'awaiting_skills'
+          'awaiting_skills', 'quarantined'
       );
 
 -- At most one in-flight job per recurring schedule (no overlapping runs).
@@ -573,6 +586,18 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_spend_window_check CH
 ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_spend_counters_check;
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_spend_counters_check CHECK (
     spend_enqueues >= 0 AND spend_runtime_ms >= 0
+);
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS default_max_worker_hops INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS default_quarantine_action TEXT;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_default_hops_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_default_hops_check CHECK (
+    default_max_worker_hops IS NULL OR default_max_worker_hops >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_default_quarantine_action_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_default_quarantine_action_check CHECK (
+    default_quarantine_action IS NULL
+    OR default_quarantine_action IN ('dead', 'release')
 );
 
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.

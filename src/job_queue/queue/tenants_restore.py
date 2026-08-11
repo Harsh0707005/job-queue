@@ -1277,6 +1277,8 @@ class TenantsRestoreMixin:
         d_ret = None
         def_ttl = None
         def_exp = None
+        hops = None
+        qact = None
         spend_e = None
         spend_r = None
         spend_w = None
@@ -1292,6 +1294,8 @@ class TenantsRestoreMixin:
             d_ret = exported_settings.get("dead_retention_seconds")
             def_ttl = exported_settings.get("default_job_ttl_seconds")
             def_exp = exported_settings.get("default_expiry_action")
+            hops = exported_settings.get("default_max_worker_hops")
+            qact = exported_settings.get("default_quarantine_action")
             spend_e = exported_settings.get("spend_enqueue_limit")
             spend_r = exported_settings.get("spend_runtime_ms_limit")
             spend_w = exported_settings.get("spend_window_seconds")
@@ -1304,6 +1308,7 @@ class TenantsRestoreMixin:
                 lease_rate_per_sec, lease_burst,
                 completed_retention_seconds, dead_retention_seconds,
                 default_job_ttl_seconds, default_expiry_action,
+                default_max_worker_hops, default_quarantine_action,
                 spend_enqueue_limit, spend_runtime_ms_limit,
                 spend_window_seconds, spend_window_start,
                 spend_enqueues, spend_runtime_ms,
@@ -1311,6 +1316,7 @@ class TenantsRestoreMixin:
             ) VALUES (
                 %s, %s, %s,
                 %s, FALSE, FALSE,
+                %s, %s,
                 %s, %s,
                 %s, %s,
                 %s, %s,
@@ -1334,6 +1340,8 @@ class TenantsRestoreMixin:
                 dead_retention_seconds = EXCLUDED.dead_retention_seconds,
                 default_job_ttl_seconds = EXCLUDED.default_job_ttl_seconds,
                 default_expiry_action = EXCLUDED.default_expiry_action,
+                default_max_worker_hops = EXCLUDED.default_max_worker_hops,
+                default_quarantine_action = EXCLUDED.default_quarantine_action,
                 spend_enqueue_limit = EXCLUDED.spend_enqueue_limit,
                 spend_runtime_ms_limit = EXCLUDED.spend_runtime_ms_limit,
                 spend_window_seconds = EXCLUDED.spend_window_seconds,
@@ -1352,6 +1360,8 @@ class TenantsRestoreMixin:
                 d_ret,
                 def_ttl,
                 def_exp,
+                hops,
+                qact,
                 spend_e,
                 spend_r,
                 spend_w,

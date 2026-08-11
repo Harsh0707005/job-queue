@@ -64,6 +64,7 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "enqueue_tokens_at, lease_rate_per_sec, lease_burst, lease_tokens, "
         "lease_tokens_at, completed_retention_seconds, dead_retention_seconds, "
         "default_job_ttl_seconds, default_expiry_action, "
+        "default_max_worker_hops, default_quarantine_action, "
         "spend_enqueue_limit, spend_runtime_ms_limit, spend_window_seconds, "
         "updated_at, restoring",
         "tenant_settings",

@@ -281,6 +281,10 @@ class SpawnChildrenMixin:
                             enqueues=1,
                             spawn_children=1,
                         )
+                    if hasattr(self, "_stamp_job_quarantine"):
+                        self._stamp_job_quarantine(
+                            conn, job_id=crow["id"], tenant_id=tenant_id
+                        )
 
                 if not wait:
                     result = SpawnChildrenResult(

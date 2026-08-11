@@ -274,6 +274,20 @@ class JobsEnqueueDagMixin:
                         },
                         now=now,
                     )
+                if hasattr(self, "_stamp_job_quarantine"):
+                    self._stamp_job_quarantine(
+                        conn,
+                        job_id=job.id,
+                        tenant_id=tenant_id,
+                        max_worker_hops=spec.get("max_worker_hops"),
+                        quarantine_action=spec.get("quarantine_action"),
+                    )
+                    stamped = conn.execute(
+                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                        (job.id,),
+                    ).fetchone()
+                    if stamped is not None:
+                        job = self._job(stamped, conn=conn)
                 inserted.append(job)
                 refs.append(spec["ref"])
 
@@ -513,6 +527,8 @@ class JobsEnqueueDagMixin:
                     "ttl_seconds": ttl,
                     "expires_at": expires_at,
                     "expiry_action": raw.get("expiry_action"),
+                    "max_worker_hops": raw.get("max_worker_hops"),
+                    "quarantine_action": raw.get("quarantine_action"),
                     "deadline": deadline,
                     "estimated_duration_seconds": est,
                     "preemptible": bool(raw.get("preemptible", True)),

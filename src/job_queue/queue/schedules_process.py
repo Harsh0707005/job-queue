@@ -279,6 +279,12 @@ class SchedulesProcessMixin:
                                     now=now,
                                     enqueues=1,
                                 )
+                            if hasattr(self, "_stamp_job_quarantine"):
+                                self._stamp_job_quarantine(
+                                    conn,
+                                    job_id=job_row["id"],
+                                    tenant_id=str(sched_row["tenant_id"]),
+                                )
                 except UniqueViolation:
                     # Race: another ticker inserted an active job for this schedule.
                     continue

@@ -73,6 +73,7 @@ class JobsEnqueueHelpersMixin:
             JobStatus.FAILED.value,
             JobStatus.DEAD.value,
             JobStatus.CANCELLED.value,
+            JobStatus.QUARANTINED.value,
         }
         # Lock order must be stable vs other multi-parent enqueue/cancel paths.
         for parent_id in sorted(depends_on, key=lambda u: u.int):
@@ -110,7 +111,7 @@ class JobsEnqueueHelpersMixin:
             WHERE tenant_id = %s
               AND queue_name = %s
               AND dedupe_key = %s
-              AND status IN (%s, %s, %s, %s, %s)
+              AND status IN (%s, %s, %s, %s, %s, %s)
             LIMIT 1
             """,
             (
@@ -122,5 +123,6 @@ class JobsEnqueueHelpersMixin:
                 JobStatus.AWAITING_APPROVAL.value,
                 JobStatus.AWAITING_CHILDREN.value,
                 JobStatus.AWAITING_SKILLS.value,
+                JobStatus.QUARANTINED.value,
             ),
         ).fetchone()

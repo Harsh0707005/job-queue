@@ -251,6 +251,28 @@ class LeaseClaimTenantMixin:
         visibility_timeout_seconds: int | None,
         now: datetime,
     ) -> Job:
+        from job_queue.queue.lease_quarantine import _failed_workers_plus
+
+        workers = list(candidate.get("failed_workers") or [])
+        if (
+            candidate["status"] == JobStatus.LEASED.value
+            and candidate.get("leased_by")
+            and hasattr(self, "_quarantine_job_if_due")
+        ):
+            workers = _failed_workers_plus(workers, candidate["leased_by"])
+            qrow = self._quarantine_job_if_due(
+                conn,
+                candidate,
+                workers=workers,
+                worker_id=str(candidate["leased_by"]),
+                reason="lease expired",
+                now=now,
+            )
+            if qrow is not None:
+                raise LeaseError(
+                    f"job {candidate['id']} quarantined after worker hops"
+                )
+
         new_attempts = candidate["attempts"] + 1
         vt = visibility_timeout_seconds or candidate["visibility_timeout_seconds"]
         max_rt = int(candidate.get("max_runtime_seconds") or 3600)
@@ -278,6 +300,7 @@ class LeaseClaimTenantMixin:
                 lease_started_at = %s,
                 attempts = %s,
                 visibility_timeout_seconds = %s,
+                failed_workers = %s,
                 updated_at = %s,
                 last_error = NULL
             WHERE id = %s
@@ -307,6 +330,7 @@ class LeaseClaimTenantMixin:
                 now,
                 new_attempts,
                 vt,
+                workers,
                 now,
                 candidate["id"],
                 candidate["tenant_id"],

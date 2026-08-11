@@ -83,6 +83,36 @@ class TenantsApiLimitsMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
 
+    def _set_quarantine(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if "max_worker_hops" not in body and "hops" not in body:
+            return 400, {"error": "max_worker_hops required (null clears)"}
+        raw = body.get("max_worker_hops", body.get("hops"))
+        try:
+            hops = None if raw is None else int(raw)
+            out = self.queue.set_tenant_quarantine(
+                tenant_id,
+                hops,
+                action=body.get("action") or body.get("quarantine_action"),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, out
+
+    def _get_quarantine(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            return 200, self.queue.get_tenant_quarantine(parts[2])
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
     def _set_spend_cap(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:

@@ -109,6 +109,9 @@ def job_to_dict(
         "partition_id": int(job.partition_id),
         "expires_at": _dt(job.expires_at),
         "expiry_action": job.expiry_action,
+        "failed_workers": list(job.failed_workers),
+        "max_worker_hops": job.max_worker_hops,
+        "quarantine_action": job.quarantine_action,
     }
 
 
@@ -186,6 +189,13 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         required_skills=tuple(str(x) for x in required_skills),
         expires_at=parse_dt("expires_at"),
         expiry_action=str(data.get("expiry_action") or "dead"),
+        failed_workers=tuple(str(x) for x in (data.get("failed_workers") or [])),
+        max_worker_hops=(
+            None
+            if data.get("max_worker_hops") is None
+            else int(data["max_worker_hops"])
+        ),
+        quarantine_action=str(data.get("quarantine_action") or "dead"),
     )
 
 
