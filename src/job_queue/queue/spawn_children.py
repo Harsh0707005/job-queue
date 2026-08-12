@@ -235,8 +235,16 @@ class SpawnChildrenMixin:
                             max_attempts,
                             vt,
                             max_rt,
-                            int(row.get("retry_backoff_base_seconds") or 1),
-                            int(row.get("retry_backoff_max_seconds") or 300),
+                            (
+                                1
+                                if row.get("retry_backoff_base_seconds") is None
+                                else int(row["retry_backoff_base_seconds"])
+                            ),
+                            (
+                                300
+                                if row.get("retry_backoff_max_seconds") is None
+                                else int(row["retry_backoff_max_seconds"])
+                            ),
                             now,
                             dedupe_key,
                             job_id,
@@ -258,7 +266,6 @@ class SpawnChildrenMixin:
                             conn, crow, now=now
                         )
                     child = self._job(crow)
-                    child_jobs.append(child)
                     child_ids.append(child.id)
                     self._append_job_audit(
                         conn,
@@ -283,8 +290,20 @@ class SpawnChildrenMixin:
                         )
                     if hasattr(self, "_stamp_job_quarantine"):
                         self._stamp_job_quarantine(
-                            conn, job_id=crow["id"], tenant_id=tenant_id
+                            conn,
+                            job_id=crow["id"],
+                            tenant_id=tenant_id,
+                            max_worker_hops=spec.get("max_worker_hops"),
+                            quarantine_action=spec.get("quarantine_action"),
                         )
+                        stamped = conn.execute(
+                            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                            (crow["id"],),
+                        ).fetchone()
+                        if stamped is not None:
+                            crow = stamped
+                            child = self._job(crow)
+                    child_jobs.append(child)
 
                 if not wait:
                     result = SpawnChildrenResult(

@@ -69,6 +69,7 @@ class SpawnJoinMixin:
             JobStatus.FAILED.value,
             JobStatus.DEAD.value,
             JobStatus.CANCELLED.value,
+            JobStatus.QUARANTINED.value,
         }
         activeish = {
             JobStatus.PENDING.value,

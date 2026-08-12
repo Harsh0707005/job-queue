@@ -515,11 +515,15 @@ class JobsEnqueueDagMixin:
                     "max_attempts": max_attempts,
                     "visibility_timeout_seconds": vt,
                     "max_runtime_seconds": max_rt,
-                    "retry_backoff_base_seconds": int(
-                        raw.get("retry_backoff_base_seconds") or 1
+                    "retry_backoff_base_seconds": (
+                        1
+                        if raw.get("retry_backoff_base_seconds") is None
+                        else int(raw["retry_backoff_base_seconds"])
                     ),
-                    "retry_backoff_max_seconds": int(
-                        raw.get("retry_backoff_max_seconds") or 300
+                    "retry_backoff_max_seconds": (
+                        300
+                        if raw.get("retry_backoff_max_seconds") is None
+                        else int(raw["retry_backoff_max_seconds"])
                     ),
                     "dedupe_key": dedupe_key,
                     "labels": _normalize_labels(raw.get("labels")),

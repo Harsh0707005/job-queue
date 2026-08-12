@@ -188,21 +188,33 @@ class LeaseQuarantineMixin:
                 self._record_metric(
                     conn, tenant_id=tenant_id, metric="dead", count=1, now=now
                 )
-            if hasattr(self, "_cascade_cancel_dependents"):
-                self._cascade_cancel_dependents(
-                    conn,
-                    parent_id=row["id"],
-                    tenant_id=tenant_id,
-                    reason=err,
-                    now=now,
-                )
             job = self._job(updated)
             if hasattr(self, "_enqueue_job_webhooks"):
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_DEAD, now=now
                 )
-            if hasattr(self, "_on_workflow_step_terminal"):
-                self._on_workflow_step_terminal(
-                    conn, updated, success=False, error=err, now=now
-                )
+        # Both actions are terminal for dependents: a quarantined DAG parent
+        # must not leave children pending, and a quarantined spawn child
+        # must fail the parked parent join.
+        if hasattr(self, "_cascade_cancel_dependents"):
+            self._cascade_cancel_dependents(
+                conn,
+                parent_id=row["id"],
+                tenant_id=tenant_id,
+                reason=err,
+                now=now,
+            )
+        if updated.get("parent_job_id") is not None and hasattr(
+            self, "_maybe_wake_parent_on_join_locked"
+        ):
+            self._maybe_wake_parent_on_join_locked(
+                conn,
+                parent_id=updated["parent_job_id"],
+                tenant_id=tenant_id,
+                now=now,
+            )
+        if hasattr(self, "_on_workflow_step_terminal"):
+            self._on_workflow_step_terminal(
+                conn, updated, success=False, error=err, now=now
+            )
         return updated
