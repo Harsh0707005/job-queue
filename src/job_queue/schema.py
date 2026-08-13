@@ -61,7 +61,7 @@ ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
     status IN (
         'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-        'awaiting_skills', 'quarantined',
+        'awaiting_skills', 'quarantined', 'frozen',
         'completed', 'failed', 'dead', 'cancelled'
     )
 );
@@ -283,7 +283,7 @@ CREATE UNIQUE INDEX idx_jobs_dedupe_active
     WHERE dedupe_key IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-          'awaiting_skills', 'quarantined'
+          'awaiting_skills', 'quarantined', 'frozen'
       );
 
 -- At most one in-flight job per recurring schedule (no overlapping runs).
@@ -293,7 +293,7 @@ CREATE UNIQUE INDEX idx_jobs_schedule_active
     WHERE schedule_id IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-          'awaiting_skills'
+          'awaiting_skills', 'frozen'
       );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_parent

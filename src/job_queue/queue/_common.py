@@ -63,7 +63,16 @@ _CANCELABLE_STATUSES = (
     JobStatus.AWAITING_CHILDREN,
     JobStatus.AWAITING_SKILLS,
     JobStatus.QUARANTINED,
+    JobStatus.FROZEN,
 )
+
+
+class FreezeError(Exception):
+    """Raised when a job cannot be frozen / unfrozen / dead-lettered."""
+
+    def __init__(self, message: str, *, job: Job | None = None) -> None:
+        super().__init__(message)
+        self.job = job
 
 _NOT_TTL_EXPIRED_SQL = "AND (expires_at IS NULL OR expires_at > %s)"
 

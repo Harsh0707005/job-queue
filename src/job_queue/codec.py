@@ -392,6 +392,7 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "failed": stats.failed,
         "dead": stats.dead,
         "cancelled": stats.cancelled,
+        "frozen": int(getattr(stats, "frozen", 0) or 0),
         "total": stats.total,
         "claimable": stats.claimable,
         "awaiting_skills": int(getattr(stats, "awaiting_skills", 0) or 0),

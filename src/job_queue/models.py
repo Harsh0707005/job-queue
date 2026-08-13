@@ -16,6 +16,7 @@ class JobStatus(str, Enum):
     AWAITING_CHILDREN = "awaiting_children"
     AWAITING_SKILLS = "awaiting_skills"
     QUARANTINED = "quarantined"
+    FROZEN = "frozen"
     COMPLETED = "completed"
     FAILED = "failed"
     DEAD = "dead"
@@ -178,6 +179,10 @@ class Job:
     def is_quarantined(self) -> bool:
         return self.status == JobStatus.QUARANTINED
 
+    @property
+    def is_frozen(self) -> bool:
+        return self.status == JobStatus.FROZEN
+
 
 @dataclass(frozen=True, slots=True)
 class SpawnChildrenResult:
@@ -289,6 +294,7 @@ class TenantStats:
     # or when the tenant failure breaker is open.
     claimable: int
     awaiting_skills: int = 0
+    frozen: int = 0
     breaker_open: bool = False
 
 

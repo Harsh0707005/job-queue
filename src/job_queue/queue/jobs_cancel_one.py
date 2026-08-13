@@ -58,7 +58,7 @@ class JobsCancelOneMixin:
                     f"job {job_id} cannot be cancelled "
                     f"(status={job.status.value}; only pending, leased, "
                     f"awaiting_approval, awaiting_children, "
-                    f"awaiting_skills, or quarantined jobs cancel)",
+                    f"awaiting_skills, quarantined, or frozen jobs cancel)",
                     job=job,
                 )
 
@@ -96,7 +96,7 @@ class JobsCancelOneMixin:
                     updated_at = %s
                 WHERE id = %s
                   AND tenant_id = %s
-                  AND status IN (%s, %s, %s, %s, %s, %s)
+                  AND status IN (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING {_JOB_COLUMNS}
                 """,
                 (
@@ -117,6 +117,7 @@ class JobsCancelOneMixin:
                     JobStatus.AWAITING_CHILDREN.value,
                     JobStatus.AWAITING_SKILLS.value,
                     JobStatus.QUARANTINED.value,
+                    JobStatus.FROZEN.value,
                 ),
             ).fetchone()
             if updated is None:
@@ -208,7 +209,7 @@ class JobsCancelOneMixin:
                 updated_at = %s
             WHERE id = %s
               AND tenant_id = %s
-              AND status IN (%s, %s, %s, %s, %s, %s)
+              AND status IN (%s, %s, %s, %s, %s, %s, %s)
             RETURNING {_JOB_COLUMNS}
             """,
             (
@@ -227,6 +228,7 @@ class JobsCancelOneMixin:
                 JobStatus.AWAITING_CHILDREN.value,
                 JobStatus.AWAITING_SKILLS.value,
                 JobStatus.QUARANTINED.value,
+                JobStatus.FROZEN.value,
             ),
         ).fetchone()
         if updated is None:

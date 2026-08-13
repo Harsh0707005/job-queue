@@ -19,6 +19,7 @@ from job_queue.codec import (
 from job_queue.queue import (
     CancelError,
     DependencyError,
+    FreezeError,
     LeaseError,
     RateLimitError,
     SpendCapError,
@@ -209,6 +210,86 @@ class JobsApiMixin:
             return 409, {
                 "error": str(exc),
                 "code": "cancel_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
+
+    def _freeze_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            job = self.queue.freeze(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                reason=body.get("reason"),
+            )
+        except FreezeError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "freeze_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
+
+    def _unfreeze_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            job = self.queue.unfreeze(UUID(job_id_s), tenant_id=str(tenant_id))
+        except FreezeError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "freeze_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
+
+    def _dead_letter_frozen(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            job = self.queue.dead_letter_frozen(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                error=body.get("error") or body.get("reason"),
+            )
+        except FreezeError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "freeze_error",
                 "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
             }
         except ValueError as exc:

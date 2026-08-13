@@ -240,6 +240,7 @@ class JobsCancelBulkMixin:
         active_approval = JobStatus.AWAITING_APPROVAL.value
         active_children = JobStatus.AWAITING_CHILDREN.value
         active_skills = JobStatus.AWAITING_SKILLS.value
+        active_frozen = JobStatus.FROZEN.value
         frontier: list[UUID] = [parent_id]
         visited: set[UUID] = set()
         while frontier:
@@ -252,7 +253,7 @@ class JobsCancelBulkMixin:
                 SELECT {_JOB_COLUMNS}
                 FROM jobs
                 WHERE tenant_id = %s
-                  AND status IN (%s, %s, %s, %s, %s)
+                  AND status IN (%s, %s, %s, %s, %s, %s)
                   AND (
                       depends_on @> ARRAY[%s]::uuid[]
                       OR parent_job_id = %s
@@ -266,6 +267,7 @@ class JobsCancelBulkMixin:
                     active_approval,
                     active_children,
                     active_skills,
+                    active_frozen,
                     current,
                     current,
                 ),
@@ -302,7 +304,7 @@ class JobsCancelBulkMixin:
                         updated_at = %s
                     WHERE id = %s
                       AND tenant_id = %s
-                      AND status IN (%s, %s, %s, %s)
+                      AND status IN (%s, %s, %s, %s, %s, %s)
                     RETURNING {_JOB_COLUMNS}
                     """,
                     (
@@ -318,6 +320,8 @@ class JobsCancelBulkMixin:
                         active_leased,
                         active_approval,
                         active_children,
+                        active_skills,
+                        active_frozen,
                     ),
                 ).fetchone()
                 if updated is not None:

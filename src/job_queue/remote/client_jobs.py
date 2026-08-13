@@ -124,6 +124,45 @@ class ClientJobsMixin:
             batches=int(payload.get("batches") or 1),
         )
 
+    def freeze_job(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        reason: str | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if reason is not None:
+            body["reason"] = reason
+        payload = self._request("POST", f"/v1/jobs/{job_id}/freeze", body)
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def unfreeze_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/unfreeze",
+            {"tenant_id": tenant_id},
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
+    def dead_letter_frozen(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        error: str | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if error is not None:
+            body["error"] = error
+        payload = self._request(
+            "POST", f"/v1/jobs/{job_id}/freeze/dead", body
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(
             "POST",

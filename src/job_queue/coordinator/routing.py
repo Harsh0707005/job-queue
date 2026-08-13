@@ -138,6 +138,24 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/jobs/")
+            and path.endswith("/freeze/dead")
+        ):
+            return self._dead_letter_frozen(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/unfreeze")
+        ):
+            return self._unfreeze_job(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/freeze")
+        ):
+            return self._freeze_job(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
             and path.endswith("/cancel")
         ):
             return self._cancel_job(path, body)

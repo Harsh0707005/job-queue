@@ -111,7 +111,7 @@ class JobsEnqueueHelpersMixin:
             WHERE tenant_id = %s
               AND queue_name = %s
               AND dedupe_key = %s
-              AND status IN (%s, %s, %s, %s, %s, %s)
+              AND status IN (%s, %s, %s, %s, %s, %s, %s)
             LIMIT 1
             """,
             (
@@ -124,5 +124,6 @@ class JobsEnqueueHelpersMixin:
                 JobStatus.AWAITING_CHILDREN.value,
                 JobStatus.AWAITING_SKILLS.value,
                 JobStatus.QUARANTINED.value,
+                JobStatus.FROZEN.value,
             ),
         ).fetchone()

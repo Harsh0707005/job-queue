@@ -143,6 +143,10 @@ class ClientCoreMixin:
                     from job_queue.queue import CancelError
 
                     raise CancelError(payload.get("error") or "cancel error") from exc
+                if exc.code == 409 and payload.get("code") == "freeze_error":
+                    from job_queue.queue import FreezeError
+
+                    raise FreezeError(payload.get("error") or "freeze error") from exc
                 if exc.code == 409 and payload.get("code") == "replay_error":
                     from job_queue.queue import ReplayError
 

@@ -19,7 +19,10 @@ EXPIRY_CANCEL = "cancel"
 EXPIRY_DEAD = "dead"
 EXPIRY_ACTIONS = frozenset({EXPIRY_CANCEL, EXPIRY_DEAD})
 
-_EXPIRE_STATUSES = tuple(s.value for s in _CANCELABLE_STATUSES)
+# Frozen jobs are an operator hold — TTL must not lift them.
+_EXPIRE_STATUSES = tuple(
+    s.value for s in _CANCELABLE_STATUSES if s is not JobStatus.FROZEN
+)
 
 _TTL_MSG = "job ttl expired"
 
