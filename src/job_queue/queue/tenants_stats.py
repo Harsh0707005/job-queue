@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from job_queue.models import (
@@ -11,6 +11,7 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _DEPS_SATISFIED_SQL,
+    _as_utc,
     _utcnow,
 )
 
@@ -71,13 +72,23 @@ class TenantsStatsMixin:
             """
             SELECT max_concurrent_leases, max_pending_jobs, paused,
                    enqueue_rate_per_sec, enqueue_burst,
-                   lease_rate_per_sec, lease_burst
+                   lease_rate_per_sec, lease_burst,
+                   breaker_opened_at, breaker_cooldown_seconds
             FROM tenant_settings
             WHERE tenant_id = %s
             """,
             (tenant_id,),
         ).fetchone()
         paused = bool(settings["paused"]) if settings else False
+        breaker_open = False
+        if settings and settings.get("breaker_opened_at") is not None:
+            cooldown = settings.get("breaker_cooldown_seconds")
+            if cooldown is None:
+                breaker_open = True
+            else:
+                breaker_open = _as_utc(settings["breaker_opened_at"]) + timedelta(
+                    seconds=int(cooldown)
+                ) > now
         max_conc = settings["max_concurrent_leases"] if settings else None
         max_pending = settings["max_pending_jobs"] if settings else None
         enq_rate = (
@@ -101,7 +112,7 @@ class TenantsStatsMixin:
             else None
         )
 
-        if paused:
+        if paused or breaker_open:
             claimable = 0
         else:
             claimable_row = conn.execute(
@@ -136,4 +147,5 @@ class TenantsStatsMixin:
             total=total,
             claimable=claimable,
             awaiting_skills=int(counts.get(JobStatus.AWAITING_SKILLS.value) or 0),
+            breaker_open=breaker_open,
         )

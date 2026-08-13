@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from job_queue.queue._common import _DEPS_SATISFIED_SQL, _utcnow
+from job_queue.queue.tenants_breaker import _TENANT_CLAIMS_BLOCKED_SQL
 
 # Fixed bucket width for counter history (seconds).
 _METRIC_BUCKET_SECONDS = 60
@@ -291,7 +292,7 @@ class MetricsMixin:
 
         claimable = 0
         if tenant_id is not None:
-            paused = self._is_tenant_paused(conn, tenant_id)
+            paused = self._tenant_claims_blocked(conn, tenant_id, now=now)
             if not paused:
                 crow = conn.execute(
                     f"""
@@ -315,7 +316,8 @@ class MetricsMixin:
                   AND {_DEPS_SATISFIED_SQL}
                   AND NOT EXISTS (
                     SELECT 1 FROM tenant_settings ts
-                    WHERE ts.tenant_id = jobs.tenant_id AND ts.paused = TRUE
+                    WHERE ts.tenant_id = jobs.tenant_id
+                      AND {_TENANT_CLAIMS_BLOCKED_SQL}
                   )
                 """,
                 (now,),

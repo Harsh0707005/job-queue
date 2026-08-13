@@ -77,9 +77,9 @@ class LeaseClaimTenantMixin:
                 (tenant_id,),
             )
 
-            # Paused: no new claims (pending or reclaim). In-flight holders
-            # still use heartbeat/ack/nack outside this path.
-            if self._is_tenant_paused(conn, tenant_id):
+            # Paused or breaker open: no new claims (pending or reclaim).
+            # In-flight holders still use heartbeat/ack/nack outside this path.
+            if self._tenant_claims_blocked(conn, tenant_id, now=now):
                 return []
 
             conc_limit = self._read_concurrency_limit(conn, tenant_id)

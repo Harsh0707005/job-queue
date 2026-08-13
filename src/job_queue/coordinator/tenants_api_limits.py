@@ -6,6 +6,7 @@ from typing import Any
 
 from job_queue.codec import (
     job_retention_to_dict,
+    tenant_breaker_to_dict,
     tenant_spend_cap_to_dict,
 )
 
@@ -138,6 +139,58 @@ class TenantsApiLimitsMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, tenant_spend_cap_to_dict(cap)
+
+    def _set_breaker(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        try:
+            if body.get("clear"):
+                br = self.queue.set_tenant_breaker(tenant_id, clear=True)
+            else:
+                raw_t = body.get("failure_threshold", body.get("threshold"))
+                raw_w = body.get("window_seconds", body.get("window"))
+                raw_c = body.get("cooldown_seconds", body.get("cooldown"))
+                if raw_t is None and "failure_threshold" not in body and "threshold" not in body:
+                    return 400, {
+                        "error": "failure_threshold required (null / clear=true "
+                        "disables the breaker)"
+                    }
+                br = self.queue.set_tenant_breaker(
+                    tenant_id,
+                    failure_threshold=None if raw_t is None else int(raw_t),
+                    window_seconds=None if raw_w is None else int(raw_w),
+                    cooldown_seconds=None if raw_c is None else int(raw_c),
+                )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, tenant_breaker_to_dict(br)
+
+    def _get_breaker(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            return 200, tenant_breaker_to_dict(
+                self.queue.get_tenant_breaker(parts[2])
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
+    def _reset_breaker(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / breaker / reset
+        if len(parts) != 5:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            return 200, tenant_breaker_to_dict(
+                self.queue.reset_tenant_breaker(parts[2])
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
 
     def _get_spend_cap(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")

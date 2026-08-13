@@ -32,6 +32,7 @@ def _format_rate(rate: float | None, burst: int | None) -> str:
 
 def _format_stats(stats: TenantStats) -> str:
     paused = "yes" if stats.paused else "no"
+    breaker = "open" if getattr(stats, "breaker_open", False) else "closed"
     limit = (
         str(stats.max_concurrent_leases)
         if stats.max_concurrent_leases is not None
@@ -45,6 +46,7 @@ def _format_stats(stats: TenantStats) -> str:
     return (
         f"tenant={stats.tenant_id}\n"
         f"  paused={paused}\n"
+        f"  breaker={breaker}\n"
         f"  max_concurrent_leases={limit}\n"
         f"  max_pending_jobs={pending_cap}\n"
         f"  enqueue_rate={_format_rate(stats.enqueue_rate_per_sec, stats.enqueue_burst)}\n"
@@ -67,6 +69,7 @@ def _format_table(rows: Sequence[TenantStats]) -> str:
     headers = (
         "TENANT",
         "PAUSED",
+        "BREAKER",
         "LIMIT",
         "PENDING",
         "LEASED",
@@ -86,6 +89,7 @@ def _format_table(rows: Sequence[TenantStats]) -> str:
             (
                 s.tenant_id,
                 "yes" if s.paused else "no",
+                "open" if getattr(s, "breaker_open", False) else "closed",
                 limit,
                 str(s.pending),
                 str(s.leased),

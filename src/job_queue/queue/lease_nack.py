@@ -67,6 +67,10 @@ class LeaseNackMixin:
                     now=now,
                 )
                 if qrow is not None:
+                    if hasattr(self, "_note_tenant_failure"):
+                        self._note_tenant_failure(
+                            conn, str(owner_tenant), now=now
+                        )
                     return self._job(qrow)
 
             if requeue and attempts < max_attempts:
@@ -151,6 +155,8 @@ class LeaseNackMixin:
                 metric_increments["dead"] = 1
             elif new_status == JobStatus.FAILED.value:
                 metric_increments["failed"] = 1
+            if hasattr(self, "_note_tenant_failure"):
+                self._note_tenant_failure(conn, str(owner_tenant), now=now)
             self._record_metrics_batch(
                 conn,
                 tenant_id=str(owner_tenant),

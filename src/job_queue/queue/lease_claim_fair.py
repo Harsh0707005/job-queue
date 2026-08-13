@@ -21,6 +21,7 @@ from job_queue.queue._common import (
     _skill_claim_sql,
     _utcnow,
 )
+from job_queue.queue.tenants_breaker import _TENANT_CLAIMS_BLOCKED_SQL
 
 
 class LeaseClaimFairMixin:
@@ -105,7 +106,11 @@ class LeaseClaimFairMixin:
                     claimed.append(job)
             except _SkipLeaseCandidate as skip:
                 skips += 1
-                if skip.tenant_id and skip.reason == "tenant lease rate limited":
+                if skip.tenant_id and skip.reason in (
+                    "tenant lease rate limited",
+                    "tenant paused",
+                    "tenant breaker open",
+                ):
                     rate_limited_tenants.add(skip.tenant_id)
                 continue
             except LeaseError:
@@ -176,7 +181,7 @@ class LeaseClaimFairMixin:
                     SELECT 1
                     FROM tenant_settings ts
                     WHERE ts.tenant_id = jobs.tenant_id
-                      AND ts.paused = TRUE
+                      AND {_TENANT_CLAIMS_BLOCKED_SQL}
               )
               AND (
                     (
@@ -250,13 +255,18 @@ class LeaseClaimFairMixin:
                 expected_generation=exp,
             )
 
-        # Re-check pause + concurrency under tenant lock (closes races).
+        # Re-check pause / breaker + concurrency under tenant lock (closes races).
         conn.execute(
             "SELECT pg_advisory_xact_lock(hashtext(%s))",
             (candidate["tenant_id"],),
         )
-        if self._is_tenant_paused(conn, candidate["tenant_id"]):
-            raise _SkipLeaseCandidate("tenant paused", tenant_id=candidate["tenant_id"])
+        if self._tenant_claims_blocked(conn, candidate["tenant_id"], now=now):
+            reason = (
+                "tenant paused"
+                if self._is_tenant_paused(conn, candidate["tenant_id"])
+                else "tenant breaker open"
+            )
+            raise _SkipLeaseCandidate(reason, tenant_id=candidate["tenant_id"])
         if candidate["status"] == JobStatus.PENDING.value:
             limit = self._read_concurrency_limit(conn, candidate["tenant_id"])
             leased_count = self._count_leased(conn, candidate["tenant_id"])

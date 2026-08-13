@@ -253,6 +253,7 @@ class LeasePreemptOpsMixin:
               AND j.available_at <= %s
               AND ts.max_concurrent_leases IS NOT NULL
               AND ts.paused = FALSE
+              AND ts.breaker_opened_at IS NULL
             LIMIT %s
             """,
             (

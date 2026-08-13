@@ -105,6 +105,10 @@ class LeaseMaxRuntimeMixin:
                         count=1,
                         now=now,
                     )
+                    if hasattr(self, "_note_tenant_failure"):
+                        self._note_tenant_failure(
+                            conn, str(tenant_id), now=now
+                        )
                 if hasattr(self, "_record_lease_end_usage"):
                     self._record_lease_end_usage(conn, row, now=now)
             self._cascade_cancel_dependents(

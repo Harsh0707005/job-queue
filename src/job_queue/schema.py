@@ -600,6 +600,33 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_default_quarantine_ac
     OR default_quarantine_action IN ('dead', 'release')
 );
 
+-- Per-tenant failure circuit breaker. NULL threshold = disabled.
+-- Failures are server-counted (worker nack / max-runtime dead). When the
+-- count hits threshold inside the window, breaker_opened_at is set and
+-- new leases/schedule ticks are skipped until cooldown elapses or reset.
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS breaker_failure_threshold INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS breaker_window_seconds INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS breaker_cooldown_seconds INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS breaker_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS breaker_window_start TIMESTAMPTZ;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS breaker_opened_at TIMESTAMPTZ;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_breaker_threshold_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_breaker_threshold_check CHECK (
+    breaker_failure_threshold IS NULL OR breaker_failure_threshold >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_breaker_window_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_breaker_window_check CHECK (
+    breaker_window_seconds IS NULL OR breaker_window_seconds >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_breaker_cooldown_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_breaker_cooldown_check CHECK (
+    breaker_cooldown_seconds IS NULL OR breaker_cooldown_seconds >= 1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_breaker_failures_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_breaker_failures_check CHECK (
+    breaker_failures >= 0
+);
+
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.
 CREATE TABLE IF NOT EXISTS tenant_fairness (
     tenant_id       TEXT PRIMARY KEY,

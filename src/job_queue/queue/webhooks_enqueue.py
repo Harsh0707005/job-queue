@@ -25,9 +25,10 @@ class WebhooksEnqueueMixin:
     ) -> None:
         """Insert pending delivery rows for all matching enabled endpoints.
 
-        No-op when the tenant is paused (no new outbox rows until resume).
+        No-op when the tenant is paused or the failure breaker is open
+        (no new outbox rows until resume / reset).
         """
-        if self._is_tenant_paused(conn, job.tenant_id):
+        if self._tenant_claims_blocked(conn, job.tenant_id):
             return
 
         endpoints = conn.execute(

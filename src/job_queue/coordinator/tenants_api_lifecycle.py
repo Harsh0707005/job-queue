@@ -349,7 +349,7 @@ class TenantsApiLifecycleMixin:
             ).fetchone()
             settings = conn.execute(
                 """
-                SELECT paused, offboarding
+                SELECT paused, offboarding, breaker_opened_at
                 FROM tenant_settings
                 WHERE tenant_id = %s
                 """,
@@ -380,6 +380,9 @@ class TenantsApiLifecycleMixin:
                 "empty": empty,
                 "offboarding": bool(settings["offboarding"]) if settings else False,
                 "paused": bool(settings["paused"]) if settings else False,
+                "breaker_open": bool(settings["breaker_opened_at"])
+                if settings
+                else False,
                 "jobs": dict(jobs) if jobs else {},
                 "schedules": s_n,
                 "webhook_endpoints": e_n,

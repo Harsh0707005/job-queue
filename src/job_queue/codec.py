@@ -26,6 +26,7 @@ from job_queue.models import (
     TenantPayloadKey,
     TenantRestore,
     TenantSnapshot,
+    TenantBreaker,
     TenantSpendCap,
     TenantStats,
     TenantUsage,
@@ -394,6 +395,21 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "total": stats.total,
         "claimable": stats.claimable,
         "awaiting_skills": int(getattr(stats, "awaiting_skills", 0) or 0),
+        "breaker_open": bool(getattr(stats, "breaker_open", False)),
+    }
+
+
+def tenant_breaker_to_dict(breaker: TenantBreaker) -> dict[str, Any]:
+    return {
+        "tenant_id": breaker.tenant_id,
+        "failure_threshold": breaker.failure_threshold,
+        "window_seconds": breaker.window_seconds,
+        "cooldown_seconds": breaker.cooldown_seconds,
+        "failures": breaker.failures,
+        "window_start": _dt(breaker.window_start),
+        "opened_at": _dt(breaker.opened_at),
+        "open": breaker.open,
+        "reset_at": _dt(breaker.reset_at),
     }
 
 

@@ -285,9 +285,31 @@ class TenantStats:
     dead: int
     cancelled: int
     total: int
-    # Ready to lease right now (pending, due, deps met); 0 when paused.
+    # Ready to lease right now (pending, due, deps met); 0 when paused
+    # or when the tenant failure breaker is open.
     claimable: int
     awaiting_skills: int = 0
+    breaker_open: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TenantBreaker:
+    """Per-tenant failure circuit breaker state.
+
+    Operator-set *failure_threshold* / *window_seconds* / *cooldown_seconds*.
+    *failures* and *opened_at* are server-written only. NULL threshold means
+    the breaker is disabled. *cooldown_seconds* NULL means manual reset only.
+    """
+
+    tenant_id: str
+    failure_threshold: int | None
+    window_seconds: int | None
+    cooldown_seconds: int | None
+    failures: int
+    window_start: datetime | None
+    opened_at: datetime | None
+    open: bool
+    reset_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -312,6 +312,24 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/breaker/reset")
+        ):
+            return self._reset_breaker(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/breaker")
+        ):
+            return self._set_breaker(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/breaker")
+        ):
+            return self._get_breaker(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/retention")
         ):
             return self._set_tenant_retention(path, body)

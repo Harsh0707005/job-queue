@@ -18,6 +18,7 @@ from job_queue.queue._common import (
     SpendCapError,
     _utcnow,
 )
+from job_queue.queue.tenants_breaker import _TENANT_CLAIMS_BLOCKED_SQL
 
 
 class SchedulesProcessMixin:
@@ -38,9 +39,10 @@ class SchedulesProcessMixin:
         **Schedule fires bypass pending caps and enqueue rate limits** so
         timed work still runs under tenant throttles.
 
-        **Paused tenants are skipped entirely** — no jobs are enqueued for their
-        schedules while paused, so ticks do not pile up. After ``resume_tenant``,
-        overdue schedules fire once (clean pickup).
+        **Paused tenants and tenants with an open failure breaker are skipped
+        entirely** — no jobs are enqueued for their schedules so ticks do not
+        pile up. After ``resume_tenant`` / breaker reset, overdue schedules
+        fire once (clean pickup).
 
         **No overlapping runs:** if a previous job for the same schedule is
         still ``pending`` or ``leased``, this tick is skipped and
@@ -55,19 +57,19 @@ class SchedulesProcessMixin:
         now = _utcnow()
         fires: list[ScheduleFire] = []
 
-        # Shared filter: never tick schedules for paused tenants.
-        paused_filter = """
+        # Shared filter: never tick schedules for paused / breaker-open tenants.
+        paused_filter = f"""
             AND NOT EXISTS (
                 SELECT 1
                 FROM tenant_settings ts
                 WHERE ts.tenant_id = schedules.tenant_id
-                  AND ts.paused = TRUE
+                  AND {_TENANT_CLAIMS_BLOCKED_SQL}
             )
         """
 
         with transaction(self._pool) as conn:
             if tenant_id is not None:
-                if self._is_tenant_paused(conn, tenant_id):
+                if self._tenant_claims_blocked(conn, tenant_id, now=now):
                     return []
                 due = conn.execute(
                     f"""
@@ -99,8 +101,10 @@ class SchedulesProcessMixin:
                 ).fetchall()
 
             for sched_row in due:
-                # Race: tenant paused after SELECT.
-                if self._is_tenant_paused(conn, sched_row["tenant_id"]):
+                # Race: tenant paused / breaker opened after SELECT.
+                if self._tenant_claims_blocked(
+                    conn, sched_row["tenant_id"], now=now
+                ):
                     self._record_metric(
                         conn,
                         tenant_id=str(sched_row["tenant_id"]),

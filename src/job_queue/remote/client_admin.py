@@ -90,6 +90,40 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def set_tenant_breaker(
+        self,
+        tenant_id: str,
+        *,
+        failure_threshold: int | None = None,
+        window_seconds: int | None = None,
+        cooldown_seconds: int | None = None,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"clear": clear}
+        if failure_threshold is not None:
+            body["failure_threshold"] = failure_threshold
+        if window_seconds is not None:
+            body["window_seconds"] = window_seconds
+        if cooldown_seconds is not None:
+            body["cooldown_seconds"] = cooldown_seconds
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/breaker", body
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_breaker(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/breaker")
+        assert payload is not None
+        return payload
+
+    def reset_tenant_breaker(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/breaker/reset", {}
+        )
+        assert payload is not None
+        return payload
+
     def get_tenant_usage(
         self,
         tenant_id: str,

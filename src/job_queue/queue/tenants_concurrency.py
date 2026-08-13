@@ -176,6 +176,10 @@ class TenantsConcurrencyMixin:
               AND spend_window_seconds IS NULL
               AND default_max_worker_hops IS NULL
               AND default_quarantine_action IS NULL
+              AND breaker_failure_threshold IS NULL
+              AND breaker_window_seconds IS NULL
+              AND breaker_cooldown_seconds IS NULL
+              AND breaker_opened_at IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from job_queue.queue.tenants_breaker import TenantsBreakerMixin
 from job_queue.queue.tenants_concurrency import TenantsConcurrencyMixin
 from job_queue.queue.tenants_rate import TenantsRateMixin
 from job_queue.queue.tenants_retention import TenantsRetentionMixin
@@ -17,6 +18,7 @@ class TenantsLimitsMixin(
     TenantsTtlMixin,
     TenantsSpendMixin,
     TenantsQuarantineMixin,
+    TenantsBreakerMixin,
 ):
     """Aggregated TenantsLimitsMixin (split for maintainability)."""
 

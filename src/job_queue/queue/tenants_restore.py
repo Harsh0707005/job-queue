@@ -1282,6 +1282,9 @@ class TenantsRestoreMixin:
         spend_e = None
         spend_r = None
         spend_w = None
+        br_t = None
+        br_w = None
+        br_c = None
         if isinstance(exported_settings, dict):
             paused = bool(exported_settings.get("paused") or False)
             max_c = exported_settings.get("max_concurrent_leases")
@@ -1299,6 +1302,9 @@ class TenantsRestoreMixin:
             spend_e = exported_settings.get("spend_enqueue_limit")
             spend_r = exported_settings.get("spend_runtime_ms_limit")
             spend_w = exported_settings.get("spend_window_seconds")
+            br_t = exported_settings.get("breaker_failure_threshold")
+            br_w = exported_settings.get("breaker_window_seconds")
+            br_c = exported_settings.get("breaker_cooldown_seconds")
         conn.execute(
             """
             INSERT INTO tenant_settings (
@@ -1312,6 +1318,9 @@ class TenantsRestoreMixin:
                 spend_enqueue_limit, spend_runtime_ms_limit,
                 spend_window_seconds, spend_window_start,
                 spend_enqueues, spend_runtime_ms,
+                breaker_failure_threshold, breaker_window_seconds,
+                breaker_cooldown_seconds, breaker_failures,
+                breaker_window_start, breaker_opened_at,
                 updated_at
             ) VALUES (
                 %s, %s, %s,
@@ -1324,6 +1333,7 @@ class TenantsRestoreMixin:
                 %s, %s,
                 %s, NULL,
                 0, 0,
+                %s, %s, %s, 0, NULL, NULL,
                 %s
             )
             ON CONFLICT (tenant_id) DO UPDATE
@@ -1345,6 +1355,9 @@ class TenantsRestoreMixin:
                 spend_enqueue_limit = EXCLUDED.spend_enqueue_limit,
                 spend_runtime_ms_limit = EXCLUDED.spend_runtime_ms_limit,
                 spend_window_seconds = EXCLUDED.spend_window_seconds,
+                breaker_failure_threshold = EXCLUDED.breaker_failure_threshold,
+                breaker_window_seconds = EXCLUDED.breaker_window_seconds,
+                breaker_cooldown_seconds = EXCLUDED.breaker_cooldown_seconds,
                 updated_at = EXCLUDED.updated_at
             """,
             (
@@ -1365,6 +1378,9 @@ class TenantsRestoreMixin:
                 spend_e,
                 spend_r,
                 spend_w,
+                br_t,
+                br_w,
+                br_c,
                 now,
             ),
         )
