@@ -1,0 +1,37 @@
+# Failing jobs hop to other workers, then quarantine (dead or release).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.hop-skip.yml \
+#     up --build --abort-on-container-exit --exit-code-from hop-skip-soak \
+#     hop-skip-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  hop-skip-soak:
+    build: .
+    command: ["python", "scripts/hop_skip_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      DEAD_TENANTS: "3"
+      REL_TENANTS: "3"
+      POISON_EACH: "4"
+      HEALTHY_EACH: "8"
+      MAX_WORKER_HOPS: "2"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

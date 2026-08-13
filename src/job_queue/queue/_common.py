@@ -168,6 +168,49 @@ def _row_has_required_skills(row: Any) -> bool:
         return False
 
 
+def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
+    """Skip jobs this worker already failed when another worker can take them.
+
+    Binds *worker_id* three times: ``failed_workers`` membership, expired
+    self-reclaim, and the other-active-worker EXISTS. When no other
+    capable worker is registered the clause is a no-op so a solo worker
+    can still retry and trip hop quarantine.
+    """
+    skills = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
+    return f"""
+              AND NOT (
+                    (
+                        %s = ANY(COALESCE({jobs_alias}.failed_workers, '{{}}'::text[]))
+                        OR (
+                            {jobs_alias}.status = 'leased'
+                            AND {jobs_alias}.leased_by = %s
+                        )
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM worker_nodes wn
+                        WHERE wn.status = 'active'
+                          AND wn.worker_id <> %s
+                          AND (
+                                {skills} = '{{}}'::text[]
+                                OR {skills} <@ COALESCE(wn.skills, '{{}}'::text[])
+                          )
+                    )
+              )
+    """
+
+
+def _failed_worker_prefer_sql(jobs_alias: str = "jobs") -> str:
+    """ORDER BY fragment: jobs this worker has not failed come first.
+
+    Binds one ``%s`` (worker_id).
+    """
+    return (
+        f"CASE WHEN %s = ANY(COALESCE({jobs_alias}.failed_workers, "
+        f"'{{}}'::text[])) THEN 1 ELSE 0 END ASC"
+    )
+
+
 def _skill_claim_sql(jobs_alias: str = "jobs") -> str:
     """SQL AND-clause: job skills empty or subset of the worker's skills.
 

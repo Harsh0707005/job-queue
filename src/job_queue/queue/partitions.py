@@ -511,11 +511,22 @@ class PartitionsMixin(SkillsWaitMixin):
                       AND wn.status = 'active'
               )
         """
+        # Jobs that already died (or whose lease expired) may hop to any
+        # active worker so the previous holder cannot monopolize retries.
+        hop_open = f"""
+            (
+                COALESCE(array_length({jobs_alias}.failed_workers, 1), 0) > 0
+                OR {jobs_alias}.status = 'leased'
+            )
+        """
         if not owned_parts:
             # Active but currently owns no shard (more workers than
-            # partitions): still eligible for skilled work only.
+            # partitions): still eligible for skilled work and hop-open jobs.
             sql = f"""
-              AND {skilled}
+              AND (
+                    {skilled}
+                    OR {hop_open}
+              )
               AND {active}
             """
             return sql, [worker_id]
@@ -535,9 +546,13 @@ class PartitionsMixin(SkillsWaitMixin):
                         {skilled}
                         AND {active}
                     )
+                 OR (
+                        {hop_open}
+                        AND {active}
+                    )
               )
         """
-        return sql, [list(owned_parts), worker_id, worker_id]
+        return sql, [list(owned_parts), worker_id, worker_id, worker_id]
 
     def _guard_partition_claim(
         self,

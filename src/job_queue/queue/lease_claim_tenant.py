@@ -16,6 +16,8 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _NOT_TTL_EXPIRED_SQL,
     LeaseError,
+    _failed_worker_avoid_sql,
+    _failed_worker_prefer_sql,
     _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
@@ -110,6 +112,9 @@ class LeaseClaimTenantMixin:
 
             skill_sql = _skill_claim_sql("jobs")
             skill_params: list[Any] = [worker_id]
+            avoid_sql = _failed_worker_avoid_sql("jobs")
+            avoid_params: list[Any] = [worker_id, worker_id, worker_id]
+            prefer_sql = _failed_worker_prefer_sql("jobs")
 
             if conc_limit is not None and leased_count >= conc_limit:
                 # Only reclaim expired leases (does not increase concurrent
@@ -122,11 +127,13 @@ class LeaseClaimTenantMixin:
                       AND queue_name = %s
                       {part_sql}
                       {skill_sql}
+                      {avoid_sql}
                       AND status = %s
                       AND lease_expires_at < %s
                       AND attempts < max_attempts
                       {_NOT_TTL_EXPIRED_SQL}
-                    ORDER BY priority DESC,
+                    ORDER BY {prefer_sql},
+                      priority DESC,
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
                       created_at ASC
@@ -137,10 +144,12 @@ class LeaseClaimTenantMixin:
                         [tenant_id, queue_name]
                         + part_params
                         + skill_params
+                        + avoid_params
                         + [
                             JobStatus.LEASED.value,
                             now,
                             now,
+                            worker_id,
                             now,
                             now,
                             limit,
@@ -162,6 +171,7 @@ class LeaseClaimTenantMixin:
                       AND queue_name = %s
                       {part_sql}
                       {skill_sql}
+                      {avoid_sql}
                       AND (
                             (
                                 status = %s
@@ -175,7 +185,8 @@ class LeaseClaimTenantMixin:
                          )
                       )
                       {_NOT_TTL_EXPIRED_SQL}
-                    ORDER BY priority DESC,
+                    ORDER BY {prefer_sql},
+                      priority DESC,
                       CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
@@ -187,12 +198,14 @@ class LeaseClaimTenantMixin:
                         [tenant_id, queue_name]
                         + part_params
                         + skill_params
+                        + avoid_params
                         + [
                             JobStatus.PENDING.value,
                             now,
                             JobStatus.LEASED.value,
                             now,
                             now,
+                            worker_id,
                             now,
                             now,
                             take,
@@ -203,9 +216,13 @@ class LeaseClaimTenantMixin:
             for candidate in candidates:
                 # Rebalance fence for unskilled work only. Skilled jobs may
                 # cross shards so they do not stall on an incapable owner.
+                hop_open = bool(candidate.get("failed_workers")) or (
+                    candidate["status"] == JobStatus.LEASED.value
+                )
                 if (
                     owned_parts is not None
                     and not _row_has_required_skills(candidate)
+                    and not hop_open
                     and hasattr(self, "_guard_partition_claim")
                 ):
                     exp = None

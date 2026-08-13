@@ -323,3 +323,129 @@ def test_quarantine_http_roundtrip(queue: JobQueue):
         assert got is not None and got.status == JobStatus.DEAD
     finally:
         server.shutdown()
+
+
+def test_failed_worker_skipped_when_another_worker_is_active(queue: JobQueue):
+    queue.register_worker("fw-a")
+    queue.register_worker("fw-b")
+    job = queue.enqueue(
+        tenant_id="fw-skip",
+        payload={"poison": True},
+        max_attempts=8,
+        max_worker_hops=2,
+        quarantine_action="dead",
+        retry_backoff_base_seconds=0,
+    )
+    first = queue.lease(tenant_id="fw-skip", worker_id="fw-a")
+    assert first is not None
+    _nack(queue, first, "fw-a", error="boom")
+    assert queue.lease(tenant_id="fw-skip", worker_id="fw-a") is None
+    second = queue.lease(tenant_id="fw-skip", worker_id="fw-b")
+    assert second is not None
+    assert second.id == job.id
+    assert "fw-a" in second.failed_workers
+    dead = _nack(queue, second, "fw-b", error="boom2")
+    assert dead.status == JobStatus.DEAD
+    assert list(dead.failed_workers) == ["fw-a", "fw-b"]
+
+
+def test_failed_worker_takes_sibling_not_poison_again(queue: JobQueue):
+    queue.register_worker("fw-1")
+    queue.register_worker("fw-2")
+    poison = queue.enqueue(
+        tenant_id="fw-mix",
+        payload={"poison": True},
+        max_attempts=8,
+        retry_backoff_base_seconds=0,
+        priority=100,
+    )
+    ok = queue.enqueue(
+        tenant_id="fw-mix",
+        payload={"ok": True},
+        priority=1,
+    )
+    first = queue.lease(tenant_id="fw-mix", worker_id="fw-1")
+    assert first is not None and first.id == poison.id
+    _nack(queue, first, "fw-1", error="x")
+    nxt = queue.lease(tenant_id="fw-mix", worker_id="fw-1")
+    assert nxt is not None and nxt.id == ok.id
+    _ack(queue, nxt, "fw-1")
+    other = queue.lease(tenant_id="fw-mix", worker_id="fw-2")
+    assert other is not None and other.id == poison.id
+
+
+def test_solo_registered_worker_can_still_retry_and_quarantine(queue: JobQueue):
+    queue.register_worker("solo")
+    job = queue.enqueue(
+        tenant_id="fw-solo",
+        payload={"x": 1},
+        max_attempts=5,
+        max_worker_hops=2,
+        quarantine_action="dead",
+        retry_backoff_base_seconds=0,
+    )
+    first = queue.lease(tenant_id="fw-solo", worker_id="solo")
+    assert first is not None
+    _nack(queue, first, "solo", error="again")
+    second = queue.lease(tenant_id="fw-solo", worker_id="solo")
+    assert second is not None
+    dead = _nack(queue, second, "solo", error="again")
+    assert dead.status == JobStatus.DEAD
+    assert queue.get(job.id, tenant_id="fw-solo").failed_workers == ("solo", "solo")
+
+
+def test_failed_worker_skip_fair_lease_other_tenant_unaffected(queue: JobQueue):
+    queue.register_worker("fair-a")
+    queue.register_worker("fair-b")
+    poison = queue.enqueue(
+        tenant_id="fw-bad",
+        payload={"p": 1},
+        max_attempts=8,
+        retry_backoff_base_seconds=0,
+    )
+    queue.enqueue(tenant_id="fw-ok", payload={"ok": True})
+    first = queue.lease(worker_id="fair-a")
+    assert first is not None
+    if first.tenant_id != "fw-bad":
+        _ack(queue, first, "fair-a")
+        first = queue.lease(worker_id="fair-a")
+        assert first is not None
+    assert first.id == poison.id
+    _nack(queue, first, "fair-a", error="x")
+    nxt = queue.lease(worker_id="fair-a")
+    assert nxt is not None
+    assert nxt.tenant_id == "fw-ok"
+    _ack(queue, nxt, "fair-a")
+    hopped = queue.lease(worker_id="fair-b")
+    assert hopped is not None
+    assert hopped.id == poison.id
+
+
+def test_expired_lease_goes_to_other_worker_not_holder(queue: JobQueue):
+    queue.register_worker("dead-w")
+    queue.register_worker("rescuer")
+    job = queue.enqueue(
+        tenant_id="fw-exp",
+        payload={"x": 1},
+        max_attempts=8,
+        visibility_timeout_seconds=1,
+    )
+    first = queue.lease(
+        tenant_id="fw-exp",
+        worker_id="dead-w",
+        visibility_timeout_seconds=1,
+    )
+    assert first is not None
+    with queue._pool.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET lease_expires_at = %s WHERE id = %s",
+            (_utcnow() - timedelta(seconds=5), job.id),
+        )
+        conn.commit()
+    assert queue.lease(tenant_id="fw-exp", worker_id="dead-w") is None
+    second = queue.lease(tenant_id="fw-exp", worker_id="rescuer")
+    assert second is not None
+    assert second.id == job.id
+    assert "dead-w" in second.failed_workers
+    _ack(queue, second, "rescuer")
+

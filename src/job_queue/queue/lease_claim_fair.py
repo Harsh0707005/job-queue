@@ -17,6 +17,8 @@ from job_queue.queue._common import (
     _NOT_TTL_EXPIRED_SQL,
     LeaseError,
     _SkipLeaseCandidate,
+    _failed_worker_avoid_sql,
+    _failed_worker_prefer_sql,
     _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
@@ -157,6 +159,9 @@ class LeaseClaimFairMixin:
             params.append(list(partitions))
         skill_sql = _skill_claim_sql("jobs")
         params.append(worker_id)
+        avoid_sql = _failed_worker_avoid_sql("jobs")
+        params.extend([worker_id, worker_id, worker_id])
+        prefer_sql = _failed_worker_prefer_sql("jobs")
         params.extend(
             [
                 JobStatus.PENDING.value,
@@ -165,10 +170,10 @@ class LeaseClaimFairMixin:
                 JobStatus.LEASED.value,
                 now,
                 now,
-                now,
-                now,
             ]
         )
+        params.append(worker_id)
+        params.extend([now, now])
         candidate = conn.execute(
             f"""
             SELECT {_JOB_COLUMNS}
@@ -177,6 +182,7 @@ class LeaseClaimFairMixin:
               {exclude_sql}
               {part_sql}
               {skill_sql}
+              {avoid_sql}
               AND NOT EXISTS (
                     SELECT 1
                     FROM tenant_settings ts
@@ -215,6 +221,7 @@ class LeaseClaimFairMixin:
               )
               {_NOT_TTL_EXPIRED_SQL}
             ORDER BY
+              {prefer_sql},
               priority DESC,
               CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
               (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
@@ -240,9 +247,13 @@ class LeaseClaimFairMixin:
         # Rebalance fence: unskilled jobs stay on owned shards. Skilled jobs
         # are allowed to cross partitions so they cannot stick on a worker
         # that cannot run them.
+        hop_open = bool(candidate.get("failed_workers")) or (
+            candidate["status"] == JobStatus.LEASED.value
+        )
         if (
             partitions is not None
             and not _row_has_required_skills(candidate)
+            and not hop_open
             and hasattr(self, "_guard_partition_claim")
         ):
             exp = None
