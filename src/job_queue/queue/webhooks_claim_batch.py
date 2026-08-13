@@ -9,7 +9,6 @@ from job_queue.db import transaction
 from job_queue.queue._common import (
     _utcnow,
 )
-from job_queue.queue.tenants_breaker import _TENANT_CLAIMS_BLOCKED_SQL
 
 
 class WebhooksClaimBatchMixin:
@@ -87,7 +86,7 @@ class WebhooksClaimBatchMixin:
                             OR NOT EXISTS (
                                 SELECT 1 FROM tenant_settings ts
                                 WHERE ts.tenant_id = d2.tenant_id
-                                  AND {_TENANT_CLAIMS_BLOCKED_SQL}
+                                  AND ts.paused = TRUE
                                   AND ts.offboarding = FALSE
                             )
                       )
@@ -149,7 +148,7 @@ class WebhooksClaimBatchMixin:
                             SELECT 1
                             FROM tenant_settings ts
                             WHERE ts.tenant_id = d.tenant_id
-                              AND {_TENANT_CLAIMS_BLOCKED_SQL}
+                              AND ts.paused = TRUE
                         )
                     )
                     ORDER BY d.next_attempt_at ASC

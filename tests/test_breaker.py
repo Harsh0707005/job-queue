@@ -11,7 +11,7 @@ import pytest
 from job_queue import JobQueue, JobStatus
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
-from tests.helpers_queue import _ack, _hb, _nack
+from tests.helpers_queue import _WebhookCapture, _ack, _hb, _nack
 
 
 def _fail_once(queue: JobQueue, tenant_id: str, *, n: int = 1) -> None:
@@ -313,6 +313,109 @@ def test_breaker_nack_counts_once_when_also_dead(queue: JobQueue):
     assert br.failures == 1
     _fail_once(queue, "t1", n=1)
     assert queue.get_tenant_breaker("t1").open is True
+
+
+def test_breaker_trip_still_enqueues_and_delivers_dead_webhook(queue: JobQueue):
+    """The nack that opens the breaker must still notify with the failure."""
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="wh-dead",
+            url=capture.url,
+            events=["job.dead", "job.failed"],
+            backoff_base_seconds=0,
+        )
+        queue.set_tenant_breaker(
+            "wh-dead", failure_threshold=1, window_seconds=60
+        )
+        queue.enqueue(
+            tenant_id="wh-dead",
+            payload={"kind": "fail"},
+            max_attempts=1,
+            retry_backoff_base_seconds=0,
+        )
+        job = queue.lease(tenant_id="wh-dead", worker_id="w")
+        assert job is not None
+        nacked = _nack(queue, job, "w", error="disk full", requeue=True)
+        assert nacked.status == JobStatus.DEAD
+        assert queue.get_tenant_breaker("wh-dead").open is True
+
+        pending = queue.list_webhook_deliveries(
+            tenant_id="wh-dead", status="pending"
+        )
+        assert len(pending) == 1
+        assert pending[0].event == "job.dead"
+        assert pending[0].payload.get("last_error") == "disk full"
+        assert pending[0].job_id == job.id
+
+        results = queue.process_webhook_deliveries(limit=10)
+        assert len(results) == 1
+        assert results[0].success is True
+        assert capture.received[-1]["body"]["event"] == "job.dead"
+        assert capture.received[-1]["body"]["last_error"] == "disk full"
+        assert capture.received[-1]["body"]["tenant_id"] == "wh-dead"
+    finally:
+        capture.stop()
+
+
+def test_breaker_in_flight_complete_still_sends_webhook(queue: JobQueue):
+    """A job already running when the breaker trips still notifies on finish."""
+    capture = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="wh-done",
+            url=capture.url,
+            events=["job.completed", "job.dead"],
+            backoff_base_seconds=0,
+        )
+        queue.set_tenant_breaker(
+            "wh-done", failure_threshold=1, window_seconds=60
+        )
+        live = queue.enqueue(tenant_id="wh-done", payload={"live": True})
+        leased = queue.lease(tenant_id="wh-done", worker_id="holder")
+        assert leased is not None
+        assert leased.id == live.id
+
+        queue.enqueue(
+            tenant_id="wh-done",
+            payload={"trip": True},
+            max_attempts=1,
+            retry_backoff_base_seconds=0,
+        )
+        trip = queue.lease(tenant_id="wh-done", worker_id="failer")
+        assert trip is not None
+        _nack(queue, trip, "failer", error="boom", requeue=True)
+        assert queue.get_tenant_breaker("wh-done").open is True
+
+        done = _ack(queue, leased, "holder", result={"ok": True})
+        assert done.status == JobStatus.COMPLETED
+
+        pending = [
+            d
+            for d in queue.list_webhook_deliveries(tenant_id="wh-done")
+            if d.event == "job.completed"
+        ]
+        assert len(pending) == 1
+        assert pending[0].job_id == live.id
+        assert pending[0].payload.get("result") == {"ok": True}
+
+        results = queue.process_webhook_deliveries(limit=10)
+        completed = [
+            r for r in results if r.delivery.event == "job.completed"
+        ]
+        assert len(completed) == 1
+        assert completed[0].success is True
+        bodies = [c["body"] for c in capture.received]
+        assert any(
+            b.get("event") == "job.completed" and b.get("result") == {"ok": True}
+            for b in bodies
+        )
+        assert any(
+            b.get("event") == "job.dead" and b.get("last_error") == "boom"
+            for b in bodies
+        )
+    finally:
+        capture.stop()
 
 
 def test_breaker_http_roundtrip(queue: JobQueue):
