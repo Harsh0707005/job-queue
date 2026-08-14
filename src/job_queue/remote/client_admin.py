@@ -124,6 +124,27 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def set_tenant_lease_weight(
+        self,
+        tenant_id: str,
+        weight: int | None = None,
+        *,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"clear": clear}
+        if not clear:
+            body["lease_weight"] = weight
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/lease-weight", body
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_lease_weight(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/lease-weight")
+        assert payload is not None
+        return payload
+
     def get_tenant_usage(
         self,
         tenant_id: str,

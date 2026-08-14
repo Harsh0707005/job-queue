@@ -352,6 +352,18 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/lease-weight")
+        ):
+            return self._set_lease_weight(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/lease-weight")
+        ):
+            return self._get_lease_weight(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/retention")
         ):
             return self._set_tenant_retention(path, body)

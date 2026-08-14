@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import threading
 import time
+from http.server import ThreadingHTTPServer
+
+import pytest
 
 from job_queue import Job, JobQueue, JobStatus, Worker
+from job_queue.coordinator import Coordinator, _make_handler
+from job_queue.remote import CoordinatorClient
 
 from tests.helpers_queue import (
     _ack,
@@ -345,3 +350,151 @@ def test_fair_multi_worker_respects_per_tenant_cap(queue: JobQueue):
         assert n <= 2, f"tenant {tid} leased {n} > cap 2"
     for tid in tenants:
         assert queue.count(tenant_id=tid, status=JobStatus.LEASED) <= 2
+
+
+def test_lease_weight_default_is_one(queue: JobQueue):
+    assert queue.get_tenant_lease_weight("never-set") == 1
+    assert queue.set_tenant_lease_weight("never-set", None) == 1
+    stats = queue.get_tenant_stats("ghost")
+    assert stats.lease_weight == 1
+
+
+def test_lease_weight_validation(queue: JobQueue):
+    with pytest.raises(ValueError, match="lease_weight"):
+        queue.set_tenant_lease_weight("t", 0)
+    with pytest.raises(ValueError, match="lease_weight"):
+        queue.set_tenant_lease_weight("t", 101)
+    with pytest.raises(ValueError, match="tenant_id"):
+        queue.set_tenant_lease_weight("", 2)
+
+
+def test_lease_weight_gives_more_turns_without_starving(queue: JobQueue):
+    """WFQ: weight 4/2/1 yields ~4:2:1 over a full virtual-time cycle."""
+    queue.set_tenant_lease_weight("heavy", 4)
+    queue.set_tenant_lease_weight("mid", 2)
+    # light stays at the default of 1
+    assert queue.get_tenant_lease_weight("light") == 1
+    assert queue.get_tenant_stats("heavy").lease_weight == 4
+
+    for tid in ("heavy", "mid", "light"):
+        for i in range(40):
+            queue.enqueue(tenant_id=tid, payload={"t": tid, "i": i})
+
+    order: list[str] = []
+    for _ in range(28):
+        job = queue.lease(worker_id="wfq-w")
+        assert job is not None
+        order.append(job.tenant_id)
+        _ack(queue, job, "wfq-w")
+
+    assert order.count("heavy") == 16
+    assert order.count("mid") == 8
+    assert order.count("light") == 4
+    # Low-weight tenant is served in the first cycle, not after the backlog.
+    assert "light" in order[:7]
+
+
+def test_lease_weight_equal_weights_still_round_robin(queue: JobQueue):
+    queue.set_tenant_lease_weight("a", 3)
+    queue.set_tenant_lease_weight("b", 3)
+    for tid in ("a", "b"):
+        for i in range(10):
+            queue.enqueue(tenant_id=tid, payload={"t": tid, "i": i})
+
+    first: list[str] = []
+    for _ in range(4):
+        job = queue.lease(worker_id="eq-w")
+        assert job is not None
+        first.append(job.tenant_id)
+        _ack(queue, job, "eq-w")
+    assert first.count("a") == 2
+    assert first.count("b") == 2
+
+
+def test_lease_weight_reset_returns_to_one(queue: JobQueue):
+    queue.set_tenant_lease_weight("was-heavy", 8)
+    assert queue.set_tenant_lease_weight("was-heavy", None) == 1
+    assert queue.get_tenant_lease_weight("was-heavy") == 1
+
+    queue.set_tenant_lease_weight("peer", 8)
+    for tid in ("was-heavy", "peer"):
+        for i in range(8):
+            queue.enqueue(tenant_id=tid, payload={"t": tid, "i": i})
+
+    order: list[str] = []
+    for _ in range(9):
+        job = queue.lease(worker_id="rst-w")
+        assert job is not None
+        order.append(job.tenant_id)
+        _ack(queue, job, "rst-w")
+    # 8:1 → eight peer, one was-heavy in the first cycle of 9.
+    assert order.count("peer") == 8
+    assert order.count("was-heavy") == 1
+
+
+def test_lease_weight_ignored_on_scoped_lease(queue: JobQueue):
+    queue.set_tenant_lease_weight("heavy", 10)
+    queue.set_tenant_lease_weight("light", 1)
+    for i in range(10):
+        queue.enqueue(tenant_id="heavy", payload={"i": i})
+    light = queue.enqueue(tenant_id="light", payload={"only": True})
+
+    got = queue.lease(tenant_id="light", worker_id="scoped")
+    assert got is not None
+    assert got.id == light.id
+    _ack(queue, got, "scoped")
+
+
+def test_lease_weight_priority_still_wins(queue: JobQueue):
+    queue.set_tenant_lease_weight("heavy", 10)
+    for i in range(20):
+        queue.enqueue(tenant_id="heavy", payload={"i": i}, priority=0)
+    high = queue.enqueue(tenant_id="light", payload={"t": "q"}, priority=10)
+
+    first = queue.lease(worker_id="pri-w")
+    assert first is not None
+    assert first.id == high.id
+    _ack(queue, first, "pri-w")
+
+
+def test_lease_weight_export_restore(queue: JobQueue):
+    queue.set_tenant_lease_weight("src-w", 7)
+    queue.enqueue(tenant_id="src-w", payload={"n": 1})
+    snap = queue.export_tenant("src-w")
+    rst = queue.restore_tenant(
+        "dst-w", snapshot_id=snap.id, batch_size=20, run_until_complete=True
+    )
+    assert rst.status == "complete"
+    assert queue.get_tenant_lease_weight("dst-w") == 7
+    assert queue.get_tenant_stats("dst-w").lease_weight == 7
+
+
+def test_lease_weight_http_roundtrip(queue: JobQueue):
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = CoordinatorClient(f"http://127.0.0.1:{server.server_address[1]}")
+        unset = client.get_tenant_lease_weight("http-w")
+        assert unset["lease_weight"] == 1
+        set_w = client.set_tenant_lease_weight("http-w", 5)
+        assert set_w["lease_weight"] == 5
+        got = client.get_tenant_lease_weight("http-w")
+        assert got["lease_weight"] == 5
+        client.enqueue(tenant_id="http-w", payload={"n": 1})
+        job = client.lease(tenant_id="http-w", worker_id="w")
+        assert job is not None
+        assert job.lease_token is not None
+        client.ack(
+            job.id,
+            tenant_id="http-w",
+            worker_id="w",
+            lease_token=job.lease_token,
+        )
+        cleared = client.set_tenant_lease_weight("http-w", clear=True)
+        assert cleared["lease_weight"] == 1
+        again = client.get_tenant_lease_weight("http-w")
+        assert again["lease_weight"] == 1
+    finally:
+        server.shutdown()

@@ -203,6 +203,41 @@ class TenantsApiLimitsMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
 
+    def _set_lease_weight(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if body.get("clear"):
+            raw = None
+        elif "lease_weight" not in body and "weight" not in body:
+            return 400, {
+                "error": "lease_weight required (null / clear=true resets to 1)"
+            }
+        else:
+            raw = body.get("lease_weight", body.get("weight"))
+        try:
+            weight = None if raw is None else int(raw)
+            applied = self.queue.set_tenant_lease_weight(tenant_id, weight)
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"tenant_id": tenant_id, "lease_weight": applied}
+
+    def _get_lease_weight(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            tenant_id = parts[2]
+            return 200, {
+                "tenant_id": tenant_id,
+                "lease_weight": self.queue.get_tenant_lease_weight(tenant_id),
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
     def _set_rate_limits(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:

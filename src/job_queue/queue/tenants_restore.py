@@ -527,14 +527,24 @@ class TenantsRestoreMixin:
     def _restore_tenant_fairness(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:
+        fv = raw.get("fair_virtual")
+        try:
+            fair_virtual = 0.0 if fv is None else float(fv)
+        except (TypeError, ValueError):
+            fair_virtual = 0.0
         conn.execute(
             """
-            INSERT INTO tenant_fairness (tenant_id, last_lease_at)
-            VALUES (%s, %s)
+            INSERT INTO tenant_fairness (tenant_id, last_lease_at, fair_virtual)
+            VALUES (%s, %s, %s)
             ON CONFLICT (tenant_id) DO UPDATE
-            SET last_lease_at = EXCLUDED.last_lease_at
+            SET last_lease_at = EXCLUDED.last_lease_at,
+                fair_virtual = EXCLUDED.fair_virtual
             """,
-            (target, _parse_dt(raw.get("last_lease_at")) or _utcnow()),
+            (
+                target,
+                _parse_dt(raw.get("last_lease_at")) or _utcnow(),
+                fair_virtual,
+            ),
         )
 
     def _restore_duration_estimates(
@@ -1285,6 +1295,7 @@ class TenantsRestoreMixin:
         br_t = None
         br_w = None
         br_c = None
+        lease_weight = None
         if isinstance(exported_settings, dict):
             paused = bool(exported_settings.get("paused") or False)
             max_c = exported_settings.get("max_concurrent_leases")
@@ -1305,6 +1316,7 @@ class TenantsRestoreMixin:
             br_t = exported_settings.get("breaker_failure_threshold")
             br_w = exported_settings.get("breaker_window_seconds")
             br_c = exported_settings.get("breaker_cooldown_seconds")
+            lease_weight = exported_settings.get("lease_weight")
         conn.execute(
             """
             INSERT INTO tenant_settings (
@@ -1321,6 +1333,7 @@ class TenantsRestoreMixin:
                 breaker_failure_threshold, breaker_window_seconds,
                 breaker_cooldown_seconds, breaker_failures,
                 breaker_window_start, breaker_opened_at,
+                lease_weight,
                 updated_at
             ) VALUES (
                 %s, %s, %s,
@@ -1334,6 +1347,7 @@ class TenantsRestoreMixin:
                 %s, NULL,
                 0, 0,
                 %s, %s, %s, 0, NULL, NULL,
+                %s,
                 %s
             )
             ON CONFLICT (tenant_id) DO UPDATE
@@ -1358,6 +1372,7 @@ class TenantsRestoreMixin:
                 breaker_failure_threshold = EXCLUDED.breaker_failure_threshold,
                 breaker_window_seconds = EXCLUDED.breaker_window_seconds,
                 breaker_cooldown_seconds = EXCLUDED.breaker_cooldown_seconds,
+                lease_weight = EXCLUDED.lease_weight,
                 updated_at = EXCLUDED.updated_at
             """,
             (
@@ -1381,6 +1396,7 @@ class TenantsRestoreMixin:
                 br_t,
                 br_w,
                 br_c,
+                lease_weight,
                 now,
             ),
         )

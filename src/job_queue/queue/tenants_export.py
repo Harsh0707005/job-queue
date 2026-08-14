@@ -68,10 +68,11 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "spend_enqueue_limit, spend_runtime_ms_limit, spend_window_seconds, "
         "breaker_failure_threshold, breaker_window_seconds, "
         "breaker_cooldown_seconds, "
+        "lease_weight, "
         "updated_at, restoring",
         "tenant_settings",
     ),
-    "tenant_fairness": ("tenant_id, last_lease_at", "tenant_fairness"),
+    "tenant_fairness": ("tenant_id, last_lease_at, fair_virtual", "tenant_fairness"),
     "duration_estimates": (
         "tenant_id, queue_name, kind, ewma_seconds, samples, updated_at",
         "duration_estimates",

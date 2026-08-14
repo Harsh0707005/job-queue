@@ -180,6 +180,7 @@ class TenantsConcurrencyMixin:
               AND breaker_window_seconds IS NULL
               AND breaker_cooldown_seconds IS NULL
               AND breaker_opened_at IS NULL
+              AND lease_weight IS NULL
               AND paused = FALSE
               AND offboarding = FALSE
             """,

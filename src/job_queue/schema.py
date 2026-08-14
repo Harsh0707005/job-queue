@@ -628,13 +628,30 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_breaker_failures_chec
 );
 
 -- Fair multi-tenant lease: least-recently-served tenant wins the next claim.
+-- fair_virtual is a weighted-fair score (increment 1/weight on each serve).
 CREATE TABLE IF NOT EXISTS tenant_fairness (
     tenant_id       TEXT PRIMARY KEY,
     last_lease_at   TIMESTAMPTZ NOT NULL
 );
 
+ALTER TABLE tenant_fairness ADD COLUMN IF NOT EXISTS fair_virtual DOUBLE PRECISION;
+UPDATE tenant_fairness SET fair_virtual = 0 WHERE fair_virtual IS NULL;
+ALTER TABLE tenant_fairness ALTER COLUMN fair_virtual SET DEFAULT 0;
+ALTER TABLE tenant_fairness ALTER COLUMN fair_virtual SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_tenant_fairness_last_lease
     ON tenant_fairness (last_lease_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_fairness_virtual
+    ON tenant_fairness (fair_virtual ASC);
+
+-- Per-tenant fair-lease weight (NULL / missing = 1). Higher weight gets
+-- more turns under load; WFQ virtual time still serves low-weight tenants.
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS lease_weight INTEGER;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_lease_weight_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_lease_weight_check CHECK (
+    lease_weight IS NULL OR (lease_weight >= 1 AND lease_weight <= 100)
+);
 
 -- Recurring schedules: cron expression and/or fixed interval_seconds.
 -- Prefer cron (5-field min hour dom mon dow, or 6-field with seconds).

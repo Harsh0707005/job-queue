@@ -73,7 +73,8 @@ class TenantsStatsMixin:
             SELECT max_concurrent_leases, max_pending_jobs, paused,
                    enqueue_rate_per_sec, enqueue_burst,
                    lease_rate_per_sec, lease_burst,
-                   breaker_opened_at, breaker_cooldown_seconds
+                   breaker_opened_at, breaker_cooldown_seconds,
+                   lease_weight
             FROM tenant_settings
             WHERE tenant_id = %s
             """,
@@ -111,6 +112,9 @@ class TenantsStatsMixin:
             if settings and settings["lease_burst"] is not None
             else None
         )
+        lease_weight = 1
+        if settings and settings.get("lease_weight") is not None:
+            lease_weight = max(1, int(settings["lease_weight"]))
 
         if paused or breaker_open:
             claimable = 0
@@ -149,4 +153,5 @@ class TenantsStatsMixin:
             awaiting_skills=int(counts.get(JobStatus.AWAITING_SKILLS.value) or 0),
             frozen=int(counts.get(JobStatus.FROZEN.value) or 0),
             breaker_open=breaker_open,
+            lease_weight=lease_weight,
         )

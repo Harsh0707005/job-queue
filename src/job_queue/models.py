@@ -314,6 +314,8 @@ class TenantStats:
     awaiting_skills: int = 0
     frozen: int = 0
     breaker_open: bool = False
+    # Fair-lease weight (1..100). Missing / unset is 1 (equal share).
+    lease_weight: int = 1
 
 
 @dataclass(frozen=True, slots=True)

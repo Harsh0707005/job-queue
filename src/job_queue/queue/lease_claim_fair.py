@@ -38,8 +38,11 @@ class LeaseClaimFairMixin:
     ) -> list[Job]:
         """Lease up to *limit* jobs fairly across tenants for *queue_name*.
 
-        Each claim updates ``tenant_fairness.last_lease_at`` so subsequent
-        jobs in the same batch rotate tenants within a priority lane.
+        Each claim advances ``tenant_fairness.fair_virtual`` by ``1/weight``
+        (and ``last_lease_at``) so subsequent jobs rotate tenants within a
+        priority lane. Higher-weight tenants increment slower and get more
+        turns; lower-weight tenants still become the min score and cannot
+        starve.
         """
         now = _utcnow()
         claimed: list[Job] = []
@@ -135,10 +138,12 @@ class LeaseClaimFairMixin:
     ) -> Job | None:
         token = uuid4()
         # Priority lanes first (higher priority always before lower), then
-        # least-recently-served tenant within that lane (never-served =
-        # -infinity). A noisy tenant's high-priority flood still rotates with
-        # other tenants at the same priority; it cannot leapfrog higher-priority
-        # work of quieter tenants, and low-priority noise cannot starve high.
+        # weighted virtual time within that lane (never-served = 0). A noisy
+        # tenant's high-priority flood still rotates with other tenants at
+        # the same priority; it cannot leapfrog higher-priority work of
+        # quieter tenants, and low-priority noise cannot starve high.
+        # Higher lease_weight increments virtual time slower (more turns)
+        # without starving weight-1 tenants.
         excluded = sorted(exclude_tenants or ())
         exclude_sql = ""
         part_sql = ""
@@ -228,6 +233,14 @@ class LeaseClaimFairMixin:
                 - COALESCE(estimated_duration_seconds, 60)) ASC,
               COALESCE(
                 (
+                    SELECT tf.fair_virtual
+                    FROM tenant_fairness tf
+                    WHERE tf.tenant_id = jobs.tenant_id
+                ),
+                0
+              ) ASC,
+              COALESCE(
+                (
                     SELECT tf.last_lease_at
                     FROM tenant_fairness tf
                     WHERE tf.tenant_id = jobs.tenant_id
@@ -299,15 +312,7 @@ class LeaseClaimFairMixin:
             # Token-bucket lease rate: skip + rotate LRS so other tenants
             # keep getting work while this tenant waits for tokens.
             if not self._try_consume_lease_rate(conn, candidate["tenant_id"], now=now):
-                conn.execute(
-                    """
-                    INSERT INTO tenant_fairness (tenant_id, last_lease_at)
-                    VALUES (%s, clock_timestamp())
-                    ON CONFLICT (tenant_id) DO UPDATE
-                    SET last_lease_at = clock_timestamp()
-                    """,
-                    (candidate["tenant_id"],),
-                )
+                self._touch_tenant_fairness(conn, candidate["tenant_id"])
                 raise _SkipLeaseCandidate(
                     "tenant lease rate limited",
                     tenant_id=candidate["tenant_id"],
@@ -321,16 +326,6 @@ class LeaseClaimFairMixin:
             visibility_timeout_seconds=visibility_timeout_seconds,
             now=now,
         )
-        # Record that this tenant was just served (drives next fair pick).
-        # Use clock_timestamp() so successive claims in the same batch get
-        # distinct last_lease_at values and rotate tenants correctly.
-        conn.execute(
-            """
-            INSERT INTO tenant_fairness (tenant_id, last_lease_at)
-            VALUES (%s, clock_timestamp())
-            ON CONFLICT (tenant_id) DO UPDATE
-            SET last_lease_at = clock_timestamp()
-            """,
-            (claimed.tenant_id,),
-        )
+        # Weighted virtual time + LRS tie-break (drives the next fair pick).
+        self._touch_tenant_fairness(conn, claimed.tenant_id)
         return claimed
