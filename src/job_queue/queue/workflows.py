@@ -27,6 +27,7 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     CancelError,
+    QueueDrainError,
     _JOB_COLUMNS,
     _as_utc,
     _normalize_skills,
@@ -90,6 +91,12 @@ class WorkflowsMixin:
         now = _utcnow()
         rid = run_id or uuid4()
         with transaction(self._pool) as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (tenant_id,),
+            )
+            if hasattr(self, "_assert_queue_accepts_enqueue"):
+                self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
             sealed_steps, steps_key_id = self._seal_dict(
                 conn,
                 tenant_id=tenant_id,
@@ -778,7 +785,116 @@ class WorkflowsMixin:
                     fixed += 1
             except Exception:  # noqa: BLE001
                 continue
+
+        # Resume forward fan-out that drain skipped (step ack must not raise).
+        remaining = limit - fixed
+        if remaining > 0:
+            fixed += self._redrive_ready_forward_runs(
+                tenant_id=tenant_id, limit=remaining
+            )
         return fixed
+
+    def _redrive_ready_forward_runs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 50,
+    ) -> int:
+        """Enqueue skipped next-forward steps once the queue is not draining."""
+        params: list[Any] = [WorkflowRunStatus.RUNNING.value]
+        tclause = ""
+        if tenant_id is not None:
+            tclause = "AND tenant_id = %s"
+            params.append(str(tenant_id).strip())
+        params.append(limit)
+        with self._pool.connection() as conn:
+            run_ids = [
+                r["id"]
+                for r in conn.execute(
+                    f"""
+                    SELECT id
+                    FROM workflow_runs
+                    WHERE status = %s
+                    {tclause}
+                    ORDER BY updated_at ASC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                ).fetchall()
+            ]
+        fixed = 0
+        for rid in run_ids:
+            if fixed >= limit:
+                break
+            try:
+                if self._redrive_one_ready_forward_run(rid):
+                    fixed += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return fixed
+
+    def _redrive_one_ready_forward_run(self, run_id: UUID) -> bool:
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            run = conn.execute(
+                f"""
+                SELECT {_RUN_COLUMNS}
+                FROM workflow_runs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None or run["status"] != WorkflowRunStatus.RUNNING.value:
+                return False
+            qn = self._workflow_queue_name(conn, run_id) or "default"
+            if hasattr(self, "_is_queue_draining") and self._is_queue_draining(
+                conn, str(run["tenant_id"]), qn
+            ):
+                return False
+            job = conn.execute(
+                f"""
+                SELECT max_attempts, visibility_timeout_seconds
+                FROM jobs
+                WHERE id IN (
+                    SELECT job_id FROM workflow_step_runs
+                    WHERE run_id = %s AND job_id IS NOT NULL
+                )
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            n = self._enqueue_ready_forward_steps(
+                conn,
+                run_id=run_id,
+                tenant_id=str(run["tenant_id"]),
+                steps_def=self._parse_steps_def(run, conn),
+                queue_name=qn,
+                max_attempts=int(job["max_attempts"]) if job else 3,
+                visibility_timeout_seconds=(
+                    int(job["visibility_timeout_seconds"]) if job else 30
+                ),
+                now=now,
+            )
+            return n > 0
+
+    @staticmethod
+    def _workflow_queue_name(conn: Any, run_id: UUID) -> str | None:
+        row = conn.execute(
+            """
+            SELECT j.queue_name
+            FROM workflow_step_runs s
+            JOIN jobs j ON j.id = s.job_id
+            WHERE s.run_id = %s
+            ORDER BY s.step_index ASC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None or not row.get("queue_name"):
+            return None
+        return str(row["queue_name"])
 
     def _repair_one_stuck_compensate_step(self, step_id: UUID) -> bool:
         """Redrive a single compensate step whose job is terminal/missing."""
@@ -1057,6 +1173,12 @@ class WorkflowsMixin:
         now: Any,
     ) -> int:
         """Enqueue every forward step whose dependencies are all completed."""
+        if hasattr(self, "_is_queue_draining") and self._is_queue_draining(
+            conn, tenant_id, queue_name
+        ):
+            # Drain closes intake. Do not raise — callers include the step
+            # ack transaction, which must still complete the finished job.
+            return 0
         st = conn.execute(
             "SELECT status FROM workflow_runs WHERE id = %s",
             (run_id,),
@@ -1839,6 +1961,16 @@ class WorkflowsMixin:
             return step_row
         idx = int(step_row["step_index"])
         direction = step_row["direction"]
+        # Forward intake is blocked on a drained queue. Compensate is cleanup
+        # of work already accepted, so it may still enqueue.
+        if (
+            direction != WorkflowStepDirection.COMPENSATE.value
+            and hasattr(self, "_assert_queue_accepts_enqueue")
+        ):
+            try:
+                self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
+            except QueueDrainError:
+                return step_row
         sdef = steps_def[idx]
         if direction == WorkflowStepDirection.COMPENSATE.value:
             action = dict(sdef.get("compensate") or {})

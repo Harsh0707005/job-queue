@@ -27,10 +27,11 @@ class TenantsDrainMixin:
     def drain_tenant_queue(self, tenant_id: str, queue_name: str) -> list[str]:
         """Stop new intake on one queue. Existing jobs still lease and finish.
 
-        New enqueues, DAG creates, spawn children, dead-letter replays, and
-        schedule fires into *queue_name* are rejected or skipped. Other
-        queues on the same tenant are unchanged. This is not a tenant pause:
-        pending and in-flight work on the drained queue keep running.
+        New enqueues, DAG creates, spawn children, dead-letter replays,
+        workflow starts / next forward steps, and schedule fires into
+        *queue_name* are rejected or skipped. Other queues on the same
+        tenant are unchanged. This is not a tenant pause: pending and
+        in-flight work on the drained queue keep running.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")

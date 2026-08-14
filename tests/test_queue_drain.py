@@ -9,8 +9,9 @@ import pytest
 
 from job_queue import JobQueue, JobStatus, QueueDrainError, ReplayError, SpawnError
 from job_queue.coordinator import Coordinator, _make_handler
+from job_queue.models import WorkflowRunStatus, WorkflowStepStatus
 from job_queue.remote import CoordinatorClient
-from tests.helpers_queue import _ack, _hb
+from tests.helpers_queue import _ack, _hb, _nack
 
 
 def test_drain_blocks_new_enqueue_other_queue_works(queue: JobQueue):
@@ -244,5 +245,179 @@ def test_drain_http_roundtrip(queue: JobQueue):
             tenant_id="http-d", queue_name="email", payload={"after": True}
         )
         assert again.queue_name == "email"
+    finally:
+        server.shutdown()
+
+
+def _wf_steps(*, fail_last: bool = False) -> list[dict]:
+    steps = [
+        {
+            "name": "reserve",
+            "kind": "effect",
+            "payload": {"op": "reserve"},
+            "compensate": {"kind": "effect", "payload": {"op": "release"}},
+        },
+        {
+            "name": "charge",
+            "kind": "effect",
+            "payload": {"op": "charge"},
+            "compensate": {"kind": "effect", "payload": {"op": "refund"}},
+        },
+    ]
+    if fail_last:
+        steps[-1]["fail"] = True
+        steps[-1]["fail_error"] = "forced"
+    return steps
+
+
+def test_drain_blocks_start_workflow_no_run_no_jobs(queue: JobQueue):
+    queue.drain_tenant_queue("wf-d", "email")
+    with pytest.raises(QueueDrainError, match="draining"):
+        queue.start_workflow(
+            tenant_id="wf-d",
+            queue_name="email",
+            max_attempts=1,
+            steps=_wf_steps(),
+        )
+    assert queue.count(tenant_id="wf-d") == 0
+    with queue._pool.connection() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*)::int AS n FROM workflow_runs WHERE tenant_id = %s",
+            ("wf-d",),
+        ).fetchone()["n"]
+    assert n == 0
+
+
+def test_drain_workflow_other_queue_and_tenant_still_start(queue: JobQueue):
+    queue.drain_tenant_queue("wf-d", "email")
+    ok = queue.start_workflow(
+        tenant_id="wf-d",
+        queue_name="sms",
+        max_attempts=1,
+        steps=_wf_steps(),
+    )
+    assert ok.status == WorkflowRunStatus.RUNNING.value
+    assert queue.count(tenant_id="wf-d", queue_name="sms") == 1
+    assert queue.count(tenant_id="wf-d", queue_name="email") == 0
+    peer = queue.start_workflow(
+        tenant_id="wf-other",
+        queue_name="email",
+        max_attempts=1,
+        steps=_wf_steps(),
+    )
+    assert peer.status == WorkflowRunStatus.RUNNING.value
+    assert queue.count(tenant_id="wf-other", queue_name="email") == 1
+
+
+def test_drain_blocks_next_workflow_step_but_finished_step_acks(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="wf-mid",
+        queue_name="email",
+        max_attempts=1,
+        steps=_wf_steps(),
+    )
+    assert queue.count(tenant_id="wf-mid", queue_name="email") == 1
+    queue.drain_tenant_queue("wf-mid", "email")
+    first = queue.lease(tenant_id="wf-mid", worker_id="w", queue_name="email")
+    assert first is not None
+    _ack(queue, first, "w", result={"ok": True})
+    # Step 1 finished; drain must not insert step 2.
+    assert queue.count(tenant_id="wf-mid", queue_name="email", status=JobStatus.PENDING) == 0
+    assert queue.count(tenant_id="wf-mid", queue_name="email", status=JobStatus.LEASED) == 0
+    still = queue.get_workflow(run.id, tenant_id="wf-mid")
+    assert still is not None
+    assert still.status == WorkflowRunStatus.RUNNING.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="wf-mid")
+    forwards = [s for s in steps if s.direction == "forward"]
+    assert len(forwards) == 1
+    assert forwards[0].status == WorkflowStepStatus.COMPLETED.value
+    # Redrive while still draining must not sneak a job in.
+    assert queue.process_workflow_compensation(tenant_id="wf-mid", limit=20) == 0
+    assert queue.count(tenant_id="wf-mid", queue_name="email", status=JobStatus.PENDING) == 0
+
+
+def test_undrain_redrives_blocked_workflow_next_step(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="wf-go",
+        queue_name="email",
+        max_attempts=1,
+        steps=_wf_steps(),
+    )
+    queue.drain_tenant_queue("wf-go", "email")
+    first = queue.lease(tenant_id="wf-go", worker_id="w", queue_name="email")
+    assert first is not None
+    _ack(queue, first, "w", result={"ok": True})
+    assert queue.count(tenant_id="wf-go", queue_name="email", status=JobStatus.PENDING) == 0
+    queue.undrain_tenant_queue("wf-go", "email")
+    n = queue.process_workflow_compensation(tenant_id="wf-go", limit=20)
+    assert n >= 1
+    assert queue.count(tenant_id="wf-go", queue_name="email", status=JobStatus.PENDING) == 1
+    second = queue.lease(tenant_id="wf-go", worker_id="w", queue_name="email")
+    assert second is not None
+    assert second.payload.get("step_name") == "charge"
+    _ack(queue, second, "w", result={"ok": True})
+    done = queue.get_workflow(run.id, tenant_id="wf-go")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+
+
+def test_drain_allows_workflow_compensate_cleanup(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="wf-c",
+        queue_name="email",
+        max_attempts=1,
+        steps=_wf_steps(fail_last=True),
+    )
+    first = queue.lease(tenant_id="wf-c", worker_id="w", queue_name="email")
+    assert first is not None
+    _ack(queue, first, "w", result={"ok": True})
+    queue.drain_tenant_queue("wf-c", "email")
+    boom = queue.lease(tenant_id="wf-c", worker_id="w", queue_name="email")
+    assert boom is not None
+    _nack(queue, boom, "w", error="forced", requeue=True)
+    # Compensate for the completed first step is cleanup, not intake.
+    pending = queue.count(
+        tenant_id="wf-c", queue_name="email", status=JobStatus.PENDING
+    )
+    assert pending >= 1
+    undo = queue.lease(tenant_id="wf-c", worker_id="w", queue_name="email")
+    assert undo is not None
+    assert undo.payload.get("direction") == "compensate"
+    _ack(queue, undo, "w", result={"undone": True})
+    done = queue.get_workflow(run.id, tenant_id="wf-c")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.FAILED.value
+
+
+def test_drain_workflow_http_start_rejected(queue: JobQueue):
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = CoordinatorClient(f"http://127.0.0.1:{server.server_address[1]}")
+        client.drain_tenant_queue("http-wf", "email")
+        with pytest.raises(QueueDrainError):
+            client.start_workflow(
+                tenant_id="http-wf",
+                queue_name="email",
+                max_attempts=1,
+                steps=_wf_steps(),
+            )
+        sms = client.start_workflow(
+            tenant_id="http-wf",
+            queue_name="sms",
+            max_attempts=1,
+            steps=_wf_steps(),
+        )
+        assert sms["run"]["status"] == WorkflowRunStatus.RUNNING.value
+        client.undrain_tenant_queue("http-wf", "email")
+        again = client.start_workflow(
+            tenant_id="http-wf",
+            queue_name="email",
+            max_attempts=1,
+            steps=_wf_steps(),
+        )
+        assert again["run"]["status"] == WorkflowRunStatus.RUNNING.value
     finally:
         server.shutdown()
