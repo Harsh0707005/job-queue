@@ -374,6 +374,48 @@ def test_failed_worker_takes_sibling_not_poison_again(queue: JobQueue):
     assert other is not None and other.id == poison.id
 
 
+def test_all_workers_failed_once_still_retries_when_hop_cap_higher(queue: JobQueue):
+    """Hop cap > worker count must not leave the job pending forever."""
+    queue.register_worker("round-a")
+    queue.register_worker("round-b")
+    job = queue.enqueue(
+        tenant_id="fw-round",
+        payload={"poison": True},
+        max_attempts=20,
+        max_worker_hops=5,
+        quarantine_action="dead",
+        retry_backoff_base_seconds=0,
+    )
+    a = queue.lease(tenant_id="fw-round", worker_id="round-a")
+    assert a is not None
+    _nack(queue, a, "round-a", error="1")
+    assert queue.lease(tenant_id="fw-round", worker_id="round-a") is None
+    b = queue.lease(tenant_id="fw-round", worker_id="round-b")
+    assert b is not None
+    _nack(queue, b, "round-b", error="2")
+    mid = queue.get(job.id, tenant_id="fw-round")
+    assert mid is not None and mid.status == JobStatus.PENDING
+    assert set(mid.failed_workers) == {"round-a", "round-b"}
+
+    # Both have failed once; someone must still be able to claim.
+    again = queue.lease(tenant_id="fw-round", worker_id="round-a")
+    if again is None:
+        again = queue.lease(tenant_id="fw-round", worker_id="round-b")
+    assert again is not None
+    _nack(queue, again, again.leased_by or "round-a", error="3")
+    # Drain remaining hops (5 total).
+    for i in range(4, 6):
+        nxt = queue.lease(tenant_id="fw-round", worker_id="round-a")
+        if nxt is None:
+            nxt = queue.lease(tenant_id="fw-round", worker_id="round-b")
+        assert nxt is not None, f"stalled before hop {i}"
+        out = _nack(queue, nxt, nxt.leased_by or "round-a", error=str(i))
+    got = queue.get(job.id, tenant_id="fw-round")
+    assert got is not None and got.status == JobStatus.DEAD
+    assert len(got.failed_workers) == 5
+    assert set(got.failed_workers) == {"round-a", "round-b"}
+
+
 def test_solo_registered_worker_can_still_retry_and_quarantine(queue: JobQueue):
     queue.register_worker("solo")
     job = queue.enqueue(

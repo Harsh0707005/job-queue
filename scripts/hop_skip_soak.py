@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fleet soak: a failing job hops to *other* workers, then quarantines.
+"""Fleet soak: failing jobs hop to unused workers, then keep going.
 
   * Dual coordinators, four registered workers, several tenants.
-  * Poison jobs (kind=fail) with hop cap 2. The worker that just nacked
-    must not grab the same job again while peers are live.
-  * failed_workers on each poison job are distinct until quarantine.
+  * Hop cap is *higher than* the worker count so every worker fails the
+    poison job once, then retries must continue (no forever-pending).
+  * A worker that just nacked is skipped only while a peer has not yet
+    failed that job.
   * Healthy jobs on the same tenants still complete.
 """
 
@@ -37,7 +38,8 @@ DEAD_TENANTS = int(os.environ.get("DEAD_TENANTS", "3") or "3")
 REL_TENANTS = int(os.environ.get("REL_TENANTS", "3") or "3")
 POISON_EACH = int(os.environ.get("POISON_EACH", "4") or "4")
 HEALTHY_EACH = int(os.environ.get("HEALTHY_EACH", "8") or "8")
-HOPS = int(os.environ.get("MAX_WORKER_HOPS", "2") or "2")
+HOPS = int(os.environ.get("MAX_WORKER_HOPS", "6") or "6")
+WORKER_COUNT = int(os.environ.get("WORKER_COUNT", "4") or "4")
 MAX_WALL = int(os.environ.get("MAX_WALL_SECONDS", "180") or "180")
 _rr = 0
 
@@ -103,10 +105,11 @@ def list_jobs(tid: str) -> list[dict[str, Any]]:
 
 def main() -> int:
     logger.info(
-        "hop-skip soak dead_tenants=%d rel_tenants=%d hops=%d",
+        "hop-skip soak dead_tenants=%d rel_tenants=%d hops=%d workers=%d",
         DEAD_TENANTS,
         REL_TENANTS,
         HOPS,
+        WORKER_COUNT,
     )
     wait_coords()
 
@@ -174,23 +177,17 @@ def main() -> int:
                     healthy_done += 1
                 elif st == "dead":
                     poison_dead += 1
-                    if len(hops) != HOPS:
-                        raise RuntimeError(
-                            f"{tid} dead hops={hops} want {HOPS} unique"
-                        )
-                    if len(set(hops)) != HOPS:
-                        raise RuntimeError(
-                            f"{tid} same worker retried before hop: {hops}"
-                        )
+                    _assert_terminal_hops(tid, hops, kind="dead")
                 elif st == "quarantined":
                     poison_parked += 1
-                    if len(set(hops)) != HOPS:
-                        raise RuntimeError(
-                            f"{tid} parked hops not distinct: {hops}"
-                        )
+                    _assert_terminal_hops(tid, hops, kind="parked")
                 elif st in ("pending", "leased"):
                     hopping += 1
-                    if len(hops) != len(set(hops)):
+                    # Duplicate hops are only a bug *before* every worker
+                    # has had a turn.
+                    if hops and len(set(hops)) < WORKER_COUNT and len(hops) != len(
+                        set(hops)
+                    ):
                         same_worker_retry += 1
         now = time.time()
         if now - last >= 2:
@@ -222,15 +219,30 @@ def main() -> int:
                     f"parked={poison_parked} want {want_park}"
                 )
             logger.info(
-                "hop-skip soak OK healthy=%d dead=%d parked=%d distinct_hops=%d",
+                "hop-skip soak OK healthy=%d dead=%d parked=%d hops=%d workers=%d",
                 healthy_done,
                 poison_dead,
                 poison_parked,
                 HOPS,
+                WORKER_COUNT,
             )
             return 0
         time.sleep(0.4)
     raise RuntimeError("hop-skip soak timed out")
+
+
+def _assert_terminal_hops(tid: str, hops: list, *, kind: str) -> None:
+    if len(hops) != HOPS:
+        raise RuntimeError(f"{tid} {kind} hops={hops} want length {HOPS}")
+    uniq = set(hops)
+    if HOPS <= WORKER_COUNT:
+        if len(uniq) != HOPS:
+            raise RuntimeError(f"{tid} {kind} hops not distinct: {hops}")
+    else:
+        if len(uniq) < WORKER_COUNT:
+            raise RuntimeError(
+                f"{tid} {kind} never reached every worker: {hops}"
+            )
 
 
 if __name__ == "__main__":

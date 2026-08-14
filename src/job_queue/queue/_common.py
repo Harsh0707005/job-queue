@@ -169,18 +169,21 @@ def _row_has_required_skills(row: Any) -> bool:
 
 
 def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
-    """Skip jobs this worker already failed when another worker can take them.
+    """Skip jobs this worker already failed when a *fresh* peer can take them.
 
     Binds *worker_id* three times: ``failed_workers`` membership, expired
-    self-reclaim, and the other-active-worker EXISTS. When no other
-    capable worker is registered the clause is a no-op so a solo worker
-    can still retry and trip hop quarantine.
+    self-reclaim, and the unused-peer EXISTS. A peer counts only if they
+    are active, capable, and **not already in** ``failed_workers``. Once
+    every capable worker has failed the job, the clause is a no-op so
+    retries continue until hop quarantine trips (hop cap may exceed the
+    worker count). Solo / unregistered fleets are also a no-op.
     """
     skills = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
+    failed = f"COALESCE({jobs_alias}.failed_workers, '{{}}'::text[])"
     return f"""
               AND NOT (
                     (
-                        %s = ANY(COALESCE({jobs_alias}.failed_workers, '{{}}'::text[]))
+                        %s = ANY({failed})
                         OR (
                             {jobs_alias}.status = 'leased'
                             AND {jobs_alias}.leased_by = %s
@@ -191,6 +194,7 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
                         FROM worker_nodes wn
                         WHERE wn.status = 'active'
                           AND wn.worker_id <> %s
+                          AND NOT (wn.worker_id = ANY({failed}))
                           AND (
                                 {skills} = '{{}}'::text[]
                                 OR {skills} <@ COALESCE(wn.skills, '{{}}'::text[])
