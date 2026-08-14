@@ -213,6 +213,24 @@ class BulkCancelResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BulkFreezeResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.freeze_matching` / unfreeze.
+
+    ``count`` is the number of rows changed across all batches.
+    ``action`` is ``freeze`` or ``unfreeze``. ``jobs`` is a sample (capped).
+    ``complete`` is True when no matching target rows remain.
+    """
+
+    tenant_id: str
+    action: str
+    count: int
+    jobs: tuple[Job, ...]
+    complete: bool = True
+    remaining_estimate: int = 0
+    batches: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class Schedule:
     """A recurring schedule that materializes jobs on a cron or fixed interval.
 

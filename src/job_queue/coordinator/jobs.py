@@ -11,6 +11,7 @@ from uuid import UUID
 
 from job_queue.codec import (
     bulk_cancel_result_to_dict,
+    bulk_freeze_result_to_dict,
     dag_enqueue_result_to_dict,
     job_to_dict,
     schedule_to_dict,
@@ -435,6 +436,50 @@ class JobsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, bulk_cancel_result_to_dict(result)
+
+    def _freeze_matching(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id required"}
+        try:
+            max_jobs = body.get("max_jobs", body.get("limit"))
+            result = self.queue.freeze_matching(
+                tenant_id=str(tenant_id),
+                labels=body.get("labels"),
+                status=body.get("status"),
+                queue_name=(
+                    str(body["queue_name"])
+                    if body.get("queue_name") is not None
+                    else None
+                ),
+                reason=body.get("reason"),
+                batch_size=int(body.get("batch_size") or 500),
+                max_jobs=(None if max_jobs is None else int(max_jobs)),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, bulk_freeze_result_to_dict(result)
+
+    def _unfreeze_matching(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id required"}
+        try:
+            max_jobs = body.get("max_jobs", body.get("limit"))
+            result = self.queue.unfreeze_matching(
+                tenant_id=str(tenant_id),
+                labels=body.get("labels"),
+                queue_name=(
+                    str(body["queue_name"])
+                    if body.get("queue_name") is not None
+                    else None
+                ),
+                batch_size=int(body.get("batch_size") or 500),
+                max_jobs=(None if max_jobs is None else int(max_jobs)),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, bulk_freeze_result_to_dict(result)
 
     def _get_job(
         self, path: str, query: dict[str, list[str]]

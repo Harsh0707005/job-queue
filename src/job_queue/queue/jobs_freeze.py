@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from job_queue.db import transaction
@@ -18,6 +20,7 @@ _FREEZEABLE = (
     JobStatus.LEASED,
     JobStatus.AWAITING_SKILLS,
 )
+_FREEZEABLE_VALUES = tuple(s.value for s in _FREEZEABLE)
 
 
 class JobsFreezeMixin:
@@ -63,33 +66,9 @@ class JobsFreezeMixin:
                     f"or awaiting_skills jobs freeze)",
                     job=job,
                 )
-            updated = conn.execute(
-                f"""
-                UPDATE jobs
-                SET status = %s,
-                    leased_by = NULL,
-                    lease_token = NULL,
-                    lease_tenant_id = NULL,
-                    lease_expires_at = NULL,
-                    lease_started_at = NULL,
-                    last_error = %s,
-                    updated_at = %s
-                WHERE id = %s
-                  AND tenant_id = %s
-                  AND status IN (%s, %s, %s)
-                RETURNING {_JOB_COLUMNS}
-                """,
-                (
-                    JobStatus.FROZEN.value,
-                    err[:2000],
-                    now,
-                    job_id,
-                    tenant_id,
-                    JobStatus.PENDING.value,
-                    JobStatus.LEASED.value,
-                    JobStatus.AWAITING_SKILLS.value,
-                ),
-            ).fetchone()
+            updated = self._freeze_locked_row(
+                conn, row=row, tenant_id=tenant_id, now=now, reason=err
+            )
             if updated is None:
                 current = conn.execute(
                     f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s AND tenant_id = %s",
@@ -100,25 +79,7 @@ class JobsFreezeMixin:
                     f"job {job_id} cannot be frozen (status changed during freeze)",
                     job=current_job,
                 )
-            if hasattr(self, "_append_job_audit"):
-                self._append_job_audit(
-                    conn,
-                    job_row=updated,
-                    event_type="frozen",
-                    from_status=job.status.value,
-                    actor=None,
-                    detail={"reason": err, "was_leased": job.status == JobStatus.LEASED},
-                    now=now,
-                )
-            if job.status == JobStatus.LEASED and hasattr(
-                self, "_record_lease_end_usage"
-            ):
-                self._record_lease_end_usage(conn, row, now=now)
-            if hasattr(self, "_record_metric"):
-                self._record_metric(
-                    conn, tenant_id=tenant_id, metric="freeze", count=1, now=now
-                )
-            return self._job(updated)
+            return updated
 
     def unfreeze(self, job_id: UUID, *, tenant_id: str) -> Job:
         """Release a frozen job back to pending so it can be leased again."""
@@ -145,27 +106,9 @@ class JobsFreezeMixin:
                     f"job {job_id} is not frozen (status={job.status.value})",
                     job=job,
                 )
-            updated = conn.execute(
-                f"""
-                UPDATE jobs
-                SET status = %s,
-                    available_at = %s,
-                    last_error = NULL,
-                    updated_at = %s
-                WHERE id = %s
-                  AND tenant_id = %s
-                  AND status = %s
-                RETURNING {_JOB_COLUMNS}
-                """,
-                (
-                    JobStatus.PENDING.value,
-                    now,
-                    now,
-                    job_id,
-                    tenant_id,
-                    JobStatus.FROZEN.value,
-                ),
-            ).fetchone()
+            updated = self._unfreeze_locked_row(
+                conn, row=row, tenant_id=tenant_id, now=now
+            )
             if updated is None:
                 current = conn.execute(
                     f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s AND tenant_id = %s",
@@ -176,17 +119,119 @@ class JobsFreezeMixin:
                     f"job {job_id} cannot be unfrozen (status changed)",
                     job=current_job,
                 )
-            if hasattr(self, "_append_job_audit"):
-                self._append_job_audit(
-                    conn,
-                    job_row=updated,
-                    event_type="unfrozen",
-                    from_status=JobStatus.FROZEN.value,
-                    actor=None,
-                    detail={},
-                    now=now,
-                )
-            return self._job(updated)
+            return updated
+
+    def _freeze_locked_row(
+        self,
+        conn: Any,
+        *,
+        row: dict[str, Any],
+        tenant_id: str,
+        now: datetime,
+        reason: str,
+    ) -> Job | None:
+        """Freeze one already-locked freezeable row. None if the race lost."""
+        status = row["status"]
+        if status == JobStatus.FROZEN.value:
+            return self._job(row)
+        if status not in _FREEZEABLE_VALUES:
+            return None
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = NULL,
+                lease_token = NULL,
+                lease_tenant_id = NULL,
+                lease_expires_at = NULL,
+                lease_started_at = NULL,
+                last_error = %s,
+                updated_at = %s
+            WHERE id = %s
+              AND tenant_id = %s
+              AND status IN (%s, %s, %s)
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.FROZEN.value,
+                reason[:2000],
+                now,
+                row["id"],
+                tenant_id,
+                JobStatus.PENDING.value,
+                JobStatus.LEASED.value,
+                JobStatus.AWAITING_SKILLS.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return None
+        if hasattr(self, "_append_job_audit"):
+            self._append_job_audit(
+                conn,
+                job_row=updated,
+                event_type="frozen",
+                from_status=status,
+                actor=None,
+                detail={
+                    "reason": reason,
+                    "was_leased": status == JobStatus.LEASED.value,
+                },
+                now=now,
+            )
+        if status == JobStatus.LEASED.value and hasattr(
+            self, "_record_lease_end_usage"
+        ):
+            self._record_lease_end_usage(conn, row, now=now)
+        if hasattr(self, "_record_metric"):
+            self._record_metric(
+                conn, tenant_id=tenant_id, metric="freeze", count=1, now=now
+            )
+        return self._job(updated)
+
+    def _unfreeze_locked_row(
+        self,
+        conn: Any,
+        *,
+        row: dict[str, Any],
+        tenant_id: str,
+        now: datetime,
+    ) -> Job | None:
+        if row["status"] != JobStatus.FROZEN.value:
+            return None
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                available_at = %s,
+                last_error = NULL,
+                updated_at = %s
+            WHERE id = %s
+              AND tenant_id = %s
+              AND status = %s
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.PENDING.value,
+                now,
+                now,
+                row["id"],
+                tenant_id,
+                JobStatus.FROZEN.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return None
+        if hasattr(self, "_append_job_audit"):
+            self._append_job_audit(
+                conn,
+                job_row=updated,
+                event_type="unfrozen",
+                from_status=JobStatus.FROZEN.value,
+                actor=None,
+                detail={},
+                now=now,
+            )
+        return self._job(updated)
 
     def dead_letter_frozen(
         self,

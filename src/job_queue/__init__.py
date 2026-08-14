@@ -3,6 +3,7 @@
 from job_queue.models import (
     AuditConsistencyReport,
     BulkCancelResult,
+    BulkFreezeResult,
     ClaimedWebhook,
     DagEnqueueResult,
     DrainResult,
@@ -91,6 +92,7 @@ __all__ = [
     "ApprovalRequested",
     "AuditConsistencyReport",
     "BulkCancelResult",
+    "BulkFreezeResult",
     "CancelError",
     "FreezeError",
     "ChildrenAwaited",

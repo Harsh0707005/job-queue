@@ -51,6 +51,10 @@ class RoutingMixin:
             return self._list_jobs(query)
         if method == "POST" and path == "/v1/jobs/cancel-matching":
             return self._cancel_matching(body)
+        if method == "POST" and path == "/v1/jobs/freeze-matching":
+            return self._freeze_matching(body)
+        if method == "POST" and path == "/v1/jobs/unfreeze-matching":
+            return self._unfreeze_matching(body)
         if method == "POST" and path == "/v1/lease":
             return self._lease(body)
         if method == "POST" and path == "/v1/deadlines/process":

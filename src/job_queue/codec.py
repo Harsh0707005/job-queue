@@ -10,6 +10,7 @@ from job_queue.crypto import redact_payload
 from job_queue.models import (
     AuditConsistencyReport,
     BulkCancelResult,
+    BulkFreezeResult,
     ClaimedWebhook,
     DagEnqueueResult,
     Job,
@@ -214,6 +215,20 @@ def spawn_children_result_to_dict(result: SpawnChildrenResult) -> dict[str, Any]
     return {
         "parent": job_to_dict(result.parent),
         "children": [job_to_dict(c) for c in result.children],
+    }
+
+
+def bulk_freeze_result_to_dict(result: BulkFreezeResult) -> dict[str, Any]:
+    return {
+        "tenant_id": result.tenant_id,
+        "action": result.action,
+        "count": result.count,
+        "frozen": result.count if result.action == "freeze" else 0,
+        "unfrozen": result.count if result.action == "unfreeze" else 0,
+        "jobs": [job_to_dict(j) for j in result.jobs],
+        "complete": result.complete,
+        "remaining_estimate": result.remaining_estimate,
+        "batches": result.batches,
     }
 
 
