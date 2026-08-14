@@ -21,6 +21,7 @@ from job_queue.queue import (
     CancelError,
     DependencyError,
     FreezeError,
+    PriorityError,
     LeaseError,
     RateLimitError,
     SpendCapError,
@@ -191,6 +192,49 @@ class JobsApiMixin:
         if len(jobs_out) == 1:
             payload["job"] = jobs_out[0]
         return 200, payload
+
+    def _set_job_priority(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        has_pri = "priority" in body
+        has_delta = "delta" in body
+        if has_pri == has_delta:
+            return 400, {"error": "pass exactly one of priority or delta"}
+        try:
+            if has_pri:
+                if body["priority"] is None:
+                    return 400, {"error": "priority is required"}
+                job = self.queue.set_job_priority(
+                    UUID(job_id_s),
+                    tenant_id=str(tenant_id),
+                    priority=int(body["priority"]),
+                )
+            else:
+                if body["delta"] is None:
+                    return 400, {"error": "delta is required"}
+                job = self.queue.set_job_priority(
+                    UUID(job_id_s),
+                    tenant_id=str(tenant_id),
+                    delta=int(body["delta"]),
+                )
+        except PriorityError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "priority_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
 
     def _cancel_job(
         self, path: str, body: dict[str, Any]

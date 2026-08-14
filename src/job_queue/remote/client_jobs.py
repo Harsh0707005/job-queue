@@ -220,6 +220,25 @@ class ClientJobsMixin:
         assert payload is not None
         return job_from_dict(payload["job"])
 
+    def set_job_priority(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        priority: int | None = None,
+        delta: int | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if priority is not None:
+            body["priority"] = priority
+        if delta is not None:
+            body["delta"] = delta
+        payload = self._request(
+            "POST", f"/v1/jobs/{job_id}/priority", body
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(
             "POST",

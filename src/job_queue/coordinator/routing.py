@@ -163,6 +163,12 @@ class RoutingMixin:
             and path.endswith("/cancel")
         ):
             return self._cancel_job(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/priority")
+        ):
+            return self._set_job_priority(path, body)
         if method == "POST" and path == "/v1/approvals/process-timeouts":
             return self._process_approval_timeouts(body)
         if method == "GET" and path == "/v1/approvals":

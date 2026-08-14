@@ -147,6 +147,12 @@ class ClientCoreMixin:
                     from job_queue.queue import FreezeError
 
                     raise FreezeError(payload.get("error") or "freeze error") from exc
+                if exc.code == 409 and payload.get("code") == "priority_error":
+                    from job_queue.queue import PriorityError
+
+                    raise PriorityError(
+                        payload.get("error") or "priority error"
+                    ) from exc
                 if exc.code == 409 and payload.get("code") == "replay_error":
                     from job_queue.queue import ReplayError
 

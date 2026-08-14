@@ -8,6 +8,7 @@ from job_queue.queue.jobs_query import JobsQueryMixin
 from job_queue.queue.jobs_expire import JobsExpireMixin
 from job_queue.queue.jobs_freeze import JobsFreezeMixin
 from job_queue.queue.jobs_freeze_bulk import JobsFreezeBulkMixin
+from job_queue.queue.jobs_priority import JobsPriorityMixin
 
 
 class JobsMixin(
@@ -17,6 +18,7 @@ class JobsMixin(
     JobsExpireMixin,
     JobsFreezeMixin,
     JobsFreezeBulkMixin,
+    JobsPriorityMixin,
 ):
     """Aggregated JobsMixin (split for maintainability)."""
 

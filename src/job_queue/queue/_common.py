@@ -74,6 +74,14 @@ class FreezeError(Exception):
         super().__init__(message)
         self.job = job
 
+
+class PriorityError(Exception):
+    """Raised when a job's priority cannot be changed."""
+
+    def __init__(self, message: str, *, job: Job | None = None) -> None:
+        super().__init__(message)
+        self.job = job
+
 _NOT_TTL_EXPIRED_SQL = "AND (expires_at IS NULL OR expires_at > %s)"
 
 _DEPS_SATISFIED_SQL = """
