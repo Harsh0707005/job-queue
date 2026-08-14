@@ -292,6 +292,24 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/drain-queue")
+        ):
+            return self._drain_tenant_queue(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/undrain-queue")
+        ):
+            return self._undrain_tenant_queue(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/drain-queues")
+        ):
+            return self._list_draining_queues(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/concurrency")
         ):
             return self._set_concurrency(path, body)

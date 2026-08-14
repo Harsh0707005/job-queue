@@ -31,6 +31,7 @@ class RemoteWorkerLoopMixin:
         batch_size: int = 1,
         drain_timeout_seconds: float = 60.0,
         skills: Sequence[str] | None = None,
+        queue_name: str = "default",
     ) -> None:
         self.client = client
         self.worker_id = (
@@ -45,6 +46,14 @@ class RemoteWorkerLoopMixin:
         self.batch_size = batch_size
         self.drain_timeout_seconds = float(drain_timeout_seconds)
         self.skills = list(skills or [])
+        names = [
+            part.strip()
+            for part in str(queue_name or "default").split(",")
+            if part.strip()
+        ]
+        self.queue_names = names or ["default"]
+        self.queue_name = self.queue_names[0]
+        self._queue_rr = 0
         self._stop = threading.Event()
         self._draining = threading.Event()
         self._active: dict[Any, _ActiveRemoteJob] = {}
@@ -181,12 +190,19 @@ class RemoteWorkerLoopMixin:
                 self._heartbeat_partitions()
                 last_part_hb = time.monotonic()
             try:
-                jobs = self.client.lease_batch(
-                    worker_id=self.worker_id,
-                    limit=self.batch_size,
-                    tenant_id=self.tenant_id,
-                    visibility_timeout_seconds=self.visibility_timeout_seconds,
-                )
+                jobs = []
+                for _ in range(len(self.queue_names)):
+                    qn = self.queue_names[self._queue_rr % len(self.queue_names)]
+                    self._queue_rr += 1
+                    jobs = self.client.lease_batch(
+                        worker_id=self.worker_id,
+                        limit=self.batch_size,
+                        tenant_id=self.tenant_id,
+                        queue_name=qn,
+                        visibility_timeout_seconds=self.visibility_timeout_seconds,
+                    )
+                    if jobs:
+                        break
             except Exception:
                 logger.exception("lease error; backing off")
                 self._stop.wait(min(5.0, self.poll_interval_seconds * 4))

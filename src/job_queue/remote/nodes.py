@@ -256,6 +256,12 @@ def worker_main(argv: list[str] | None = None) -> int:
         help="Seconds to finish in-flight work on SIGTERM/SIGINT before "
         "releasing remaining leases (default 60)",
     )
+    p.add_argument(
+        "--queue-name",
+        default=_env("QUEUE_NAME", "default") or "default",
+        help="Queue this worker leases from (or QUEUE_NAME env). "
+        "Comma-separated to poll more than one queue.",
+    )
     args = p.parse_args(argv)
     client = CoordinatorClient(args.coordinator)
     client.wait_healthy(timeout=float(_env("READY_TIMEOUT", "120") or "120"))
@@ -276,6 +282,7 @@ def worker_main(argv: list[str] | None = None) -> int:
         visibility_timeout_seconds=args.visibility_timeout,
         drain_timeout_seconds=args.drain_timeout,
         skills=skills,
+        queue_name=args.queue_name,
     )
     draining = {"done": False}
 

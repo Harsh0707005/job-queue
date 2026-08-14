@@ -82,6 +82,21 @@ class PriorityError(Exception):
         super().__init__(message)
         self.job = job
 
+
+class QueueDrainError(Exception):
+    """Raised when new work is refused because a tenant queue is draining."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tenant_id: str,
+        queue_name: str,
+    ) -> None:
+        super().__init__(message)
+        self.tenant_id = tenant_id
+        self.queue_name = queue_name
+
 _NOT_TTL_EXPIRED_SQL = "AND (expires_at IS NULL OR expires_at > %s)"
 
 _DEPS_SATISFIED_SQL = """

@@ -251,6 +251,29 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def drain_tenant_queue(self, tenant_id: str, queue_name: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/drain-queue",
+            {"queue_name": queue_name},
+        )
+        assert payload is not None
+        return payload
+
+    def undrain_tenant_queue(self, tenant_id: str, queue_name: str) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/undrain-queue",
+            {"queue_name": queue_name},
+        )
+        assert payload is not None
+        return payload
+
+    def list_draining_queues(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/drain-queues")
+        assert payload is not None
+        return payload
+
     def offboard_tenant(self, tenant_id: str) -> dict[str, Any]:
         payload = self._request("POST", f"/v1/tenants/{tenant_id}/offboard", {})
         assert payload is not None

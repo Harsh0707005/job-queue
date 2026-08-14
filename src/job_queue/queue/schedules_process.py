@@ -58,12 +58,20 @@ class SchedulesProcessMixin:
         fires: list[ScheduleFire] = []
 
         # Shared filter: never tick schedules for paused / breaker-open tenants.
+        # Draining queues skip fires too (other queues on the tenant still tick).
         paused_filter = f"""
             AND NOT EXISTS (
                 SELECT 1
                 FROM tenant_settings ts
                 WHERE ts.tenant_id = schedules.tenant_id
                   AND {_TENANT_CLAIMS_BLOCKED_SQL}
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM tenant_settings ts
+                WHERE ts.tenant_id = schedules.tenant_id
+                  AND ts.draining_queues IS NOT NULL
+                  AND schedules.queue_name = ANY(ts.draining_queues)
             )
         """
 
@@ -104,6 +112,13 @@ class SchedulesProcessMixin:
                 # Race: tenant paused / breaker opened after SELECT.
                 if self._tenant_claims_blocked(
                     conn, sched_row["tenant_id"], now=now
+                ) or (
+                    hasattr(self, "_is_queue_draining")
+                    and self._is_queue_draining(
+                        conn,
+                        str(sched_row["tenant_id"]),
+                        str(sched_row["queue_name"]),
+                    )
                 ):
                     self._record_metric(
                         conn,

@@ -87,7 +87,6 @@ class JobsEnqueueDagMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is restoring; enqueue is rejected"
                 )
-
             existing = conn.execute(
                 """
                 SELECT id, job_ids, refs
@@ -103,6 +102,8 @@ class JobsEnqueueDagMixin:
                     batch_key=batch_key,
                     specs=specs,
                 )
+            if hasattr(self, "_assert_queue_accepts_enqueue"):
+                self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
 
             ref_to_id = {spec["ref"]: spec["job_id"] for spec in specs}
             in_batch_ids = {spec["job_id"] for spec in specs}

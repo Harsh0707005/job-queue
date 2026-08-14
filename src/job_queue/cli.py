@@ -48,6 +48,7 @@ def _format_stats(stats: TenantStats) -> str:
         f"  paused={paused}\n"
         f"  breaker={breaker}\n"
         f"  lease_weight={int(getattr(stats, 'lease_weight', 1) or 1)}\n"
+        f"  draining_queues={','.join(getattr(stats, 'draining_queues', ()) or ()) or '-'}\n"
         f"  max_concurrent_leases={limit}\n"
         f"  max_pending_jobs={pending_cap}\n"
         f"  enqueue_rate={_format_rate(stats.enqueue_rate_per_sec, stats.enqueue_burst)}\n"

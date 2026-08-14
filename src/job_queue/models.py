@@ -316,6 +316,8 @@ class TenantStats:
     breaker_open: bool = False
     # Fair-lease weight (1..100). Missing / unset is 1 (equal share).
     lease_weight: int = 1
+    # Queues that reject new intake while existing jobs still finish.
+    draining_queues: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

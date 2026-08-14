@@ -153,6 +153,14 @@ class ClientCoreMixin:
                     raise PriorityError(
                         payload.get("error") or "priority error"
                     ) from exc
+                if exc.code == 409 and payload.get("code") == "queue_draining":
+                    from job_queue.queue import QueueDrainError
+
+                    raise QueueDrainError(
+                        payload.get("error") or "queue draining",
+                        tenant_id=str(payload.get("tenant_id") or ""),
+                        queue_name=str(payload.get("queue_name") or ""),
+                    ) from exc
                 if exc.code == 409 and payload.get("code") == "replay_error":
                     from job_queue.queue import ReplayError
 

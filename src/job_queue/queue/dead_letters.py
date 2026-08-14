@@ -15,6 +15,7 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _JOB_COLUMNS,
+    QueueDrainError,
     RateLimitError,
     ReplayError,
     _as_utc,
@@ -128,6 +129,13 @@ class DeadLettersMixin:
                 raise ReplayError(f"job {job_id} not found for tenant {tenant_id!r}")
 
             job = self._job(row)
+            if hasattr(self, "_assert_queue_accepts_enqueue"):
+                try:
+                    self._assert_queue_accepts_enqueue(
+                        conn, tenant_id, job.queue_name
+                    )
+                except QueueDrainError as exc:
+                    raise ReplayError(str(exc), job=job) from exc
             if job.status not in (JobStatus.DEAD, JobStatus.QUARANTINED):
                 raise ReplayError(
                     f"job {job_id} is not dead-lettered or quarantined "

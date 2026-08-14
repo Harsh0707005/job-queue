@@ -1,0 +1,68 @@
+# Per-queue drain under multi-tenant multi-worker load.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.queue-drain.yml \
+#     up --build --abort-on-container-exit --exit-code-from queue-drain-soak \
+#     queue-drain-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  worker-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+      WORKER_ID: worker-1
+      QUEUE_NAME: default,email
+  worker-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+      WORKER_ID: worker-2
+      QUEUE_NAME: default,email
+  worker-3:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+      WORKER_ID: worker-3
+      QUEUE_NAME: default,email
+  worker-4:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      VISIBILITY_TIMEOUT: "30"
+      LOG_LEVEL: INFO
+      WORKER_ID: worker-4
+      QUEUE_NAME: default,email
+
+  queue-drain-soak:
+    build: .
+    command: ["python", "scripts/queue_drain_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      JOBS_EACH: "20"
+      EXTRA_EACH: "8"
+      JOB_MS: "40"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

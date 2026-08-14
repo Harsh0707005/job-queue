@@ -74,7 +74,7 @@ class TenantsStatsMixin:
                    enqueue_rate_per_sec, enqueue_burst,
                    lease_rate_per_sec, lease_burst,
                    breaker_opened_at, breaker_cooldown_seconds,
-                   lease_weight
+                   lease_weight, draining_queues
             FROM tenant_settings
             WHERE tenant_id = %s
             """,
@@ -115,6 +115,16 @@ class TenantsStatsMixin:
         lease_weight = 1
         if settings and settings.get("lease_weight") is not None:
             lease_weight = max(1, int(settings["lease_weight"]))
+        draining_queues: tuple[str, ...] = ()
+        if settings and settings.get("draining_queues"):
+            seen: set[str] = set()
+            names: list[str] = []
+            for raw in settings["draining_queues"]:
+                name = str(raw or "").strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+            draining_queues = tuple(sorted(names))
 
         if paused or breaker_open:
             claimable = 0
@@ -154,4 +164,5 @@ class TenantsStatsMixin:
             frozen=int(counts.get(JobStatus.FROZEN.value) or 0),
             breaker_open=breaker_open,
             lease_weight=lease_weight,
+            draining_queues=draining_queues,
         )

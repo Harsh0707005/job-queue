@@ -653,6 +653,11 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_lease_weight_check CH
     lease_weight IS NULL OR (lease_weight >= 1 AND lease_weight <= 100)
 );
 
+-- Per-queue drain: block new enqueues + schedule fires for listed queues.
+-- Existing pending / leased jobs still finish. Other queues keep running.
+-- NULL / empty = nothing draining (not a tenant pause).
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS draining_queues TEXT[];
+
 -- Recurring schedules: cron expression and/or fixed interval_seconds.
 -- Prefer cron (5-field min hour dom mon dow, or 6-field with seconds).
 -- interval_seconds remains for simple fixed delays / backward compatibility.

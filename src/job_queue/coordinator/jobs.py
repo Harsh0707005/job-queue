@@ -22,6 +22,7 @@ from job_queue.queue import (
     DependencyError,
     FreezeError,
     PriorityError,
+    QueueDrainError,
     LeaseError,
     RateLimitError,
     SpendCapError,
@@ -112,6 +113,13 @@ class JobsApiMixin:
             )
         except RateLimitError as exc:
             return _limit_error_response(exc)
+        except QueueDrainError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "queue_draining",
+                "tenant_id": exc.tenant_id,
+                "queue_name": exc.queue_name,
+            }
         except (KeyError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(job, include_payload=True)}
@@ -126,6 +134,13 @@ class JobsApiMixin:
             )
         except RateLimitError as exc:
             return _limit_error_response(exc)
+        except QueueDrainError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "queue_draining",
+                "tenant_id": exc.tenant_id,
+                "queue_name": exc.queue_name,
+            }
         except (KeyError, ValueError, TypeError, DependencyError) as exc:
             return 400, {"error": str(exc)}
         status = 201 if result.created else 200

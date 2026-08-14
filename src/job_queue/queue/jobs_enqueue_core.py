@@ -188,6 +188,8 @@ class JobsEnqueueCoreMixin:
                     return self._job(existing, conn=conn)
 
                 # New pending row: enforce per-tenant pending cap + rate.
+                if hasattr(self, "_assert_queue_accepts_enqueue"):
+                    self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
                 self._assert_pending_capacity(conn, tenant_id)
                 self._consume_enqueue_rate(conn, tenant_id, now=now)
                 if hasattr(self, "_consume_spend_enqueues"):
@@ -318,6 +320,8 @@ class JobsEnqueueCoreMixin:
                         job = self._job(stamped, conn=conn)
                 out = job
             else:
+                if hasattr(self, "_assert_queue_accepts_enqueue"):
+                    self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
                 self._assert_pending_capacity(conn, tenant_id)
                 self._consume_enqueue_rate(conn, tenant_id, now=now)
                 if hasattr(self, "_consume_spend_enqueues"):

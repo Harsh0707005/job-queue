@@ -1296,6 +1296,7 @@ class TenantsRestoreMixin:
         br_w = None
         br_c = None
         lease_weight = None
+        draining_queues = None
         if isinstance(exported_settings, dict):
             paused = bool(exported_settings.get("paused") or False)
             max_c = exported_settings.get("max_concurrent_leases")
@@ -1317,6 +1318,9 @@ class TenantsRestoreMixin:
             br_w = exported_settings.get("breaker_window_seconds")
             br_c = exported_settings.get("breaker_cooldown_seconds")
             lease_weight = exported_settings.get("lease_weight")
+            raw_dq = exported_settings.get("draining_queues")
+            if isinstance(raw_dq, (list, tuple)):
+                draining_queues = [str(q) for q in raw_dq if str(q).strip()] or None
         conn.execute(
             """
             INSERT INTO tenant_settings (
@@ -1333,7 +1337,7 @@ class TenantsRestoreMixin:
                 breaker_failure_threshold, breaker_window_seconds,
                 breaker_cooldown_seconds, breaker_failures,
                 breaker_window_start, breaker_opened_at,
-                lease_weight,
+                lease_weight, draining_queues,
                 updated_at
             ) VALUES (
                 %s, %s, %s,
@@ -1347,7 +1351,7 @@ class TenantsRestoreMixin:
                 %s, NULL,
                 0, 0,
                 %s, %s, %s, 0, NULL, NULL,
-                %s,
+                %s, %s,
                 %s
             )
             ON CONFLICT (tenant_id) DO UPDATE
@@ -1373,6 +1377,7 @@ class TenantsRestoreMixin:
                 breaker_window_seconds = EXCLUDED.breaker_window_seconds,
                 breaker_cooldown_seconds = EXCLUDED.breaker_cooldown_seconds,
                 lease_weight = EXCLUDED.lease_weight,
+                draining_queues = EXCLUDED.draining_queues,
                 updated_at = EXCLUDED.updated_at
             """,
             (
@@ -1397,6 +1402,7 @@ class TenantsRestoreMixin:
                 br_w,
                 br_c,
                 lease_weight,
+                draining_queues,
                 now,
             ),
         )

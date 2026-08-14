@@ -76,6 +76,59 @@ class TenantsApiLifecycleMixin:
             return 400, {"error": str(exc)}
         return 200, {"tenant_id": tenant_id, "paused": False}
 
+    def _drain_tenant_queue(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        raw = body.get("queue_name", body.get("queue"))
+        if raw is None or str(raw).strip() == "":
+            return 400, {"error": "queue_name is required"}
+        try:
+            queues = self.queue.drain_tenant_queue(tenant_id, str(raw))
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "tenant_id": tenant_id,
+            "queue_name": str(raw).strip(),
+            "draining": True,
+            "draining_queues": queues,
+        }
+
+    def _undrain_tenant_queue(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        raw = body.get("queue_name", body.get("queue"))
+        if raw is None or str(raw).strip() == "":
+            return 400, {"error": "queue_name is required"}
+        try:
+            queues = self.queue.undrain_tenant_queue(tenant_id, str(raw))
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "tenant_id": tenant_id,
+            "queue_name": str(raw).strip(),
+            "draining": False,
+            "draining_queues": queues,
+        }
+
+    def _list_draining_queues(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        try:
+            queues = self.queue.list_draining_queues(tenant_id)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"tenant_id": tenant_id, "draining_queues": queues}
+
     def _offboard_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")
         # v1 / tenants / {id} / offboard

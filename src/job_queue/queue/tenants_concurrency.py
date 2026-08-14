@@ -181,6 +181,7 @@ class TenantsConcurrencyMixin:
               AND breaker_cooldown_seconds IS NULL
               AND breaker_opened_at IS NULL
               AND lease_weight IS NULL
+              AND (draining_queues IS NULL OR draining_queues = '{}')
               AND paused = FALSE
               AND offboarding = FALSE
             """,

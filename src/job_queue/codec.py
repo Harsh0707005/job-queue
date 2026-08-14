@@ -413,6 +413,7 @@ def tenant_stats_to_dict(stats: TenantStats) -> dict[str, Any]:
         "awaiting_skills": int(getattr(stats, "awaiting_skills", 0) or 0),
         "breaker_open": bool(getattr(stats, "breaker_open", False)),
         "lease_weight": int(getattr(stats, "lease_weight", 1) or 1),
+        "draining_queues": list(getattr(stats, "draining_queues", ()) or ()),
     }
 
 

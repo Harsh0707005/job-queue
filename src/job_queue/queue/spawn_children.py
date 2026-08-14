@@ -18,6 +18,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     LeaseError,
+    QueueDrainError,
     SpawnError,
     _normalize_labels,
     _normalize_skills,
@@ -121,6 +122,14 @@ class SpawnChildrenMixin:
                     )
 
                 for i, spec in enumerate(specs):
+                    qcheck = str(spec.get("queue_name") or parent_queue)
+                    if hasattr(self, "_assert_queue_accepts_enqueue"):
+                        try:
+                            self._assert_queue_accepts_enqueue(
+                                conn, tenant_id, qcheck
+                            )
+                        except QueueDrainError as exc:
+                            raise SpawnError(str(exc), job=self._job(row)) from exc
                     self._assert_pending_capacity(conn, tenant_id)
                     # Spawn under parent lease: still consumes enqueue rate so a
                     # fan-out storm cannot bypass tenant throttles.
