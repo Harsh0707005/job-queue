@@ -16,6 +16,7 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     JOB_EVENTS_CHANNEL,
+    _AUDIT_SEQ_LOCK_CLASS,
     _NOTIFY_MAX_BYTES,
     _as_utc,
     _utcnow,
@@ -154,6 +155,13 @@ class AuditAppendMixin:
             raise ValueError("job_id and tenant_id are required for audit")
         if to_status is None:
             raise ValueError("to_status is required for audit")
+        # Serialize MAX(seq)+1 for this job. Callers that FOR UPDATE the job
+        # row already exclude other mutators; this lock also covers appends
+        # that only touch the audit stream (clone-of-source).
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (_AUDIT_SEQ_LOCK_CLASS, str(job_id)),
+        )
         event_id = uuid4()
         row = conn.execute(
             """

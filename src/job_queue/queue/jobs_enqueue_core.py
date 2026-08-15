@@ -7,15 +7,12 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from psycopg.types.json import Jsonb
-
 from job_queue.db import transaction
 from job_queue.models import (
     Job,
     JobStatus,
 )
 from job_queue.queue._common import (
-    _JOB_COLUMNS,
     DependencyError,
     _as_utc,
     _normalize_labels,
@@ -164,7 +161,6 @@ class JobsEnqueueCoreMixin:
                 self._validate_dependencies(
                     conn, tenant_id=tenant_id, depends_on=dep_ids
                 )
-
             expires, exp_action = self._resolve_job_expiry(
                 conn,
                 tenant_id=tenant_id,
@@ -173,287 +169,35 @@ class JobsEnqueueCoreMixin:
                 expires_at=expires_at,
                 expiry_action=expiry_action,
             )
-
-            if dedupe_key is not None:
-                # Serialize with replay_dead_letter on the same key so a
-                # check-then-activate race cannot create two active rows or
-                # surface a raw unique_violation.
-                self._lock_dedupe_key(
-                    conn,
-                    tenant_id=tenant_id,
-                    queue_name=queue_name,
-                    dedupe_key=dedupe_key,
-                )
-                existing = self._find_active_dedupe(
-                    conn,
-                    tenant_id=tenant_id,
-                    queue_name=queue_name,
-                    dedupe_key=dedupe_key,
-                )
-                if existing is not None:
-                    return self._job(existing, conn=conn)
-
-                # New pending row: enforce per-tenant pending cap + rate.
-                if hasattr(self, "_assert_queue_accepts_enqueue"):
-                    self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
-                self._assert_pending_capacity(conn, tenant_id)
-                self._consume_enqueue_rate(conn, tenant_id, now=now)
-                if hasattr(self, "_consume_spend_enqueues"):
-                    self._consume_spend_enqueues(
-                        conn, tenant_id, extra=1, now=now
-                    )
-
-                part_id = self._compute_partition_id(
-                    conn, tenant_id=tenant_id, job_id=jid
-                )
-                sealed, payload_key_id = self._seal_job_payload(
-                    conn, tenant_id=tenant_id, job_id=jid, payload=payload
-                )
-                status = self._enqueue_status_for_skills(conn, skill_list)
-                # ON CONFLICT remains a safety net for any missed paths.
-                row = conn.execute(
-                    f"""
-                    INSERT INTO jobs (
-                        id, tenant_id, queue_name, payload, status, priority,
-                        attempts, max_attempts, visibility_timeout_seconds,
-                        max_runtime_seconds,
-                        retry_backoff_base_seconds, retry_backoff_max_seconds,
-                        available_at, dedupe_key, schedule_id, depends_on,
-                        labels, required_skills,
-                        deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id, payload_key_id,
-                        expires_at, expiry_action,
-                        prefer_last_worker, payload_kind, cloned_from_job_id
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        0, %s, %s,
-                        %s,
-                        %s, %s,
-                        %s, %s, NULL, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s,
-                        %s, %s, %s
-                    )
-                    ON CONFLICT (tenant_id, queue_name, dedupe_key)
-                        WHERE dedupe_key IS NOT NULL
-                          AND status IN (
-                              'pending', 'leased',
-                              'awaiting_approval', 'awaiting_children',
-                              'awaiting_skills', 'quarantined'
-                          )
-                    DO NOTHING
-                    RETURNING {_JOB_COLUMNS}
-                    """,
-                    (
-                        jid,
-                        tenant_id,
-                        queue_name,
-                        Jsonb(sealed),
-                        status,
-                        priority,
-                        max_attempts,
-                        visibility_timeout_seconds,
-                        max_runtime_seconds,
-                        retry_backoff_base_seconds,
-                        retry_backoff_max_seconds,
-                        run_at,
-                        dedupe_key,
-                        dep_ids,
-                        label_list,
-                        skill_list,
-                        deadline,
-                        estimated_duration_seconds,
-                        bool(preemptible),
-                        now,
-                        now,
-                        part_id,
-                        payload_key_id,
-                        expires,
-                        exp_action,
-                        prefer_lw,
-                        payload_kind,
-                        cloned_from_job_id,
-                    ),
-                ).fetchone()
-
-                if row is None:
-                    existing = self._find_active_dedupe(
-                        conn,
-                        tenant_id=tenant_id,
-                        queue_name=queue_name,
-                        dedupe_key=dedupe_key,
-                    )
-                    if existing is None:
-                        raise RuntimeError(
-                            f"dedupe race for key {dedupe_key!r}: "
-                            "conflict without an active row"
-                        )
-                    return self._job(existing, conn=conn)
-                if hasattr(self, "_recheck_awaiting_skills_row_locked"):
-                    row = self._recheck_awaiting_skills_row_locked(
-                        conn, row, now=now
-                    )
-                job = self._job(row, conn=conn)
-                self._append_job_audit(
-                    conn,
-                    job_row=row,
-                    event_type="enqueued",
-                    from_status=None,
-                    actor=None,
-                    detail={
-                        "queue_name": queue_name,
-                        "priority": priority,
-                        "dedupe_key": dedupe_key,
-                        "required_skills": skill_list,
-                        "status": job.status.value,
-                        "cloned_from_job_id": (
-                            str(cloned_from_job_id)
-                            if cloned_from_job_id is not None
-                            else None
-                        ),
-                    },
-                    now=now,
-                )
-                if hasattr(self, "_record_usage"):
-                    self._record_usage(
-                        conn, tenant_id=tenant_id, now=now, enqueues=1
-                    )
-                if hasattr(self, "_stamp_job_quarantine"):
-                    self._stamp_job_quarantine(
-                        conn,
-                        job_id=job.id,
-                        tenant_id=tenant_id,
-                        max_worker_hops=max_worker_hops,
-                        quarantine_action=quarantine_action,
-                    )
-                    stamped = conn.execute(
-                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-                        (job.id,),
-                    ).fetchone()
-                    if stamped is not None:
-                        job = self._job(stamped, conn=conn)
-                out = job
-            else:
-                if hasattr(self, "_assert_queue_accepts_enqueue"):
-                    self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
-                self._assert_pending_capacity(conn, tenant_id)
-                self._consume_enqueue_rate(conn, tenant_id, now=now)
-                if hasattr(self, "_consume_spend_enqueues"):
-                    self._consume_spend_enqueues(
-                        conn, tenant_id, extra=1, now=now
-                    )
-                part_id = self._compute_partition_id(
-                    conn, tenant_id=tenant_id, job_id=jid
-                )
-                sealed, payload_key_id = self._seal_job_payload(
-                    conn, tenant_id=tenant_id, job_id=jid, payload=payload
-                )
-                status = self._enqueue_status_for_skills(conn, skill_list)
-
-                row = conn.execute(
-                    f"""
-                    INSERT INTO jobs (
-                        id, tenant_id, queue_name, payload, status, priority,
-                        attempts, max_attempts, visibility_timeout_seconds,
-                        max_runtime_seconds,
-                        retry_backoff_base_seconds, retry_backoff_max_seconds,
-                        available_at, dedupe_key, schedule_id, depends_on,
-                        labels, required_skills,
-                        deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id, payload_key_id,
-                        expires_at, expiry_action,
-                        prefer_last_worker, payload_kind, cloned_from_job_id
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        0, %s, %s,
-                        %s,
-                        %s, %s,
-                        %s, NULL, NULL, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s,
-                        %s, %s, %s
-                    )
-                    RETURNING {_JOB_COLUMNS}
-                    """,
-                    (
-                        jid,
-                        tenant_id,
-                        queue_name,
-                        Jsonb(sealed),
-                        status,
-                        priority,
-                        max_attempts,
-                        visibility_timeout_seconds,
-                        max_runtime_seconds,
-                        retry_backoff_base_seconds,
-                        retry_backoff_max_seconds,
-                        run_at,
-                        dep_ids,
-                        label_list,
-                        skill_list,
-                        deadline,
-                        estimated_duration_seconds,
-                        bool(preemptible),
-                        now,
-                        now,
-                        part_id,
-                        payload_key_id,
-                        expires,
-                        exp_action,
-                        prefer_lw,
-                        payload_kind,
-                        cloned_from_job_id,
-                    ),
-                ).fetchone()
-                assert row is not None
-                if hasattr(self, "_recheck_awaiting_skills_row_locked"):
-                    row = self._recheck_awaiting_skills_row_locked(
-                        conn, row, now=now
-                    )
-                job = self._job(row, conn=conn)
-                self._append_job_audit(
-                    conn,
-                    job_row=row,
-                    event_type="enqueued",
-                    from_status=None,
-                    actor=None,
-                    detail={
-                        "queue_name": queue_name,
-                        "priority": priority,
-                        "labels": label_list,
-                        "required_skills": skill_list,
-                        "status": job.status.value,
-                        "cloned_from_job_id": (
-                            str(cloned_from_job_id)
-                            if cloned_from_job_id is not None
-                            else None
-                        ),
-                    },
-                    now=now,
-                )
-                if hasattr(self, "_record_usage"):
-                    self._record_usage(
-                        conn, tenant_id=tenant_id, now=now, enqueues=1
-                    )
-                if hasattr(self, "_stamp_job_quarantine"):
-                    self._stamp_job_quarantine(
-                        conn,
-                        job_id=job.id,
-                        tenant_id=tenant_id,
-                        max_worker_hops=max_worker_hops,
-                        quarantine_action=quarantine_action,
-                    )
-                    stamped = conn.execute(
-                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-                        (job.id,),
-                    ).fetchone()
-                    if stamped is not None:
-                        job = self._job(stamped, conn=conn)
-                out = job
+            out = self._enqueue_pending_on_conn(
+                conn,
+                tenant_id=tenant_id,
+                payload=payload,
+                queue_name=queue_name,
+                priority=priority,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                max_runtime_seconds=max_runtime_seconds,
+                retry_backoff_base_seconds=retry_backoff_base_seconds,
+                retry_backoff_max_seconds=retry_backoff_max_seconds,
+                run_at=run_at,
+                dedupe_key=dedupe_key,
+                dep_ids=dep_ids,
+                label_list=label_list,
+                skill_list=skill_list,
+                deadline=deadline,
+                estimated_duration_seconds=estimated_duration_seconds,
+                preemptible=bool(preemptible),
+                now=now,
+                jid=jid,
+                expires=expires,
+                exp_action=exp_action,
+                prefer_lw=prefer_lw,
+                payload_kind=payload_kind,
+                cloned_from_job_id=cloned_from_job_id,
+                max_worker_hops=max_worker_hops,
+                quarantine_action=quarantine_action,
+            )
 
         if (
             skill_list

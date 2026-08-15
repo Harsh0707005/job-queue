@@ -269,3 +269,170 @@ def test_clone_http_and_list_filter(queue: JobQueue):
             client.clone_job(src.id, tenant_id="other")
     finally:
         server.shutdown()
+
+
+def test_clone_rolls_back_when_source_audit_fails(queue: JobQueue):
+    src = queue.enqueue(tenant_id="t1", payload={"kind": "render"})
+    orig = queue._append_job_audit
+
+    def boom(*args: object, **kwargs: object):
+        if kwargs.get("event_type") == "cloned":
+            raise RuntimeError("audit boom")
+        return orig(*args, **kwargs)
+
+    queue._append_job_audit = boom  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="audit boom"):
+            queue.clone_job(src.id, tenant_id="t1")
+    finally:
+        queue._append_job_audit = orig  # type: ignore[method-assign]
+    assert queue.list_jobs(tenant_id="t1", cloned_from_job_id=src.id) == []
+    leftover = [j for j in queue.list_jobs(tenant_id="t1") if j.id != src.id]
+    assert leftover == []
+    src_events = queue.list_job_audit(src.id, tenant_id="t1")
+    assert [e.event_type for e in src_events] == ["enqueued"]
+
+
+def test_concurrent_clones_same_source_are_atomic(queue: JobQueue):
+    src = queue.enqueue(tenant_id="t1", payload={"kind": "render", "n": 1})
+    n = 16
+    barrier = threading.Barrier(n)
+    ok: list = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def go() -> None:
+        barrier.wait()
+        try:
+            job = queue.clone_job(src.id, tenant_id="t1")
+            with lock:
+                ok.append(job)
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=go) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert len(ok) == n
+    ids = {j.id for j in ok}
+    assert len(ids) == n
+    kids = queue.list_jobs(tenant_id="t1", cloned_from_job_id=src.id, limit=500)
+    assert {j.id for j in kids} == ids
+    cloned = [
+        e
+        for e in queue.list_job_audit(src.id, tenant_id="t1")
+        if e.event_type == "cloned"
+    ]
+    assert len(cloned) == n
+    seqs = [e.seq for e in cloned]
+    assert seqs == list(range(min(seqs), min(seqs) + n))
+    clone_ids = {e.detail.get("clone_job_id") for e in cloned}
+    assert clone_ids == {str(i) for i in ids}
+
+
+def test_concurrent_clones_two_queues_same_source(
+    queue: JobQueue, postgres_url: str
+):
+    other = JobQueue.connect(
+        postgres_url,
+        min_size=2,
+        max_size=8,
+        require_worker_registration=False,
+    )
+    try:
+        src = queue.enqueue(
+            tenant_id="dual-clone", payload={"kind": "render"}
+        )
+        n = 8
+        barrier = threading.Barrier(n * 2)
+        ok: list = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def go(q: JobQueue) -> None:
+            barrier.wait()
+            try:
+                job = q.clone_job(src.id, tenant_id="dual-clone")
+                with lock:
+                    ok.append(job)
+            except BaseException as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=go, args=(queue,)) for _ in range(n)]
+        threads += [threading.Thread(target=go, args=(other,)) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert len(ok) == n * 2
+        kids = queue.list_jobs(
+            tenant_id="dual-clone", cloned_from_job_id=src.id, limit=500
+        )
+        assert len(kids) == n * 2
+        cloned = [
+            e
+            for e in queue.list_job_audit(src.id, tenant_id="dual-clone")
+            if e.event_type == "cloned"
+        ]
+        assert len(cloned) == n * 2
+        seqs = [e.seq for e in cloned]
+        assert len(set(seqs)) == n * 2
+    finally:
+        other.close()
+
+
+def test_http_concurrent_clones_same_source(queue: JobQueue):
+    src = queue.enqueue(
+        tenant_id="http-race", payload={"kind": "render", "n": 1}
+    )
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address
+    n = 20
+    barrier = threading.Barrier(n)
+    ok: list = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def go() -> None:
+        client = CoordinatorClient(f"http://{host}:{port}")
+        barrier.wait()
+        last: BaseException | None = None
+        for _ in range(2):
+            try:
+                job = client.clone_job(src.id, tenant_id="http-race")
+                with lock:
+                    ok.append(job)
+                return
+            except BaseException as exc:  # noqa: BLE001
+                last = exc
+        with lock:
+            errors.append(last or RuntimeError("clone failed"))
+
+    try:
+        threads = [threading.Thread(target=go) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert len(ok) == n
+        kids = queue.list_jobs(
+            tenant_id="http-race", cloned_from_job_id=src.id, limit=500
+        )
+        assert len(kids) == n
+        cloned = [
+            e
+            for e in queue.list_job_audit(src.id, tenant_id="http-race")
+            if e.event_type == "cloned"
+        ]
+        assert len(cloned) == n
+    finally:
+        server.shutdown()
