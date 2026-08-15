@@ -109,6 +109,45 @@ def test_move_rejects_graph_links(queue: JobQueue):
     assert still is not None and still.tenant_id == "alpha"
 
 
+def test_move_rejects_parent_while_live_dependents_wait(queue: JobQueue):
+    parent = queue.enqueue(tenant_id="alpha", payload={"kind": "parent"})
+    child = queue.enqueue(
+        tenant_id="alpha", payload={"kind": "child"}, depends_on=parent.id
+    )
+    with pytest.raises(TenantMoveError, match="still depends"):
+        queue.move_job_tenant(parent.id, tenant_id="alpha", to_tenant_id="beta")
+    stuck = queue.get(parent.id, tenant_id="alpha")
+    assert stuck is not None and stuck.tenant_id == "alpha"
+    waiting = queue.get(child.id, tenant_id="alpha")
+    assert waiting is not None and waiting.status == JobStatus.PENDING
+    # After the child is gone, the parent is free to transfer.
+    queue.cancel(child.id, tenant_id="alpha")
+    moved = queue.move_job_tenant(
+        parent.id, tenant_id="alpha", to_tenant_id="beta"
+    )
+    assert moved.tenant_id == "beta"
+    assert queue.get(parent.id, tenant_id="alpha") is None
+
+
+def test_move_parent_after_dependents_complete(queue: JobQueue):
+    parent = queue.enqueue(tenant_id="alpha", payload={"kind": "parent"})
+    child = queue.enqueue(
+        tenant_id="alpha", payload={"kind": "child"}, depends_on=parent.id
+    )
+    first = queue.lease(tenant_id="alpha", worker_id="w")
+    assert first is not None and first.id == parent.id
+    _ack(queue, first, "w")
+    second = queue.lease(tenant_id="alpha", worker_id="w")
+    assert second is not None and second.id == child.id
+    _ack(queue, second, "w")
+    # Completed child is not waiting; a leftover pending sibling would block.
+    leftover = queue.enqueue(tenant_id="alpha", payload={"solo": True})
+    moved = queue.move_job_tenant(
+        leftover.id, tenant_id="alpha", to_tenant_id="beta"
+    )
+    assert moved.tenant_id == "beta"
+
+
 def test_move_blocked_by_dest_drain_and_pending_cap(queue: JobQueue):
     job = queue.enqueue(
         tenant_id="alpha", queue_name="email", payload={"kind": "mail"}

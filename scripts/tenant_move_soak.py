@@ -3,8 +3,10 @@
 
   * Dual coordinators, four workers, two source tenants and two dest tenants.
   * Sources get a backlog; dests get a few native controls.
-  * Every source pending job is moved (same id) onto its dest tenant.
-  * Source can no longer see or cancel the job; dest workers complete it.
+  * Independent source jobs are moved (same id) onto the dest tenant.
+  * A parent+child pair on the source must stay: moving either is refused
+    so the child cannot stall forever.
+  * Source can no longer see moved jobs; dest workers complete those.
 """
 
 from __future__ import annotations
@@ -177,9 +179,46 @@ def main() -> int:
 
     seeds: dict[str, list[str]] = {}
     controls: dict[str, list[str]] = {}
+    dags: dict[str, tuple[str, str]] = {}
     for src, dest in PAIRS:
         seeds[src] = enqueue(src, SEED_EACH, prefix="xfer")
         controls[dest] = enqueue(dest, CONTROL_EACH, prefix="ok")
+        code, resp = http_json(
+            "POST",
+            "/v1/jobs",
+            {
+                "tenant_id": src,
+                "payload": {"kind": "render", "ms": JOB_MS, "p": "parent"},
+                "labels": ["dag", "parent"],
+            },
+        )
+        if code != 201:
+            raise RuntimeError(f"parent {src} {code} {resp}")
+        parent_id = str(resp["job"]["id"])
+        code, resp = http_json(
+            "POST",
+            "/v1/jobs",
+            {
+                "tenant_id": src,
+                "payload": {"kind": "render", "ms": JOB_MS, "p": "child"},
+                "depends_on": [parent_id],
+                "labels": ["dag", "child"],
+            },
+        )
+        if code != 201:
+            raise RuntimeError(f"child {src} {code} {resp}")
+        child_id = str(resp["job"]["id"])
+        dags[src] = (parent_id, child_id)
+        for label, jid in (("parent", parent_id), ("child", child_id)):
+            code, body = http_json(
+                "POST",
+                f"/v1/jobs/{jid}/tenant",
+                {"tenant_id": src, "to_tenant_id": dest},
+            )
+            if code != 409 or body.get("code") != "tenant_move_error":
+                raise RuntimeError(
+                    f"{src} {label} move should be refused: {code} {body}"
+                )
 
     for src, dest in PAIRS:
         for sid in seeds[src]:
@@ -198,20 +237,24 @@ def main() -> int:
             )
             if code != 409:
                 raise RuntimeError(f"source cancel {sid} {code} {body}")
-        leftover = list_jobs(src)
-        if leftover:
-            raise RuntimeError(f"{src} still has jobs: {leftover}")
+        leftover = {str(j["id"]) for j in list_jobs(src)}
+        parent_id, child_id = dags[src]
+        if leftover != {parent_id, child_id}:
+            raise RuntimeError(f"{src} leftover {leftover} != dag pair")
         dest_ids = {str(j["id"]) for j in list_jobs(dest)}
         if not set(seeds[src]).issubset(dest_ids):
             raise RuntimeError(f"{dest} missing moved jobs")
+        if parent_id in dest_ids or child_id in dest_ids:
+            raise RuntimeError(f"{dest} absorbed dag jobs")
 
-    for tid in dests:
+    for tid in dests + srcs:
         code, body = http_json("POST", f"/v1/tenants/{tid}/resume", {})
         if code != 200:
             raise RuntimeError(f"resume {tid} {code} {body}")
 
     expect = {dest: CONTROL_EACH + SEED_EACH for _, dest in PAIRS}
-    wait_completed(dests, expect)
+    expect.update({src: 2 for src in srcs})
+    wait_completed(srcs + dests, expect)
     for src, dest in PAIRS:
         jobs = {str(j["id"]): j for j in list_jobs(dest)}
         for sid in seeds[src] + controls[dest]:
@@ -220,8 +263,14 @@ def main() -> int:
                 raise RuntimeError(f"{dest} {sid} not completed: {row}")
             if row.get("tenant_id") != dest:
                 raise RuntimeError(f"{dest} {sid} owner {row}")
-        if list_jobs(src):
-            raise RuntimeError(f"{src} grew jobs after transfer")
+        parent_id, child_id = dags[src]
+        src_jobs = {str(j["id"]): j for j in list_jobs(src)}
+        for sid in (parent_id, child_id):
+            row = src_jobs.get(sid)
+            if row is None or row.get("status") != "completed":
+                raise RuntimeError(f"{src} dag {sid} not completed: {row}")
+            if row.get("tenant_id") != src:
+                raise RuntimeError(f"{src} dag {sid} left tenant: {row}")
     logger.info("tenant-move soak OK %s", expect)
     return 0
 

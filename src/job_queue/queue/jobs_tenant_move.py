@@ -11,9 +11,12 @@ from job_queue.db import transaction
 from job_queue.models import Job, JobStatus
 from job_queue.queue._common import (
     TenantMoveError,
+    _CANCELABLE_STATUSES,
     _JOB_COLUMNS,
     _utcnow,
 )
+
+_LIVE = tuple(s.value for s in _CANCELABLE_STATUSES)
 
 
 class JobsTenantMoveMixin:
@@ -28,8 +31,10 @@ class JobsTenantMoveMixin:
 
         Same row, same id, same audit stream. The source tenant can no
         longer get, cancel, or lease it. Payload is re-sealed under the
-        destination tenant. Graph links (depends_on / parent) stay on the
-        source tenant, so those jobs are refused rather than left stuck.
+        destination tenant. Graph links stay tenant-scoped: a job that
+        depends on parents, is a spawn child, or still has live dependents
+        / children on the source tenant is refused so leftovers cannot
+        stall forever.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -89,6 +94,29 @@ class JobsTenantMoveMixin:
             if job.waiting_on:
                 raise TenantMoveError(
                     f"job {job_id} cannot move tenant: it is waiting on children",
+                    job=job,
+                )
+            held = conn.execute(
+                """
+                SELECT id
+                FROM jobs
+                WHERE tenant_id = %s
+                  AND id <> %s
+                  AND status = ANY(%s)
+                  AND (
+                      depends_on @> ARRAY[%s]::uuid[]
+                      OR parent_job_id = %s
+                      OR waiting_on @> ARRAY[%s]::uuid[]
+                  )
+                ORDER BY id
+                LIMIT 1
+                """,
+                (tenant_id, job_id, list(_LIVE), job_id, job_id, job_id),
+            ).fetchone()
+            if held is not None:
+                raise TenantMoveError(
+                    f"job {job_id} cannot move tenant: "
+                    f"job {held['id']} on {tenant_id!r} still depends on it",
                     job=job,
                 )
             step = conn.execute(
