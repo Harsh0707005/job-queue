@@ -1,0 +1,51 @@
+# In-place queue move under multi-tenant multi-worker load.
+#
+# Workers stay on the default queue so jobs enqueued on ``wrong`` sit
+# until the soak moves them.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.queue-move.yml \
+#     up --build --abort-on-container-exit --exit-code-from queue-move-soak \
+#     queue-move-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  worker-1:
+    environment:
+      QUEUE_NAME: default
+  worker-2:
+    environment:
+      QUEUE_NAME: default
+  worker-3:
+    environment:
+      QUEUE_NAME: default
+  worker-4:
+    environment:
+      QUEUE_NAME: default
+
+  queue-move-soak:
+    build: .
+    command: ["python", "scripts/queue_move_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      SEED_EACH: "24"
+      CONTROL_EACH: "8"
+      JOB_MS: "25"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

@@ -181,6 +181,12 @@ class RoutingMixin:
             and path.endswith("/clone")
         ):
             return self._clone_job(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/queue")
+        ):
+            return self._move_job_queue(path, body)
         if method == "POST" and path == "/v1/approvals/process-timeouts":
             return self._process_approval_timeouts(body)
         if method == "GET" and path == "/v1/approvals":

@@ -280,6 +280,21 @@ class ClientJobsMixin:
         assert result is not None
         return job_from_dict(result["job"])
 
+    def move_job_queue(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        queue_name: str,
+    ) -> Job:
+        result = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/queue",
+            {"tenant_id": tenant_id, "queue_name": queue_name},
+        )
+        assert result is not None
+        return job_from_dict(result["job"])
+
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(
             "POST",

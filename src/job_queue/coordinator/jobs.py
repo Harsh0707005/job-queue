@@ -23,6 +23,7 @@ from job_queue.queue import (
     FreezeError,
     PriorityError,
     CloneError,
+    QueueMoveError,
     QueueDrainError,
     LeaseError,
     RateLimitError,
@@ -336,6 +337,46 @@ class JobsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 201, {"job": job_to_dict(clone, include_payload=True)}
+
+    def _move_job_queue(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        raw = body.get("queue_name", body.get("queue"))
+        if raw is None or str(raw).strip() == "":
+            return 400, {"error": "queue_name is required"}
+        try:
+            job = self.queue.move_job_queue(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                queue_name=str(raw),
+            )
+        except QueueMoveError as exc:
+            missing = getattr(exc, "job", None) is None and "not found" in str(exc)
+            code = 404 if missing else 409
+            return code, {
+                "error": str(exc),
+                "code": "queue_move_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except QueueDrainError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "queue_draining",
+                "tenant_id": exc.tenant_id,
+                "queue_name": exc.queue_name,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
 
     def _cancel_job(
         self, path: str, body: dict[str, Any]
