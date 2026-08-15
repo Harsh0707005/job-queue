@@ -9,6 +9,7 @@ from uuid import UUID
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from job_queue.crypto import result_aad
 from job_queue.db import transaction
 from job_queue.models import (
     JobStatus,
@@ -218,6 +219,17 @@ class TenantsSplitMixin:
                     job_id=job.id,
                     payload=job.payload,
                 )
+                # Terminals that ride along (completed parent, etc.) keep a
+                # result sealed under the source DEK. Dest get/list decrypts
+                # with the new owner, so reseal or dest hits PayloadCryptoError.
+                sealed_result = None
+                if job.result is not None:
+                    sealed_result, _ = self._seal_json_value(
+                        conn,
+                        tenant_id=dest,
+                        value=job.result,
+                        aad=result_aad(job.id),
+                    )
                 part_id = self._compute_partition_id(
                     conn, tenant_id=dest, job_id=job.id
                 )
@@ -228,6 +240,7 @@ class TenantsSplitMixin:
                             UPDATE jobs
                             SET tenant_id = %s,
                                 payload = %s,
+                                result = %s,
                                 payload_key_id = %s,
                                 partition_id = %s,
                                 schedule_id = NULL,
@@ -241,6 +254,9 @@ class TenantsSplitMixin:
                             (
                                 dest,
                                 Jsonb(sealed),
+                                None
+                                if sealed_result is None
+                                else Jsonb(sealed_result),
                                 payload_key_id,
                                 part_id,
                                 now,

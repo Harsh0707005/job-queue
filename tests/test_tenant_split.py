@@ -7,7 +7,13 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from job_queue import JobQueue, TenantSplitError, TenantSplitPlan, TenantSplitResult
+from job_queue import (
+    JobQueue,
+    JobStatus,
+    TenantSplitError,
+    TenantSplitPlan,
+    TenantSplitResult,
+)
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack
@@ -181,6 +187,38 @@ def test_split_fails_closed_on_broken_graph_and_moves_nothing(queue: JobQueue):
     assert queue.get(child.id, tenant_id="src") is not None
     assert queue.get(extra.id, tenant_id="src") is not None
     assert queue.get(extra.id, tenant_id="dst") is None
+
+
+def test_split_reseals_completed_parent_result_for_dest(queue: JobQueue):
+    parent = queue.enqueue(
+        tenant_id="src", queue_name="email", payload={"p": "plain"}
+    )
+    child = queue.enqueue(
+        tenant_id="src",
+        queue_name="email",
+        payload={"c": 1},
+        depends_on=parent.id,
+    )
+    leased = queue.lease(tenant_id="src", worker_id="w", queue_name="email")
+    assert leased is not None and leased.id == parent.id
+    _ack(queue, leased, "w", result={"out": "secret", "n": 7})
+    assert queue.get_result(parent.id, tenant_id="src") == {"out": "secret", "n": 7}
+
+    moved = queue.split_tenant("src", "dst", queue_name="email")
+    assert set(moved.job_ids) == {parent.id, child.id}
+    assert queue.get(parent.id, tenant_id="src") is None
+
+    dest_parent = queue.get(parent.id, tenant_id="dst")
+    assert dest_parent is not None
+    assert dest_parent.status == JobStatus.COMPLETED
+    assert dest_parent.payload == {"p": "plain"}
+    assert dest_parent.result == {"out": "secret", "n": 7}
+    assert queue.get_result(parent.id, tenant_id="dst") == {"out": "secret", "n": 7}
+
+    listed = queue.list_jobs(tenant_id="dst", queue_name="email")
+    by_id = {j.id: j for j in listed}
+    assert by_id[parent.id].result == {"out": "secret", "n": 7}
+    assert by_id[child.id].payload == {"c": 1}
 
 
 def test_split_moves_matching_parent_and_child_together(queue: JobQueue):

@@ -5,6 +5,7 @@ SPLIT_STAGE=1  dry-run only: plan while other tenants keep completing.
 SPLIT_STAGE=2  execute a graph-safe queue split; dest finishes moved jobs.
 SPLIT_STAGE=3  race split while workers may already be leasing.
 SPLIT_STAGE=4  split by labels and by skills on the same live queues.
+SPLIT_STAGE=5  completed parent+result rides along; dest get/list decrypts.
 """
 
 from __future__ import annotations
@@ -136,6 +137,28 @@ def enqueue(
 
 def completed(jobs: list[dict[str, Any]]) -> int:
     return sum(1 for j in jobs if j.get("status") == "completed")
+
+
+def wait_ids_status(owned: dict[str, list[str]], *, status: str = "completed") -> None:
+    deadline = time.time() + MAX_WALL
+    last = 0.0
+    while time.time() < deadline:
+        done = 0
+        total = 0
+        for tid, ids in owned.items():
+            total += len(ids)
+            for jid in ids:
+                code, body = http_json("GET", f"/v1/jobs/{jid}?tenant_id={tid}")
+                if code == 200 and (body.get("job") or {}).get("status") == status:
+                    done += 1
+        now = time.time()
+        if now - last >= 2:
+            logger.info("wait status=%s %d/%d", status, done, total)
+            last = now
+        if done == total and total > 0:
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f"timed out waiting for {status}: {done}/{total}")
 
 
 def wait_completed(tids: list[str], expect: dict[str, int]) -> None:
@@ -504,6 +527,102 @@ def main() -> int:
     expect.update({s: KEEP_EACH for s in srcs})
     wait_completed(srcs + dests, expect)
     logger.info("tenant-split stage 4 OK")
+    if STAGE < 5:
+        return 0
+
+    # Stage 5: a completed email parent (result sealed on src) rides along
+    # with a pending child. Dest get/list must decrypt both payload and result.
+    res_pairs = (("res-src-a", "res-dst-a"), ("res-src-b", "res-dst-b"))
+    rsrcs = [s for s, _ in res_pairs]
+    rdests = [d for _, d in res_pairs]
+    for tid in rsrcs + rdests:
+        code, body = http_json("POST", f"/v1/tenants/{tid}/pause", {})
+        if code != 200:
+            raise RuntimeError(f"pause {tid} {code} {body}")
+
+    parents: dict[str, list[str]] = {}
+    for src, dest in res_pairs:
+        parents[src] = enqueue(src, 2, queue_name="email", prefix="done")
+        enqueue(dest, KEEP_EACH, queue_name="default", prefix="rdst5")
+
+    for src in rsrcs:
+        code, body = http_json("POST", f"/v1/tenants/{src}/resume", {})
+        if code != 200:
+            raise RuntimeError(f"resume {src} {code} {body}")
+    wait_ids_status(parents)
+    for src in rsrcs:
+        code, body = http_json("POST", f"/v1/tenants/{src}/pause", {})
+        if code != 200:
+            raise RuntimeError(f"re-pause {src} {code} {body}")
+
+    children: dict[str, list[str]] = {}
+    extra: dict[str, list[str]] = {}
+    keep5: dict[str, list[str]] = {}
+    for src, dest in res_pairs:
+        kids: list[str] = []
+        for pid in parents[src]:
+            code, resp = http_json(
+                "POST",
+                "/v1/jobs",
+                {
+                    "tenant_id": src,
+                    "queue_name": "email",
+                    "payload": {"kind": "render", "ms": JOB_MS, "p": "ch5"},
+                    "depends_on": [pid],
+                    "labels": ["ch5", "email"],
+                },
+            )
+            if code != 201:
+                raise RuntimeError(f"child {src} {code} {resp}")
+            kids.append(str(resp["job"]["id"]))
+        children[src] = kids
+        extra[src] = enqueue(src, EMAIL_EACH, queue_name="email", prefix="x5")
+        keep5[src] = enqueue(src, KEEP_EACH, queue_name="default", prefix="k5")
+
+    for dest in rdests:
+        code, body = http_json("POST", f"/v1/tenants/{dest}/resume", {})
+        if code != 200:
+            raise RuntimeError(f"resume dest {dest} {code} {body}")
+
+    for src, dest in res_pairs:
+        want = set(parents[src]) | set(children[src]) | set(extra[src])
+        plan = plan_split(src, dest, queue_name="email")
+        if plan.get("ok") is not True:
+            raise RuntimeError(f"{src} result plan not ok: {plan}")
+        if set(plan.get("move_job_ids") or []) != want:
+            raise RuntimeError(f"{src} result move set {plan}")
+        code, body = exec_split(src, dest, queue_name="email")
+        if code != 200:
+            raise RuntimeError(f"result split {src}->{dest} {code} {body}")
+        if int(body.get("jobs_moved") or 0) != len(want):
+            raise RuntimeError(f"result split count {body}")
+        # Dest get/list must open the source-completed result.
+        listed_code, listed = http_json("GET", f"/v1/jobs?tenant_id={dest}&limit=500")
+        if listed_code != 200:
+            raise RuntimeError(f"dest list {dest} {listed_code} {listed}")
+        for pid in parents[src]:
+            sc, _ = http_json("GET", f"/v1/jobs/{pid}?tenant_id={src}")
+            dc, got = http_json("GET", f"/v1/jobs/{pid}?tenant_id={dest}")
+            if sc != 404:
+                raise RuntimeError(f"src still owns completed {pid}")
+            if dc != 200:
+                raise RuntimeError(f"dest get completed {pid}: {dc} {got}")
+            job = got.get("job") or {}
+            if job.get("status") != "completed":
+                raise RuntimeError(f"dest parent not completed {got}")
+            result = job.get("result")
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise RuntimeError(f"dest result not decrypted {pid}: {got}")
+
+    for src in rsrcs:
+        code, body = http_json("POST", f"/v1/tenants/{src}/resume", {})
+        if code != 200:
+            raise RuntimeError(f"resume src {src} {code} {body}")
+
+    expect = {d: KEEP_EACH + 2 + 2 + EMAIL_EACH for d in rdests}
+    expect.update({s: KEEP_EACH for s in rsrcs})
+    wait_completed(rsrcs + rdests, expect)
+    logger.info("tenant-split stage 5 OK")
     return 0
 
 
