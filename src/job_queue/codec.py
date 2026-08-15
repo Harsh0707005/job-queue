@@ -116,6 +116,7 @@ def job_to_dict(
         "quarantine_action": job.quarantine_action,
         "prefer_last_worker": bool(getattr(job, "prefer_last_worker", False)),
         "payload_kind": str(getattr(job, "payload_kind", "") or ""),
+        "cloned_from_job_id": _uuid(getattr(job, "cloned_from_job_id", None)),
     }
 
 
@@ -202,6 +203,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         quarantine_action=str(data.get("quarantine_action") or "dead"),
         prefer_last_worker=bool(data.get("prefer_last_worker") or False),
         payload_kind=str(data.get("payload_kind") or ""),
+        cloned_from_job_id=parse_uuid("cloned_from_job_id"),
     )
 
 

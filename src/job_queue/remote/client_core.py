@@ -165,6 +165,10 @@ class ClientCoreMixin:
                     from job_queue.queue import ReplayError
 
                     raise ReplayError(payload.get("error") or "replay error") from exc
+                if payload.get("code") == "clone_error" and exc.code in (404, 409):
+                    from job_queue.queue import CloneError
+
+                    raise CloneError(payload.get("error") or "clone error") from exc
                 if int(exc.code) == 404:
                     return {"error": payload.get("error") or "not found", "_http": 404}
                 # 5xx → try next coordinator; 4xx is definitive.

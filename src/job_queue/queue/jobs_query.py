@@ -25,13 +25,15 @@ class JobsQueryMixin:
         labels: Sequence[str] | str | None = None,
         status: JobStatus | str | Sequence[JobStatus | str] | None = None,
         queue_name: str | None = None,
+        cloned_from_job_id: UUID | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[Job]:
         """List jobs for *tenant_id*, optionally filtered by labels and status.
 
         *labels*: job must include **all** listed labels (AND). Order is
-        newest ``created_at`` first.
+        newest ``created_at`` first. *cloned_from_job_id* lists re-runs of
+        that source job.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -53,6 +55,9 @@ class JobsQueryMixin:
         if label_list:
             clauses.append("labels @> %s::text[]")
             params.append(label_list)
+        if cloned_from_job_id is not None:
+            clauses.append("cloned_from_job_id = %s")
+            params.append(cloned_from_job_id)
         params.extend([limit, offset])
         where = " AND ".join(clauses)
         with self._pool.connection() as conn:

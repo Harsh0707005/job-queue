@@ -47,7 +47,7 @@ _JOB_COLUMNS = """
     await_children_resolved_at, last_error, partition_id, payload_key_id,
     required_skills, expires_at, expiry_action,
     failed_workers, max_worker_hops, quarantine_action,
-    prefer_last_worker, payload_kind
+    prefer_last_worker, payload_kind, cloned_from_job_id
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -78,6 +78,14 @@ class FreezeError(Exception):
 
 class PriorityError(Exception):
     """Raised when a job's priority cannot be changed."""
+
+    def __init__(self, message: str, *, job: Job | None = None) -> None:
+        super().__init__(message)
+        self.job = job
+
+
+class CloneError(Exception):
+    """Raised when a job cannot be cloned / re-run."""
 
     def __init__(self, message: str, *, job: Job | None = None) -> None:
         super().__init__(message)
@@ -451,6 +459,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         quarantine_action=str(row.get("quarantine_action") or "dead"),
         prefer_last_worker=bool(row.get("prefer_last_worker") or False),
         payload_kind=str(row.get("payload_kind") or ""),
+        cloned_from_job_id=row.get("cloned_from_job_id"),
     )
 
 

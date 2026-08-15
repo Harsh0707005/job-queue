@@ -86,6 +86,7 @@ class Job:
     ``depends_on`` lists parent job ids that must be ``completed`` before this
     job is claimable. If a parent ends in failure, dependents are cancelled.
     ``parent_job_id`` links a spawned subtask back to its parent job.
+    ``cloned_from_job_id`` points a re-run at the job it was copied from.
     ``waiting_on`` lists child ids a parked parent is joining on.
     ``labels`` is a sorted set of free-form string tags for list / bulk cancel.
     ``required_skills`` is the set of worker capabilities this job needs
@@ -157,6 +158,7 @@ class Job:
     # Opt this job into last-success-worker preference (queue opt-in also works).
     prefer_last_worker: bool = False
     payload_kind: str = ""
+    cloned_from_job_id: UUID | None = None
 
     @property
     def is_leased(self) -> bool:

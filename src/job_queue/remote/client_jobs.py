@@ -68,6 +68,7 @@ class ClientJobsMixin:
         labels: list[str] | None = None,
         status: str | list[str] | None = None,
         queue_name: str | None = None,
+        cloned_from_job_id: UUID | str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[Job]:
@@ -80,6 +81,8 @@ class ClientJobsMixin:
         ]
         if queue_name is not None:
             q.append(("queue_name", queue_name))
+        if cloned_from_job_id is not None:
+            q.append(("cloned_from_job_id", str(cloned_from_job_id)))
         if labels:
             for lab in labels:
                 q.append(("label", lab))
@@ -253,6 +256,29 @@ class ClientJobsMixin:
         )
         assert payload is not None
         return job_from_dict(payload["job"])
+
+    def clone_job(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        payload: dict[str, Any] | None = None,
+        available_at: str | None = None,
+        delay_seconds: float | int | None = None,
+        dedupe_key: str | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if payload is not None:
+            body["payload"] = payload
+        if available_at is not None:
+            body["available_at"] = available_at
+        if delay_seconds is not None:
+            body["delay_seconds"] = delay_seconds
+        if dedupe_key is not None:
+            body["dedupe_key"] = dedupe_key
+        result = self._request("POST", f"/v1/jobs/{job_id}/clone", body)
+        assert result is not None
+        return job_from_dict(result["job"])
 
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(

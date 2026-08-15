@@ -233,6 +233,12 @@ UPDATE jobs SET payload_kind = '' WHERE payload_kind IS NULL;
 ALTER TABLE jobs ALTER COLUMN payload_kind SET DEFAULT '';
 ALTER TABLE jobs ALTER COLUMN payload_kind SET NOT NULL;
 
+-- Clone / re-run: new pending job points at the source it was copied from.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cloned_from_job_id UUID;
+CREATE INDEX IF NOT EXISTS idx_jobs_cloned_from
+    ON jobs (tenant_id, cloned_from_job_id)
+    WHERE cloned_from_job_id IS NOT NULL;
+
 UPDATE jobs
 SET retry_backoff_base_seconds = 1
 WHERE retry_backoff_base_seconds IS NULL;

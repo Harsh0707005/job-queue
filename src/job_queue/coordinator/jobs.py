@@ -22,6 +22,7 @@ from job_queue.queue import (
     DependencyError,
     FreezeError,
     PriorityError,
+    CloneError,
     QueueDrainError,
     LeaseError,
     RateLimitError,
@@ -283,6 +284,59 @@ class JobsApiMixin:
             return 400, {"error": str(exc)}
         return 200, {"job": job_to_dict(job)}
 
+    def _clone_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        payload = body.get("payload")
+        if payload is not None and not isinstance(payload, dict):
+            return 400, {"error": "payload must be an object"}
+        from datetime import datetime
+
+        available_at = None
+        raw_at = body.get("available_at")
+        if raw_at is not None:
+            if not isinstance(raw_at, str):
+                return 400, {"error": "available_at must be an ISO-8601 string"}
+            available_at = datetime.fromisoformat(raw_at.replace("Z", "+00:00"))
+        delay = body.get("delay_seconds")
+        try:
+            clone = self.queue.clone_job(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                payload=payload,
+                available_at=available_at,
+                delay_seconds=(None if delay is None else float(delay)),
+                dedupe_key=body.get("dedupe_key"),
+            )
+        except CloneError as exc:
+            code = 404 if getattr(exc, "job", None) is None else 409
+            return code, {
+                "error": str(exc),
+                "code": "clone_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except RateLimitError as exc:
+            return _limit_error_response(exc)
+        except QueueDrainError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "queue_draining",
+                "tenant_id": exc.tenant_id,
+                "queue_name": exc.queue_name,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 201, {"job": job_to_dict(clone, include_payload=True)}
+
     def _cancel_job(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
@@ -486,9 +540,13 @@ class JobsApiMixin:
         labels = query.get("label") or query.get("labels") or []
         statuses = query.get("status") or []
         queue_names = query.get("queue_name") or []
+        cloned_from = query.get("cloned_from_job_id") or []
         try:
             limit = int((query.get("limit") or ["100"])[0])
             offset = int((query.get("offset") or ["0"])[0])
+            cloned_from_id = None
+            if cloned_from and cloned_from[0]:
+                cloned_from_id = UUID(str(cloned_from[0]))
             jobs = self.queue.list_jobs(
                 tenant_id=str(tenants[0]),
                 labels=labels or None,
@@ -496,6 +554,7 @@ class JobsApiMixin:
                 queue_name=(
                     str(queue_names[0]) if queue_names and queue_names[0] else None
                 ),
+                cloned_from_job_id=cloned_from_id,
                 limit=limit,
                 offset=offset,
             )
