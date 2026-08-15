@@ -40,7 +40,15 @@ def _psycopg_dsn(sqlalchemy_url: str) -> str:
 
 @pytest.fixture(scope="session")
 def postgres_url():
-    """Start a throwaway Postgres container; delete it after all tests."""
+    """Start a throwaway Postgres container; delete it after all tests.
+
+    Set ``JOB_QUEUE_TEST_DSN`` to reuse an already-running database (when
+    Docker Desktop is unavailable).
+    """
+    existing = os.environ.get("JOB_QUEUE_TEST_DSN")
+    if existing:
+        yield existing
+        return
     postgres = PostgresContainer("postgres:16-alpine")
     postgres.start()
     try:

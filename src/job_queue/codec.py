@@ -23,6 +23,9 @@ from job_queue.models import (
     Schedule,
     SpawnChildrenResult,
     TenantMergeResult,
+    TenantSplitBlocker,
+    TenantSplitPlan,
+    TenantSplitResult,
     TenantOffboardResult,
     TenantPayloadKey,
     TenantRestore,
@@ -519,6 +522,40 @@ def tenant_offboard_result_to_dict(result: TenantOffboardResult) -> dict[str, An
         "webhooks_delivering_remaining": result.webhooks_delivering_remaining,
         "offboarding": result.offboarding,
         "empty": result.empty,
+    }
+
+
+def tenant_split_plan_to_dict(plan: TenantSplitPlan) -> dict[str, Any]:
+    return {
+        "source_tenant_id": plan.source_tenant_id,
+        "target_tenant_id": plan.target_tenant_id,
+        "queue_name": plan.queue_name,
+        "labels": list(plan.labels),
+        "required_skills": list(plan.required_skills),
+        "ok": plan.ok,
+        "move_job_ids": [str(j) for j in plan.move_job_ids],
+        "stay_leased_ids": [str(j) for j in plan.stay_leased_ids],
+        "blockers": [tenant_split_blocker_to_dict(b) for b in plan.blockers],
+        "jobs_to_move": len(plan.move_job_ids),
+    }
+
+
+def tenant_split_blocker_to_dict(blocker: TenantSplitBlocker) -> dict[str, Any]:
+    return {
+        "job_id": str(blocker.job_id),
+        "reason": blocker.reason,
+        "related_job_id": (
+            str(blocker.related_job_id) if blocker.related_job_id else None
+        ),
+    }
+
+
+def tenant_split_result_to_dict(result: TenantSplitResult) -> dict[str, Any]:
+    return {
+        "source_tenant_id": result.source_tenant_id,
+        "target_tenant_id": result.target_tenant_id,
+        "jobs_moved": result.jobs_moved,
+        "job_ids": [str(j) for j in result.job_ids],
     }
 
 

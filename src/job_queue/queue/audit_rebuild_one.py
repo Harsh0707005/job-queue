@@ -185,19 +185,19 @@ class AuditRebuildOneMixin:
                         job_id=job_id,
                         events=events,
                     )
-            if ev.event_type == "tenant_merged":
+            if ev.event_type in ("tenant_merged", "tenant_moved", "tenant_split"):
                 ft = (ev.detail or {}).get("from_tenant")
                 tt = (ev.detail or {}).get("to_tenant")
                 if not ft or not tt:
                     raise RebuildError(
-                        f"job {job_id} tenant_merged seq={ev.seq} missing "
+                        f"job {job_id} {ev.event_type} seq={ev.seq} missing "
                         f"from_tenant/to_tenant",
                         job_id=job_id,
                         events=events,
                     )
                 if snap.get("tenant_id") != tt:
                     raise RebuildError(
-                        f"job {job_id} tenant_merged seq={ev.seq}: snapshot "
+                        f"job {job_id} {ev.event_type} seq={ev.seq}: snapshot "
                         f"tenant {snap.get('tenant_id')!r} != to_tenant {tt!r}",
                         job_id=job_id,
                         events=events,

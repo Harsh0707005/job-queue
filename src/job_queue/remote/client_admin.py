@@ -319,6 +319,50 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def plan_tenant_split(
+        self,
+        source_tenant_id: str,
+        target_tenant_id: str,
+        *,
+        queue_name: str | None = None,
+        labels: list[str] | None = None,
+        required_skills: list[str] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"target_tenant_id": target_tenant_id}
+        if queue_name is not None:
+            body["queue_name"] = queue_name
+        if labels is not None:
+            body["labels"] = labels
+        if required_skills is not None:
+            body["required_skills"] = required_skills
+        payload = self._request(
+            "POST", f"/v1/tenants/{source_tenant_id}/split/plan", body
+        )
+        assert payload is not None
+        return payload
+
+    def split_tenant(
+        self,
+        source_tenant_id: str,
+        target_tenant_id: str,
+        *,
+        queue_name: str | None = None,
+        labels: list[str] | None = None,
+        required_skills: list[str] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"target_tenant_id": target_tenant_id}
+        if queue_name is not None:
+            body["queue_name"] = queue_name
+        if labels is not None:
+            body["labels"] = labels
+        if required_skills is not None:
+            body["required_skills"] = required_skills
+        payload = self._request(
+            "POST", f"/v1/tenants/{source_tenant_id}/split", body
+        )
+        assert payload is not None
+        return payload
+
     def list_tenant_payload_keys(self, tenant_id: str) -> dict[str, Any]:
         payload = self._request("GET", f"/v1/tenants/{tenant_id}/payload-keys")
         assert payload is not None

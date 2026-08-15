@@ -117,6 +117,14 @@ class PostponeError(Exception):
         self.job = job
 
 
+class TenantSplitError(Exception):
+    """Raised when a tenant split would break graph links or half-move work."""
+
+    def __init__(self, message: str, *, plan: Any | None = None) -> None:
+        super().__init__(message)
+        self.plan = plan
+
+
 class QueueDrainError(Exception):
     """Raised when new work is refused because a tenant queue is draining."""
 

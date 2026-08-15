@@ -470,6 +470,40 @@ class TenantOffboardResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantSplitBlocker:
+    """Why a tenant split cannot move a job without breaking the graph."""
+
+    job_id: UUID
+    reason: str
+    related_job_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TenantSplitPlan:
+    """Dry-run of :meth:`~job_queue.queue.JobQueue.plan_tenant_split`."""
+
+    source_tenant_id: str
+    target_tenant_id: str
+    queue_name: str | None
+    labels: tuple[str, ...]
+    required_skills: tuple[str, ...]
+    ok: bool
+    move_job_ids: tuple[UUID, ...]
+    stay_leased_ids: tuple[UUID, ...]
+    blockers: tuple[TenantSplitBlocker, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TenantSplitResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.split_tenant`."""
+
+    source_tenant_id: str
+    target_tenant_id: str
+    jobs_moved: int
+    job_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class TenantMergeResult:
     """Result of :meth:`~job_queue.queue.JobQueue.merge_tenant` (source → target)."""
 

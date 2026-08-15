@@ -466,6 +466,18 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/split/plan")
+        ):
+            return self._plan_tenant_split(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/split")
+        ):
+            return self._split_tenant(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/export")
         ):
             return self._export_tenant(path)

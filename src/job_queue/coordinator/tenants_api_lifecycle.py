@@ -11,6 +11,8 @@ from job_queue.codec import (
     job_audit_event_to_dict,
     payload_key_rotation_to_dict,
     tenant_merge_result_to_dict,
+    tenant_split_plan_to_dict,
+    tenant_split_result_to_dict,
     tenant_offboard_result_to_dict,
     tenant_payload_key_to_dict,
     tenant_restore_to_dict,
@@ -178,6 +180,79 @@ class TenantsApiLifecycleMixin:
             "jobs_moved": result.jobs_moved,
             "jobs_leased_moved": result.jobs_leased_moved,
         }
+
+    def _plan_tenant_split(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {source} / split / plan
+        if len(parts) != 5:
+            return 400, {"error": "invalid tenant split path"}
+        source = parts[2]
+        dest = body.get("target_tenant_id") or body.get("to_tenant_id")
+        if not dest:
+            return 400, {"error": "target_tenant_id is required"}
+        try:
+            plan = self.queue.plan_tenant_split(
+                source,
+                str(dest),
+                queue_name=(
+                    str(body["queue_name"])
+                    if body.get("queue_name") is not None
+                    else None
+                ),
+                labels=body.get("labels"),
+                required_skills=body.get("required_skills"),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, tenant_split_plan_to_dict(plan)
+
+    def _split_tenant(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {source} / split
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant split path"}
+        source = parts[2]
+        dest = body.get("target_tenant_id") or body.get("to_tenant_id")
+        if not dest:
+            return 400, {"error": "target_tenant_id is required"}
+        try:
+            result = self.queue.split_tenant(
+                source,
+                str(dest),
+                queue_name=(
+                    str(body["queue_name"])
+                    if body.get("queue_name") is not None
+                    else None
+                ),
+                labels=body.get("labels"),
+                required_skills=body.get("required_skills"),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except Exception as exc:
+            from job_queue.queue import QueueDrainError, TenantSplitError
+
+            if isinstance(exc, QueueDrainError):
+                return 409, {
+                    "error": str(exc),
+                    "code": "queue_draining",
+                    "tenant_id": exc.tenant_id,
+                    "queue_name": exc.queue_name,
+                }
+            if isinstance(exc, TenantSplitError):
+                payload: dict[str, Any] = {
+                    "error": str(exc),
+                    "code": "tenant_split_error",
+                }
+                if getattr(exc, "plan", None) is not None:
+                    payload["plan"] = tenant_split_plan_to_dict(exc.plan)
+                return 409, payload
+            raise
+        return 200, tenant_split_result_to_dict(result)
 
     def _export_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")
