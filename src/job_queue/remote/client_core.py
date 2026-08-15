@@ -178,6 +178,15 @@ class ClientCoreMixin:
                     raise QueueMoveError(
                         payload.get("error") or "queue move error"
                     ) from exc
+                if payload.get("code") == "tenant_move_error" and exc.code in (
+                    404,
+                    409,
+                ):
+                    from job_queue.queue import TenantMoveError
+
+                    raise TenantMoveError(
+                        payload.get("error") or "tenant move error"
+                    ) from exc
                 if int(exc.code) == 404:
                     return {"error": payload.get("error") or "not found", "_http": 404}
                 # 5xx → try next coordinator; 4xx is definitive.

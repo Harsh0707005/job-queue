@@ -295,6 +295,21 @@ class ClientJobsMixin:
         assert result is not None
         return job_from_dict(result["job"])
 
+    def move_job_tenant(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        to_tenant_id: str,
+    ) -> Job:
+        result = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/tenant",
+            {"tenant_id": tenant_id, "to_tenant_id": to_tenant_id},
+        )
+        assert result is not None
+        return job_from_dict(result["job"])
+
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(
             "POST",

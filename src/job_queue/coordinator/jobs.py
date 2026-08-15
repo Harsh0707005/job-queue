@@ -24,6 +24,7 @@ from job_queue.queue import (
     PriorityError,
     CloneError,
     QueueMoveError,
+    TenantMoveError,
     QueueDrainError,
     LeaseError,
     RateLimitError,
@@ -377,6 +378,46 @@ class JobsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"job": job_to_dict(job)}
+
+    def _move_job_tenant(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        dest = body.get("to_tenant_id", body.get("dest_tenant_id"))
+        if dest is None or str(dest).strip() == "":
+            return 400, {"error": "to_tenant_id is required"}
+        try:
+            job = self.queue.move_job_tenant(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                to_tenant_id=str(dest),
+            )
+        except TenantMoveError as exc:
+            missing = getattr(exc, "job", None) is None and "not found" in str(exc)
+            code = 404 if missing else 409
+            return code, {
+                "error": str(exc),
+                "code": "tenant_move_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except QueueDrainError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "queue_draining",
+                "tenant_id": exc.tenant_id,
+                "queue_name": exc.queue_name,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job, include_payload=True)}
 
     def _cancel_job(
         self, path: str, body: dict[str, Any]

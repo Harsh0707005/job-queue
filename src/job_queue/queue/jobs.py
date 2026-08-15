@@ -11,6 +11,7 @@ from job_queue.queue.jobs_freeze_bulk import JobsFreezeBulkMixin
 from job_queue.queue.jobs_priority import JobsPriorityMixin
 from job_queue.queue.jobs_clone import JobsCloneMixin
 from job_queue.queue.jobs_queue_move import JobsQueueMoveMixin
+from job_queue.queue.jobs_tenant_move import JobsTenantMoveMixin
 
 
 class JobsMixin(
@@ -23,6 +24,7 @@ class JobsMixin(
     JobsPriorityMixin,
     JobsCloneMixin,
     JobsQueueMoveMixin,
+    JobsTenantMoveMixin,
 ):
     """Aggregated JobsMixin (split for maintainability)."""
 
