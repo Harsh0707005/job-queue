@@ -25,6 +25,7 @@ from job_queue.queue import (
     CloneError,
     QueueMoveError,
     TenantMoveError,
+    PostponeError,
     QueueDrainError,
     LeaseError,
     RateLimitError,
@@ -418,6 +419,51 @@ class JobsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"job": job_to_dict(job, include_payload=True)}
+
+    def _postpone_job(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        has_at = "available_at" in body and body.get("available_at") is not None
+        has_delay = "delay_seconds" in body and body.get("delay_seconds") is not None
+        if has_at == has_delay:
+            return 400, {"error": "pass exactly one of available_at or delay_seconds"}
+        from datetime import datetime
+
+        available_at = None
+        if has_at:
+            raw_at = body.get("available_at")
+            if not isinstance(raw_at, str):
+                return 400, {"error": "available_at must be an ISO-8601 string"}
+            available_at = datetime.fromisoformat(raw_at.replace("Z", "+00:00"))
+        try:
+            job = self.queue.postpone_job(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                available_at=available_at,
+                delay_seconds=(
+                    None if not has_delay else float(body["delay_seconds"])
+                ),
+            )
+        except PostponeError as exc:
+            missing = getattr(exc, "job", None) is None and "not found" in str(exc)
+            code = 404 if missing else 409
+            return code, {
+                "error": str(exc),
+                "code": "postpone_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
 
     def _cancel_job(
         self, path: str, body: dict[str, Any]

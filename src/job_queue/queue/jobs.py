@@ -12,6 +12,7 @@ from job_queue.queue.jobs_priority import JobsPriorityMixin
 from job_queue.queue.jobs_clone import JobsCloneMixin
 from job_queue.queue.jobs_queue_move import JobsQueueMoveMixin
 from job_queue.queue.jobs_tenant_move import JobsTenantMoveMixin
+from job_queue.queue.jobs_postpone import JobsPostponeMixin
 
 
 class JobsMixin(
@@ -25,6 +26,7 @@ class JobsMixin(
     JobsCloneMixin,
     JobsQueueMoveMixin,
     JobsTenantMoveMixin,
+    JobsPostponeMixin,
 ):
     """Aggregated JobsMixin (split for maintainability)."""
 

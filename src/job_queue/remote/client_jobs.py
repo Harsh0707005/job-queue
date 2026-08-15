@@ -310,6 +310,23 @@ class ClientJobsMixin:
         assert result is not None
         return job_from_dict(result["job"])
 
+    def postpone_job(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        available_at: str | None = None,
+        delay_seconds: float | int | None = None,
+    ) -> Job:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if available_at is not None:
+            body["available_at"] = available_at
+        if delay_seconds is not None:
+            body["delay_seconds"] = delay_seconds
+        result = self._request("POST", f"/v1/jobs/{job_id}/postpone", body)
+        assert result is not None
+        return job_from_dict(result["job"])
+
     def cancel_job(self, job_id: str | UUID, *, tenant_id: str) -> Job:
         payload = self._request(
             "POST",

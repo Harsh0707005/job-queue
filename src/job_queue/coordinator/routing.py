@@ -193,6 +193,12 @@ class RoutingMixin:
             and path.endswith("/tenant")
         ):
             return self._move_job_tenant(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/postpone")
+        ):
+            return self._postpone_job(path, body)
         if method == "POST" and path == "/v1/approvals/process-timeouts":
             return self._process_approval_timeouts(body)
         if method == "GET" and path == "/v1/approvals":
