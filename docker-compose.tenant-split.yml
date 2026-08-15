@@ -28,7 +28,7 @@ services:
     command: ["python", "scripts/tenant_split_soak.py"]
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
-      SPLIT_STAGE: "1"
+      SPLIT_STAGE: ${SPLIT_STAGE:-1}
       EMAIL_EACH: "16"
       KEEP_EACH: "8"
       JOB_MS: "25"

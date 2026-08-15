@@ -300,6 +300,77 @@ def main() -> int:
     expect.update({s: KEEP_EACH for s in srcs})
     wait_completed(srcs + dests, expect)
     logger.info("tenant-split stage 2 OK")
+    if STAGE < 3:
+        return 0
+
+    # Stage 3: split while workers may already be leasing the email queue.
+    race_pairs = (("race-src-a", "race-dst-a"), ("race-src-b", "race-dst-b"))
+    rsrcs = [s for s, _ in race_pairs]
+    rdests = [d for _, d in race_pairs]
+    for tid in rsrcs + rdests:
+        code, body = http_json("POST", f"/v1/tenants/{tid}/pause", {})
+        if code != 200:
+            raise RuntimeError(f"pause {tid} {code} {body}")
+    remail: dict[str, list[str]] = {}
+    rkeep: dict[str, list[str]] = {}
+    for src, dest in race_pairs:
+        remail[src] = enqueue(src, EMAIL_EACH, queue_name="email", prefix="race")
+        rkeep[src] = enqueue(src, KEEP_EACH, queue_name="default", prefix="rkeep")
+        enqueue(dest, KEEP_EACH, queue_name="default", prefix="rdst")
+    for tid in rsrcs + rdests:
+        code, body = http_json("POST", f"/v1/tenants/{tid}/resume", {})
+        if code != 200:
+            raise RuntimeError(f"resume {tid} {code} {body}")
+    time.sleep(0.25)
+    for src, dest in race_pairs:
+        code, body = http_json(
+            "POST",
+            f"/v1/tenants/{src}/split",
+            {"target_tenant_id": dest, "queue_name": "email"},
+        )
+        if code not in (200, 409):
+            raise RuntimeError(f"race split {src} {code} {body}")
+        for sid in remail[src]:
+            sc, _ = http_json("GET", f"/v1/jobs/{sid}?tenant_id={src}")
+            dc, _ = http_json("GET", f"/v1/jobs/{sid}?tenant_id={dest}")
+            if sc == 200 and dc == 200:
+                raise RuntimeError(f"{sid} owned by both tenants")
+            if sc != 200 and dc != 200:
+                raise RuntimeError(f"{sid} owned by neither tenant")
+        logger.info("race split %s -> %s code=%s", src, dest, code)
+    need = EMAIL_EACH + KEEP_EACH + KEEP_EACH
+    deadline = time.time() + MAX_WALL
+    last = 0.0
+    while time.time() < deadline:
+        totals = {
+            src: completed(list_jobs(src)) + completed(list_jobs(dest))
+            for src, dest in race_pairs
+        }
+        now = time.time()
+        if now - last >= 2:
+            logger.info("race drain %s need=%d", totals, need)
+            last = now
+        if all(n >= need for n in totals.values()):
+            break
+        time.sleep(0.2)
+    else:
+        raise RuntimeError(f"race drain timed out {totals}")
+    # Every email/keep job finished on exactly one tenant.
+    for src, dest in race_pairs:
+        seen: set[str] = set()
+        for tid in (src, dest):
+            for j in list_jobs(tid):
+                jid = str(j["id"])
+                if jid in remail[src] or jid in rkeep[src]:
+                    if j.get("status") != "completed":
+                        raise RuntimeError(f"{tid} {jid} unfinished {j}")
+                    if jid in seen:
+                        raise RuntimeError(f"{jid} duplicated")
+                    seen.add(jid)
+        want = set(remail[src]) | set(rkeep[src])
+        if seen != want:
+            raise RuntimeError(f"{src} missing {want - seen}")
+    logger.info("tenant-split stage 3 OK")
     return 0
 
 
