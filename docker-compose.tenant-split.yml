@@ -13,15 +13,19 @@ services:
   worker-1:
     environment:
       QUEUE_NAME: default,email
+      WORKER_SKILLS: gpu
   worker-2:
     environment:
       QUEUE_NAME: default,email
+      WORKER_SKILLS: gpu
   worker-3:
     environment:
       QUEUE_NAME: default,email
+      WORKER_SKILLS: gpu
   worker-4:
     environment:
       QUEUE_NAME: default,email
+      WORKER_SKILLS: gpu
 
   tenant-split-soak:
     build: .

@@ -249,6 +249,34 @@ def test_split_http_execute(queue: JobQueue):
         server.shutdown()
 
 
+def test_split_by_labels_and_skills_moves_only_matches(queue: JobQueue):
+    keep = queue.enqueue(tenant_id="src", payload={"n": 1}, labels=["keep"])
+    labeled = queue.enqueue(
+        tenant_id="src",
+        payload={"n": 2},
+        labels=["xfer"],
+        required_skills=["gpu"],
+    )
+    extra = queue.enqueue(
+        tenant_id="src", payload={"n": 3}, required_skills=["cpu"]
+    )
+    by_label = queue.split_tenant("src", "dst-l", labels=["xfer"])
+    assert by_label.job_ids == (labeled.id,)
+    assert queue.get(keep.id, tenant_id="src") is not None
+    assert queue.get(extra.id, tenant_id="src") is not None
+    moved = queue.get(labeled.id, tenant_id="dst-l")
+    assert moved is not None and moved.payload == {"n": 2}
+
+    skilled = queue.enqueue(
+        tenant_id="src", payload={"n": 4}, required_skills=["cpu"]
+    )
+    by_skill = queue.split_tenant("src", "dst-s", required_skills=["cpu"])
+    assert set(by_skill.job_ids) == {extra.id, skilled.id}
+    assert queue.get(keep.id, tenant_id="src") is not None
+    assert queue.get(extra.id, tenant_id="src") is None
+    assert queue.get(skilled.id, tenant_id="dst-s") is not None
+
+
 def test_split_and_keep_queue_workers_run_together(
     queue: JobQueue, postgres_url: str
 ):

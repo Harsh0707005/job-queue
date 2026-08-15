@@ -3,6 +3,8 @@
 
 SPLIT_STAGE=1  dry-run only: plan while other tenants keep completing.
 SPLIT_STAGE=2  execute a graph-safe queue split; dest finishes moved jobs.
+SPLIT_STAGE=3  race split while workers may already be leasing.
+SPLIT_STAGE=4  split by labels and by skills on the same live queues.
 """
 
 from __future__ import annotations
@@ -101,24 +103,31 @@ def list_jobs(tid: str, **extra: str) -> list[dict[str, Any]]:
     return list(body.get("jobs") or [])
 
 
-def enqueue(tid: str, n: int, *, queue_name: str, prefix: str) -> list[str]:
+def enqueue(
+    tid: str,
+    n: int,
+    *,
+    queue_name: str,
+    prefix: str,
+    labels: list[str] | None = None,
+    required_skills: list[str] | None = None,
+) -> list[str]:
     ids: list[str] = []
     for i in range(n):
-        code, resp = http_json(
-            "POST",
-            "/v1/jobs",
-            {
-                "tenant_id": tid,
-                "queue_name": queue_name,
-                "payload": {
-                    "kind": "render",
-                    "ms": JOB_MS,
-                    "i": i,
-                    "p": prefix,
-                },
-                "labels": [prefix, queue_name],
+        body: dict[str, Any] = {
+            "tenant_id": tid,
+            "queue_name": queue_name,
+            "payload": {
+                "kind": "render",
+                "ms": JOB_MS,
+                "i": i,
+                "p": prefix,
             },
-        )
+            "labels": labels if labels is not None else [prefix, queue_name],
+        }
+        if required_skills is not None:
+            body["required_skills"] = required_skills
+        code, resp = http_json("POST", "/v1/jobs", body)
         if code != 201:
             raise RuntimeError(f"enqueue {tid}/{queue_name} {code} {resp}")
         ids.append(str(resp["job"]["id"]))
@@ -145,15 +154,43 @@ def wait_completed(tids: list[str], expect: dict[str, int]) -> None:
     raise RuntimeError(f"timed out waiting for drain: {counts}")
 
 
-def plan_split(src: str, dest: str, queue_name: str) -> dict[str, Any]:
-    code, body = http_json(
-        "POST",
-        f"/v1/tenants/{src}/split/plan",
-        {"target_tenant_id": dest, "queue_name": queue_name},
-    )
+def plan_split(
+    src: str,
+    dest: str,
+    *,
+    queue_name: str | None = None,
+    labels: list[str] | None = None,
+    required_skills: list[str] | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"target_tenant_id": dest}
+    if queue_name is not None:
+        body["queue_name"] = queue_name
+    if labels is not None:
+        body["labels"] = labels
+    if required_skills is not None:
+        body["required_skills"] = required_skills
+    code, resp = http_json("POST", f"/v1/tenants/{src}/split/plan", body)
     if code != 200:
-        raise RuntimeError(f"plan {src}->{dest} {code} {body}")
-    return body
+        raise RuntimeError(f"plan {src}->{dest} {code} {resp}")
+    return resp
+
+
+def exec_split(
+    src: str,
+    dest: str,
+    *,
+    queue_name: str | None = None,
+    labels: list[str] | None = None,
+    required_skills: list[str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    body: dict[str, Any] = {"target_tenant_id": dest}
+    if queue_name is not None:
+        body["queue_name"] = queue_name
+    if labels is not None:
+        body["labels"] = labels
+    if required_skills is not None:
+        body["required_skills"] = required_skills
+    return http_json("POST", f"/v1/tenants/{src}/split", body)
 
 
 def main() -> int:
@@ -215,7 +252,7 @@ def main() -> int:
             raise RuntimeError(f"resume dest {dest} {code} {body}")
 
     for src, dest in PAIRS:
-        good = plan_split(src, dest, "email")
+        good = plan_split(src, dest, queue_name="email")
         # Isolated email jobs should be listed; the child that depends on
         # a default-queue parent must fail the whole email plan closed.
         if good.get("ok") is not False:
@@ -244,11 +281,7 @@ def main() -> int:
 
     # Fail-closed execute while the broken DAG is still present.
     for src, dest in PAIRS:
-        code, body = http_json(
-            "POST",
-            f"/v1/tenants/{src}/split",
-            {"target_tenant_id": dest, "queue_name": "email"},
-        )
+        code, body = exec_split(src, dest, queue_name="email")
         if code != 409 or body.get("code") != "tenant_split_error":
             raise RuntimeError(f"{src} expected split refuse: {code} {body}")
         for sid in email[src]:
@@ -265,16 +298,12 @@ def main() -> int:
             )
             if code != 200:
                 raise RuntimeError(f"cancel dag {src}/{jid} {code} {body}")
-        plan = plan_split(src, dest, "email")
+        plan = plan_split(src, dest, queue_name="email")
         if plan.get("ok") is not True:
             raise RuntimeError(f"{src} plan after cancel not ok: {plan}")
         if set(plan.get("move_job_ids") or []) != set(email[src]):
             raise RuntimeError(f"{src} unexpected move set {plan}")
-        code, body = http_json(
-            "POST",
-            f"/v1/tenants/{src}/split",
-            {"target_tenant_id": dest, "queue_name": "email"},
-        )
+        code, body = exec_split(src, dest, queue_name="email")
         if code != 200:
             raise RuntimeError(f"split {src}->{dest} {code} {body}")
         if int(body.get("jobs_moved") or 0) != EMAIL_EACH:
@@ -323,11 +352,7 @@ def main() -> int:
             raise RuntimeError(f"resume {tid} {code} {body}")
     time.sleep(0.25)
     for src, dest in race_pairs:
-        code, body = http_json(
-            "POST",
-            f"/v1/tenants/{src}/split",
-            {"target_tenant_id": dest, "queue_name": "email"},
-        )
+        code, body = exec_split(src, dest, queue_name="email")
         if code not in (200, 409):
             raise RuntimeError(f"race split {src} {code} {body}")
         for sid in remail[src]:
@@ -371,6 +396,114 @@ def main() -> int:
         if seen != want:
             raise RuntimeError(f"{src} missing {want - seen}")
     logger.info("tenant-split stage 3 OK")
+    if STAGE < 4:
+        return 0
+
+    # Stage 4: same-queue split by labels, then by skills, dest keeps running.
+    label_pairs = (("lab-src-a", "lab-dst-a"), ("lab-src-b", "lab-dst-b"))
+    skill_pairs = (("sk-src-a", "sk-dst-a"), ("sk-src-b", "sk-dst-b"))
+    all_tids = [t for pair in (label_pairs + skill_pairs) for t in pair]
+    for tid in all_tids:
+        code, body = http_json("POST", f"/v1/tenants/{tid}/pause", {})
+        if code != 200:
+            raise RuntimeError(f"pause {tid} {code} {body}")
+
+    xfer: dict[str, list[str]] = {}
+    stay: dict[str, list[str]] = {}
+    for src, dest in label_pairs:
+        xfer[src] = enqueue(
+            src,
+            EMAIL_EACH,
+            queue_name="default",
+            prefix="xfer",
+            labels=["xfer"],
+        )
+        stay[src] = enqueue(
+            src,
+            KEEP_EACH,
+            queue_name="default",
+            prefix="stay",
+            labels=["stay"],
+        )
+        enqueue(dest, KEEP_EACH, queue_name="default", prefix="ldst")
+    gpu: dict[str, list[str]] = {}
+    unsk: dict[str, list[str]] = {}
+    for src, dest in skill_pairs:
+        gpu[src] = enqueue(
+            src,
+            EMAIL_EACH,
+            queue_name="default",
+            prefix="gpu",
+            labels=["gpu"],
+            required_skills=["gpu"],
+        )
+        unsk[src] = enqueue(
+            src,
+            KEEP_EACH,
+            queue_name="default",
+            prefix="unsk",
+            labels=["unsk"],
+        )
+        enqueue(dest, KEEP_EACH, queue_name="default", prefix="sdst")
+
+    dests = [d for _, d in label_pairs + skill_pairs]
+    for dest in dests:
+        code, body = http_json("POST", f"/v1/tenants/{dest}/resume", {})
+        if code != 200:
+            raise RuntimeError(f"resume dest {dest} {code} {body}")
+
+    for src, dest in label_pairs:
+        plan = plan_split(src, dest, labels=["xfer"])
+        if plan.get("ok") is not True:
+            raise RuntimeError(f"{src} label plan not ok: {plan}")
+        if set(plan.get("move_job_ids") or []) != set(xfer[src]):
+            raise RuntimeError(f"{src} label move set {plan}")
+        code, body = exec_split(src, dest, labels=["xfer"])
+        if code != 200:
+            raise RuntimeError(f"label split {src}->{dest} {code} {body}")
+        if int(body.get("jobs_moved") or 0) != EMAIL_EACH:
+            raise RuntimeError(f"label split count {body}")
+        for sid in xfer[src]:
+            sc, _ = http_json("GET", f"/v1/jobs/{sid}?tenant_id={src}")
+            dc, got = http_json("GET", f"/v1/jobs/{sid}?tenant_id={dest}")
+            if sc != 404 or dc != 200 or got.get("job", {}).get("tenant_id") != dest:
+                raise RuntimeError(f"label ownership {sid}: src={sc} dest={dc}")
+        for sid in stay[src]:
+            sc, _ = http_json("GET", f"/v1/jobs/{sid}?tenant_id={src}")
+            if sc != 200:
+                raise RuntimeError(f"label keep left {src}: {sid}")
+
+    for src, dest in skill_pairs:
+        plan = plan_split(src, dest, required_skills=["gpu"])
+        if plan.get("ok") is not True:
+            raise RuntimeError(f"{src} skill plan not ok: {plan}")
+        if set(plan.get("move_job_ids") or []) != set(gpu[src]):
+            raise RuntimeError(f"{src} skill move set {plan}")
+        code, body = exec_split(src, dest, required_skills=["gpu"])
+        if code != 200:
+            raise RuntimeError(f"skill split {src}->{dest} {code} {body}")
+        if int(body.get("jobs_moved") or 0) != EMAIL_EACH:
+            raise RuntimeError(f"skill split count {body}")
+        for sid in gpu[src]:
+            sc, _ = http_json("GET", f"/v1/jobs/{sid}?tenant_id={src}")
+            dc, got = http_json("GET", f"/v1/jobs/{sid}?tenant_id={dest}")
+            if sc != 404 or dc != 200 or got.get("job", {}).get("tenant_id") != dest:
+                raise RuntimeError(f"skill ownership {sid}: src={sc} dest={dc}")
+        for sid in unsk[src]:
+            sc, _ = http_json("GET", f"/v1/jobs/{sid}?tenant_id={src}")
+            if sc != 200:
+                raise RuntimeError(f"skill keep left {src}: {sid}")
+
+    srcs = [s for s, _ in label_pairs + skill_pairs]
+    for src in srcs:
+        code, body = http_json("POST", f"/v1/tenants/{src}/resume", {})
+        if code != 200:
+            raise RuntimeError(f"resume src {src} {code} {body}")
+
+    expect = {d: KEEP_EACH + EMAIL_EACH for d in dests}
+    expect.update({s: KEEP_EACH for s in srcs})
+    wait_completed(srcs + dests, expect)
+    logger.info("tenant-split stage 4 OK")
     return 0
 
 
