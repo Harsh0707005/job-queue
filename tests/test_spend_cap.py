@@ -68,14 +68,21 @@ def test_spend_window_reset_allows_new_work(queue: JobQueue):
     queue.enqueue(tenant_id="cap-w", payload={"i": 1})
     with pytest.raises(SpendCapError):
         queue.enqueue(tenant_id="cap-w", payload={"i": 2})
-    time.sleep(1.15)
-    rolled = queue.get_tenant_spend_cap("cap-w")
-    assert rolled.exhausted is False
-    assert rolled.enqueues == 0
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        rolled = queue.get_tenant_spend_cap("cap-w")
+        if rolled.exhausted is False and rolled.enqueues == 0:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("spend window did not roll")
     again = queue.enqueue(tenant_id="cap-w", payload={"i": 3})
     assert again.payload["i"] == 3
+    # Tumbling windows are epoch-aligned. A 1s window can roll between
+    # enqueue and the following read, so accept 0 (already rolled) or 1.
     cap = queue.get_tenant_spend_cap("cap-w")
-    assert cap.enqueues == 1
+    assert cap.enqueues in (0, 1)
+    assert len(queue.list_jobs(tenant_id="cap-w")) == 2
 
 
 def test_spend_cap_isolated_across_tenants(queue: JobQueue):
