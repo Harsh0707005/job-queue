@@ -87,6 +87,7 @@ class AuditAppendMixin:
             ),
             "available_at": _dt(row.get("available_at")),
             "dedupe_key": row.get("dedupe_key"),
+            "coalesce_key": row.get("coalesce_key"),
             "schedule_id": _uuid(row.get("schedule_id")),
             "depends_on": dep_out,
             "labels": list(row.get("labels") or []),

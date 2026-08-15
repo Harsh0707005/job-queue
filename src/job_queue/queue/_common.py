@@ -48,7 +48,7 @@ _JOB_COLUMNS = """
     await_children_resolved_at, last_error, partition_id, payload_key_id,
     required_skills, expires_at, expiry_action,
     failed_workers, max_worker_hops, quarantine_action,
-    prefer_last_worker, payload_kind, cloned_from_job_id
+    prefer_last_worker, payload_kind, cloned_from_job_id, coalesce_key
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -123,6 +123,14 @@ class TenantSplitError(Exception):
     def __init__(self, message: str, *, plan: Any | None = None) -> None:
         super().__init__(message)
         self.plan = plan
+
+
+class CoalesceError(Exception):
+    """Raised when live jobs cannot be folded into one survivor."""
+
+    def __init__(self, message: str, *, job: Job | None = None) -> None:
+        super().__init__(message)
+        self.job = job
 
 
 class QueueDrainError(Exception):
@@ -493,6 +501,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         prefer_last_worker=bool(row.get("prefer_last_worker") or False),
         payload_kind=str(row.get("payload_kind") or ""),
         cloned_from_job_id=row.get("cloned_from_job_id"),
+        coalesce_key=row.get("coalesce_key"),
     )
 
 

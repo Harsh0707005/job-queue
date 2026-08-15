@@ -26,6 +26,7 @@ from job_queue.models import (
     TenantSplitBlocker,
     TenantSplitPlan,
     TenantSplitResult,
+    CoalesceResult,
     TenantOffboardResult,
     TenantPayloadKey,
     TenantRestore,
@@ -120,6 +121,7 @@ def job_to_dict(
         "prefer_last_worker": bool(getattr(job, "prefer_last_worker", False)),
         "payload_kind": str(getattr(job, "payload_kind", "") or ""),
         "cloned_from_job_id": _uuid(getattr(job, "cloned_from_job_id", None)),
+        "coalesce_key": getattr(job, "coalesce_key", None),
     }
 
 
@@ -207,6 +209,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         prefer_last_worker=bool(data.get("prefer_last_worker") or False),
         payload_kind=str(data.get("payload_kind") or ""),
         cloned_from_job_id=parse_uuid("cloned_from_job_id"),
+        coalesce_key=data.get("coalesce_key"),
     )
 
 
@@ -547,6 +550,19 @@ def tenant_split_blocker_to_dict(blocker: TenantSplitBlocker) -> dict[str, Any]:
         "related_job_id": (
             str(blocker.related_job_id) if blocker.related_job_id else None
         ),
+    }
+
+
+def coalesce_result_to_dict(result: CoalesceResult) -> dict[str, Any]:
+    return {
+        "tenant_id": result.tenant_id,
+        "queue_name": result.queue_name,
+        "coalesce_key": result.coalesce_key,
+        "survivor_job_id": (
+            str(result.survivor_job_id) if result.survivor_job_id else None
+        ),
+        "jobs_folded": result.jobs_folded,
+        "folded_job_ids": [str(j) for j in result.folded_job_ids],
     }
 
 

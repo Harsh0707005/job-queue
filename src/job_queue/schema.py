@@ -239,6 +239,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_cloned_from
     ON jobs (tenant_id, cloned_from_job_id)
     WHERE cloned_from_job_id IS NOT NULL;
 
+-- Live fold key: same logical work may pile up (not unique, unlike dedupe).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS coalesce_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_jobs_coalesce_key
+    ON jobs (tenant_id, queue_name, coalesce_key)
+    WHERE coalesce_key IS NOT NULL
+      AND status IN (
+          'pending', 'leased', 'awaiting_skills', 'quarantined', 'frozen'
+      );
+
 UPDATE jobs
 SET retry_backoff_base_seconds = 1
 WHERE retry_backoff_base_seconds IS NULL;

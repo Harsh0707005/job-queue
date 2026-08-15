@@ -115,6 +115,7 @@ class JobsApiMixin:
                 ),
                 quarantine_action=body.get("quarantine_action"),
                 prefer_last_worker=bool(body.get("prefer_last_worker") or False),
+                coalesce_key=body.get("coalesce_key"),
             )
         except RateLimitError as exc:
             return _limit_error_response(exc)

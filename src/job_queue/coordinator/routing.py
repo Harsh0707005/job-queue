@@ -478,6 +478,12 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/coalesce")
+        ):
+            return self._coalesce_jobs(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/export")
         ):
             return self._export_tenant(path)

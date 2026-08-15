@@ -363,6 +363,26 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def coalesce_jobs(
+        self,
+        tenant_id: str,
+        coalesce_key: str,
+        *,
+        queue_name: str = "default",
+        keep_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "coalesce_key": coalesce_key,
+            "queue_name": queue_name,
+        }
+        if keep_job_id is not None:
+            body["keep_job_id"] = str(keep_job_id)
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/coalesce", body
+        )
+        assert payload is not None
+        return payload
+
     def list_tenant_payload_keys(self, tenant_id: str) -> dict[str, Any]:
         payload = self._request("GET", f"/v1/tenants/{tenant_id}/payload-keys")
         assert payload is not None

@@ -202,6 +202,12 @@ class ClientCoreMixin:
                     raise TenantSplitError(
                         payload.get("error") or "tenant split error"
                     ) from exc
+                if exc.code == 409 and payload.get("code") == "coalesce_error":
+                    from job_queue.queue import CoalesceError
+
+                    raise CoalesceError(
+                        payload.get("error") or "coalesce error"
+                    ) from exc
                 if int(exc.code) == 404:
                     return {"error": payload.get("error") or "not found", "_http": 404}
                 # 5xx → try next coordinator; 4xx is definitive.

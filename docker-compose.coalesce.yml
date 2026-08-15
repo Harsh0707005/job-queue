@@ -1,0 +1,35 @@
+# Live coalesce/fold on a multi-tenant multi-worker fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.coalesce.yml \
+#     up --build --abort-on-container-exit --exit-code-from coalesce-soak \
+#     coalesce-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  coalesce-soak:
+    build: .
+    command: ["python", "scripts/coalesce_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      FOLD_EACH: "16"
+      KEEP_EACH: "8"
+      JOB_MS: "25"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

@@ -8,6 +8,7 @@ from uuid import UUID
 
 from job_queue.codec import (
     audit_consistency_report_to_dict,
+    coalesce_result_to_dict,
     job_audit_event_to_dict,
     payload_key_rotation_to_dict,
     tenant_merge_result_to_dict,
@@ -253,6 +254,44 @@ class TenantsApiLifecycleMixin:
                 return 409, payload
             raise
         return 200, tenant_split_result_to_dict(result)
+
+    def _coalesce_jobs(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / tenants / {id} / coalesce
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant coalesce path"}
+        tenant_id = parts[2]
+        key = body.get("coalesce_key")
+        if not key:
+            return 400, {"error": "coalesce_key is required"}
+        keep_raw = body.get("keep_job_id")
+        keep_id = None
+        if keep_raw is not None and str(keep_raw).strip():
+            try:
+                keep_id = UUID(str(keep_raw))
+            except ValueError:
+                return 400, {"error": "keep_job_id must be a UUID"}
+        try:
+            result = self.queue.coalesce_jobs(
+                tenant_id,
+                str(key),
+                queue_name=str(body.get("queue_name") or "default"),
+                keep_job_id=keep_id,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except Exception as exc:
+            from job_queue.queue import CoalesceError
+
+            if isinstance(exc, CoalesceError):
+                return 409, {
+                    "error": str(exc),
+                    "code": "coalesce_error",
+                }
+            raise
+        return 200, coalesce_result_to_dict(result)
 
     def _export_tenant(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")

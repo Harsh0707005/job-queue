@@ -87,6 +87,8 @@ class Job:
     job is claimable. If a parent ends in failure, dependents are cancelled.
     ``parent_job_id`` links a spawned subtask back to its parent job.
     ``cloned_from_job_id`` points a re-run at the job it was copied from.
+    ``coalesce_key`` groups the same logical work so extras can later be
+    folded into one survivor. Unlike ``dedupe_key`` it is not unique.
     ``waiting_on`` lists child ids a parked parent is joining on.
     ``labels`` is a sorted set of free-form string tags for list / bulk cancel.
     ``required_skills`` is the set of worker capabilities this job needs
@@ -159,6 +161,7 @@ class Job:
     prefer_last_worker: bool = False
     payload_kind: str = ""
     cloned_from_job_id: UUID | None = None
+    coalesce_key: str | None = None
 
     @property
     def is_leased(self) -> bool:
@@ -491,6 +494,18 @@ class TenantSplitPlan:
     move_job_ids: tuple[UUID, ...]
     stay_leased_ids: tuple[UUID, ...]
     blockers: tuple[TenantSplitBlocker, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CoalesceResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.coalesce_jobs`."""
+
+    tenant_id: str
+    queue_name: str
+    coalesce_key: str
+    survivor_job_id: UUID | None
+    jobs_folded: int
+    folded_job_ids: tuple[UUID, ...]
 
 
 @dataclass(frozen=True, slots=True)

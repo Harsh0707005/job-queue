@@ -51,6 +51,7 @@ class JobsEnqueueCoreMixin:
         quarantine_action: str | None = None,
         prefer_last_worker: bool = False,
         cloned_from_job_id: UUID | None = None,
+        coalesce_key: str | None = None,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -66,6 +67,10 @@ class JobsEnqueueCoreMixin:
             may exist for the tenant/queue. A second enqueue returns the
             existing job instead of creating a duplicate. Completed / dead /
             failed jobs do not block a later enqueue with the same key.
+        coalesce_key:
+            Optional fold group. Unlike ``dedupe_key`` this is not unique,
+            so the same logical work can pile up. ``coalesce_jobs`` later
+            absorbs extras into one survivor.
         depends_on:
             Parent job id or list of parent ids (same tenant). The job is not
             claimable until every parent is ``completed``. If a parent is
@@ -119,6 +124,9 @@ class JobsEnqueueCoreMixin:
             raise ValueError("delay_seconds must be >= 0")
         if dedupe_key is not None and dedupe_key == "":
             raise ValueError("dedupe_key must be non-empty when provided")
+        if coalesce_key is not None and coalesce_key == "":
+            raise ValueError("coalesce_key must be non-empty when provided")
+        coal_key = coalesce_key.strip() if coalesce_key is not None else None
         if estimated_duration_seconds is not None and estimated_duration_seconds < 1:
             raise ValueError("estimated_duration_seconds must be >= 1 when set")
 
@@ -197,6 +205,7 @@ class JobsEnqueueCoreMixin:
                 cloned_from_job_id=cloned_from_job_id,
                 max_worker_hops=max_worker_hops,
                 quarantine_action=quarantine_action,
+                coalesce_key=coal_key,
             )
 
         if (
