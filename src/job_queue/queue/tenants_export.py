@@ -31,6 +31,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "tenant_settings",
     "tenant_fairness",
     "duration_estimates",
+    "job_worker_affinity",
     "schedules",
     "workflow_runs",
     "jobs",
@@ -69,6 +70,7 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "breaker_failure_threshold, breaker_window_seconds, "
         "breaker_cooldown_seconds, "
         "lease_weight, draining_queues, "
+        "prefer_last_worker_queues, prefer_last_worker_hold_seconds, "
         "updated_at, restoring",
         "tenant_settings",
     ),
@@ -76,6 +78,10 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     "duration_estimates": (
         "tenant_id, queue_name, kind, ewma_seconds, samples, updated_at",
         "duration_estimates",
+    ),
+    "job_worker_affinity": (
+        "tenant_id, queue_name, kind, last_worker_id, last_success_at",
+        "job_worker_affinity",
     ),
     "schedules": (_SCHEDULE_COLUMNS.strip().replace("\n", " "), "schedules"),
     "workflow_runs": (
@@ -316,6 +322,7 @@ class TenantsExportMixin:
         order = {
             "payload_keys": "key_id ASC",
             "duration_estimates": "queue_name ASC, kind ASC",
+            "job_worker_affinity": "queue_name ASC, kind ASC",
             "tenant_settings": "tenant_id ASC",
             "tenant_fairness": "tenant_id ASC",
             "job_side_effects": "job_id ASC, effect_key ASC",

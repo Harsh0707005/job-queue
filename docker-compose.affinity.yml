@@ -1,0 +1,35 @@
+# Last-success worker preference under multi-tenant multi-worker load.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.affinity.yml \
+#     up --build --abort-on-container-exit --exit-code-from affinity-soak \
+#     affinity-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  affinity-soak:
+    build: .
+    command: ["python", "scripts/affinity_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      RENDER_EACH: "24"
+      OTHER_EACH: "16"
+      JOB_MS: "40"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

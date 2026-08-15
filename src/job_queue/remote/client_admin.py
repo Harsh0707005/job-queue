@@ -145,6 +145,35 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def set_queue_worker_affinity(
+        self,
+        tenant_id: str,
+        queue_name: str,
+        enabled: bool = True,
+        *,
+        hold_seconds: int | None = None,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "queue_name": queue_name,
+            "enabled": enabled,
+            "clear": clear,
+        }
+        if hold_seconds is not None:
+            body["hold_seconds"] = hold_seconds
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/worker-affinity", body
+        )
+        assert payload is not None
+        return payload
+
+    def get_queue_worker_affinity(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request(
+            "GET", f"/v1/tenants/{tenant_id}/worker-affinity"
+        )
+        assert payload is not None
+        return payload
+
     def get_tenant_usage(
         self,
         tenant_id: str,

@@ -19,6 +19,7 @@ from job_queue.queue._common import (
     _SkipLeaseCandidate,
     _failed_worker_avoid_sql,
     _failed_worker_prefer_sql,
+    _last_success_worker_prefer_sql,
     _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
@@ -167,6 +168,7 @@ class LeaseClaimFairMixin:
         avoid_sql = _failed_worker_avoid_sql("jobs")
         params.extend([worker_id, worker_id, worker_id])
         prefer_sql = _failed_worker_prefer_sql("jobs")
+        affinity_sql = _last_success_worker_prefer_sql("jobs")
         params.extend(
             [
                 JobStatus.PENDING.value,
@@ -177,6 +179,7 @@ class LeaseClaimFairMixin:
                 now,
             ]
         )
+        params.append(worker_id)
         params.append(worker_id)
         params.extend([now, now])
         candidate = conn.execute(
@@ -228,6 +231,7 @@ class LeaseClaimFairMixin:
             ORDER BY
               {prefer_sql},
               priority DESC,
+              {affinity_sql},
               CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
               (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                 - COALESCE(estimated_duration_seconds, 60)) ASC,
@@ -263,10 +267,14 @@ class LeaseClaimFairMixin:
         hop_open = bool(candidate.get("failed_workers")) or (
             candidate["status"] == JobStatus.LEASED.value
         )
+        affinity_hop = hasattr(self, "_job_allows_affinity_hop") and (
+            self._job_allows_affinity_hop(conn, candidate, worker_id)
+        )
         if (
             partitions is not None
             and not _row_has_required_skills(candidate)
             and not hop_open
+            and not affinity_hop
             and hasattr(self, "_guard_partition_claim")
         ):
             exp = None

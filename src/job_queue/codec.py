@@ -114,6 +114,8 @@ def job_to_dict(
         "failed_workers": list(job.failed_workers),
         "max_worker_hops": job.max_worker_hops,
         "quarantine_action": job.quarantine_action,
+        "prefer_last_worker": bool(getattr(job, "prefer_last_worker", False)),
+        "payload_kind": str(getattr(job, "payload_kind", "") or ""),
     }
 
 
@@ -198,6 +200,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
             else int(data["max_worker_hops"])
         ),
         quarantine_action=str(data.get("quarantine_action") or "dead"),
+        prefer_last_worker=bool(data.get("prefer_last_worker") or False),
+        payload_kind=str(data.get("payload_kind") or ""),
     )
 
 

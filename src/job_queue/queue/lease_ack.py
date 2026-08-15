@@ -111,6 +111,31 @@ class LeaseAckMixin:
                 if hasattr(self, "_record_lease_end_usage"):
                     self._record_lease_end_usage(conn, row, now=now)
                 self._record_job_duration(conn, job=job, now=now)
+                if hasattr(self, "_record_last_success_worker"):
+                    enabled = bool(updated.get("prefer_last_worker"))
+                    if not enabled:
+                        qs = conn.execute(
+                            """
+                            SELECT prefer_last_worker_queues
+                            FROM tenant_settings
+                            WHERE tenant_id = %s
+                            """,
+                            (updated["tenant_id"],),
+                        ).fetchone()
+                        opted = list(
+                            (qs or {}).get("prefer_last_worker_queues") or []
+                        )
+                        enabled = str(updated["queue_name"]) in opted
+                    if enabled:
+                        self._record_last_success_worker(
+                            conn,
+                            tenant_id=str(updated["tenant_id"]),
+                            queue_name=str(updated["queue_name"]),
+                            kind=str(updated.get("payload_kind") or "")
+                            or self._payload_kind(job.payload),
+                            worker_id=worker_id,
+                            now=now,
+                        )
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now
                 )

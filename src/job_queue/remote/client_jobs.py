@@ -220,6 +220,21 @@ class ClientJobsMixin:
         assert payload is not None
         return job_from_dict(payload["job"])
 
+    def set_job_prefer_last_worker(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        enabled: bool,
+    ) -> Job:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/worker-affinity",
+            {"tenant_id": tenant_id, "enabled": enabled},
+        )
+        assert payload is not None
+        return job_from_dict(payload["job"])
+
     def set_job_priority(
         self,
         job_id: str | UUID,

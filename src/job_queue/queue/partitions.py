@@ -519,6 +519,33 @@ class PartitionsMixin(SkillsWaitMixin):
                 OR {jobs_alias}.status = 'leased'
             )
         """
+        # Last-success worker may claim an opted-in similar job off-shard
+        # while they are still the live preferred holder.
+        affinity_open = f"""
+            (
+                (
+                    COALESCE({jobs_alias}.prefer_last_worker, FALSE)
+                    OR EXISTS (
+                        SELECT 1
+                        FROM tenant_settings ts
+                        WHERE ts.tenant_id = {jobs_alias}.tenant_id
+                          AND ts.prefer_last_worker_queues IS NOT NULL
+                          AND {jobs_alias}.queue_name
+                                = ANY(ts.prefer_last_worker_queues)
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM job_worker_affinity a
+                    JOIN worker_nodes wn ON wn.worker_id = a.last_worker_id
+                    WHERE a.tenant_id = {jobs_alias}.tenant_id
+                      AND a.queue_name = {jobs_alias}.queue_name
+                      AND a.kind = COALESCE({jobs_alias}.payload_kind, '')
+                      AND a.last_worker_id = %s
+                      AND wn.status = 'active'
+                )
+            )
+        """
         if not owned_parts:
             # Active but currently owns no shard (more workers than
             # partitions): still eligible for skilled work and hop-open jobs.
@@ -526,10 +553,11 @@ class PartitionsMixin(SkillsWaitMixin):
               AND (
                     {skilled}
                     OR {hop_open}
+                    OR {affinity_open}
               )
               AND {active}
             """
-            return sql, [worker_id]
+            return sql, [worker_id, worker_id]
         sql = f"""
               AND (
                     (
@@ -550,9 +578,20 @@ class PartitionsMixin(SkillsWaitMixin):
                         {hop_open}
                         AND {active}
                     )
+                 OR (
+                        {affinity_open}
+                        AND {active}
+                    )
               )
         """
-        return sql, [list(owned_parts), worker_id, worker_id, worker_id]
+        return sql, [
+            list(owned_parts),
+            worker_id,
+            worker_id,
+            worker_id,
+            worker_id,
+            worker_id,
+        ]
 
     def _guard_partition_claim(
         self,

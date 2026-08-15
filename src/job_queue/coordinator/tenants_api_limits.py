@@ -225,6 +225,40 @@ class TenantsApiLimitsMixin:
             return 400, {"error": str(exc)}
         return 200, {"tenant_id": tenant_id, "lease_weight": applied}
 
+    def _set_worker_affinity(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        try:
+            if "hold_seconds" in body or "hold" in body:
+                raw = body.get("hold_seconds", body.get("hold"))
+                hold = None if raw is None else int(raw)
+                self.queue.set_prefer_last_worker_hold(tenant_id, hold)
+            if "queue_name" in body or "queue" in body:
+                qn = str(body.get("queue_name", body.get("queue")) or "")
+                if body.get("clear"):
+                    enabled = False
+                elif "enabled" in body or "prefer_last_worker" in body:
+                    enabled = bool(body.get("enabled", body.get("prefer_last_worker")))
+                else:
+                    enabled = True
+                self.queue.set_queue_worker_affinity(tenant_id, qn, enabled)
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        return 200, self.queue.get_queue_worker_affinity(tenant_id)
+
+    def _get_worker_affinity(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        try:
+            return 200, self.queue.get_queue_worker_affinity(parts[2])
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+
     def _get_lease_weight(self, path: str) -> tuple[int, dict[str, Any]]:
         parts = path.strip("/").split("/")
         if len(parts) != 4:

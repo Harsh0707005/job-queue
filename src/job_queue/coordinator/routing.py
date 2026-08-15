@@ -169,6 +169,12 @@ class RoutingMixin:
             and path.endswith("/priority")
         ):
             return self._set_job_priority(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/worker-affinity")
+        ):
+            return self._set_job_worker_affinity(path, body)
         if method == "POST" and path == "/v1/approvals/process-timeouts":
             return self._process_approval_timeouts(body)
         if method == "GET" and path == "/v1/approvals":
@@ -385,6 +391,18 @@ class RoutingMixin:
             and path.endswith("/lease-weight")
         ):
             return self._get_lease_weight(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/worker-affinity")
+        ):
+            return self._set_worker_affinity(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/worker-affinity")
+        ):
+            return self._get_worker_affinity(path)
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")

@@ -18,6 +18,7 @@ from job_queue.queue._common import (
     LeaseError,
     _failed_worker_avoid_sql,
     _failed_worker_prefer_sql,
+    _last_success_worker_prefer_sql,
     _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
@@ -115,6 +116,7 @@ class LeaseClaimTenantMixin:
             avoid_sql = _failed_worker_avoid_sql("jobs")
             avoid_params: list[Any] = [worker_id, worker_id, worker_id]
             prefer_sql = _failed_worker_prefer_sql("jobs")
+            affinity_sql = _last_success_worker_prefer_sql("jobs")
 
             if conc_limit is not None and leased_count >= conc_limit:
                 # Only reclaim expired leases (does not increase concurrent
@@ -134,6 +136,7 @@ class LeaseClaimTenantMixin:
                       {_NOT_TTL_EXPIRED_SQL}
                     ORDER BY {prefer_sql},
                       priority DESC,
+                      {affinity_sql},
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
                       created_at ASC
@@ -149,6 +152,7 @@ class LeaseClaimTenantMixin:
                             JobStatus.LEASED.value,
                             now,
                             now,
+                            worker_id,
                             worker_id,
                             now,
                             now,
@@ -187,6 +191,7 @@ class LeaseClaimTenantMixin:
                       {_NOT_TTL_EXPIRED_SQL}
                     ORDER BY {prefer_sql},
                       priority DESC,
+                      {affinity_sql},
                       CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
                       (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
                         - COALESCE(estimated_duration_seconds, 60)) ASC,
@@ -206,6 +211,7 @@ class LeaseClaimTenantMixin:
                             now,
                             now,
                             worker_id,
+                            worker_id,
                             now,
                             now,
                             take,
@@ -219,10 +225,14 @@ class LeaseClaimTenantMixin:
                 hop_open = bool(candidate.get("failed_workers")) or (
                     candidate["status"] == JobStatus.LEASED.value
                 )
+                affinity_hop = hasattr(self, "_job_allows_affinity_hop") and (
+                    self._job_allows_affinity_hop(conn, candidate, worker_id)
+                )
                 if (
                     owned_parts is not None
                     and not _row_has_required_skills(candidate)
                     and not hop_open
+                    and not affinity_hop
                     and hasattr(self, "_guard_partition_claim")
                 ):
                     exp = None

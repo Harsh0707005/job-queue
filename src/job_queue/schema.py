@@ -211,6 +211,28 @@ CREATE TABLE IF NOT EXISTS duration_estimates (
     PRIMARY KEY (tenant_id, queue_name, kind)
 );
 
+-- Last successful worker for similar work (tenant + queue + payload kind).
+-- Soft preference only: lease ranks that worker first while they are
+-- active and skilled; other workers can still claim so jobs cannot stall.
+CREATE TABLE IF NOT EXISTS job_worker_affinity (
+    tenant_id         TEXT NOT NULL,
+    queue_name        TEXT NOT NULL,
+    kind              TEXT NOT NULL DEFAULT '',
+    last_worker_id    TEXT NOT NULL,
+    last_success_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, queue_name, kind)
+);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS prefer_last_worker BOOLEAN;
+UPDATE jobs SET prefer_last_worker = FALSE WHERE prefer_last_worker IS NULL;
+ALTER TABLE jobs ALTER COLUMN prefer_last_worker SET DEFAULT FALSE;
+ALTER TABLE jobs ALTER COLUMN prefer_last_worker SET NOT NULL;
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS payload_kind TEXT;
+UPDATE jobs SET payload_kind = '' WHERE payload_kind IS NULL;
+ALTER TABLE jobs ALTER COLUMN payload_kind SET DEFAULT '';
+ALTER TABLE jobs ALTER COLUMN payload_kind SET NOT NULL;
+
 UPDATE jobs
 SET retry_backoff_base_seconds = 1
 WHERE retry_backoff_base_seconds IS NULL;
@@ -657,6 +679,15 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_lease_weight_check CH
 -- Existing pending / leased jobs still finish. Other queues keep running.
 -- NULL / empty = nothing draining (not a tenant pause).
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS draining_queues TEXT[];
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS prefer_last_worker_queues TEXT[];
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS prefer_last_worker_hold_seconds INTEGER;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_affinity_hold_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_affinity_hold_check CHECK (
+    prefer_last_worker_hold_seconds IS NULL
+    OR (prefer_last_worker_hold_seconds >= 0
+        AND prefer_last_worker_hold_seconds <= 3600)
+);
 
 -- Recurring schedules: cron expression and/or fixed interval_seconds.
 -- Prefer cron (5-field min hour dom mon dow, or 6-field with seconds).

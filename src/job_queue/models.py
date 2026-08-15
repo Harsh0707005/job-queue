@@ -154,6 +154,9 @@ class Job:
     failed_workers: tuple[str, ...] = ()
     max_worker_hops: int | None = None
     quarantine_action: str = "dead"
+    # Opt this job into last-success-worker preference (queue opt-in also works).
+    prefer_last_worker: bool = False
+    payload_kind: str = ""
 
     @property
     def is_leased(self) -> bool:

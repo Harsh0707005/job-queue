@@ -10,6 +10,7 @@ from job_queue.queue.tenants_spend import TenantsSpendMixin
 from job_queue.queue.tenants_ttl import TenantsTtlMixin
 from job_queue.queue.tenants_quarantine import TenantsQuarantineMixin
 from job_queue.queue.tenants_weight import TenantsWeightMixin
+from job_queue.queue.tenants_affinity import TenantsAffinityMixin
 
 
 class TenantsLimitsMixin(
@@ -21,6 +22,7 @@ class TenantsLimitsMixin(
     TenantsQuarantineMixin,
     TenantsBreakerMixin,
     TenantsWeightMixin,
+    TenantsAffinityMixin,
 ):
     """Aggregated TenantsLimitsMixin (split for maintainability)."""
 

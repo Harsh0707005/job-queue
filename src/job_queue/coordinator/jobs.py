@@ -110,6 +110,7 @@ class JobsApiMixin:
                     else int(body["max_worker_hops"])
                 ),
                 quarantine_action=body.get("quarantine_action"),
+                prefer_last_worker=bool(body.get("prefer_last_worker") or False),
             )
         except RateLimitError as exc:
             return _limit_error_response(exc)
@@ -241,6 +242,37 @@ class JobsApiMixin:
                     tenant_id=str(tenant_id),
                     delta=int(body["delta"]),
                 )
+        except PriorityError as exc:
+            return 409, {
+                "error": str(exc),
+                "code": "priority_error",
+                "job": job_to_dict(exc.job) if getattr(exc, "job", None) else None,
+            }
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"job": job_to_dict(job)}
+
+    def _set_job_worker_affinity(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid job path"}
+        job_id_s = parts[2]
+        if not _UUID_RE.match(job_id_s):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        if "enabled" not in body and "prefer_last_worker" not in body:
+            return 400, {"error": "enabled is required"}
+        raw = body.get("enabled", body.get("prefer_last_worker"))
+        try:
+            job = self.queue.set_job_prefer_last_worker(
+                UUID(job_id_s),
+                tenant_id=str(tenant_id),
+                enabled=bool(raw),
+            )
         except PriorityError as exc:
             return 409, {
                 "error": str(exc),

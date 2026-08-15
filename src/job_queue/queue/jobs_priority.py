@@ -20,6 +20,68 @@ _MUTABLE = tuple(s.value for s in _CANCELABLE_STATUSES)
 
 
 class JobsPriorityMixin:
+    def set_job_prefer_last_worker(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        enabled: bool,
+    ) -> Job:
+        """Mark one live job to prefer the last successful similar worker."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {_JOB_COLUMNS}
+                FROM jobs
+                WHERE id = %s AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (job_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise PriorityError(
+                    f"job {job_id} not found for tenant {tenant_id!r}"
+                )
+            job = self._job(row)
+            if job.status not in _CANCELABLE_STATUSES:
+                raise PriorityError(
+                    f"job {job_id} cannot change prefer_last_worker "
+                    f"(status={job.status.value})",
+                    job=job,
+                )
+            flag = bool(enabled)
+            if bool(row.get("prefer_last_worker") or False) == flag:
+                return job
+            updated = conn.execute(
+                f"""
+                UPDATE jobs
+                SET prefer_last_worker = %s,
+                    updated_at = %s
+                WHERE id = %s AND tenant_id = %s
+                RETURNING {_JOB_COLUMNS}
+                """,
+                (flag, now, job_id, tenant_id),
+            ).fetchone()
+            if updated is None:
+                raise PriorityError(
+                    f"job {job_id} cannot change prefer_last_worker",
+                    job=job,
+                )
+            if hasattr(self, "_append_job_audit"):
+                self._append_job_audit(
+                    conn,
+                    job_row=updated,
+                    event_type="prefer_last_worker_changed",
+                    from_status=updated["status"],
+                    actor=None,
+                    detail={"prefer_last_worker": flag},
+                    now=now,
+                )
+            return self._job(updated)
+
     def set_job_priority(
         self,
         job_id: UUID,

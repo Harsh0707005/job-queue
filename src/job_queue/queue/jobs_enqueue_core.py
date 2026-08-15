@@ -52,6 +52,7 @@ class JobsEnqueueCoreMixin:
         expiry_action: str | None = None,
         max_worker_hops: int | None = None,
         quarantine_action: str | None = None,
+        prefer_last_worker: bool = False,
     ) -> Job:
         """Add a job to the queue (or return an existing active dedupe match).
 
@@ -128,6 +129,8 @@ class JobsEnqueueCoreMixin:
         skill_list = _normalize_skills(required_skills)
 
         now = _utcnow()
+        payload_kind = self._payload_kind(payload)
+        prefer_lw = bool(prefer_last_worker)
         if available_at is not None:
             run_at = _as_utc(available_at)
         elif delay_seconds is not None:
@@ -216,7 +219,8 @@ class JobsEnqueueCoreMixin:
                         labels, required_skills,
                         deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at, partition_id, payload_key_id,
-                        expires_at, expiry_action
+                        expires_at, expiry_action,
+                        prefer_last_worker, payload_kind
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -226,6 +230,7 @@ class JobsEnqueueCoreMixin:
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s,
+                        %s, %s,
                         %s, %s
                     )
                     ON CONFLICT (tenant_id, queue_name, dedupe_key)
@@ -264,6 +269,8 @@ class JobsEnqueueCoreMixin:
                         payload_key_id,
                         expires,
                         exp_action,
+                        prefer_lw,
+                        payload_kind,
                     ),
                 ).fetchone()
 
@@ -347,7 +354,8 @@ class JobsEnqueueCoreMixin:
                         labels, required_skills,
                         deadline_at, estimated_duration_seconds, preemptible,
                         created_at, updated_at, partition_id, payload_key_id,
-                        expires_at, expiry_action
+                        expires_at, expiry_action,
+                        prefer_last_worker, payload_kind
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
                         0, %s, %s,
@@ -357,6 +365,7 @@ class JobsEnqueueCoreMixin:
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s,
+                        %s, %s,
                         %s, %s
                     )
                     RETURNING {_JOB_COLUMNS}
@@ -386,6 +395,8 @@ class JobsEnqueueCoreMixin:
                         payload_key_id,
                         expires,
                         exp_action,
+                        prefer_lw,
+                        payload_kind,
                     ),
                 ).fetchone()
                 assert row is not None

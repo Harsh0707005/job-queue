@@ -46,7 +46,8 @@ _JOB_COLUMNS = """
     await_children_deadline_at, await_children_outcome,
     await_children_resolved_at, last_error, partition_id, payload_key_id,
     required_skills, expires_at, expiry_action,
-    failed_workers, max_worker_hops, quarantine_action
+    failed_workers, max_worker_hops, quarantine_action,
+    prefer_last_worker, payload_kind
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -227,6 +228,82 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
     """
 
 
+_DEFAULT_AFFINITY_HOLD_SECONDS = 10
+
+
+def _last_success_worker_prefer_sql(jobs_alias: str = "jobs") -> str:
+    """ORDER BY fragment: rank this worker first on opted-in similar jobs.
+
+    Soft preference only (no skip). Binds one ``%s`` (worker_id). After the
+    tenant hold window — or if the last worker is dead / unskilled — every
+    worker ranks equally so the job cannot stall.
+    """
+    skills = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
+    kind = f"COALESCE({jobs_alias}.payload_kind, '')"
+    enabled = f"""
+        (
+            COALESCE({jobs_alias}.prefer_last_worker, FALSE)
+            OR EXISTS (
+                SELECT 1
+                FROM tenant_settings ts
+                WHERE ts.tenant_id = {jobs_alias}.tenant_id
+                  AND ts.prefer_last_worker_queues IS NOT NULL
+                  AND {jobs_alias}.queue_name = ANY(ts.prefer_last_worker_queues)
+            )
+        )
+    """
+    hold = f"""
+        COALESCE(
+            (
+                SELECT ts.prefer_last_worker_hold_seconds
+                FROM tenant_settings ts
+                WHERE ts.tenant_id = {jobs_alias}.tenant_id
+            ),
+            {_DEFAULT_AFFINITY_HOLD_SECONDS}
+        )
+    """
+    alive = f"""
+        EXISTS (
+            SELECT 1
+            FROM job_worker_affinity a
+            JOIN worker_nodes wn ON wn.worker_id = a.last_worker_id
+            WHERE a.tenant_id = {jobs_alias}.tenant_id
+              AND a.queue_name = {jobs_alias}.queue_name
+              AND a.kind = {kind}
+              AND wn.status = 'active'
+              AND wn.last_seen_at >= NOW()
+                - make_interval(secs => {WORKER_HEARTBEAT_TTL_SECONDS})
+              AND (
+                    {skills} = '{{}}'::text[]
+                    OR {skills} <@ COALESCE(wn.skills, '{{}}'::text[])
+              )
+              AND (
+                    {hold} <= 0
+                    OR {jobs_alias}.available_at
+                        > NOW() - make_interval(secs => {hold})
+              )
+        )
+    """
+    mine = f"""
+        EXISTS (
+            SELECT 1
+            FROM job_worker_affinity a
+            WHERE a.tenant_id = {jobs_alias}.tenant_id
+              AND a.queue_name = {jobs_alias}.queue_name
+              AND a.kind = {kind}
+              AND a.last_worker_id = %s
+        )
+    """
+    return f"""
+        CASE
+          WHEN NOT {enabled} THEN 1
+          WHEN NOT ({alive}) THEN 1
+          WHEN {mine} THEN 0
+          ELSE 2
+        END ASC
+    """
+
+
 def _failed_worker_prefer_sql(jobs_alias: str = "jobs") -> str:
     """ORDER BY fragment: jobs this worker has not failed come first.
 
@@ -372,6 +449,8 @@ def _row_to_job(row: dict[str, Any]) -> Job:
             else int(row["max_worker_hops"])
         ),
         quarantine_action=str(row.get("quarantine_action") or "dead"),
+        prefer_last_worker=bool(row.get("prefer_last_worker") or False),
+        payload_kind=str(row.get("payload_kind") or ""),
     )
 
 

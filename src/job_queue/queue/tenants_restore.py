@@ -547,6 +547,27 @@ class TenantsRestoreMixin:
             ),
         )
 
+    def _restore_job_worker_affinity(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO job_worker_affinity (
+                tenant_id, queue_name, kind, last_worker_id, last_success_at
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, queue_name, kind) DO UPDATE
+            SET last_worker_id = EXCLUDED.last_worker_id,
+                last_success_at = EXCLUDED.last_success_at
+            """,
+            (
+                target,
+                str(raw.get("queue_name") or "default"),
+                str(raw.get("kind") or ""),
+                str(raw.get("last_worker_id") or ""),
+                _parse_dt(raw.get("last_success_at")) or _utcnow(),
+            ),
+        )
+
     def _restore_duration_estimates(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:
@@ -1297,6 +1318,8 @@ class TenantsRestoreMixin:
         br_c = None
         lease_weight = None
         draining_queues = None
+        prefer_queues = None
+        prefer_hold = None
         if isinstance(exported_settings, dict):
             paused = bool(exported_settings.get("paused") or False)
             max_c = exported_settings.get("max_concurrent_leases")
@@ -1321,6 +1344,10 @@ class TenantsRestoreMixin:
             raw_dq = exported_settings.get("draining_queues")
             if isinstance(raw_dq, (list, tuple)):
                 draining_queues = [str(q) for q in raw_dq if str(q).strip()] or None
+            raw_pq = exported_settings.get("prefer_last_worker_queues")
+            if isinstance(raw_pq, (list, tuple)):
+                prefer_queues = [str(q) for q in raw_pq if str(q).strip()] or None
+            prefer_hold = exported_settings.get("prefer_last_worker_hold_seconds")
         conn.execute(
             """
             INSERT INTO tenant_settings (
@@ -1338,6 +1365,7 @@ class TenantsRestoreMixin:
                 breaker_cooldown_seconds, breaker_failures,
                 breaker_window_start, breaker_opened_at,
                 lease_weight, draining_queues,
+                prefer_last_worker_queues, prefer_last_worker_hold_seconds,
                 updated_at
             ) VALUES (
                 %s, %s, %s,
@@ -1351,6 +1379,7 @@ class TenantsRestoreMixin:
                 %s, NULL,
                 0, 0,
                 %s, %s, %s, 0, NULL, NULL,
+                %s, %s,
                 %s, %s,
                 %s
             )
@@ -1378,6 +1407,9 @@ class TenantsRestoreMixin:
                 breaker_cooldown_seconds = EXCLUDED.breaker_cooldown_seconds,
                 lease_weight = EXCLUDED.lease_weight,
                 draining_queues = EXCLUDED.draining_queues,
+                prefer_last_worker_queues = EXCLUDED.prefer_last_worker_queues,
+                prefer_last_worker_hold_seconds
+                    = EXCLUDED.prefer_last_worker_hold_seconds,
                 updated_at = EXCLUDED.updated_at
             """,
             (
@@ -1403,6 +1435,8 @@ class TenantsRestoreMixin:
                 br_c,
                 lease_weight,
                 draining_queues,
+                prefer_queues,
+                prefer_hold,
                 now,
             ),
         )
