@@ -606,9 +606,16 @@ class CancelError(Exception):
 class ReplayError(Exception):
     """Raised when a dead-lettered job cannot be replayed."""
 
-    def __init__(self, message: str, *, job: Job | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        job: Job | None = None,
+        plan: Any | None = None,
+    ) -> None:
         super().__init__(message)
         self.job = job
+        self.plan = plan
 
 
 class DependencyError(Exception):

@@ -21,9 +21,10 @@ from job_queue.queue._common import (
     _as_utc,
     _utcnow,
 )
+from job_queue.queue.dead_letters_graph import DeadLettersGraphMixin
 
 
-class DeadLettersMixin:
+class DeadLettersMixin(DeadLettersGraphMixin):
     def list_dead_letters(
         self,
         *,

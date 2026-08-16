@@ -637,6 +637,52 @@ class ClientAdminMixin:
         assert payload is not None
         return job_from_dict(payload["job"])
 
+    def plan_replay_dead_letter_graph(
+        self,
+        *,
+        tenant_id: str,
+        job_ids: list[str | UUID] | None = None,
+        queue_name: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if job_ids is not None:
+            body["job_ids"] = [str(j) for j in job_ids]
+        if queue_name is not None:
+            body["queue_name"] = queue_name
+        payload = self._request(
+            "POST", "/v1/dead-letters/replay-graph/plan", body
+        )
+        assert payload is not None
+        return payload
+
+    def replay_dead_letter_graph(
+        self,
+        *,
+        tenant_id: str,
+        job_ids: list[str | UUID] | None = None,
+        queue_name: str | None = None,
+        reset_attempts: bool = True,
+        max_attempts: int | None = None,
+        delay_seconds: float | int | None = None,
+        clear_error: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "reset_attempts": reset_attempts,
+            "clear_error": clear_error,
+        }
+        if job_ids is not None:
+            body["job_ids"] = [str(j) for j in job_ids]
+        if queue_name is not None:
+            body["queue_name"] = queue_name
+        if max_attempts is not None:
+            body["max_attempts"] = max_attempts
+        if delay_seconds is not None:
+            body["delay_seconds"] = delay_seconds
+        payload = self._request("POST", "/v1/dead-letters/replay-graph", body)
+        assert payload is not None
+        return payload
+
     def replay_dead_letters(
         self,
         *,

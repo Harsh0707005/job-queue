@@ -299,6 +299,10 @@ class RoutingMixin:
 
         if method == "GET" and path == "/v1/dead-letters":
             return self._list_dead_letters(query)
+        if method == "POST" and path == "/v1/dead-letters/replay-graph/plan":
+            return self._plan_replay_dead_letter_graph(body)
+        if method == "POST" and path == "/v1/dead-letters/replay-graph":
+            return self._replay_dead_letter_graph(body)
         if method == "POST" and path == "/v1/dead-letters/replay":
             return self._replay_dead_letters(body)
         if (

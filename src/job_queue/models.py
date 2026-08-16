@@ -497,6 +497,37 @@ class TenantSplitPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayGraphBlocker:
+    """Why a graph-closed dead-letter replay cannot proceed."""
+
+    job_id: UUID
+    reason: str
+    related_job_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayGraphPlan:
+    """Dry-run of :meth:`~job_queue.queue.JobQueue.plan_replay_dead_letter_graph`."""
+
+    tenant_id: str
+    ok: bool
+    replay_job_ids: tuple[UUID, ...]
+    stay_job_ids: tuple[UUID, ...]
+    rejoin_job_ids: tuple[UUID, ...]
+    blockers: tuple[ReplayGraphBlocker, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayGraphResult:
+    """Result of :meth:`~job_queue.queue.JobQueue.replay_dead_letter_graph`."""
+
+    tenant_id: str
+    jobs_replayed: int
+    job_ids: tuple[UUID, ...]
+    rejoin_job_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CoalesceResult:
     """Result of :meth:`~job_queue.queue.JobQueue.coalesce_jobs`."""
 

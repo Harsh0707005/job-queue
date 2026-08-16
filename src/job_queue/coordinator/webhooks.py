@@ -12,6 +12,8 @@ from uuid import UUID
 from job_queue.codec import (
     claimed_webhook_to_dict,
     job_to_dict,
+    replay_graph_plan_to_dict,
+    replay_graph_result_to_dict,
     webhook_delivery_to_dict,
     webhook_endpoint_to_dict,
 )
@@ -276,6 +278,76 @@ class WebhooksApiMixin:
             "jobs": [job_to_dict(j) for j in jobs],
             "replayed": len(jobs),
         }
+
+    def _plan_replay_dead_letter_graph(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        raw_ids = body.get("job_ids")
+        job_ids: list[UUID] | None = None
+        if raw_ids is not None:
+            try:
+                job_ids = [UUID(str(x)) for x in raw_ids]
+            except (TypeError, ValueError) as exc:
+                return 400, {"error": f"invalid job_ids: {exc}"}
+        try:
+            plan = self.queue.plan_replay_dead_letter_graph(
+                str(tenant_id),
+                job_ids=job_ids,
+                queue_name=(
+                    None if body.get("queue_name") is None else str(body["queue_name"])
+                ),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, replay_graph_plan_to_dict(plan)
+
+    def _replay_dead_letter_graph(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        raw_ids = body.get("job_ids")
+        job_ids: list[UUID] | None = None
+        if raw_ids is not None:
+            try:
+                job_ids = [UUID(str(x)) for x in raw_ids]
+            except (TypeError, ValueError) as exc:
+                return 400, {"error": f"invalid job_ids: {exc}"}
+        try:
+            result = self.queue.replay_dead_letter_graph(
+                str(tenant_id),
+                job_ids=job_ids,
+                queue_name=(
+                    None if body.get("queue_name") is None else str(body["queue_name"])
+                ),
+                reset_attempts=bool(body.get("reset_attempts", True)),
+                max_attempts=(
+                    None
+                    if body.get("max_attempts") is None
+                    else int(body["max_attempts"])
+                ),
+                delay_seconds=(
+                    None
+                    if body.get("delay_seconds") is None
+                    else float(body["delay_seconds"])
+                ),
+                clear_error=bool(body.get("clear_error", False)),
+            )
+        except (ValueError, TypeError) as exc:
+            return 400, {"error": str(exc)}
+        except ReplayError as exc:
+            payload: dict[str, Any] = {
+                "error": str(exc),
+                "code": "replay_error",
+            }
+            if getattr(exc, "plan", None) is not None:
+                payload["plan"] = replay_graph_plan_to_dict(exc.plan)
+            return 409, payload
+        return 200, replay_graph_result_to_dict(result)
 
     def _webhook_stats(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:

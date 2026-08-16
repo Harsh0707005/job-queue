@@ -27,6 +27,9 @@ from job_queue.models import (
     TenantSplitPlan,
     TenantSplitResult,
     CoalesceResult,
+    ReplayGraphBlocker,
+    ReplayGraphPlan,
+    ReplayGraphResult,
     TenantOffboardResult,
     TenantPayloadKey,
     TenantRestore,
@@ -550,6 +553,36 @@ def tenant_split_blocker_to_dict(blocker: TenantSplitBlocker) -> dict[str, Any]:
         "related_job_id": (
             str(blocker.related_job_id) if blocker.related_job_id else None
         ),
+    }
+
+
+def replay_graph_blocker_to_dict(blocker: ReplayGraphBlocker) -> dict[str, Any]:
+    return {
+        "job_id": str(blocker.job_id),
+        "reason": blocker.reason,
+        "related_job_id": (
+            str(blocker.related_job_id) if blocker.related_job_id else None
+        ),
+    }
+
+
+def replay_graph_plan_to_dict(plan: ReplayGraphPlan) -> dict[str, Any]:
+    return {
+        "tenant_id": plan.tenant_id,
+        "ok": plan.ok,
+        "replay_job_ids": [str(j) for j in plan.replay_job_ids],
+        "stay_job_ids": [str(j) for j in plan.stay_job_ids],
+        "rejoin_job_ids": [str(j) for j in plan.rejoin_job_ids],
+        "blockers": [replay_graph_blocker_to_dict(b) for b in plan.blockers],
+    }
+
+
+def replay_graph_result_to_dict(result: ReplayGraphResult) -> dict[str, Any]:
+    return {
+        "tenant_id": result.tenant_id,
+        "jobs_replayed": result.jobs_replayed,
+        "job_ids": [str(j) for j in result.job_ids],
+        "rejoin_job_ids": [str(j) for j in result.rejoin_job_ids],
     }
 
 
