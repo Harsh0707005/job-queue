@@ -19,6 +19,7 @@ from job_queue.queue._common import (
     _as_utc,
     _utcnow,
 )
+from job_queue.queue.schedules_blackout import _BLACKOUT_EXISTS_SQL
 from job_queue.queue.schedules_crud import (
     MISFIRE_CATCH_UP,
     MISFIRE_CATCH_UP_ONE,
@@ -57,9 +58,10 @@ class SchedulesProcessMixin:
         **Schedule fires bypass pending caps and enqueue rate limits** so
         timed work still runs under tenant throttles.
 
-        **Paused tenants and tenants with an open failure breaker are skipped
-        entirely** — ``next_run_at`` is left in the past so the policy can
-        run on resume / breaker close. No jobs pile up while paused.
+        **Paused tenants, open failure breakers, and covering blackout
+        windows are skipped entirely** — ``next_run_at`` is left in the
+        past so the policy can run on resume / breaker close / window end.
+        No jobs pile up while blocked.
 
         **No overlapping runs:** if a previous job for the same schedule is
         still ``pending`` or ``leased``, this tick is skipped and
@@ -90,6 +92,7 @@ class SchedulesProcessMixin:
                   AND ts.draining_queues IS NOT NULL
                   AND schedules.queue_name = ANY(ts.draining_queues)
             )
+            AND NOT {_BLACKOUT_EXISTS_SQL}
         """
 
         with transaction(self._pool) as conn:
@@ -108,7 +111,7 @@ class SchedulesProcessMixin:
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
                     """,
-                    (now, tenant_id, limit),
+                    (now, tenant_id, now, limit),
                 ).fetchall()
             else:
                 due = conn.execute(
@@ -122,11 +125,11 @@ class SchedulesProcessMixin:
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
                     """,
-                    (now, limit),
+                    (now, now, limit),
                 ).fetchall()
 
             for sched_row in due:
-                # Race: tenant paused / breaker opened after SELECT.
+                # Race: tenant paused / breaker opened / blackout set after SELECT.
                 if self._tenant_claims_blocked(
                     conn, sched_row["tenant_id"], now=now
                 ) or (
@@ -141,6 +144,20 @@ class SchedulesProcessMixin:
                         conn,
                         tenant_id=str(sched_row["tenant_id"]),
                         metric="schedule_skip",
+                        count=1,
+                        now=now,
+                    )
+                    continue
+                if self._is_schedule_blacked_out(
+                    conn,
+                    str(sched_row["tenant_id"]),
+                    sched_row["id"],
+                    now,
+                ):
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        metric="schedule_blackout",
                         count=1,
                         now=now,
                     )

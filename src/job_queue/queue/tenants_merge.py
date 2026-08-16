@@ -219,6 +219,15 @@ class TenantsMergeMixin:
                 """,
                 (target, now, source),
             ).fetchall()
+            conn.execute(
+                """
+                UPDATE schedule_blackouts
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                """,
+                (target, now, source),
+            )
 
             # Endpoints before deliveries is fine (no tenant FK); both move.
             ep_moved = conn.execute(

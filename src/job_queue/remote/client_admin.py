@@ -477,6 +477,98 @@ class ClientAdminMixin:
         assert payload is not None
         return payload["schedule"]
 
+    def create_blackout(self, **kwargs: Any) -> dict[str, Any]:
+        schedule_id = kwargs.get("schedule_id")
+        tenant_id = kwargs.get("tenant_id")
+        if schedule_id:
+            payload = self._request(
+                "POST", f"/v1/schedules/{schedule_id}/blackouts", kwargs
+            )
+        else:
+            payload = self._request(
+                "POST", f"/v1/tenants/{tenant_id}/blackouts", kwargs
+            )
+        assert payload is not None
+        return payload["blackout"]
+
+    def update_blackout(
+        self,
+        blackout_id: str | UUID,
+        *,
+        tenant_id: str,
+        schedule_id: str | UUID | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        body = dict(kwargs)
+        body["tenant_id"] = tenant_id
+        if schedule_id:
+            payload = self._request(
+                "POST",
+                f"/v1/schedules/{schedule_id}/blackouts/{blackout_id}",
+                body,
+            )
+        else:
+            payload = self._request(
+                "POST",
+                f"/v1/tenants/{tenant_id}/blackouts/{blackout_id}",
+                body,
+            )
+        assert payload is not None
+        return payload["blackout"]
+
+    def delete_blackout(
+        self,
+        blackout_id: str | UUID,
+        *,
+        tenant_id: str,
+        schedule_id: str | UUID | None = None,
+    ) -> bool:
+        if schedule_id:
+            payload = self._request(
+                "POST",
+                f"/v1/schedules/{schedule_id}/blackouts/{blackout_id}/delete",
+                {"tenant_id": tenant_id},
+            )
+        else:
+            payload = self._request(
+                "POST",
+                f"/v1/tenants/{tenant_id}/blackouts/{blackout_id}/delete",
+                {},
+            )
+        if payload is None or payload.get("_http") == 404:
+            return False
+        return bool(payload.get("deleted"))
+
+    def list_blackouts(
+        self,
+        *,
+        tenant_id: str,
+        schedule_id: str | UUID | None = None,
+        include_tenant: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        from urllib.parse import urlencode
+
+        q = urlencode(
+            {
+                "tenant_id": tenant_id,
+                "include_tenant": "1" if include_tenant else "0",
+                "limit": str(limit),
+                "offset": str(offset),
+            }
+        )
+        if schedule_id:
+            payload = self._request(
+                "GET", f"/v1/schedules/{schedule_id}/blackouts?{q}"
+            )
+        else:
+            payload = self._request(
+                "GET", f"/v1/tenants/{tenant_id}/blackouts?{q}"
+            )
+        assert payload is not None
+        return list(payload.get("blackouts") or [])
+
     def set_schedule_misfire(
         self,
         schedule_id: str | UUID,

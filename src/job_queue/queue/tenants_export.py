@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -33,6 +33,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "duration_estimates",
     "job_worker_affinity",
     "schedules",
+    "schedule_blackouts",
     "workflow_runs",
     "jobs",
     "job_dag_batches",
@@ -84,6 +85,11 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "job_worker_affinity",
     ),
     "schedules": (_SCHEDULE_COLUMNS.strip().replace("\n", " "), "schedules"),
+    "schedule_blackouts": (
+        "id, tenant_id, schedule_id, kind, starts_at, ends_at, "
+        "daily_start, daily_end, timezone, reason, created_at, updated_at",
+        "schedule_blackouts",
+    ),
     "workflow_runs": (
         "id, tenant_id, name, status, steps_def, current_index, "
         "fail_step_index, fail_reason, max_compensate_retries, created_at, "
@@ -189,6 +195,8 @@ def _jsonable(value: Any) -> Any:
         return None
     if isinstance(value, datetime):
         return _as_utc(value).isoformat()
+    if isinstance(value, time):
+        return value.strftime("%H:%M:%S")
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, memoryview):

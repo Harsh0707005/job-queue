@@ -706,6 +706,14 @@ class ScheduleError(Exception):
         self.schedule = schedule
 
 
+class BlackoutError(Exception):
+    """Raised when a maintenance blackout cannot be created or changed."""
+
+    def __init__(self, message: str, *, blackout: Any | None = None) -> None:
+        super().__init__(message)
+        self.blackout = blackout
+
+
 _SIDE_EFFECT_SELECT = "\n        job_id, effect_key, tenant_id, status, idempotency_key, result,\n        started_by, started_at, completed_by, lease_token,\n        created_at, completed_at\n    "
 
 _WEBHOOK_ENDPOINT_COLUMNS = "\n        id, tenant_id, url, secret, events, enabled, max_attempts,\n        backoff_base_seconds, backoff_max_seconds, created_at, updated_at\n    "

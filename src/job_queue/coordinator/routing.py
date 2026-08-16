@@ -256,6 +256,31 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/schedules/")
+            and "/blackouts/" in path
+            and path.endswith("/delete")
+        ):
+            return self._delete_schedule_blackout(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
+            and path.endswith("/blackouts")
+        ):
+            return self._create_schedule_blackout(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/schedules/")
+            and path.endswith("/blackouts")
+        ):
+            return self._list_schedule_blackouts(path, query)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
+            and "/blackouts/" in path
+        ):
+            return self._update_schedule_blackout(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
             and path.endswith("/misfire")
         ):
             return self._set_schedule_misfire(path, body)
@@ -317,6 +342,31 @@ class RoutingMixin:
             and path.endswith("/replay")
         ):
             return self._replay_dead_letter(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and "/blackouts/" in path
+            and path.endswith("/delete")
+        ):
+            return self._delete_tenant_blackout(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/blackouts")
+        ):
+            return self._create_tenant_blackout(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/blackouts")
+        ):
+            return self._list_tenant_blackouts(path, query)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and "/blackouts/" in path
+        ):
+            return self._update_tenant_blackout(path, body)
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")

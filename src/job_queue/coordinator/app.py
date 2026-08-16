@@ -28,6 +28,7 @@ from job_queue.coordinator.routing import RoutingMixin
 from job_queue.coordinator.jobs import JobsApiMixin
 from job_queue.coordinator.webhooks import WebhooksApiMixin
 from job_queue.coordinator.schedules import SchedulesApiMixin
+from job_queue.coordinator.blackouts import BlackoutsApiMixin
 from job_queue.coordinator.tenants import TenantsApiMixin
 from job_queue.coordinator.audit import AuditApiMixin
 from job_queue.coordinator.admin import AdminApiMixin
@@ -45,6 +46,7 @@ class Coordinator(
     JobsApiMixin,
     WebhooksApiMixin,
     SchedulesApiMixin,
+    BlackoutsApiMixin,
     TenantsApiMixin,
     AuditApiMixin,
     AdminApiMixin,

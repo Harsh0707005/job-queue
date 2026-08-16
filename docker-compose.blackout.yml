@@ -1,0 +1,53 @@
+# Maintenance blackout windows on a multi-tenant multi-worker fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.blackout.yml \
+#     up --build --abort-on-container-exit --exit-code-from blackout-soak \
+#     blackout-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  scheduler-2:
+    build: .
+    command: ["job-queue-scheduler-node"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  blackout-soak:
+    build: .
+    command: ["python", "scripts/blackout_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WINDOW_SECONDS: "10"
+      CRON_EVERY_SEC: "2"
+      CATCH_UP_MAX: "3"
+      JOB_MS: "20"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      scheduler:
+        condition: service_started
+      scheduler-2:
+        condition: service_started

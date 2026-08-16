@@ -650,6 +650,44 @@ class TenantsRestoreMixin:
             ),
         )
 
+    def _restore_schedule_blackouts(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        old_id = _parse_uuid(raw["id"])
+        new_id = self._map_id(id_map, "schedule_blackouts", old_id)
+        old_sid = _parse_uuid(raw.get("schedule_id"))
+        new_sid = None
+        if old_sid is not None:
+            new_sid = self._mapped(id_map, "schedules", old_sid)
+            if new_sid is None:
+                return
+        conn.execute(
+            """
+            INSERT INTO schedule_blackouts (
+                id, tenant_id, schedule_id, kind, starts_at, ends_at,
+                daily_start, daily_end, timezone, reason, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                new_id,
+                target,
+                new_sid,
+                raw.get("kind") or "once",
+                _parse_dt(raw.get("starts_at")),
+                _parse_dt(raw.get("ends_at")),
+                raw.get("daily_start"),
+                raw.get("daily_end"),
+                raw.get("timezone") or "UTC",
+                raw.get("reason"),
+                _parse_dt(raw.get("created_at")) or _utcnow(),
+                _parse_dt(raw.get("updated_at")) or _utcnow(),
+            ),
+        )
+
     def _restore_workflow_runs(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 from uuid import UUID
 
@@ -21,6 +21,7 @@ from job_queue.models import (
     PayloadKeyRotation,
     PreemptResult,
     Schedule,
+    ScheduleBlackout,
     SpawnChildrenResult,
     TenantMergeResult,
     TenantSplitBlocker,
@@ -376,6 +377,30 @@ def schedule_to_dict(
         "missed_ticks": int(getattr(sched, "missed_ticks", 0) or 0),
         "last_misfire_at": _dt(getattr(sched, "last_misfire_at", None)),
         "catch_up_remaining": getattr(sched, "catch_up_remaining", None),
+    }
+
+
+def _clock(value: time | None) -> str | None:
+    if value is None:
+        return None
+    return value.strftime("%H:%M:%S")
+
+
+def blackout_to_dict(win: ScheduleBlackout) -> dict[str, Any]:
+    return {
+        "id": str(win.id),
+        "tenant_id": win.tenant_id,
+        "schedule_id": str(win.schedule_id) if win.schedule_id else None,
+        "kind": win.kind,
+        "starts_at": _dt(win.starts_at),
+        "ends_at": _dt(win.ends_at),
+        "daily_start": _clock(win.daily_start),
+        "daily_end": _clock(win.daily_end),
+        "timezone": win.timezone,
+        "reason": win.reason,
+        "active": bool(win.active),
+        "created_at": _dt(win.created_at),
+        "updated_at": _dt(win.updated_at),
     }
 
 

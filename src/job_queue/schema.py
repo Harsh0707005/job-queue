@@ -800,6 +800,56 @@ ALTER TABLE schedules ALTER COLUMN missed_ticks SET NOT NULL;
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_misfire_at TIMESTAMPTZ;
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catch_up_remaining INTEGER;
 
+-- Maintenance blackout windows: tenant-wide (schedule_id NULL) or one schedule.
+-- During a covering window process_due does not enqueue; next_run_at stays
+-- overdue so misfire_policy (skip / catch_up_one / catch_up) runs when the
+-- window ends. Overlapping windows are a union. Quiet hours are kind=daily.
+CREATE TABLE IF NOT EXISTS schedule_blackouts (
+    id              UUID PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    schedule_id     UUID,
+    kind            TEXT NOT NULL,
+    starts_at       TIMESTAMPTZ,
+    ends_at         TIMESTAMPTZ,
+    daily_start     TIME,
+    daily_end       TIME,
+    timezone        TEXT NOT NULL DEFAULT 'UTC',
+    reason          TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT schedule_blackouts_kind_check CHECK (
+        kind IN ('once', 'daily')
+    ),
+    CONSTRAINT schedule_blackouts_once_check CHECK (
+        kind <> 'once' OR (
+            starts_at IS NOT NULL
+            AND ends_at IS NOT NULL
+            AND ends_at > starts_at
+        )
+    ),
+    CONSTRAINT schedule_blackouts_daily_check CHECK (
+        kind <> 'daily' OR (
+            daily_start IS NOT NULL
+            AND daily_end IS NOT NULL
+            AND daily_start <> daily_end
+        )
+    ),
+    CONSTRAINT schedule_blackouts_schedule_fk
+        FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_blackouts_tenant
+    ON schedule_blackouts (tenant_id, schedule_id);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_blackouts_once_active
+    ON schedule_blackouts (tenant_id, starts_at, ends_at)
+    WHERE kind = 'once';
+
+CREATE INDEX IF NOT EXISTS idx_schedule_blackouts_daily
+    ON schedule_blackouts (tenant_id)
+    WHERE kind = 'daily';
+
 -- HTTP webhooks: endpoints + durable delivery outbox.
 CREATE TABLE IF NOT EXISTS webhook_endpoints (
     id                          UUID PRIMARY KEY,

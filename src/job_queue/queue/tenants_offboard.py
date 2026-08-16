@@ -117,6 +117,10 @@ class TenantsOffboardMixin:
                     now=now,
                 )
 
+            conn.execute(
+                "DELETE FROM schedule_blackouts WHERE tenant_id = %s",
+                (tenant_id,),
+            )
             sched_del = conn.execute(
                 """
                 DELETE FROM schedules
@@ -220,6 +224,12 @@ class TenantsOffboardMixin:
         ).fetchone()
         if sched is not None:
             return False
+        blackouts = conn.execute(
+            "SELECT 1 FROM schedule_blackouts WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if blackouts is not None:
+            return False
         wh = conn.execute(
             "SELECT 1 FROM webhook_endpoints WHERE tenant_id = %s LIMIT 1",
             (tenant_id,),
@@ -276,6 +286,10 @@ class TenantsOffboardMixin:
         )
         conn.execute(
             "DELETE FROM jobs WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM schedule_blackouts WHERE tenant_id = %s",
             (tenant_id,),
         )
         conn.execute(

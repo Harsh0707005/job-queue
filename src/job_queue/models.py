@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from enum import Enum
 from typing import Any
 from uuid import UUID
@@ -278,6 +278,31 @@ class Schedule:
     missed_ticks: int = 0
     last_misfire_at: datetime | None = None
     catch_up_remaining: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleBlackout:
+    """A maintenance window that stops schedule fires without pausing the tenant.
+
+    ``schedule_id`` is None for a tenant-wide window. ``kind`` is ``once``
+    (absolute ``starts_at``/``ends_at``) or ``daily`` (quiet hours in
+    ``timezone``). Overlapping windows are a union. Ticks that land inside
+    a window stay overdue so ``misfire_policy`` runs when the window ends.
+    """
+
+    id: UUID
+    tenant_id: str
+    schedule_id: UUID | None
+    kind: str
+    starts_at: datetime | None
+    ends_at: datetime | None
+    daily_start: time | None
+    daily_end: time | None
+    timezone: str
+    reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
