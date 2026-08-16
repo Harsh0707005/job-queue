@@ -115,6 +115,49 @@ class JobsExpireMixin:
         action = normalize_expiry_action(expiry_action or default_action)
         return exp, action
 
+    def _replay_refresh_expires_at(
+        self,
+        conn: Any,
+        *,
+        row: dict[str, Any],
+        tenant_id: str,
+        now: datetime,
+        run_at: datetime,
+    ) -> datetime | None:
+        """Keep a still-valid TTL; give another full window if it already elapsed.
+
+        Replay must not restore ``pending`` with ``expires_at`` in the past or
+        the cleaner / lease path immediately dead-letters the set again.
+        """
+        raw = row.get("expires_at")
+        if raw is None:
+            return None
+        exp = _as_utc(raw)
+        if exp > now and run_at < exp:
+            return exp
+        created = row.get("created_at")
+        created_at = _as_utc(created) if created is not None else now
+        window = (exp - created_at).total_seconds()
+        if window < 1:
+            refreshed, _ = self._resolve_job_expiry(
+                conn,
+                tenant_id=tenant_id,
+                now=now,
+                ttl_seconds=None,
+                expires_at=None,
+                expiry_action=None,
+            )
+            if refreshed is None:
+                window = 1.0
+                new_exp = now + timedelta(seconds=window)
+            else:
+                new_exp = refreshed
+        else:
+            new_exp = now + timedelta(seconds=window)
+        if run_at >= new_exp:
+            new_exp = run_at + timedelta(seconds=max(window, 1.0))
+        return new_exp
+
     def _expire_unfinished_jobs_locked(
         self,
         conn: Any,

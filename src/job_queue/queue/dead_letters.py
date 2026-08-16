@@ -91,6 +91,10 @@ class DeadLettersMixin(DeadLettersGraphMixin):
         clear_error:
             When True, clear ``last_error``; otherwise keep it for forensics.
 
+        If ``expires_at`` is already in the past (TTL death), it is pushed
+        forward by the original window so the cleaner does not immediately
+        dead-letter the job again.
+
         Raises ``ReplayError`` if the job is missing, wrong tenant, not dead,
         or its ``dedupe_key`` collides with another active job.
         """
@@ -184,6 +188,13 @@ class DeadLettersMixin(DeadLettersGraphMixin):
             new_attempts = 0 if reset_attempts else job.attempts
             new_max = max_attempts if max_attempts is not None else job.max_attempts
             new_error = None if clear_error else job.last_error
+            new_expires = self._replay_refresh_expires_at(
+                conn,
+                row=row,
+                tenant_id=tenant_id,
+                now=now,
+                run_at=run_at,
+            )
 
             # Savepoint: if the unique index still fires (defensive), convert
             # to ReplayError instead of leaking a raw DB error.
@@ -196,6 +207,7 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                             attempts = %s,
                             max_attempts = %s,
                             available_at = %s,
+                            expires_at = %s,
                             leased_by = NULL,
                             lease_token = NULL,
                             lease_tenant_id = NULL,
@@ -220,6 +232,7 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                             new_attempts,
                             new_max,
                             run_at,
+                            new_expires,
                             new_error,
                             now,
                             job_id,
@@ -246,7 +259,12 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                 event_type="replayed",
                 from_status=JobStatus.DEAD.value,
                 actor=None,
-                detail={"reset_attempts": reset_attempts},
+                detail={
+                    "reset_attempts": reset_attempts,
+                    "expires_at": (
+                        new_expires.isoformat() if new_expires is not None else None
+                    ),
+                },
                 now=now,
             )
             return out

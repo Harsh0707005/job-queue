@@ -71,6 +71,46 @@ def test_list_dead_letters_filter_queue_name_and_paging(queue: JobQueue):
     assert len(all_ids) == len(set(all_ids)) == 5
 
 
+def test_replay_dead_letter_refreshes_expired_ttl(queue: JobQueue):
+    dead = queue.enqueue(
+        tenant_id="t1",
+        payload={"ttl": True},
+        ttl_seconds=1,
+        expiry_action="dead",
+        required_skills=["gone"],
+    )
+    time.sleep(1.1)
+    queue.process_expired_jobs(tenant_id="t1")
+    assert queue.get(dead.id, tenant_id="t1").status == JobStatus.DEAD
+    before = time.time()
+    replayed = queue.replay_dead_letter(dead.id, tenant_id="t1")
+    assert replayed.status == JobStatus.AWAITING_SKILLS
+    assert replayed.expires_at is not None
+    assert replayed.expires_at.timestamp() > before
+    again = queue.process_expired_jobs(tenant_id="t1")
+    assert again["dead"] == 0
+    still = queue.get(dead.id, tenant_id="t1")
+    assert still is not None and still.status == JobStatus.AWAITING_SKILLS
+
+
+def test_replay_dead_letter_keeps_future_expires_at(queue: JobQueue):
+    from datetime import timedelta
+
+    from job_queue.queue._common import _utcnow
+
+    job = _drive_to_dead(queue, tenant_id="t1", payload={"n": 1})
+    future = _utcnow() + timedelta(hours=2)
+    with queue._pool.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET expires_at = %s WHERE id = %s",
+            (future, job.id),
+        )
+        conn.commit()
+    replayed = queue.replay_dead_letter(job.id, tenant_id="t1")
+    assert replayed.expires_at is not None
+    assert abs((replayed.expires_at - future).total_seconds()) < 1
+
+
 def test_replay_dead_letter_makes_job_claimable(queue: JobQueue):
     from job_queue import ReplayError  # noqa: F401
 

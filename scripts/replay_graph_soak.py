@@ -18,6 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logging.basicConfig(
@@ -100,7 +101,13 @@ def list_jobs(tid: str) -> list[dict[str, Any]]:
     return list(body.get("jobs") or [])
 
 
-def enqueue(tid: str, *, prefix: str, depends_on: list[str] | None = None) -> str:
+def enqueue(
+    tid: str,
+    *,
+    prefix: str,
+    depends_on: list[str] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> str:
     body: dict[str, Any] = {
         "tenant_id": tid,
         "queue_name": "default",
@@ -110,6 +117,8 @@ def enqueue(tid: str, *, prefix: str, depends_on: list[str] | None = None) -> st
     }
     if depends_on is not None:
         body["depends_on"] = depends_on
+    if extra:
+        body.update(extra)
     code, resp = http_json("POST", "/v1/jobs", body)
     if code != 201:
         raise RuntimeError(f"enqueue {tid} {code} {resp}")
@@ -281,6 +290,56 @@ def main() -> int:
     if code != 200:
         raise RuntimeError(f"resume race {code} {body}")
     wait_completed([race_src, race_ctl], {race_src: 3, race_ctl: KEEP_EACH})
+
+    # TTL-killed DAG: replay must refresh expires_at or the cleaner reaps again.
+    ttl_src, ttl_ctl = "rg-ttl", "rg-ttl-ctl"
+    code, body = http_json("POST", f"/v1/tenants/{ttl_src}/pause", {})
+    if code != 200:
+        raise RuntimeError(f"pause {ttl_src} {code} {body}")
+    code, body = http_json(
+        "POST",
+        f"/v1/tenants/{ttl_src}/job-ttl",
+        {"ttl_seconds": 60, "expiry_action": "dead"},
+    )
+    if code != 200:
+        raise RuntimeError(f"set ttl {ttl_src} {code} {body}")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    ttl_extra = {"expires_at": past, "expiry_action": "dead"}
+    tparent = enqueue(ttl_src, prefix="tpar", extra=ttl_extra)
+    tkids = [
+        enqueue(ttl_src, prefix="tch", depends_on=[tparent], extra=ttl_extra),
+        enqueue(ttl_src, prefix="tch", depends_on=[tparent], extra=ttl_extra),
+    ]
+    for _ in range(KEEP_EACH):
+        enqueue(ttl_ctl, prefix="tctl")
+    wait_completed([ttl_ctl], {ttl_ctl: KEEP_EACH})
+    code, body = http_json(
+        "POST", "/v1/jobs/process-expired", {"tenant_id": ttl_src, "limit": 50}
+    )
+    if code != 200:
+        raise RuntimeError(f"expire {ttl_src} {code} {body}")
+    if get_job(ttl_src, tparent).get("status") != "dead":
+        raise RuntimeError(f"ttl parent not dead {get_job(ttl_src, tparent)}")
+    code, body = http_json(
+        "POST",
+        "/v1/dead-letters/replay-graph",
+        {"tenant_id": ttl_src, "job_ids": [tparent], "clear_error": True},
+    )
+    if code != 200 or int(body.get("jobs_replayed") or 0) < 1:
+        raise RuntimeError(f"ttl replay {code} {body}")
+    code, body = http_json(
+        "POST", "/v1/jobs/process-expired", {"tenant_id": ttl_src, "limit": 50}
+    )
+    if code != 200:
+        raise RuntimeError(f"re-expire {ttl_src} {code} {body}")
+    for jid in [tparent, *tkids]:
+        st = get_job(ttl_src, jid).get("status")
+        if st not in ("pending", "awaiting_skills"):
+            raise RuntimeError(f"ttl cleaner reaped {jid} as {st}")
+    code, body = http_json("POST", f"/v1/tenants/{ttl_src}/resume", {})
+    if code != 200:
+        raise RuntimeError(f"resume ttl {code} {body}")
+    wait_completed([ttl_src, ttl_ctl], {ttl_src: 3, ttl_ctl: KEEP_EACH})
     logger.info("replay-graph soak OK")
     return 0
 

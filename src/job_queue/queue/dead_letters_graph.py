@@ -84,7 +84,9 @@ class DeadLettersGraphMixin:
 
         The fleet is not paused. If the closed set is not safe (missing
         neighbor, frozen parent, workflow step, drain, pending cap,
-        dedupe clash) nothing is replayed.
+        dedupe clash) nothing is replayed. Past ``expires_at`` values are
+        refreshed so a TTL-killed graph is not cleaned again on the next
+        expire pass.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -474,6 +476,13 @@ class DeadLettersGraphMixin:
             max_attempts if max_attempts is not None else int(row["max_attempts"])
         )
         new_error = None if clear_error else row.get("last_error")
+        new_expires = self._replay_refresh_expires_at(
+            conn,
+            row=row,
+            tenant_id=tenant_id,
+            now=now,
+            run_at=run_at,
+        )
         if restore_join:
             new_status = JobStatus.AWAITING_CHILDREN.value
         elif hasattr(self, "_enqueue_status_for_skills"):
@@ -489,6 +498,7 @@ class DeadLettersGraphMixin:
                 attempts = %s,
                 max_attempts = %s,
                 available_at = %s,
+                expires_at = %s,
                 leased_by = NULL,
                 lease_token = NULL,
                 lease_tenant_id = NULL,
@@ -516,6 +526,7 @@ class DeadLettersGraphMixin:
                 new_attempts,
                 new_max,
                 run_at,
+                new_expires,
                 new_error,
                 restore_join,
                 restore_join,
@@ -541,6 +552,9 @@ class DeadLettersGraphMixin:
                     "reset_attempts": reset_attempts,
                     "graph": True,
                     "restore_join": restore_join,
+                    "expires_at": (
+                        new_expires.isoformat() if new_expires is not None else None
+                    ),
                 },
                 now=now,
             )

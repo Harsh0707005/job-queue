@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from http.server import ThreadingHTTPServer
 
 import pytest
@@ -15,6 +16,7 @@ from job_queue import (
     ReplayGraphResult,
 )
 from job_queue.coordinator import Coordinator, _make_handler
+from job_queue.queue._common import _utcnow
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack, _nack
 
@@ -53,6 +55,47 @@ def test_plan_and_replay_parent_dead_brings_cancelled_children(queue: JobQueue):
     third = queue.lease(tenant_id="t1", worker_id="w2")
     got = {j.id for j in (second, third) if j is not None}
     assert got == {child_a.id, child_b.id}
+
+
+def test_replay_graph_refreshes_ttl_so_cleaner_does_not_reap(queue: JobQueue):
+    parent = queue.enqueue(
+        tenant_id="t1",
+        payload={"p": 1},
+        ttl_seconds=1,
+        expiry_action="dead",
+    )
+    child = queue.enqueue(
+        tenant_id="t1",
+        payload={"c": 1},
+        depends_on=parent.id,
+        ttl_seconds=1,
+        expiry_action="dead",
+    )
+    old_exp = parent.expires_at
+    assert old_exp is not None
+    time.sleep(1.1)
+    killed = queue.process_expired_jobs(tenant_id="t1")
+    assert killed["dead"] >= 1
+    assert queue.get(parent.id, tenant_id="t1").status == JobStatus.DEAD
+
+    before = _utcnow()
+    out = queue.replay_dead_letter_graph("t1", job_ids=[parent.id])
+    assert parent.id in out.job_ids
+    assert child.id in out.job_ids
+    again = queue.process_expired_jobs(tenant_id="t1")
+    assert again["dead"] == 0 and again["cancelled"] == 0
+    live_p = queue.get(parent.id, tenant_id="t1")
+    live_c = queue.get(child.id, tenant_id="t1")
+    assert live_p is not None and live_p.status == JobStatus.PENDING
+    assert live_c is not None and live_c.status == JobStatus.PENDING
+    assert live_p.expires_at is not None and live_p.expires_at > before
+    assert live_c.expires_at is not None and live_c.expires_at > before
+    first = queue.lease(tenant_id="t1", worker_id="w")
+    assert first is not None and first.id == parent.id
+    _ack(queue, first, "w")
+    second = queue.lease(tenant_id="t1", worker_id="w")
+    assert second is not None and second.id == child.id
+    _ack(queue, second, "w")
 
 
 def test_replay_from_child_pulls_dead_parent(queue: JobQueue):
