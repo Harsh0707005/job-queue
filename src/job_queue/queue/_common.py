@@ -170,7 +170,9 @@ _SCHEDULE_COLUMNS = """
     id, tenant_id, name, queue_name, payload, interval_seconds, cron_expr,
     timezone, priority, max_attempts, visibility_timeout_seconds, enabled,
     next_run_at, last_enqueued_at, created_at, updated_at, labels,
-    payload_key_id, required_skills
+    payload_key_id, required_skills,
+    misfire_policy, catch_up_max, missed_ticks, last_misfire_at,
+    catch_up_remaining
 """
 
 _CANCEL_MATCHING_BATCH_DEFAULT = 500
@@ -567,6 +569,15 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
         updated_at=row["updated_at"],
         labels=tuple(labs),
         required_skills=tuple(skills),
+        misfire_policy=str(row.get("misfire_policy") or "catch_up_one"),
+        catch_up_max=int(row.get("catch_up_max") or 8),
+        missed_ticks=int(row.get("missed_ticks") or 0),
+        last_misfire_at=row.get("last_misfire_at"),
+        catch_up_remaining=(
+            None
+            if row.get("catch_up_remaining") is None
+            else int(row["catch_up_remaining"])
+        ),
     )
 
 

@@ -256,6 +256,12 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/schedules/")
+            and path.endswith("/misfire")
+        ):
+            return self._set_schedule_misfire(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
             and path.endswith("/pause")
         ):
             return self._pause_schedule(path, body)

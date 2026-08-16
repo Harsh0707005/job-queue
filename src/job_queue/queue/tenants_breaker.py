@@ -316,17 +316,6 @@ class TenantsBreakerMixin:
             """,
             (now, tenant_id),
         )
-        conn.execute(
-            """
-            UPDATE schedules
-            SET next_run_at = %s,
-                updated_at = %s
-            WHERE tenant_id = %s
-              AND enabled = TRUE
-              AND next_run_at < %s
-            """,
-            (now, now, tenant_id, now),
-        )
 
     def _note_tenant_failure(
         self,

@@ -247,6 +247,12 @@ class Schedule:
     ``interval_seconds`` remains for simple fixed delays.
     ``labels`` are copied onto every job this schedule enqueues.
     ``required_skills`` are copied onto every job this schedule enqueues.
+    ``misfire_policy`` is what happens after a pause or coordinator gap:
+    ``skip`` records missed ticks and jumps to the next future fire;
+    ``catch_up_one`` enqueues a single pickup then jumps (default);
+    ``catch_up`` drains up to ``catch_up_max`` missed ticks one at a time
+    (no overlapping runs) and skips the rest.
+    ``missed_ticks`` is a running count of ticks that were not enqueued.
     """
 
     id: UUID
@@ -267,6 +273,11 @@ class Schedule:
     updated_at: datetime
     labels: tuple[str, ...] = ()
     required_skills: tuple[str, ...] = ()
+    misfire_policy: str = "catch_up_one"
+    catch_up_max: int = 8
+    missed_ticks: int = 0
+    last_misfire_at: datetime | None = None
+    catch_up_remaining: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

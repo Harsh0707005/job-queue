@@ -371,6 +371,11 @@ def schedule_to_dict(
         "updated_at": _dt(sched.updated_at),
         "labels": list(sched.labels),
         "required_skills": list(sched.required_skills),
+        "misfire_policy": getattr(sched, "misfire_policy", None) or "catch_up_one",
+        "catch_up_max": int(getattr(sched, "catch_up_max", 8) or 8),
+        "missed_ticks": int(getattr(sched, "missed_ticks", 0) or 0),
+        "last_misfire_at": _dt(getattr(sched, "last_misfire_at", None)),
+        "catch_up_remaining": getattr(sched, "catch_up_remaining", None),
     }
 
 

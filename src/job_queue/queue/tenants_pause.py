@@ -43,10 +43,10 @@ class TenantsPauseMixin:
     def resume_tenant(self, tenant_id: str) -> None:
         """Resume leasing and schedule ticks for a paused tenant.
 
-        Overdue schedules are aligned so the next ``process_due_schedules``
-        produces at most one job per schedule (no catch-up flood of missed
-        ticks from the pause window). Cannot resume a tenant that is
-        offboarding.
+        Overdue schedules keep their past ``next_run_at`` so each
+        schedule's misfire policy (skip / catch_up_one / catch_up) runs
+        on the next ``process_due_schedules``. Cannot resume a tenant
+        that is offboarding.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -72,20 +72,6 @@ class TenantsPauseMixin:
                     updated_at = EXCLUDED.updated_at
                 """,
                 (tenant_id, now),
-            )
-            # Clean schedule pickup: one next fire, not N missed intervals.
-            # Schedules that were due during pause keep a single due timestamp
-            # of *now* so the next tick enqueues once, then advances normally.
-            conn.execute(
-                """
-                UPDATE schedules
-                SET next_run_at = %s,
-                    updated_at = %s
-                WHERE tenant_id = %s
-                  AND enabled = TRUE
-                  AND next_run_at < %s
-                """,
-                (now, now, tenant_id, now),
             )
             self._delete_empty_tenant_settings(conn, tenant_id)
 

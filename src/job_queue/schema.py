@@ -776,6 +776,30 @@ UPDATE schedules SET required_skills = '{}' WHERE required_skills IS NULL;
 ALTER TABLE schedules ALTER COLUMN required_skills SET DEFAULT '{}';
 ALTER TABLE schedules ALTER COLUMN required_skills SET NOT NULL;
 
+-- Miss / catch-up policy when ticks were skipped (pause, coordinator down).
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS misfire_policy TEXT;
+UPDATE schedules SET misfire_policy = 'catch_up_one' WHERE misfire_policy IS NULL;
+ALTER TABLE schedules ALTER COLUMN misfire_policy SET DEFAULT 'catch_up_one';
+ALTER TABLE schedules ALTER COLUMN misfire_policy SET NOT NULL;
+ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_misfire_policy_check;
+ALTER TABLE schedules ADD CONSTRAINT schedules_misfire_policy_check CHECK (
+    misfire_policy IN ('skip', 'catch_up', 'catch_up_one')
+);
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catch_up_max INTEGER;
+UPDATE schedules SET catch_up_max = 8 WHERE catch_up_max IS NULL;
+ALTER TABLE schedules ALTER COLUMN catch_up_max SET DEFAULT 8;
+ALTER TABLE schedules ALTER COLUMN catch_up_max SET NOT NULL;
+ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_catch_up_max_check;
+ALTER TABLE schedules ADD CONSTRAINT schedules_catch_up_max_check CHECK (
+    catch_up_max >= 1 AND catch_up_max <= 100
+);
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS missed_ticks BIGINT;
+UPDATE schedules SET missed_ticks = 0 WHERE missed_ticks IS NULL;
+ALTER TABLE schedules ALTER COLUMN missed_ticks SET DEFAULT 0;
+ALTER TABLE schedules ALTER COLUMN missed_ticks SET NOT NULL;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_misfire_at TIMESTAMPTZ;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catch_up_remaining INTEGER;
+
 -- HTTP webhooks: endpoints + durable delivery outbox.
 CREATE TABLE IF NOT EXISTS webhook_endpoints (
     id                          UUID PRIMARY KEY,

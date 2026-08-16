@@ -23,6 +23,42 @@ from job_queue.queue._common import (
     _utcnow,
 )
 
+MISFIRE_SKIP = "skip"
+MISFIRE_CATCH_UP = "catch_up"
+MISFIRE_CATCH_UP_ONE = "catch_up_one"
+MISFIRE_POLICIES = frozenset(
+    {MISFIRE_SKIP, MISFIRE_CATCH_UP, MISFIRE_CATCH_UP_ONE}
+)
+_CATCH_UP_MAX_DEFAULT = 8
+_CATCH_UP_MAX_LIMIT = 100
+_MAX_MISFIRE_WALK = 10_000
+
+
+def normalize_misfire_policy(raw: str | None) -> str:
+    if raw is None or str(raw).strip() == "":
+        return MISFIRE_CATCH_UP_ONE
+    key = str(raw).strip().lower().replace("-", "_")
+    if key in ("skip", "miss", "skip_missed", "skip_misses"):
+        return MISFIRE_SKIP
+    if key in ("catch_up", "catchup", "catch_up_all"):
+        return MISFIRE_CATCH_UP
+    if key in ("catch_up_one", "one", "latest", "catchup_one"):
+        return MISFIRE_CATCH_UP_ONE
+    raise ValueError(
+        "misfire_policy must be 'skip', 'catch_up', or 'catch_up_one'"
+    )
+
+
+def normalize_catch_up_max(raw: int | None) -> int:
+    if raw is None:
+        return _CATCH_UP_MAX_DEFAULT
+    n = int(raw)
+    if n < 1 or n > _CATCH_UP_MAX_LIMIT:
+        raise ValueError(
+            f"catch_up_max must be between 1 and {_CATCH_UP_MAX_LIMIT}"
+        )
+    return n
+
 
 class SchedulesCrudMixin:
     def create_schedule(
@@ -43,6 +79,8 @@ class SchedulesCrudMixin:
         schedule_id: UUID | None = None,
         labels: Sequence[str] | str | None = None,
         required_skills: Sequence[str] | str | None = None,
+        misfire_policy: str | None = None,
+        catch_up_max: int | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -69,6 +107,14 @@ class SchedulesCrudMixin:
             Optional unique name per tenant for lookup / idempotent registration.
         timezone:
             IANA timezone for cron evaluation (default ``UTC``).
+        misfire_policy:
+            ``skip`` jumps to the next future tick and records misses.
+            ``catch_up_one`` (default) enqueues one pickup then jumps.
+            ``catch_up`` drains up to ``catch_up_max`` missed ticks one
+            at a time after the prior job finishes.
+        catch_up_max:
+            Bound for ``catch_up`` (1–100, default 8). Extra missed
+            ticks are counted as skipped, not enqueued.
         """
         from job_queue.cronutil import next_cron_fire, validate_cron, validate_timezone
 
@@ -89,6 +135,8 @@ class SchedulesCrudMixin:
         tz_name = validate_timezone(timezone)
         label_list = _normalize_labels(labels)
         skill_list = _normalize_skills(required_skills)
+        policy = normalize_misfire_policy(misfire_policy)
+        catch_max = normalize_catch_up_max(catch_up_max)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -121,13 +169,15 @@ class SchedulesCrudMixin:
                         priority, max_attempts,
                         visibility_timeout_seconds, enabled, next_run_at,
                         labels, created_at, updated_at, payload_key_id,
-                        required_skills
+                        required_skills,
+                        misfire_policy, catch_up_max
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s,
+                        %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -150,6 +200,8 @@ class SchedulesCrudMixin:
                         now,
                         payload_key_id,
                         skill_list,
+                        policy,
+                        catch_max,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:
@@ -290,6 +342,88 @@ class SchedulesCrudMixin:
                     f"schedule {schedule_id} not found for tenant {tenant_id!r}"
                 )
             return self._schedule(row)
+
+    def set_schedule_misfire(
+        self,
+        schedule_id: UUID,
+        *,
+        tenant_id: str,
+        misfire_policy: str | None = None,
+        catch_up_max: int | None = None,
+    ) -> Schedule:
+        """Change miss / catch-up policy on an existing schedule."""
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if misfire_policy is None and catch_up_max is None:
+            raise ValueError("pass misfire_policy and/or catch_up_max")
+        policy = (
+            normalize_misfire_policy(misfire_policy)
+            if misfire_policy is not None
+            else None
+        )
+        catch_max = (
+            normalize_catch_up_max(catch_up_max)
+            if catch_up_max is not None
+            else None
+        )
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                UPDATE schedules
+                SET misfire_policy = COALESCE(%s, misfire_policy),
+                    catch_up_max = COALESCE(%s, catch_up_max),
+                    updated_at = %s
+                WHERE id = %s AND tenant_id = %s
+                RETURNING {_SCHEDULE_COLUMNS}
+                """,
+                (policy, catch_max, now, schedule_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise ScheduleError(
+                    f"schedule {schedule_id} not found for tenant {tenant_id!r}"
+                )
+            return self._schedule(row)
+
+    @staticmethod
+    def _schedule_tick_after(sched_row: dict[str, Any], after: datetime) -> datetime:
+        """Next occurrence strictly after *after*."""
+        cron = sched_row.get("cron_expr")
+        if cron:
+            from job_queue.cronutil import next_cron_fire
+
+            tz = str(sched_row.get("timezone") or "UTC")
+            return next_cron_fire(str(cron), after, timezone_name=tz)
+        interval = sched_row.get("interval_seconds")
+        if interval is None:
+            raise ValueError("schedule has neither cron_expr nor interval_seconds")
+        return after + timedelta(seconds=int(interval))
+
+    def _misfire_walk(
+        self,
+        sched_row: dict[str, Any],
+        *,
+        now: datetime,
+        fire_cap: int,
+    ) -> tuple[list[datetime], int, datetime]:
+        """Walk missed ticks from ``next_run_at``.
+
+        Returns ``(slots_to_consider, skipped_count, first_future)``.
+        ``slots_to_consider`` has at most *fire_cap* past-due times.
+        """
+        t = _as_utc(sched_row["next_run_at"])
+        slots: list[datetime] = []
+        skipped = 0
+        for _ in range(_MAX_MISFIRE_WALK):
+            if t > now:
+                return slots, skipped, t
+            if fire_cap > 0 and len(slots) < fire_cap:
+                slots.append(t)
+            else:
+                skipped += 1
+            t = self._schedule_tick_after(sched_row, t)
+        future = self._schedule_next_run(sched_row, now=now)
+        return slots, skipped + 1, future
 
     @staticmethod
     def _schedule_next_run(sched_row: dict[str, Any], *, now: datetime) -> datetime:

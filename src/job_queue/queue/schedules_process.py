@@ -16,7 +16,14 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _SCHEDULE_COLUMNS,
     SpendCapError,
+    _as_utc,
     _utcnow,
+)
+from job_queue.queue.schedules_crud import (
+    MISFIRE_CATCH_UP,
+    MISFIRE_CATCH_UP_ONE,
+    MISFIRE_SKIP,
+    normalize_misfire_policy,
 )
 from job_queue.queue.tenants_breaker import _TENANT_CLAIMS_BLOCKED_SQL
 
@@ -32,17 +39,27 @@ class SchedulesProcessMixin:
 
         Safe for concurrent callers: due rows are claimed with
         ``FOR UPDATE SKIP LOCKED``. Each claimed schedule enqueues at most one
-        job in the same transaction, then advances ``next_run_at`` via cron
-        (next occurrence after *now*) or ``now + interval_seconds`` — no
-        catch-up burst of missed windows.
+        job in the same transaction.
+
+        **Misfire policy** (per schedule) decides what happens when
+        ``next_run_at`` is already in the past (tenant pause, coordinator
+        down, or a long gap):
+
+        * ``skip`` — record every missed tick, enqueue nothing, jump
+          ``next_run_at`` to the next future occurrence.
+        * ``catch_up_one`` (default) — enqueue one pickup job, record
+          extra misses, jump to the next future occurrence.
+        * ``catch_up`` — enqueue one job for the oldest missed tick and
+          leave ``next_run_at`` on the next missed slot so later ticks
+          drain one-at-a-time up to ``catch_up_max``. Remaining ticks
+          are recorded as missed, not enqueued.
 
         **Schedule fires bypass pending caps and enqueue rate limits** so
         timed work still runs under tenant throttles.
 
         **Paused tenants and tenants with an open failure breaker are skipped
-        entirely** — no jobs are enqueued for their schedules so ticks do not
-        pile up. After ``resume_tenant`` / breaker reset, overdue schedules
-        fire once (clean pickup).
+        entirely** — ``next_run_at`` is left in the past so the policy can
+        run on resume / breaker close. No jobs pile up while paused.
 
         **No overlapping runs:** if a previous job for the same schedule is
         still ``pending`` or ``leased``, this tick is skipped and
@@ -157,7 +174,38 @@ class SchedulesProcessMixin:
                     continue
 
                 try:
-                    next_run = self._schedule_next_run(sched_row, now=now)
+                    policy = normalize_misfire_policy(
+                        sched_row.get("misfire_policy")
+                    )
+                    remaining = sched_row.get("catch_up_remaining")
+                    if policy == MISFIRE_SKIP:
+                        probe, extra, future = self._misfire_walk(
+                            sched_row, now=now, fire_cap=2
+                        )
+                        if extra or len(probe) > 1:
+                            slots, skipped, future = self._misfire_walk(
+                                sched_row, now=now, fire_cap=0
+                            )
+                        else:
+                            slots, skipped, future = probe, 0, future
+                    elif policy == MISFIRE_CATCH_UP:
+                        if remaining is None:
+                            fire_cap = int(sched_row.get("catch_up_max") or 8)
+                            slots, skipped, future = self._misfire_walk(
+                                sched_row, now=now, fire_cap=fire_cap
+                            )
+                            remaining = len(slots)
+                        else:
+                            fire_cap = max(0, int(remaining))
+                            slots, _ignored, future = self._misfire_walk(
+                                sched_row, now=now, fire_cap=fire_cap
+                            )
+                            skipped = 0
+                    else:
+                        slots, skipped, future = self._misfire_walk(
+                            sched_row, now=now, fire_cap=1
+                        )
+                        remaining = None
                 except ValueError:
                     # Bad stored cron — leave row for ops; skip this tick.
                     import logging as _logging
@@ -174,6 +222,54 @@ class SchedulesProcessMixin:
                         now=now,
                     )
                     continue
+
+                if not slots:
+                    conn.execute(
+                        f"""
+                        UPDATE schedules
+                        SET next_run_at = %s,
+                            missed_ticks = missed_ticks + %s,
+                            last_misfire_at = CASE
+                                WHEN %s > 0 THEN %s
+                                ELSE last_misfire_at
+                            END,
+                            catch_up_remaining = NULL,
+                            updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            future,
+                            skipped,
+                            skipped,
+                            now,
+                            now,
+                            sched_row["id"],
+                        ),
+                    )
+                    if skipped:
+                        self._record_metric(
+                            conn,
+                            tenant_id=str(sched_row["tenant_id"]),
+                            metric="schedule_miss",
+                            count=skipped,
+                            now=now,
+                        )
+                    continue
+
+                new_remaining = None
+                if policy == MISFIRE_CATCH_UP and remaining is not None:
+                    left = int(remaining) - 1
+                    if left > 0:
+                        nxt = self._schedule_tick_after(sched_row, slots[0])
+                        if nxt <= now:
+                            next_run = nxt
+                            new_remaining = left
+                        else:
+                            next_run = future
+                    else:
+                        next_run = future
+                else:
+                    next_run = future
                 job_id = uuid4()
                 payload = self._open_schedule_payload(
                     sched_row["payload"],
@@ -288,6 +384,9 @@ class SchedulesProcessMixin:
                                 detail={
                                     "schedule_id": str(sched_row["id"]),
                                     "cron_expr": sched_row.get("cron_expr"),
+                                    "misfire_policy": policy,
+                                    "scheduled_for": slots[0].isoformat(),
+                                    "missed_skipped": skipped,
                                 },
                                 now=now,
                             )
@@ -319,11 +418,26 @@ class SchedulesProcessMixin:
                     UPDATE schedules
                     SET next_run_at = %s,
                         last_enqueued_at = %s,
+                        missed_ticks = missed_ticks + %s,
+                        last_misfire_at = CASE
+                            WHEN %s > 0 THEN %s
+                            ELSE last_misfire_at
+                        END,
+                        catch_up_remaining = %s,
                         updated_at = %s
                     WHERE id = %s
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
-                    (next_run, now, now, sched_row["id"]),
+                    (
+                        next_run,
+                        now,
+                        skipped,
+                        skipped,
+                        now,
+                        new_remaining,
+                        now,
+                        sched_row["id"],
+                    ),
                 ).fetchone()
                 assert updated is not None
                 fires.append(
@@ -339,6 +453,14 @@ class SchedulesProcessMixin:
                     count=1,
                     now=now,
                 )
+                if skipped:
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        metric="schedule_miss",
+                        count=skipped,
+                        now=now,
+                    )
 
         if fires and hasattr(self, "_rescan_awaiting_skills_after_commit"):
             if any(f.job.required_skills for f in fires):

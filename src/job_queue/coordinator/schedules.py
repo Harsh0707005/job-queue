@@ -40,6 +40,12 @@ class SchedulesApiMixin:
                 enabled=bool(body.get("enabled", True)),
                 labels=body.get("labels"),
                 required_skills=body.get("required_skills"),
+                misfire_policy=body.get("misfire_policy"),
+                catch_up_max=(
+                    None
+                    if body.get("catch_up_max") is None
+                    else int(body["catch_up_max"])
+                ),
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}
@@ -78,6 +84,35 @@ class SchedulesApiMixin:
             return 400, {"error": "tenant_id is required"}
         try:
             sched = self.queue.resume_schedule(UUID(sid), tenant_id=str(tenant_id))
+        except ScheduleError as exc:
+            return 404, {"error": str(exc)}
+        return 200, {"schedule": schedule_to_dict(sched)}
+
+    def _set_schedule_misfire(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            sched = self.queue.set_schedule_misfire(
+                UUID(sid),
+                tenant_id=str(tenant_id),
+                misfire_policy=body.get("misfire_policy"),
+                catch_up_max=(
+                    None
+                    if body.get("catch_up_max") is None
+                    else int(body["catch_up_max"])
+                ),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
         except ScheduleError as exc:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}

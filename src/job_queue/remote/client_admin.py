@@ -477,6 +477,25 @@ class ClientAdminMixin:
         assert payload is not None
         return payload["schedule"]
 
+    def set_schedule_misfire(
+        self,
+        schedule_id: str | UUID,
+        *,
+        tenant_id: str,
+        misfire_policy: str | None = None,
+        catch_up_max: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if misfire_policy is not None:
+            body["misfire_policy"] = misfire_policy
+        if catch_up_max is not None:
+            body["catch_up_max"] = catch_up_max
+        payload = self._request(
+            "POST", f"/v1/schedules/{schedule_id}/misfire", body
+        )
+        assert payload is not None
+        return payload["schedule"]
+
     def rotate_webhook_secret(
         self,
         endpoint_id: str | UUID,

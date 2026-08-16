@@ -53,8 +53,8 @@ class TenantsDrainMixin:
     def undrain_tenant_queue(self, tenant_id: str, queue_name: str) -> list[str]:
         """Re-open intake on a drained queue.
 
-        Overdue schedules for that queue are aligned to *now* so the next
-        tick fires once (no catch-up flood).
+        Overdue schedules for that queue keep their past ``next_run_at``
+        so the schedule misfire policy applies on the next tick.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -69,18 +69,6 @@ class TenantsDrainMixin:
             if queue_name in current:
                 current = [q for q in current if q != queue_name]
                 self._write_draining_queues(conn, tenant_id, current, now=now)
-                conn.execute(
-                    """
-                    UPDATE schedules
-                    SET next_run_at = %s,
-                        updated_at = %s
-                    WHERE tenant_id = %s
-                      AND queue_name = %s
-                      AND enabled = TRUE
-                      AND next_run_at < %s
-                    """,
-                    (now, now, tenant_id, queue_name, now),
-                )
             return list(current)
 
     def list_draining_queues(self, tenant_id: str) -> list[str]:
