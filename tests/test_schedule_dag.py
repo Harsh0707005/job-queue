@@ -253,3 +253,110 @@ def test_same_tick_batch_key_is_idempotent(queue: JobQueue):
     assert again.batch_id == first.batch_id
     assert [j.id for j in again.jobs] == [j.id for j in first.jobs]
     assert queue.count(tenant_id="t1") == 4
+
+
+def _make_due(queue: JobQueue, schedule_id) -> None:
+    with queue._pool.connection() as conn:
+        conn.execute(
+            "UPDATE schedules SET next_run_at = NOW() - INTERVAL '1 second' "
+            "WHERE id = %s",
+            (schedule_id,),
+        )
+        conn.commit()
+
+
+def test_process_due_does_not_refire_while_awaiting_skills(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=1,
+        payload={"n": 1},
+        dag_jobs=_diamond(),
+        required_skills=["tpu"],
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    first = queue.process_due_schedules(tenant_id="t1")
+    assert len(first) == 1
+    assert len(first[0].jobs) == 4
+    assert all(j.status == JobStatus.AWAITING_SKILLS for j in first[0].jobs)
+    _make_due(queue, sched.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1") == 4
+    with pytest.raises(ScheduleError, match="in-flight"):
+        queue.fire_schedule(sched.id, tenant_id="t1")
+
+
+def test_process_due_does_not_refire_single_job_awaiting_skills(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=1,
+        payload={"n": 1},
+        required_skills=["tpu"],
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    first = queue.process_due_schedules(tenant_id="t1")
+    assert len(first) == 1
+    assert first[0].job.status == JobStatus.AWAITING_SKILLS
+    _make_due(queue, sched.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1") == 1
+
+
+def test_process_due_does_not_refire_while_frozen(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=1,
+        payload={"n": 1},
+        dag_jobs=_diamond(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    first = queue.process_due_schedules(tenant_id="t1")
+    assert len(first[0].jobs) == 4
+    held = queue.freeze(first[0].jobs[0].id, tenant_id="t1", reason="hold tick")
+    assert held.status == JobStatus.FROZEN
+    _make_due(queue, sched.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1") == 4
+    with pytest.raises(ScheduleError, match="in-flight"):
+        queue.fire_schedule(sched.id, tenant_id="t1")
+    # Other tenant still fires.
+    live = queue.create_schedule(
+        tenant_id="live",
+        interval_seconds=60,
+        payload={"ok": True},
+    )
+    live_fires = queue.process_due_schedules(tenant_id="live")
+    assert len(live_fires) == 1
+    assert live_fires[0].job.schedule_id == live.id
+    # After unfreeze + complete, a new tick is allowed.
+    queue.unfreeze(held.id, tenant_id="t1")
+    done = 0
+    while done < 4:
+        job = queue.lease(tenant_id="t1", worker_id="w")
+        if job is None:
+            break
+        _ack(queue, job, "w")
+        done += 1
+    assert done == 4
+    _make_due(queue, sched.id)
+    second = queue.process_due_schedules(tenant_id="t1")
+    assert len(second) == 1
+    assert len(second[0].jobs) == 4
+    assert {j.id for j in second[0].jobs}.isdisjoint({j.id for j in first[0].jobs})
+
+
+def test_process_due_does_not_refire_single_job_frozen(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=1,
+        payload={"n": 1},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    first = queue.process_due_schedules(tenant_id="t1")
+    queue.freeze(first[0].job.id, tenant_id="t1")
+    _make_due(queue, sched.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1") == 1

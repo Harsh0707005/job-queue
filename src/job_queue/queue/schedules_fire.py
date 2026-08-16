@@ -15,20 +15,12 @@ from job_queue.models import Job, JobStatus, ScheduleFire
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     _SCHEDULE_COLUMNS,
+    _SCHEDULE_INFLIGHT_STATUSES,
     ScheduleError,
     SpendCapError,
     _as_utc,
     _dag_jobs_from_row,
     _utcnow,
-)
-
-_ACTIVE_SCHEDULE_STATUSES = (
-    JobStatus.PENDING.value,
-    JobStatus.LEASED.value,
-    JobStatus.AWAITING_APPROVAL.value,
-    JobStatus.AWAITING_CHILDREN.value,
-    JobStatus.AWAITING_SKILLS.value,
-    JobStatus.FROZEN.value,
 )
 
 
@@ -97,7 +89,7 @@ class SchedulesFireMixin:
                   AND status = ANY(%s)
                 LIMIT 1
                 """,
-                (schedule_id, list(_ACTIVE_SCHEDULE_STATUSES)),
+                (schedule_id, list(_SCHEDULE_INFLIGHT_STATUSES)),
             ).fetchone()
             if active is not None:
                 raise ScheduleError(

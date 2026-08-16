@@ -6,11 +6,11 @@ from psycopg.errors import UniqueViolation
 
 from job_queue.db import transaction
 from job_queue.models import (
-    JobStatus,
     ScheduleFire,
 )
 from job_queue.queue._common import (
     _SCHEDULE_COLUMNS,
+    _SCHEDULE_INFLIGHT_STATUSES,
     SpendCapError,
     _utcnow,
 )
@@ -58,10 +58,10 @@ class SchedulesProcessMixin:
         past so the policy can run on resume / breaker close / window end.
         No jobs pile up while blocked.
 
-        **No overlapping runs:** if a previous job for the same schedule is
-        still ``pending`` or ``leased``, this tick is skipped and
-        ``next_run_at`` is left unchanged so the schedule remains due and can
-        fire as soon as that in-flight job completes.
+        **No overlapping runs:** if a previous job (or any node of a DAG
+        tick) for the same schedule is still pending, leased, awaiting
+        approval/children/skills, or frozen, this tick is skipped and
+        ``next_run_at`` is left unchanged so the schedule remains due.
 
         Returns a list of ``ScheduleFire`` (updated schedule + enqueued job).
         """
@@ -164,15 +164,12 @@ class SchedulesProcessMixin:
                     SELECT id
                     FROM jobs
                     WHERE schedule_id = %s
-                      AND status IN (%s, %s, %s, %s)
+                      AND status = ANY(%s)
                     LIMIT 1
                     """,
                     (
                         sched_row["id"],
-                        JobStatus.PENDING.value,
-                        JobStatus.LEASED.value,
-                        JobStatus.AWAITING_APPROVAL.value,
-                        JobStatus.AWAITING_CHILDREN.value,
+                        list(_SCHEDULE_INFLIGHT_STATUSES),
                     ),
                 ).fetchone()
                 if active is not None:
