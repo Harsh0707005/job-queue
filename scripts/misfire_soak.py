@@ -184,22 +184,47 @@ def main() -> int:
         if code != 200:
             raise RuntimeError(f"resume {tid} {code} {body}")
 
-    # Let dual schedulers apply policy and workers drain.
-    time.sleep(max(CRON_EVERY * 3, 6))
+    expected_ticks = max(1, PAUSE_SECONDS // CRON_EVERY)
+    # Dual schedulers apply policy on the next ~0.3s poll. Wait until skip
+    # has recorded the pause-window misses, then until catch_up has drained
+    # its bounded remainder. Do not sit on a 2s cron long enough for
+    # post-resume live ticks to look like a flood.
+    deadline = time.time() + 20
+    skip_sched: dict[str, Any] = {}
+    while time.time() < deadline:
+        skip_sched = get_schedule(skip_id, skip_t)
+        if int(skip_sched.get("missed_ticks") or 0) >= expected_ticks - 1:
+            break
+        time.sleep(0.15)
+    else:
+        raise RuntimeError(f"skip did not record misses: {skip_sched}")
 
     skip_jobs = list_jobs(skip_t)
-    skip_sched = get_schedule(skip_id, skip_t)
     skip_n = len(skip_jobs)
-    # skip: no backlog of every missed tick. A later future tick may have
-    # fired once after resume; never a flood.
-    expected_ticks = max(1, PAUSE_SECONDS // CRON_EVERY)
-    if skip_n > 2:
+    # skip: no backlog of every missed tick. At most one later future tick
+    # may have fired after the jump.
+    if skip_n > 1:
         raise RuntimeError(f"skip flooded {skip_n} jobs after resume")
-    if int(skip_sched.get("missed_ticks") or 0) < expected_ticks - 1:
-        raise RuntimeError(f"skip did not record misses: {skip_sched}")
     logger.info(
         "skip jobs=%d missed=%s", skip_n, skip_sched.get("missed_ticks")
     )
+
+    catch_sched: dict[str, Any] = {}
+    while time.time() < deadline:
+        catch_sched = get_schedule(catch_id, catch_t)
+        rem = catch_sched.get("catch_up_remaining")
+        missed = int(catch_sched.get("missed_ticks") or 0)
+        if rem is None and missed >= 1:
+            break
+        time.sleep(0.15)
+    else:
+        raise RuntimeError(f"catch_up did not finish drain: {catch_sched}")
+
+    # Freeze further live ticks the way the local fleet does.
+    for tid in (skip_t, one_t, catch_t):
+        code, body = http_json("POST", f"/v1/tenants/{tid}/pause", {})
+        if code != 200:
+            raise RuntimeError(f"re-pause {tid} {code} {body}")
 
     one_jobs = list_jobs(one_t)
     one_sched = get_schedule(one_id, one_t)
@@ -221,10 +246,11 @@ def main() -> int:
     if len(catch_jobs) < 1:
         raise RuntimeError("catch_up produced no jobs")
     logger.info(
-        "catch_up jobs=%d missed=%s max=%d",
+        "catch_up jobs=%d missed=%s max=%d remaining=%s",
         len(catch_jobs),
         catch_sched.get("missed_ticks"),
         CATCH_MAX,
+        catch_sched.get("catch_up_remaining"),
     )
 
     live_after = completed(list_jobs(live_t))
