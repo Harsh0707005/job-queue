@@ -5,10 +5,14 @@ from __future__ import annotations
 from job_queue.queue.schedules_crud import SchedulesCrudMixin
 from job_queue.queue.schedules_process import SchedulesProcessMixin
 from job_queue.queue.schedules_blackout import SchedulesBlackoutMixin
+from job_queue.queue.schedules_fire import SchedulesFireMixin
 
 
 class SchedulesMixin(
-    SchedulesCrudMixin, SchedulesProcessMixin, SchedulesBlackoutMixin
+    SchedulesCrudMixin,
+    SchedulesProcessMixin,
+    SchedulesBlackoutMixin,
+    SchedulesFireMixin,
 ):
     """Aggregated SchedulesMixin (split for maintainability)."""
 

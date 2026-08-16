@@ -569,6 +569,20 @@ class ClientAdminMixin:
         assert payload is not None
         return list(payload.get("blackouts") or [])
 
+    def fire_schedule(
+        self,
+        schedule_id: str | UUID,
+        *,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/fire",
+            {"tenant_id": tenant_id},
+        )
+        assert payload is not None
+        return payload
+
     def set_schedule_misfire(
         self,
         schedule_id: str | UUID,

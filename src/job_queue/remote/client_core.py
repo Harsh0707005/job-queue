@@ -131,6 +131,15 @@ class ClientCoreMixin:
                             float(retry) if retry is not None else None
                         ),
                     ) from exc
+                if payload.get("code") == "schedule_error" and exc.code in (
+                    404,
+                    409,
+                ):
+                    from job_queue.queue import ScheduleError
+
+                    raise ScheduleError(
+                        payload.get("error") or "schedule error"
+                    ) from exc
                 if exc.code == 409 and payload.get("code") == "lease_error":
                     raise LeaseError(payload.get("error") or "lease error") from exc
                 if exc.code == 409 and payload.get("code") == "approval_error":
