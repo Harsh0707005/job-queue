@@ -253,6 +253,8 @@ class Schedule:
     ``catch_up`` drains up to ``catch_up_max`` missed ticks one at a time
     (no overlapping runs) and skips the rest.
     ``missed_ticks`` is a running count of ticks that were not enqueued.
+    ``dag_jobs`` is an optional template: when set, each tick enqueues that
+    whole DAG atomically instead of a single job.
     """
 
     id: UUID
@@ -278,6 +280,7 @@ class Schedule:
     missed_ticks: int = 0
     last_misfire_at: datetime | None = None
     catch_up_remaining: int | None = None
+    dag_jobs: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,10 +330,19 @@ class DagEnqueueResult:
 
 @dataclass(frozen=True, slots=True)
 class ScheduleFire:
-    """Result of one schedule tick: the schedule state and the enqueued job."""
+    """Result of one schedule tick: the schedule state and the enqueued job(s).
+
+    ``job`` is the first node (compat). ``jobs`` / ``refs`` are the full
+    graph when the schedule has a DAG template; otherwise ``jobs`` is
+    ``(job,)``.
+    """
 
     schedule: Schedule
     job: Job
+    jobs: tuple[Job, ...] = ()
+    refs: tuple[str, ...] = ()
+    batch_id: UUID | None = None
+    batch_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

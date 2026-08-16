@@ -618,12 +618,12 @@ class TenantsRestoreMixin:
                 cron_expr, timezone, priority, max_attempts,
                 visibility_timeout_seconds, enabled, next_run_at,
                 last_enqueued_at, created_at, updated_at, labels, payload_key_id,
-                required_skills
+                required_skills, dag_jobs
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -647,6 +647,7 @@ class TenantsRestoreMixin:
                 list(raw.get("labels") or []),
                 kid,
                 list(raw.get("required_skills") or []),
+                Jsonb(raw.get("dag_jobs")) if raw.get("dag_jobs") else None,
             ),
         )
 
@@ -894,11 +895,15 @@ class TenantsRestoreMixin:
             self._map_id(id_map, "jobs", x) for x in (raw.get("job_ids") or [])
         ]
         refs = [str(r) for r in (raw.get("refs") or [])]
+        sched_id = None
+        if raw.get("schedule_id"):
+            sched_id = self._mapped(id_map, "schedules", raw["schedule_id"])
         conn.execute(
             """
             INSERT INTO job_dag_batches (
-                id, tenant_id, queue_name, batch_key, job_ids, refs, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                id, tenant_id, queue_name, batch_key, job_ids, refs, created_at,
+                schedule_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO NOTHING
             """,
             (
@@ -909,6 +914,7 @@ class TenantsRestoreMixin:
                 job_ids,
                 refs,
                 _parse_dt(raw.get("created_at")) or _utcnow(),
+                sched_id,
             ),
         )
 

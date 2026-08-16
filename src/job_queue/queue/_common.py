@@ -172,7 +172,7 @@ _SCHEDULE_COLUMNS = """
     next_run_at, last_enqueued_at, created_at, updated_at, labels,
     payload_key_id, required_skills,
     misfire_policy, catch_up_max, missed_ticks, last_misfire_at,
-    catch_up_remaining
+    catch_up_remaining, dag_jobs
 """
 
 _CANCEL_MATCHING_BATCH_DEFAULT = 500
@@ -578,7 +578,18 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
             if row.get("catch_up_remaining") is None
             else int(row["catch_up_remaining"])
         ),
+        dag_jobs=_dag_jobs_from_row(row.get("dag_jobs")),
     )
+
+
+def _dag_jobs_from_row(raw: Any) -> tuple[dict[str, Any], ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if not raw:
+        return ()
+    return tuple(dict(item) for item in raw)
 
 
 class LeaseError(Exception):

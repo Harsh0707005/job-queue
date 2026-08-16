@@ -10,12 +10,15 @@ from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
-from job_queue.models import JobStatus, ScheduleFire
+
+from job_queue.models import Job, JobStatus, ScheduleFire
 from job_queue.queue._common import (
     _JOB_COLUMNS,
     _SCHEDULE_COLUMNS,
     ScheduleError,
     SpendCapError,
+    _as_utc,
+    _dag_jobs_from_row,
     _utcnow,
 )
 
@@ -102,14 +105,19 @@ class SchedulesFireMixin:
                 )
 
             try:
-                job_row = self._insert_schedule_job(
-                    conn,
-                    sched_row,
-                    now=now,
-                    scheduled_for=now,
-                    policy=str(sched_row.get("misfire_policy") or "catch_up_one"),
-                    skipped=0,
-                    extra_detail={"fire": "manual"},
+                first, jobs, refs, batch_id, batch_key = (
+                    self._materialize_schedule_tick(
+                        conn,
+                        sched_row,
+                        now=now,
+                        scheduled_for=now,
+                        policy=str(
+                            sched_row.get("misfire_policy") or "catch_up_one"
+                        ),
+                        skipped=0,
+                        extra_detail={"fire": "manual"},
+                        tick_kind="manual",
+                    )
                 )
             except UniqueViolation as exc:
                 raise ScheduleError(
@@ -145,14 +153,115 @@ class SchedulesFireMixin:
             )
             fire = ScheduleFire(
                 schedule=self._schedule(updated),
-                job=self._job(job_row),
+                job=first,
+                jobs=jobs,
+                refs=refs,
+                batch_id=batch_id,
+                batch_key=batch_key,
             )
 
-        if fire.job.required_skills and hasattr(
+        if any(j.required_skills for j in fire.jobs or (fire.job,)) and hasattr(
             self, "_rescan_awaiting_skills_after_commit"
         ):
             self._rescan_awaiting_skills_after_commit()
         return fire
+
+    def _materialize_schedule_tick(
+        self,
+        conn: Any,
+        sched_row: Any,
+        *,
+        now: datetime,
+        scheduled_for: datetime,
+        policy: str,
+        skipped: int,
+        extra_detail: dict[str, Any] | None = None,
+        tick_kind: str = "tick",
+    ) -> tuple[Job, tuple[Job, ...], tuple[str, ...], UUID | None, str | None]:
+        """Enqueue one job or one whole DAG. Caller holds the schedule lock."""
+        dag = _dag_jobs_from_row(sched_row.get("dag_jobs"))
+        if not dag:
+            row = self._insert_schedule_job(
+                conn,
+                sched_row,
+                now=now,
+                scheduled_for=scheduled_for,
+                policy=policy,
+                skipped=skipped,
+                extra_detail=extra_detail,
+            )
+            job = self._job(row)
+            return job, (job,), (), None, None
+
+        default_payload = self._open_schedule_payload(
+            sched_row["payload"],
+            tenant_id=str(sched_row["tenant_id"]),
+            schedule_id=sched_row["id"],
+            conn=conn,
+        )
+        jobs_spec: list[dict[str, Any]] = []
+        for node in dag:
+            payload = node.get("payload")
+            if payload is None:
+                payload = dict(default_payload)
+            jobs_spec.append(
+                {
+                    "ref": node["ref"],
+                    "payload": dict(payload),
+                    "depends_on": list(node.get("depends_on") or []),
+                    "priority": (
+                        sched_row["priority"]
+                        if node.get("priority") is None
+                        else int(node["priority"])
+                    ),
+                    "max_attempts": (
+                        sched_row["max_attempts"]
+                        if node.get("max_attempts") is None
+                        else int(node["max_attempts"])
+                    ),
+                    "visibility_timeout_seconds": (
+                        sched_row["visibility_timeout_seconds"]
+                        if node.get("visibility_timeout_seconds") is None
+                        else int(node["visibility_timeout_seconds"])
+                    ),
+                    "labels": (
+                        list(sched_row.get("labels") or [])
+                        if node.get("labels") is None
+                        else node.get("labels")
+                    ),
+                    "required_skills": (
+                        list(sched_row.get("required_skills") or [])
+                        if node.get("required_skills") is None
+                        else node.get("required_skills")
+                    ),
+                }
+            )
+        specs = self._normalize_dag_specs(jobs_spec)
+        slot = _as_utc(scheduled_for).isoformat()
+        batch_key = f"sched:{sched_row['id']}:{tick_kind}:{slot}"
+        detail = {
+            "schedule_id": str(sched_row["id"]),
+            "cron_expr": sched_row.get("cron_expr"),
+            "misfire_policy": policy,
+            "scheduled_for": slot,
+            "missed_skipped": skipped,
+        }
+        if extra_detail:
+            detail.update(extra_detail)
+        with conn.transaction():
+            result = self._enqueue_dag_on_conn(
+                conn,
+                tenant_id=str(sched_row["tenant_id"]),
+                queue_name=str(sched_row["queue_name"]),
+                batch_key=batch_key,
+                specs=specs,
+                now=now,
+                schedule_id=sched_row["id"],
+                bypass_pending_and_rate=True,
+                extra_audit=detail,
+            )
+        first = result.jobs[0]
+        return first, result.jobs, result.refs, result.batch_id, result.batch_key
 
     def _insert_schedule_job(
         self,

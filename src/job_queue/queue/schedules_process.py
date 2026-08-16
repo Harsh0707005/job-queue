@@ -35,7 +35,7 @@ class SchedulesProcessMixin:
 
         Safe for concurrent callers: due rows are claimed with
         ``FOR UPDATE SKIP LOCKED``. Each claimed schedule enqueues at most one
-        job in the same transaction.
+        tick (one job, or one whole DAG) in the same transaction.
 
         **Misfire policy** (per schedule) decides what happens when
         ``next_run_at`` is already in the past (tenant pause, coordinator
@@ -288,13 +288,15 @@ class SchedulesProcessMixin:
                     # schedule materialization is system-timed work.
                     # Spend caps still apply — scheduled jobs are billed
                     # enqueues and must not bypass a tenant quota.
-                    job_row = self._insert_schedule_job(
-                        conn,
-                        sched_row,
-                        now=now,
-                        scheduled_for=slots[0],
-                        policy=policy,
-                        skipped=skipped,
+                    first_job, tick_jobs, tick_refs, batch_id, batch_key = (
+                        self._materialize_schedule_tick(
+                            conn,
+                            sched_row,
+                            now=now,
+                            scheduled_for=slots[0],
+                            policy=policy,
+                            skipped=skipped,
+                        )
                     )
                 except UniqueViolation:
                     # Race: another ticker inserted an active job for this schedule.
@@ -303,8 +305,6 @@ class SchedulesProcessMixin:
                     # Tenant quota exhausted; leave next_run so it retries
                     # after the window resets.
                     continue
-
-                assert job_row is not None
 
                 updated = conn.execute(
                     f"""
@@ -336,7 +336,11 @@ class SchedulesProcessMixin:
                 fires.append(
                     ScheduleFire(
                         schedule=self._schedule(updated),
-                        job=self._job(job_row),
+                        job=first_job,
+                        jobs=tick_jobs,
+                        refs=tick_refs,
+                        batch_id=batch_id,
+                        batch_key=batch_key,
                     )
                 )
                 self._record_metric(
@@ -356,6 +360,10 @@ class SchedulesProcessMixin:
                     )
 
         if fires and hasattr(self, "_rescan_awaiting_skills_after_commit"):
-            if any(f.job.required_skills for f in fires):
+            if any(
+                f.job.required_skills
+                or any(j.required_skills for j in (f.jobs or ()))
+                for f in fires
+            ):
                 self._rescan_awaiting_skills_after_commit()
         return fires

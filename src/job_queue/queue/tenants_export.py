@@ -98,7 +98,8 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     ),
     "jobs": (_JOB_COLUMNS.strip().replace("\n", " "), "jobs"),
     "job_dag_batches": (
-        "id, tenant_id, queue_name, batch_key, job_ids, refs, created_at",
+        "id, tenant_id, queue_name, batch_key, job_ids, refs, created_at, "
+        "schedule_id",
         "job_dag_batches",
     ),
     "workflow_step_runs": (

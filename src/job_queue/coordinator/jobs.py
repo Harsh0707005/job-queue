@@ -791,6 +791,10 @@ class JobsApiMixin:
                 {
                     "schedule": schedule_to_dict(f.schedule),
                     "job": job_to_dict(f.job),
+                    "jobs": [job_to_dict(j) for j in (f.jobs or (f.job,))],
+                    "refs": list(f.refs or ()),
+                    "batch_id": str(f.batch_id) if f.batch_id else None,
+                    "batch_key": f.batch_key,
                 }
                 for f in fires
             ],

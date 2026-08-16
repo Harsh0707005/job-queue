@@ -60,6 +60,71 @@ def normalize_catch_up_max(raw: int | None) -> int:
     return n
 
 
+_MAX_SCHEDULE_DAG_JOBS = 200
+
+
+def normalize_schedule_dag_jobs(
+    raw: Sequence[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Validate a schedule DAG template. None / empty → no DAG (single job)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("dag_jobs must be a list")
+    if len(raw) == 0:
+        return None
+    if len(raw) > _MAX_SCHEDULE_DAG_JOBS:
+        raise ValueError(
+            f"dag_jobs must have at most {_MAX_SCHEDULE_DAG_JOBS} nodes"
+        )
+    seen: set[str] = set()
+    nodes: list[dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"dag_jobs[{i}] must be a dict")
+        ref = str(item.get("ref") or "").strip()
+        if not ref:
+            raise ValueError(f"dag_jobs[{i}].ref is required")
+        if ref in seen:
+            raise ValueError(f"duplicate dag ref {ref!r}")
+        seen.add(ref)
+        payload = item.get("payload")
+        if payload is not None and not isinstance(payload, dict):
+            raise ValueError(f"dag_jobs[{i}].payload must be a dict")
+        deps = item.get("depends_on") or []
+        if isinstance(deps, str):
+            deps = [deps]
+        if not isinstance(deps, (list, tuple)):
+            raise ValueError(f"dag_jobs[{i}].depends_on must be a list")
+        node = dict(item)
+        node["ref"] = ref
+        node["depends_on"] = [str(d).strip() for d in deps if str(d).strip()]
+        nodes.append(node)
+    refs = {n["ref"] for n in nodes}
+    incoming = {n["ref"]: 0 for n in nodes}
+    adj: dict[str, list[str]] = {n["ref"]: [] for n in nodes}
+    for n in nodes:
+        for dep in n["depends_on"]:
+            if dep not in refs:
+                raise ValueError(
+                    f"dag_jobs ref {n['ref']!r} depends_on unknown ref {dep!r}"
+                )
+            adj[dep].append(n["ref"])
+            incoming[n["ref"]] += 1
+    ready = [r for r, c in incoming.items() if c == 0]
+    seen_n = 0
+    while ready:
+        node = ready.pop()
+        seen_n += 1
+        for child in adj[node]:
+            incoming[child] -= 1
+            if incoming[child] == 0:
+                ready.append(child)
+    if seen_n != len(nodes):
+        raise ValueError("dag_jobs contains a cycle")
+    return nodes
+
+
 class SchedulesCrudMixin:
     def create_schedule(
         self,
@@ -81,6 +146,7 @@ class SchedulesCrudMixin:
         required_skills: Sequence[str] | str | None = None,
         misfire_policy: str | None = None,
         catch_up_max: int | None = None,
+        dag_jobs: Sequence[dict[str, Any]] | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -115,6 +181,9 @@ class SchedulesCrudMixin:
         catch_up_max:
             Bound for ``catch_up`` (1–100, default 8). Extra missed
             ticks are counted as skipped, not enqueued.
+        dag_jobs:
+            Optional DAG template. When set, each tick enqueues this
+            whole graph in one transaction instead of a single job.
         """
         from job_queue.cronutil import next_cron_fire, validate_cron, validate_timezone
 
@@ -137,6 +206,7 @@ class SchedulesCrudMixin:
         skill_list = _normalize_skills(required_skills)
         policy = normalize_misfire_policy(misfire_policy)
         catch_max = normalize_catch_up_max(catch_up_max)
+        dag_list = normalize_schedule_dag_jobs(dag_jobs)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -170,14 +240,14 @@ class SchedulesCrudMixin:
                         visibility_timeout_seconds, enabled, next_run_at,
                         labels, created_at, updated_at, payload_key_id,
                         required_skills,
-                        misfire_policy, catch_up_max
+                        misfire_policy, catch_up_max, dag_jobs
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s
+                        %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -202,6 +272,7 @@ class SchedulesCrudMixin:
                         skill_list,
                         policy,
                         catch_max,
+                        Jsonb(dag_list) if dag_list else None,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:

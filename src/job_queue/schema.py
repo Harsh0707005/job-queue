@@ -323,9 +323,11 @@ CREATE UNIQUE INDEX idx_jobs_dedupe_active
           'awaiting_skills', 'quarantined', 'frozen'
       );
 
--- At most one in-flight job per recurring schedule (no overlapping runs).
+-- In-flight jobs per schedule (DAG ticks stamp schedule_id on every node,
+-- so this is no longer UNIQUE). Overlap is enforced by FOR UPDATE on the
+-- schedule row plus "any in-flight job for this schedule".
 DROP INDEX IF EXISTS idx_jobs_schedule_active;
-CREATE UNIQUE INDEX idx_jobs_schedule_active
+CREATE INDEX IF NOT EXISTS idx_jobs_schedule_inflight
     ON jobs (schedule_id)
     WHERE schedule_id IS NOT NULL
       AND status IN (
@@ -799,6 +801,16 @@ ALTER TABLE schedules ALTER COLUMN missed_ticks SET DEFAULT 0;
 ALTER TABLE schedules ALTER COLUMN missed_ticks SET NOT NULL;
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_misfire_at TIMESTAMPTZ;
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catch_up_remaining INTEGER;
+
+-- Optional DAG template: each tick materializes the whole graph atomically.
+-- NULL / empty = single-job schedule (payload becomes the one job).
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS dag_jobs JSONB;
+
+ALTER TABLE job_dag_batches ADD COLUMN IF NOT EXISTS schedule_id UUID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_dag_batches_schedule_key
+    ON job_dag_batches (schedule_id, batch_key)
+    WHERE schedule_id IS NOT NULL;
 
 -- Maintenance blackout windows: tenant-wide (schedule_id NULL) or one schedule.
 -- During a covering window process_due does not enqueue; next_run_at stays

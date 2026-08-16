@@ -48,6 +48,7 @@ class SchedulesApiMixin:
                     if body.get("catch_up_max") is None
                     else int(body["catch_up_max"])
                 ),
+                dag_jobs=body.get("dag_jobs"),
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}
@@ -120,6 +121,13 @@ class SchedulesApiMixin:
         return 201, {
             "schedule": schedule_to_dict(fire.schedule),
             "job": job_to_dict(fire.job, include_payload=True),
+            "jobs": [
+                job_to_dict(j, include_payload=True)
+                for j in (fire.jobs or (fire.job,))
+            ],
+            "refs": list(fire.refs or ()),
+            "batch_id": str(fire.batch_id) if fire.batch_id else None,
+            "batch_key": fire.batch_key,
         }
 
     def _set_schedule_misfire(

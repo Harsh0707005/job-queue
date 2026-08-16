@@ -73,255 +73,289 @@ class JobsEnqueueDagMixin:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (tenant_id,),
             )
-            self._lock_dag_batch_key(
+            return self._enqueue_dag_on_conn(
                 conn,
                 tenant_id=tenant_id,
                 queue_name=queue_name,
                 batch_key=batch_key,
+                specs=specs,
+                now=now,
             )
-            if self._is_tenant_offboarding(conn, tenant_id):
-                raise ValueError(
-                    f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
-                )
-            if self._is_tenant_restoring(conn, tenant_id):
-                raise ValueError(
-                    f"tenant {tenant_id!r} is restoring; enqueue is rejected"
-                )
-            existing = conn.execute(
-                """
-                SELECT id, job_ids, refs
-                FROM job_dag_batches
-                WHERE tenant_id = %s AND queue_name = %s AND batch_key = %s
-                """,
-                (tenant_id, queue_name, batch_key),
-            ).fetchone()
-            if existing is not None:
-                return self._dag_result_from_existing(
-                    conn,
-                    existing,
-                    batch_key=batch_key,
-                    specs=specs,
-                )
-            if hasattr(self, "_assert_queue_accepts_enqueue"):
-                self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
 
-            ref_to_id = {spec["ref"]: spec["job_id"] for spec in specs}
-            in_batch_ids = {spec["job_id"] for spec in specs}
-            for spec in specs:
-                dep_ids: list[UUID] = []
-                for raw in spec["depends_on_raw"]:
-                    if raw in ref_to_id:
-                        dep_ids.append(ref_to_id[raw])
-                    else:
-                        try:
-                            dep_ids.append(UUID(str(raw)))
-                        except (ValueError, TypeError, AttributeError) as exc:
-                            raise DependencyError(
-                                f"job {spec['ref']!r} depends_on unknown "
-                                f"ref or UUID {raw!r}"
-                            ) from exc
-                if spec["job_id"] in dep_ids:
-                    raise DependencyError(
-                        f"job {spec['ref']!r} cannot depend on itself"
-                    )
-                spec["dep_ids"] = self._normalize_depends_on(dep_ids)
+    def _enqueue_dag_on_conn(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        queue_name: str,
+        batch_key: str,
+        specs: list[dict[str, Any]],
+        now: datetime,
+        schedule_id: UUID | None = None,
+        bypass_pending_and_rate: bool = False,
+        extra_audit: dict[str, Any] | None = None,
+    ) -> DagEnqueueResult:
+        """Materialize a DAG on an already-open transaction.
 
-            # Cycle check uses resolved UUIDs so A↔B via explicit job_ids
-            # (not just in-batch refs) cannot deadlock after commit.
-            self._assert_dag_acyclic(specs)
-            external = []
-            for spec in specs:
-                for pid in spec["dep_ids"]:
-                    if pid not in in_batch_ids:
-                        external.append(pid)
-            if external:
-                self._validate_dependencies(
-                    conn, tenant_id=tenant_id, depends_on=list(dict.fromkeys(external))
-                )
-
-            dedupe_keys = sorted(
-                {
-                    spec["dedupe_key"]
-                    for spec in specs
-                    if spec["dedupe_key"] is not None
-                }
+        Caller is responsible for tenant/schedule locking. Same
+        *batch_key* after a committed graph is idempotent (returns the
+        existing jobs). Failure before commit leaves nothing.
+        """
+        self._lock_dag_batch_key(
+            conn,
+            tenant_id=tenant_id,
+            queue_name=queue_name,
+            batch_key=batch_key,
+        )
+        if self._is_tenant_offboarding(conn, tenant_id):
+            raise ValueError(
+                f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
             )
-            for dk in dedupe_keys:
-                self._lock_dedupe_key(
-                    conn,
-                    tenant_id=tenant_id,
-                    queue_name=queue_name,
-                    dedupe_key=dk,
-                )
-                hit = self._find_active_dedupe(
-                    conn,
-                    tenant_id=tenant_id,
-                    queue_name=queue_name,
-                    dedupe_key=dk,
-                )
-                if hit is not None:
-                    raise ValueError(
-                        f"dedupe_key {dk!r} already has an active job; "
-                        "refusing to enqueue a partial DAG"
-                    )
+        if self._is_tenant_restoring(conn, tenant_id):
+            raise ValueError(
+                f"tenant {tenant_id!r} is restoring; enqueue is rejected"
+            )
+        existing = conn.execute(
+            """
+            SELECT id, job_ids, refs
+            FROM job_dag_batches
+            WHERE tenant_id = %s AND queue_name = %s AND batch_key = %s
+            """,
+            (tenant_id, queue_name, batch_key),
+        ).fetchone()
+        if existing is not None:
+            return self._dag_result_from_existing(
+                conn,
+                existing,
+                batch_key=batch_key,
+                specs=specs,
+            )
+        if not bypass_pending_and_rate and hasattr(
+            self, "_assert_queue_accepts_enqueue"
+        ):
+            self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
 
+        ref_to_id = {spec["ref"]: spec["job_id"] for spec in specs}
+        in_batch_ids = {spec["job_id"] for spec in specs}
+        for spec in specs:
+            dep_ids: list[UUID] = []
+            for raw in spec["depends_on_raw"]:
+                if raw in ref_to_id:
+                    dep_ids.append(ref_to_id[raw])
+                else:
+                    try:
+                        dep_ids.append(UUID(str(raw)))
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        raise DependencyError(
+                            f"job {spec['ref']!r} depends_on unknown "
+                            f"ref or UUID {raw!r}"
+                        ) from exc
+            if spec["job_id"] in dep_ids:
+                raise DependencyError(
+                    f"job {spec['ref']!r} cannot depend on itself"
+                )
+            spec["dep_ids"] = self._normalize_depends_on(dep_ids)
+
+        # Cycle check uses resolved UUIDs so A↔B via explicit job_ids
+        # (not just in-batch refs) cannot deadlock after commit.
+        self._assert_dag_acyclic(specs)
+        external = []
+        for spec in specs:
+            for pid in spec["dep_ids"]:
+                if pid not in in_batch_ids:
+                    external.append(pid)
+        if external:
+            self._validate_dependencies(
+                conn, tenant_id=tenant_id, depends_on=list(dict.fromkeys(external))
+            )
+
+        dedupe_keys = sorted(
+            {
+                spec["dedupe_key"]
+                for spec in specs
+                if spec["dedupe_key"] is not None
+            }
+        )
+        for dk in dedupe_keys:
+            self._lock_dedupe_key(
+                conn,
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                dedupe_key=dk,
+            )
+            hit = self._find_active_dedupe(
+                conn,
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                dedupe_key=dk,
+            )
+            if hit is not None:
+                raise ValueError(
+                    f"dedupe_key {dk!r} already has an active job; "
+                    "refusing to enqueue a partial DAG"
+                )
+
+        if not bypass_pending_and_rate:
             self._assert_pending_capacity_for(
                 conn, tenant_id, extra=len(specs)
             )
             for _ in specs:
                 self._consume_enqueue_rate(conn, tenant_id, now=now)
-            if hasattr(self, "_consume_spend_enqueues"):
-                self._consume_spend_enqueues(
-                    conn, tenant_id, extra=len(specs), now=now
-                )
+        if hasattr(self, "_consume_spend_enqueues"):
+            self._consume_spend_enqueues(
+                conn, tenant_id, extra=len(specs), now=now
+            )
 
-            inserted: list[Job] = []
-            refs: list[str] = []
-            for spec in specs:
-                expires, exp_action = self._resolve_job_expiry(
-                    conn,
-                    tenant_id=tenant_id,
-                    now=now,
-                    ttl_seconds=spec["ttl_seconds"],
-                    expires_at=spec["expires_at"],
-                    expiry_action=spec["expiry_action"],
+        inserted: list[Job] = []
+        refs: list[str] = []
+        for spec in specs:
+            expires, exp_action = self._resolve_job_expiry(
+                conn,
+                tenant_id=tenant_id,
+                now=now,
+                ttl_seconds=spec["ttl_seconds"],
+                expires_at=spec["expires_at"],
+                expiry_action=spec["expiry_action"],
+            )
+            sealed, payload_key_id = self._seal_job_payload(
+                conn,
+                tenant_id=tenant_id,
+                job_id=spec["job_id"],
+                payload=spec["payload"],
+            )
+            status = self._enqueue_status_for_skills(conn, spec["skills"])
+            part_id = (
+                self._compute_partition_id(
+                    conn, tenant_id=tenant_id, job_id=spec["job_id"]
                 )
-                sealed, payload_key_id = self._seal_job_payload(
-                    conn,
-                    tenant_id=tenant_id,
-                    job_id=spec["job_id"],
-                    payload=spec["payload"],
+                if hasattr(self, "_compute_partition_id")
+                else 0
+            )
+            row = conn.execute(
+                f"""
+                INSERT INTO jobs (
+                    id, tenant_id, queue_name, payload, status, priority,
+                    attempts, max_attempts, visibility_timeout_seconds,
+                    max_runtime_seconds,
+                    retry_backoff_base_seconds, retry_backoff_max_seconds,
+                    available_at, dedupe_key, schedule_id, depends_on,
+                    labels, required_skills,
+                    deadline_at, estimated_duration_seconds, preemptible,
+                    created_at, updated_at, partition_id, payload_key_id,
+                    expires_at, expiry_action
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    0, %s, %s,
+                    %s,
+                    %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s
                 )
-                status = self._enqueue_status_for_skills(conn, spec["skills"])
-                part_id = (
-                    self._compute_partition_id(
-                        conn, tenant_id=tenant_id, job_id=spec["job_id"]
-                    )
-                    if hasattr(self, "_compute_partition_id")
-                    else 0
-                )
-                row = conn.execute(
-                    f"""
-                    INSERT INTO jobs (
-                        id, tenant_id, queue_name, payload, status, priority,
-                        attempts, max_attempts, visibility_timeout_seconds,
-                        max_runtime_seconds,
-                        retry_backoff_base_seconds, retry_backoff_max_seconds,
-                        available_at, dedupe_key, schedule_id, depends_on,
-                        labels, required_skills,
-                        deadline_at, estimated_duration_seconds, preemptible,
-                        created_at, updated_at, partition_id, payload_key_id,
-                        expires_at, expiry_action
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s,
-                        0, %s, %s,
-                        %s,
-                        %s, %s,
-                        %s, %s, NULL, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s
-                    )
-                    RETURNING {_JOB_COLUMNS}
-                    """,
-                    (
-                        spec["job_id"],
-                        tenant_id,
-                        queue_name,
-                        Jsonb(sealed),
-                        status,
-                        spec["priority"],
-                        spec["max_attempts"],
-                        spec["visibility_timeout_seconds"],
-                        spec["max_runtime_seconds"],
-                        spec["retry_backoff_base_seconds"],
-                        spec["retry_backoff_max_seconds"],
-                        spec["run_at"],
-                        spec["dedupe_key"],
-                        spec["dep_ids"],
-                        spec["labels"],
-                        spec["skills"],
-                        spec["deadline"],
-                        spec["estimated_duration_seconds"],
-                        spec["preemptible"],
-                        now,
-                        now,
-                        part_id,
-                        payload_key_id,
-                        expires,
-                        exp_action,
-                    ),
-                ).fetchone()
-                assert row is not None
-                if hasattr(self, "_recheck_awaiting_skills_row_locked"):
-                    row = self._recheck_awaiting_skills_row_locked(
-                        conn, row, now=now
-                    )
-                job = self._job(row, conn=conn)
-                if hasattr(self, "_append_job_audit"):
-                    self._append_job_audit(
-                        conn,
-                        job_row=row,
-                        event_type="enqueued",
-                        from_status=None,
-                        actor=None,
-                        detail={
-                            "queue_name": queue_name,
-                            "dag_batch_key": batch_key,
-                            "dag_ref": spec["ref"],
-                            "required_skills": spec["skills"],
-                            "status": job.status.value,
-                        },
-                        now=now,
-                    )
-                if hasattr(self, "_stamp_job_quarantine"):
-                    self._stamp_job_quarantine(
-                        conn,
-                        job_id=job.id,
-                        tenant_id=tenant_id,
-                        max_worker_hops=spec.get("max_worker_hops"),
-                        quarantine_action=spec.get("quarantine_action"),
-                    )
-                    stamped = conn.execute(
-                        f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-                        (job.id,),
-                    ).fetchone()
-                    if stamped is not None:
-                        job = self._job(stamped, conn=conn)
-                inserted.append(job)
-                refs.append(spec["ref"])
-
-            if hasattr(self, "_record_usage"):
-                self._record_usage(
-                    conn, tenant_id=tenant_id, now=now, enqueues=len(inserted)
-                )
-
-            batch_id = uuid4()
-            conn.execute(
-                """
-                INSERT INTO job_dag_batches (
-                    id, tenant_id, queue_name, batch_key, job_ids, refs,
-                    created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING {_JOB_COLUMNS}
                 """,
                 (
-                    batch_id,
+                    spec["job_id"],
                     tenant_id,
                     queue_name,
-                    batch_key,
-                    [j.id for j in inserted],
-                    refs,
+                    Jsonb(sealed),
+                    status,
+                    spec["priority"],
+                    spec["max_attempts"],
+                    spec["visibility_timeout_seconds"],
+                    spec["max_runtime_seconds"],
+                    spec["retry_backoff_base_seconds"],
+                    spec["retry_backoff_max_seconds"],
+                    spec["run_at"],
+                    spec["dedupe_key"],
+                    schedule_id,
+                    spec["dep_ids"],
+                    spec["labels"],
+                    spec["skills"],
+                    spec["deadline"],
+                    spec["estimated_duration_seconds"],
+                    spec["preemptible"],
                     now,
+                    now,
+                    part_id,
+                    payload_key_id,
+                    expires,
+                    exp_action,
                 ),
+            ).fetchone()
+            assert row is not None
+            if hasattr(self, "_recheck_awaiting_skills_row_locked"):
+                row = self._recheck_awaiting_skills_row_locked(
+                    conn, row, now=now
+                )
+            job = self._job(row, conn=conn)
+            if hasattr(self, "_append_job_audit"):
+                self._append_job_audit(
+                    conn,
+                    job_row=row,
+                    event_type="enqueued",
+                    from_status=None,
+                    actor=None,
+                    detail={
+                        "queue_name": queue_name,
+                        "dag_batch_key": batch_key,
+                        "dag_ref": spec["ref"],
+                        "required_skills": spec["skills"],
+                        "status": job.status.value,
+                        **(extra_audit or {}),
+                    },
+                    now=now,
+                )
+            if hasattr(self, "_stamp_job_quarantine"):
+                self._stamp_job_quarantine(
+                    conn,
+                    job_id=job.id,
+                    tenant_id=tenant_id,
+                    max_worker_hops=spec.get("max_worker_hops"),
+                    quarantine_action=spec.get("quarantine_action"),
+                )
+                stamped = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                    (job.id,),
+                ).fetchone()
+                if stamped is not None:
+                    job = self._job(stamped, conn=conn)
+            inserted.append(job)
+            refs.append(spec["ref"])
+
+        if hasattr(self, "_record_usage"):
+            self._record_usage(
+                conn, tenant_id=tenant_id, now=now, enqueues=len(inserted)
             )
-            return DagEnqueueResult(
-                batch_key=batch_key,
-                batch_id=batch_id,
-                jobs=tuple(inserted),
-                refs=tuple(refs),
-                created=True,
-            )
+
+        batch_id = uuid4()
+        conn.execute(
+            """
+            INSERT INTO job_dag_batches (
+                id, tenant_id, queue_name, batch_key, job_ids, refs,
+                created_at, schedule_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                batch_id,
+                tenant_id,
+                queue_name,
+                batch_key,
+                [j.id for j in inserted],
+                refs,
+                now,
+                schedule_id,
+            ),
+        )
+        return DagEnqueueResult(
+            batch_key=batch_key,
+            batch_id=batch_id,
+            jobs=tuple(inserted),
+            refs=tuple(refs),
+            created=True,
+        )
 
     def _dag_result_from_existing(
         self,
