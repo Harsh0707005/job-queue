@@ -477,6 +477,21 @@ class ClientAdminMixin:
         assert payload is not None
         return payload["schedule"]
 
+    def update_schedule(
+        self,
+        schedule_id: str | UUID,
+        *,
+        tenant_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        body = dict(kwargs)
+        body["tenant_id"] = tenant_id
+        payload = self._request(
+            "POST", f"/v1/schedules/{schedule_id}/update", body
+        )
+        assert payload is not None
+        return payload["schedule"]
+
     def create_blackout(self, **kwargs: Any) -> dict[str, Any]:
         schedule_id = kwargs.get("schedule_id")
         tenant_id = kwargs.get("tenant_id")

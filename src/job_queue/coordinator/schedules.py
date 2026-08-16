@@ -130,6 +130,67 @@ class SchedulesApiMixin:
             "batch_key": fire.batch_key,
         }
 
+    def _update_schedule(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        kwargs: dict[str, Any] = {}
+        if "cron" in body or "cron_expr" in body:
+            kwargs["cron"] = body.get("cron", body.get("cron_expr"))
+        if "interval_seconds" in body:
+            raw_iv = body.get("interval_seconds")
+            kwargs["interval_seconds"] = None if raw_iv is None else int(raw_iv)
+        if "timezone" in body:
+            kwargs["timezone"] = body.get("timezone")
+        if "payload" in body:
+            kwargs["payload"] = dict(body.get("payload") or {})
+        if "dag_jobs" in body:
+            kwargs["dag_jobs"] = body.get("dag_jobs")
+        if "queue_name" in body:
+            kwargs["queue_name"] = body.get("queue_name")
+        if "name" in body:
+            kwargs["name"] = body.get("name")
+        if "priority" in body:
+            kwargs["priority"] = int(body["priority"])
+        if "max_attempts" in body:
+            kwargs["max_attempts"] = int(body["max_attempts"])
+        if "visibility_timeout_seconds" in body:
+            kwargs["visibility_timeout_seconds"] = int(
+                body["visibility_timeout_seconds"]
+            )
+        if "labels" in body:
+            kwargs["labels"] = body.get("labels")
+        if "required_skills" in body:
+            kwargs["required_skills"] = body.get("required_skills")
+        if "misfire_policy" in body:
+            kwargs["misfire_policy"] = body.get("misfire_policy")
+        if "catch_up_max" in body:
+            kwargs["catch_up_max"] = (
+                None
+                if body.get("catch_up_max") is None
+                else int(body["catch_up_max"])
+            )
+        try:
+            sched = self.queue.update_schedule(
+                UUID(sid), tenant_id=str(tenant_id), **kwargs
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except ScheduleError as exc:
+            msg = str(exc)
+            if "not found" in msg:
+                return 404, {"error": msg, "code": "schedule_error"}
+            return 409, {"error": msg, "code": "schedule_error"}
+        return 200, {"schedule": schedule_to_dict(sched, include_payload=True)}
+
     def _set_schedule_misfire(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:

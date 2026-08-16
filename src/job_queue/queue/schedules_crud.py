@@ -16,6 +16,7 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _SCHEDULE_COLUMNS,
+    _UNSET,
     ScheduleError,
     _as_utc,
     _normalize_labels,
@@ -455,6 +456,225 @@ class SchedulesCrudMixin:
                     f"schedule {schedule_id} not found for tenant {tenant_id!r}"
                 )
             return self._schedule(row)
+
+    def update_schedule(
+        self,
+        schedule_id: UUID,
+        *,
+        tenant_id: str,
+        cron: Any = _UNSET,
+        interval_seconds: Any = _UNSET,
+        timezone: Any = _UNSET,
+        payload: Any = _UNSET,
+        dag_jobs: Any = _UNSET,
+        queue_name: Any = _UNSET,
+        name: Any = _UNSET,
+        priority: Any = _UNSET,
+        max_attempts: Any = _UNSET,
+        visibility_timeout_seconds: Any = _UNSET,
+        labels: Any = _UNSET,
+        required_skills: Any = _UNSET,
+        misfire_policy: Any = _UNSET,
+        catch_up_max: Any = _UNSET,
+    ) -> Schedule:
+        """Edit a live schedule without deleting it.
+
+        Cadence changes (cron, interval, timezone) recompute ``next_run_at``
+        as the next occurrence **after now** and clear ``catch_up_remaining``
+        so a faster cron cannot backfill missed ticks. The in-flight tick
+        (one job or a whole DAG) is left alone; the new DAG template /
+        payload applies on the next fire. ``process_due`` and this update
+        both ``FOR UPDATE`` the schedule row, so a tick cannot mix old and
+        new templates.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        fields = (
+            cron,
+            interval_seconds,
+            timezone,
+            payload,
+            dag_jobs,
+            queue_name,
+            name,
+            priority,
+            max_attempts,
+            visibility_timeout_seconds,
+            labels,
+            required_skills,
+            misfire_policy,
+            catch_up_max,
+        )
+        if all(f is _UNSET for f in fields):
+            raise ValueError("pass at least one field to update")
+
+        from job_queue.cronutil import validate_cron, validate_timezone
+
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {_SCHEDULE_COLUMNS}
+                FROM schedules
+                WHERE id = %s AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (schedule_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise ScheduleError(
+                    f"schedule {schedule_id} not found for tenant {tenant_id!r}"
+                )
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ScheduleError(
+                    f"tenant {tenant_id!r} is offboarding; update is refused"
+                )
+
+            cron_expr = row.get("cron_expr")
+            interval = row.get("interval_seconds")
+            tz_name = str(row.get("timezone") or "UTC")
+            cadence_changed = False
+            if cron is not _UNSET:
+                if cron is None or str(cron).strip() == "":
+                    cron_expr = None
+                else:
+                    cron_expr = validate_cron(str(cron))
+                cadence_changed = True
+            if interval_seconds is not _UNSET:
+                if interval_seconds is None:
+                    interval = None
+                else:
+                    interval = int(interval_seconds)
+                    if interval < 1:
+                        raise ValueError("interval_seconds must be >= 1 or None")
+                cadence_changed = True
+            if timezone is not _UNSET:
+                tz_name = validate_timezone(str(timezone))
+                cadence_changed = True
+            if cron_expr is None and interval is None:
+                raise ValueError("provide cron and/or interval_seconds")
+
+            qname = str(row["queue_name"])
+            if queue_name is not _UNSET:
+                qname = str(queue_name).strip()
+                if not qname:
+                    raise ValueError("queue_name is required")
+            new_name = row.get("name")
+            if name is not _UNSET:
+                if name is None or str(name).strip() == "":
+                    new_name = None
+                else:
+                    new_name = str(name).strip()
+            pri = int(row["priority"])
+            if priority is not _UNSET:
+                pri = int(priority)
+            attempts = int(row["max_attempts"])
+            if max_attempts is not _UNSET:
+                attempts = int(max_attempts)
+                if attempts < 1:
+                    raise ValueError("max_attempts must be >= 1")
+            vis = int(row["visibility_timeout_seconds"])
+            if visibility_timeout_seconds is not _UNSET:
+                vis = int(visibility_timeout_seconds)
+                if vis < 1:
+                    raise ValueError("visibility_timeout_seconds must be >= 1")
+            labs = list(row.get("labels") or [])
+            if labels is not _UNSET:
+                labs = _normalize_labels(labels)
+            skills = list(row.get("required_skills") or [])
+            if required_skills is not _UNSET:
+                skills = _normalize_skills(required_skills)
+            policy = str(row.get("misfire_policy") or "catch_up_one")
+            if misfire_policy is not _UNSET:
+                policy = normalize_misfire_policy(misfire_policy)
+            catch_max = int(row.get("catch_up_max") or 8)
+            if catch_up_max is not _UNSET:
+                catch_max = normalize_catch_up_max(catch_up_max)
+
+            dag_val = row.get("dag_jobs")
+            if dag_jobs is not _UNSET:
+                dag_list = normalize_schedule_dag_jobs(dag_jobs)
+                dag_val = Jsonb(dag_list) if dag_list else None
+
+            sealed = row["payload"]
+            payload_key_id = row.get("payload_key_id")
+            if payload is not _UNSET:
+                if not isinstance(payload, dict):
+                    raise ValueError("payload must be a dict")
+                sealed, payload_key_id = self._seal_schedule_payload(
+                    conn,
+                    tenant_id=tenant_id,
+                    schedule_id=schedule_id,
+                    payload=dict(payload),
+                )
+
+            next_run = row["next_run_at"]
+            catch_remaining = row.get("catch_up_remaining")
+            if cadence_changed:
+                merged = {
+                    "cron_expr": cron_expr,
+                    "interval_seconds": interval,
+                    "timezone": tz_name,
+                    "next_run_at": next_run,
+                }
+                next_run = self._schedule_next_run(merged, now=now)
+                catch_remaining = None
+
+            try:
+                updated = conn.execute(
+                    f"""
+                    UPDATE schedules
+                    SET cron_expr = %s,
+                        interval_seconds = %s,
+                        timezone = %s,
+                        payload = %s,
+                        payload_key_id = %s,
+                        dag_jobs = %s,
+                        queue_name = %s,
+                        name = %s,
+                        priority = %s,
+                        max_attempts = %s,
+                        visibility_timeout_seconds = %s,
+                        labels = %s,
+                        required_skills = %s,
+                        misfire_policy = %s,
+                        catch_up_max = %s,
+                        next_run_at = %s,
+                        catch_up_remaining = %s,
+                        updated_at = %s
+                    WHERE id = %s AND tenant_id = %s
+                    RETURNING {_SCHEDULE_COLUMNS}
+                    """,
+                    (
+                        cron_expr,
+                        interval,
+                        tz_name,
+                        Jsonb(sealed) if isinstance(sealed, dict) else sealed,
+                        payload_key_id,
+                        dag_val,
+                        qname,
+                        new_name,
+                        pri,
+                        attempts,
+                        vis,
+                        labs,
+                        skills,
+                        policy,
+                        catch_max,
+                        next_run,
+                        catch_remaining,
+                        now,
+                        schedule_id,
+                        tenant_id,
+                    ),
+                ).fetchone()
+            except UniqueViolation as exc:
+                raise ScheduleError(
+                    f"schedule name {new_name!r} already exists for "
+                    f"tenant {tenant_id!r}"
+                ) from exc
+            assert updated is not None
+            return self._schedule(updated)
 
     @staticmethod
     def _schedule_tick_after(sched_row: dict[str, Any], after: datetime) -> datetime:
