@@ -334,7 +334,11 @@ class SchedulesCrudMixin:
             return [self._schedule(r) for r in rows]
 
     def pause_schedule(self, schedule_id: UUID, *, tenant_id: str) -> Schedule:
-        """Stop a schedule from firing (keeps the row; use resume to re-enable)."""
+        """Stop this schedule from enqueueing. Other schedules on the tenant keep ticking.
+
+        In-flight jobs (or a whole DAG tick) finish. ``next_run_at`` is left
+        as-is so resume can apply misfire policy instead of snapping to now.
+        """
         return self._set_schedule_enabled(
             schedule_id, tenant_id=tenant_id, enabled=False
         )
@@ -348,15 +352,38 @@ class SchedulesCrudMixin:
     ) -> Schedule:
         """Re-enable a paused schedule.
 
-        If *next_run_at* is omitted, the next fire is set to now so it is due
-        on the following ``process_due_schedules`` call.
+        Overdue ``next_run_at`` is left in the past so misfire policy
+        (skip / catch_up_one / catch_up), blackout, inflight overlap, and
+        spend caps run on the next ``process_due_schedules``. Pass
+        *next_run_at* only to override that. Does not pause or resume the tenant.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         now = _utcnow()
-        run_at = _as_utc(next_run_at) if next_run_at is not None else now
         with transaction(self._pool) as conn:
+            if self._is_tenant_offboarding(conn, tenant_id):
+                raise ScheduleError(
+                    f"tenant {tenant_id!r} is offboarding; resume is refused"
+                )
             row = conn.execute(
+                f"""
+                SELECT {_SCHEDULE_COLUMNS}
+                FROM schedules
+                WHERE id = %s AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (schedule_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise ScheduleError(
+                    f"schedule {schedule_id} not found for tenant {tenant_id!r}"
+                )
+            run_at = (
+                _as_utc(next_run_at)
+                if next_run_at is not None
+                else row["next_run_at"]
+            )
+            updated = conn.execute(
                 f"""
                 UPDATE schedules
                 SET enabled = TRUE,
@@ -367,11 +394,8 @@ class SchedulesCrudMixin:
                 """,
                 (run_at, now, schedule_id, tenant_id),
             ).fetchone()
-            if row is None:
-                raise ScheduleError(
-                    f"schedule {schedule_id} not found for tenant {tenant_id!r}"
-                )
-            return self._schedule(row)
+            assert updated is not None
+            return self._schedule(updated)
 
     def delete_schedule(self, schedule_id: UUID, *, tenant_id: str) -> bool:
         """Permanently remove a schedule. Returns True if a row was deleted."""
@@ -401,6 +425,19 @@ class SchedulesCrudMixin:
         with transaction(self._pool) as conn:
             row = conn.execute(
                 f"""
+                SELECT {_SCHEDULE_COLUMNS}
+                FROM schedules
+                WHERE id = %s AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (schedule_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                raise ScheduleError(
+                    f"schedule {schedule_id} not found for tenant {tenant_id!r}"
+                )
+            updated = conn.execute(
+                f"""
                 UPDATE schedules
                 SET enabled = %s,
                     updated_at = %s
@@ -409,11 +446,8 @@ class SchedulesCrudMixin:
                 """,
                 (enabled, now, schedule_id, tenant_id),
             ).fetchone()
-            if row is None:
-                raise ScheduleError(
-                    f"schedule {schedule_id} not found for tenant {tenant_id!r}"
-                )
-            return self._schedule(row)
+            assert updated is not None
+            return self._schedule(updated)
 
     def set_schedule_misfire(
         self,

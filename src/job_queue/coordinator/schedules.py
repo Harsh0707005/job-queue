@@ -85,8 +85,18 @@ class SchedulesApiMixin:
         tenant_id = body.get("tenant_id")
         if not tenant_id:
             return 400, {"error": "tenant_id is required"}
+        next_raw = body.get("next_run_at")
+        next_run = None
+        if next_raw is not None and next_raw != "":
+            from datetime import datetime as _dt
+
+            next_run = _dt.fromisoformat(str(next_raw).replace("Z", "+00:00"))
         try:
-            sched = self.queue.resume_schedule(UUID(sid), tenant_id=str(tenant_id))
+            sched = self.queue.resume_schedule(
+                UUID(sid), tenant_id=str(tenant_id), next_run_at=next_run
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
         except ScheduleError as exc:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}

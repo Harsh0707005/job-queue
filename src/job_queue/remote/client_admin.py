@@ -646,11 +646,20 @@ class ClientAdminMixin:
         assert payload is not None
         return payload["schedule"]
 
-    def resume_schedule(self, schedule_id: str, *, tenant_id: str) -> dict[str, Any]:
+    def resume_schedule(
+        self,
+        schedule_id: str,
+        *,
+        tenant_id: str,
+        next_run_at: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if next_run_at is not None:
+            body["next_run_at"] = next_run_at
         payload = self._request(
             "POST",
             f"/v1/schedules/{schedule_id}/resume",
-            {"tenant_id": tenant_id},
+            body,
         )
         assert payload is not None
         return payload["schedule"]
