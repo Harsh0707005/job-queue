@@ -664,11 +664,23 @@ class ClientAdminMixin:
         assert payload is not None
         return payload["schedule"]
 
-    def delete_schedule(self, schedule_id: str, *, tenant_id: str) -> bool:
+    def delete_schedule(
+        self,
+        schedule_id: str,
+        *,
+        tenant_id: str,
+        wait: bool = False,
+        wait_timeout_seconds: float | None = None,
+    ) -> bool:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if wait:
+            body["wait"] = True
+        if wait_timeout_seconds is not None:
+            body["wait_timeout_seconds"] = wait_timeout_seconds
         payload = self._request(
             "POST",
             f"/v1/schedules/{schedule_id}/delete",
-            {"tenant_id": tenant_id},
+            body,
         )
         if payload is None:
             return False

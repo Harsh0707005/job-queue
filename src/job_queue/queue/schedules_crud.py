@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
@@ -16,6 +17,7 @@ from job_queue.models import (
 )
 from job_queue.queue._common import (
     _SCHEDULE_COLUMNS,
+    _SCHEDULE_INFLIGHT_STATUSES,
     _UNSET,
     ScheduleError,
     _as_utc,
@@ -397,20 +399,102 @@ class SchedulesCrudMixin:
             assert updated is not None
             return self._schedule(updated)
 
-    def delete_schedule(self, schedule_id: UUID, *, tenant_id: str) -> bool:
-        """Permanently remove a schedule. Returns True if a row was deleted."""
+    def delete_schedule(
+        self,
+        schedule_id: UUID,
+        *,
+        tenant_id: str,
+        wait: bool = False,
+        wait_timeout_seconds: float | None = None,
+    ) -> bool:
+        """Permanently remove a schedule.
+
+        Returns True if a row was deleted, False if it was already gone.
+
+        Fails closed with ``ScheduleError`` when any job for this schedule
+        is still in flight (pending, leased, awaiting approval / children
+        / skills, or frozen). Completed, cancelled, and dead-letter jobs
+        keep their ``schedule_id`` as history — there is no FK, so delete
+        does not cascade into the job table. Schedule blackouts CASCADE.
+        Other schedules on the tenant are untouched.
+
+        Serializes with ``process_due_schedules`` and ``fire_schedule``
+        via ``FOR UPDATE`` on the schedule row: a tick cannot enqueue
+        after delete has claimed the row, and delete cannot drop a row
+        a tick is currently materializing.
+
+        Set *wait* to disable the schedule (so no new tick can start)
+        and poll until in-flight work finishes, then delete. On timeout
+        the schedule stays disabled and ``ScheduleError`` is raised.
+        """
         if not tenant_id:
             raise ValueError("tenant_id is required")
-        with transaction(self._pool) as conn:
-            row = conn.execute(
-                """
-                DELETE FROM schedules
-                WHERE id = %s AND tenant_id = %s
-                RETURNING id
-                """,
-                (schedule_id, tenant_id),
-            ).fetchone()
-            return row is not None
+        deadline: float | None = None
+        if wait:
+            timeout = (
+                30.0
+                if wait_timeout_seconds is None
+                else float(wait_timeout_seconds)
+            )
+            if timeout < 0:
+                raise ValueError("wait_timeout_seconds must be >= 0")
+            deadline = time.monotonic() + timeout
+
+        while True:
+            with transaction(self._pool) as conn:
+                row = conn.execute(
+                    f"""
+                    SELECT {_SCHEDULE_COLUMNS}
+                    FROM schedules
+                    WHERE id = %s AND tenant_id = %s
+                    FOR UPDATE
+                    """,
+                    (schedule_id, tenant_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                active = conn.execute(
+                    """
+                    SELECT id, status
+                    FROM jobs
+                    WHERE schedule_id = %s
+                      AND status = ANY(%s)
+                    LIMIT 1
+                    """,
+                    (schedule_id, list(_SCHEDULE_INFLIGHT_STATUSES)),
+                ).fetchone()
+                if active is None:
+                    conn.execute(
+                        """
+                        DELETE FROM schedules
+                        WHERE id = %s AND tenant_id = %s
+                        """,
+                        (schedule_id, tenant_id),
+                    )
+                    return True
+                if not wait:
+                    raise ScheduleError(
+                        f"schedule {schedule_id} has in-flight work "
+                        f"(job {active['id']} is {active['status']}); "
+                        "delete is refused until the tick finishes"
+                    )
+                if bool(row["enabled"]):
+                    conn.execute(
+                        """
+                        UPDATE schedules
+                        SET enabled = FALSE,
+                            updated_at = %s
+                        WHERE id = %s AND tenant_id = %s
+                        """,
+                        (_utcnow(), schedule_id, tenant_id),
+                    )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ScheduleError(
+                    f"schedule {schedule_id} still has in-flight work "
+                    "after waiting; schedule is disabled so it will "
+                    "not enqueue more ticks"
+                )
+            time.sleep(0.05)
 
     def _set_schedule_enabled(
         self,

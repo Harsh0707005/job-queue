@@ -242,7 +242,27 @@ class SchedulesApiMixin:
         tenant_id = body.get("tenant_id")
         if not tenant_id:
             return 400, {"error": "tenant_id is required"}
-        deleted = self.queue.delete_schedule(UUID(sid), tenant_id=str(tenant_id))
+        wait = bool(body.get("wait") or False)
+        timeout_raw = body.get("wait_timeout_seconds")
+        timeout: float | None
+        if timeout_raw is None or timeout_raw == "":
+            timeout = None
+        else:
+            try:
+                timeout = float(timeout_raw)
+            except (TypeError, ValueError):
+                return 400, {"error": "wait_timeout_seconds must be a number"}
+        try:
+            deleted = self.queue.delete_schedule(
+                UUID(sid),
+                tenant_id=str(tenant_id),
+                wait=wait,
+                wait_timeout_seconds=timeout,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except ScheduleError as exc:
+            return 409, {"error": str(exc), "code": "schedule_error"}
         if not deleted:
             return 404, {"error": f"schedule {sid} not found for tenant"}
         return 200, {"deleted": True, "schedule_id": sid}
