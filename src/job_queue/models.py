@@ -255,6 +255,9 @@ class Schedule:
     ``missed_ticks`` is a running count of ticks that were not enqueued.
     ``dag_jobs`` is an optional template: when set, each tick enqueues that
     whole DAG atomically instead of a single job.
+    ``mutex_group`` names a per-tenant exclusive set: at most one member
+    may have a tick or DAG in flight. Missed ticks while blocked follow
+    ``misfire_policy`` instead of dumping a backlog.
     """
 
     id: UUID
@@ -281,6 +284,7 @@ class Schedule:
     last_misfire_at: datetime | None = None
     catch_up_remaining: int | None = None
     dag_jobs: tuple[dict[str, Any], ...] = ()
+    mutex_group: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

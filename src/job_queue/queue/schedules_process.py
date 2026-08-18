@@ -63,6 +63,14 @@ class SchedulesProcessMixin:
         approval/children/skills, or frozen, this tick is skipped and
         ``next_run_at`` is left unchanged so the schedule remains due.
 
+        **Mutex groups:** schedules that share ``mutex_group`` on a tenant
+        are exclusive. Two due members racing (or two coordinators) take
+        one advisory lock in sorted group order, then at most one tick
+        materializes. The blocked member keeps ``next_run_at`` overdue so
+        skip / catch_up_one / catch_up run when the group is free — no
+        backlog dump. Pause and delete only lock their own row
+        (``SKIP LOCKED`` here), so they cannot deadlock the tenant.
+
         Returns a list of ``ScheduleFire`` (updated schedule + enqueued job).
         """
         if limit < 1:
@@ -123,6 +131,8 @@ class SchedulesProcessMixin:
                     (now, now, limit),
                 ).fetchall()
 
+            self._lock_claimed_mutex_groups(conn, due)
+
             for sched_row in due:
                 # Race: tenant paused / breaker opened / blackout set after SELECT.
                 if self._tenant_claims_blocked(
@@ -158,25 +168,37 @@ class SchedulesProcessMixin:
                     )
                     continue
 
-                # Skip if a prior run is still in flight (incl. park waits).
-                active = conn.execute(
-                    """
-                    SELECT id
-                    FROM jobs
-                    WHERE schedule_id = %s
-                      AND status = ANY(%s)
-                    LIMIT 1
-                    """,
-                    (
-                        sched_row["id"],
-                        list(_SCHEDULE_INFLIGHT_STATUSES),
-                    ),
-                ).fetchone()
-                if active is not None:
+                # Skip if a prior run is still in flight (incl. park waits),
+                # or a mutex-group peer still holds the exclusive tick.
+                group = sched_row.get("mutex_group")
+                if group:
+                    blocked = self._schedule_mutex_blocked(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        mutex_group=str(group),
+                    )
+                    skip_metric = "schedule_mutex" if blocked else None
+                else:
+                    active = conn.execute(
+                        """
+                        SELECT id
+                        FROM jobs
+                        WHERE schedule_id = %s
+                          AND status = ANY(%s)
+                        LIMIT 1
+                        """,
+                        (
+                            sched_row["id"],
+                            list(_SCHEDULE_INFLIGHT_STATUSES),
+                        ),
+                    ).fetchone()
+                    blocked = active is not None
+                    skip_metric = "schedule_skip" if blocked else None
+                if blocked:
                     self._record_metric(
                         conn,
                         tenant_id=str(sched_row["tenant_id"]),
-                        metric="schedule_skip",
+                        metric=skip_metric or "schedule_skip",
                         count=1,
                         now=now,
                     )

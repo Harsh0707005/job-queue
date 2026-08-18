@@ -806,6 +806,13 @@ ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catch_up_remaining INTEGER;
 -- NULL / empty = single-job schedule (payload becomes the one job).
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS dag_jobs JSONB;
 
+-- Mutually exclusive schedule groups (per tenant). At most one member may
+-- have a tick / DAG in flight. Membership is a name; NULL means ungrouped.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS mutex_group TEXT;
+CREATE INDEX IF NOT EXISTS idx_schedules_mutex_group
+    ON schedules (tenant_id, mutex_group)
+    WHERE mutex_group IS NOT NULL;
+
 ALTER TABLE job_dag_batches ADD COLUMN IF NOT EXISTS schedule_id UUID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_job_dag_batches_schedule_key

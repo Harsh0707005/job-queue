@@ -16,6 +16,7 @@ from job_queue.models import (
     Schedule,
 )
 from job_queue.queue._common import (
+    _SCHED_MUTEX_LOCK_CLASS,
     _SCHEDULE_COLUMNS,
     _SCHEDULE_INFLIGHT_STATUSES,
     _UNSET,
@@ -64,6 +65,21 @@ def normalize_catch_up_max(raw: int | None) -> int:
 
 
 _MAX_SCHEDULE_DAG_JOBS = 200
+_MAX_MUTEX_GROUP_LEN = 128
+
+
+def normalize_mutex_group(raw: str | None) -> str | None:
+    """Empty / None → ungrouped. Same tenant + name share one mutex."""
+    if raw is None:
+        return None
+    name = str(raw).strip()
+    if name == "":
+        return None
+    if len(name) > _MAX_MUTEX_GROUP_LEN:
+        raise ValueError(
+            f"mutex_group longer than {_MAX_MUTEX_GROUP_LEN} characters"
+        )
+    return name
 
 
 def normalize_schedule_dag_jobs(
@@ -150,6 +166,7 @@ class SchedulesCrudMixin:
         misfire_policy: str | None = None,
         catch_up_max: int | None = None,
         dag_jobs: Sequence[dict[str, Any]] | None = None,
+        mutex_group: str | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -187,6 +204,10 @@ class SchedulesCrudMixin:
         dag_jobs:
             Optional DAG template. When set, each tick enqueues this
             whole graph in one transaction instead of a single job.
+        mutex_group:
+            Optional per-tenant exclusive group name. At most one
+            member may have a tick or DAG in flight. Missed ticks
+            while the group is busy follow ``misfire_policy``.
         """
         from job_queue.cronutil import next_cron_fire, validate_cron, validate_timezone
 
@@ -210,6 +231,7 @@ class SchedulesCrudMixin:
         policy = normalize_misfire_policy(misfire_policy)
         catch_max = normalize_catch_up_max(catch_up_max)
         dag_list = normalize_schedule_dag_jobs(dag_jobs)
+        group = normalize_mutex_group(mutex_group)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -243,14 +265,15 @@ class SchedulesCrudMixin:
                         visibility_timeout_seconds, enabled, next_run_at,
                         labels, created_at, updated_at, payload_key_id,
                         required_skills,
-                        misfire_policy, catch_up_max, dag_jobs
+                        misfire_policy, catch_up_max, dag_jobs,
+                        mutex_group
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -276,6 +299,7 @@ class SchedulesCrudMixin:
                         policy,
                         catch_max,
                         Jsonb(dag_list) if dag_list else None,
+                        group,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:
@@ -594,6 +618,7 @@ class SchedulesCrudMixin:
         required_skills: Any = _UNSET,
         misfire_policy: Any = _UNSET,
         catch_up_max: Any = _UNSET,
+        mutex_group: Any = _UNSET,
     ) -> Schedule:
         """Edit a live schedule without deleting it.
 
@@ -622,6 +647,7 @@ class SchedulesCrudMixin:
             required_skills,
             misfire_policy,
             catch_up_max,
+            mutex_group,
         )
         if all(f is _UNSET for f in fields):
             raise ValueError("pass at least one field to update")
@@ -708,6 +734,9 @@ class SchedulesCrudMixin:
             catch_max = int(row.get("catch_up_max") or 8)
             if catch_up_max is not _UNSET:
                 catch_max = normalize_catch_up_max(catch_up_max)
+            group = row.get("mutex_group")
+            if mutex_group is not _UNSET:
+                group = normalize_mutex_group(mutex_group)
 
             dag_val = row.get("dag_jobs")
             if dag_jobs is not _UNSET:
@@ -757,6 +786,7 @@ class SchedulesCrudMixin:
                         required_skills = %s,
                         misfire_policy = %s,
                         catch_up_max = %s,
+                        mutex_group = %s,
                         next_run_at = %s,
                         catch_up_remaining = %s,
                         updated_at = %s
@@ -779,6 +809,7 @@ class SchedulesCrudMixin:
                         skills,
                         policy,
                         catch_max,
+                        group,
                         next_run,
                         catch_remaining,
                         now,
@@ -793,6 +824,53 @@ class SchedulesCrudMixin:
                 ) from exc
             assert updated is not None
             return self._schedule(updated)
+
+    @staticmethod
+    def _lock_schedule_mutex_group(
+        conn: Any, tenant_id: str, mutex_group: str
+    ) -> None:
+        """Transaction lock for one tenant + group. Sorted callers cannot invert."""
+        lock_key = f"{tenant_id}\x1f{mutex_group}"
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (_SCHED_MUTEX_LOCK_CLASS, lock_key),
+        )
+
+    @staticmethod
+    def _lock_claimed_mutex_groups(conn: Any, rows: Sequence[Any]) -> None:
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            group = row.get("mutex_group") if hasattr(row, "get") else None
+            if not group:
+                continue
+            seen.add((str(row["tenant_id"]), str(group)))
+        for tenant_id, group in sorted(seen):
+            SchedulesCrudMixin._lock_schedule_mutex_group(conn, tenant_id, group)
+
+    @staticmethod
+    def _schedule_mutex_blocked(
+        conn: Any,
+        *,
+        tenant_id: str,
+        mutex_group: str | None,
+    ) -> bool:
+        """True when any member of the group has a live tick/DAG."""
+        if not mutex_group:
+            return False
+        row = conn.execute(
+            """
+            SELECT j.id
+            FROM jobs j
+            JOIN schedules s ON s.id = j.schedule_id
+            WHERE s.tenant_id = %s
+              AND j.tenant_id = s.tenant_id
+              AND s.mutex_group = %s
+              AND j.status = ANY(%s)
+            LIMIT 1
+            """,
+            (tenant_id, mutex_group, list(_SCHEDULE_INFLIGHT_STATUSES)),
+        ).fetchone()
+        return row is not None
 
     @staticmethod
     def _schedule_tick_after(sched_row: dict[str, Any], after: datetime) -> datetime:

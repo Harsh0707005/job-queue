@@ -40,7 +40,8 @@ class SchedulesFireMixin:
         all refuse. Pending caps and enqueue rate limits are bypassed.
 
         Concurrent callers serialize on the schedule row
-        (``FOR UPDATE``) plus ``idx_jobs_schedule_active``.
+        (``FOR UPDATE``). A ``mutex_group`` peer that is already in
+        flight refuses this fire the same way an in-flight self tick does.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -81,20 +82,33 @@ class SchedulesFireMixin:
                 raise ScheduleError(
                     f"schedule {schedule_id} is inside a blackout window"
                 )
-            active = conn.execute(
-                """
-                SELECT id
-                FROM jobs
-                WHERE schedule_id = %s
-                  AND status = ANY(%s)
-                LIMIT 1
-                """,
-                (schedule_id, list(_SCHEDULE_INFLIGHT_STATUSES)),
-            ).fetchone()
-            if active is not None:
-                raise ScheduleError(
-                    f"schedule {schedule_id} already has an in-flight job"
+            group = sched_row.get("mutex_group")
+            if group:
+                self._lock_schedule_mutex_group(
+                    conn, tenant_id, str(group)
                 )
+                if self._schedule_mutex_blocked(
+                    conn, tenant_id=tenant_id, mutex_group=str(group)
+                ):
+                    raise ScheduleError(
+                        f"schedule {schedule_id} is blocked by mutex "
+                        f"group {group!r}"
+                    )
+            else:
+                active = conn.execute(
+                    """
+                    SELECT id
+                    FROM jobs
+                    WHERE schedule_id = %s
+                      AND status = ANY(%s)
+                    LIMIT 1
+                    """,
+                    (schedule_id, list(_SCHEDULE_INFLIGHT_STATUSES)),
+                ).fetchone()
+                if active is not None:
+                    raise ScheduleError(
+                        f"schedule {schedule_id} already has an in-flight job"
+                    )
 
             try:
                 first, jobs, refs, batch_id, batch_key = (

@@ -49,6 +49,7 @@ class SchedulesApiMixin:
                     else int(body["catch_up_max"])
                 ),
                 dag_jobs=body.get("dag_jobs"),
+                mutex_group=body.get("mutex_group"),
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}
@@ -188,6 +189,8 @@ class SchedulesApiMixin:
                 if body.get("catch_up_max") is None
                 else int(body["catch_up_max"])
             )
+        if "mutex_group" in body:
+            kwargs["mutex_group"] = body.get("mutex_group")
         try:
             sched = self.queue.update_schedule(
                 UUID(sid), tenant_id=str(tenant_id), **kwargs

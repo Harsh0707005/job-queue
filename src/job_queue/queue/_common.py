@@ -28,6 +28,7 @@ _MAX_PREEMPTS_PER_JOB = 8
 _DEDUPE_LOCK_CLASS = 884_422_01
 _DAG_BATCH_LOCK_CLASS = 884_422_02
 _AUDIT_SEQ_LOCK_CLASS = 884_422_03
+_SCHED_MUTEX_LOCK_CLASS = 884_422_04
 
 _TENANT_RETENTION_FOREVER = -1
 
@@ -183,7 +184,7 @@ _SCHEDULE_COLUMNS = """
     next_run_at, last_enqueued_at, created_at, updated_at, labels,
     payload_key_id, required_skills,
     misfire_policy, catch_up_max, missed_ticks, last_misfire_at,
-    catch_up_remaining, dag_jobs
+    catch_up_remaining, dag_jobs, mutex_group
 """
 
 _CANCEL_MATCHING_BATCH_DEFAULT = 500
@@ -590,6 +591,11 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
             else int(row["catch_up_remaining"])
         ),
         dag_jobs=_dag_jobs_from_row(row.get("dag_jobs")),
+        mutex_group=(
+            None
+            if not row.get("mutex_group")
+            else str(row["mutex_group"])
+        ),
     )
 
 
