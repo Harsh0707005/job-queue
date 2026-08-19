@@ -826,26 +826,26 @@ class SchedulesCrudMixin:
             return self._schedule(updated)
 
     @staticmethod
-    def _lock_schedule_mutex_group(
-        conn: Any, tenant_id: str, mutex_group: str
-    ) -> None:
-        """Transaction lock for one tenant + group. Sorted callers cannot invert."""
-        lock_key = f"{tenant_id}\x1f{mutex_group}"
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
-            (_SCHED_MUTEX_LOCK_CLASS, lock_key),
-        )
+    def _mutex_lock_key(tenant_id: str, mutex_group: str) -> str:
+        return f"{tenant_id}\x1f{mutex_group}"
 
     @staticmethod
-    def _lock_claimed_mutex_groups(conn: Any, rows: Sequence[Any]) -> None:
-        seen: set[tuple[str, str]] = set()
-        for row in rows:
-            group = row.get("mutex_group") if hasattr(row, "get") else None
-            if not group:
-                continue
-            seen.add((str(row["tenant_id"]), str(group)))
-        for tenant_id, group in sorted(seen):
-            SchedulesCrudMixin._lock_schedule_mutex_group(conn, tenant_id, group)
+    def _try_lock_schedule_mutex_group(
+        conn: Any, tenant_id: str, mutex_group: str
+    ) -> bool:
+        """Non-blocking per-tenant group lock.
+
+        A blocking lock here would stall a global ``process_due`` that also
+        holds other tenants' schedule rows (``SKIP LOCKED`` then waits).
+        """
+        row = conn.execute(
+            "SELECT pg_try_advisory_xact_lock(%s, hashtext(%s)) AS locked",
+            (
+                _SCHED_MUTEX_LOCK_CLASS,
+                SchedulesCrudMixin._mutex_lock_key(tenant_id, mutex_group),
+            ),
+        ).fetchone()
+        return bool(row and row["locked"])
 
     @staticmethod
     def _schedule_mutex_blocked(

@@ -84,10 +84,9 @@ class SchedulesFireMixin:
                 )
             group = sched_row.get("mutex_group")
             if group:
-                self._lock_schedule_mutex_group(
+                if not self._try_lock_schedule_mutex_group(
                     conn, tenant_id, str(group)
-                )
-                if self._schedule_mutex_blocked(
+                ) or self._schedule_mutex_blocked(
                     conn, tenant_id=tenant_id, mutex_group=str(group)
                 ):
                     raise ScheduleError(

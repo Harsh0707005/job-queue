@@ -12,7 +12,8 @@ import pytest
 
 from job_queue import JobQueue, JobStatus, ScheduleError
 from job_queue.coordinator import Coordinator, _make_handler
-from job_queue.queue._common import _utcnow
+from job_queue.queue._common import _SCHED_MUTEX_LOCK_CLASS, _utcnow
+from job_queue.queue.schedules_crud import SchedulesCrudMixin
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack
 from tests.test_schedule_dag import _diamond, _make_due
@@ -551,3 +552,97 @@ def test_mutex_http_roundtrip(queue: JobQueue):
 def test_mutex_missing_schedule_unchanged(queue: JobQueue):
     with pytest.raises(ScheduleError, match="not found"):
         queue.update_schedule(uuid4(), tenant_id="t1", mutex_group="g")
+
+
+def test_export_restore_keeps_mutex_group(queue: JobQueue):
+    a = queue.create_schedule(
+        tenant_id="src-mx",
+        interval_seconds=60,
+        payload={"who": "a"},
+        name="a",
+        mutex_group="deploy",
+        misfire_policy="skip",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    b = queue.create_schedule(
+        tenant_id="src-mx",
+        interval_seconds=60,
+        payload={"who": "b"},
+        name="b",
+        mutex_group="deploy",
+        misfire_policy="skip",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    snap = queue.export_tenant("src-mx")
+    assert snap.status == "ready"
+    rst = queue.restore_tenant(
+        "dst-mx", snapshot_id=snap.id, batch_size=20, run_until_complete=True
+    )
+    assert rst.status == "complete"
+    dst = queue.list_schedules(tenant_id="dst-mx")
+    assert len(dst) == 2
+    assert {s.mutex_group for s in dst} == {"deploy"}
+    assert {s.misfire_policy for s in dst} == {"skip"}
+    assert {s.id for s in dst}.isdisjoint({a.id, b.id})
+    for sched in dst:
+        _make_due(queue, sched.id)
+    fires = queue.process_due_schedules(tenant_id="dst-mx")
+    assert len(fires) == 1
+    assert queue.count(tenant_id="dst-mx") == 1
+    assert queue.process_due_schedules(tenant_id="dst-mx") == []
+    src = queue.get_schedule(a.id, tenant_id="src-mx")
+    assert src is not None and src.mutex_group == "deploy"
+
+
+def test_mutex_try_lock_does_not_stall_other_tenants(queue: JobQueue):
+    queue.create_schedule(
+        tenant_id="hold-mx",
+        interval_seconds=60,
+        payload={"who": "held"},
+        name="held",
+        mutex_group="g",
+    )
+    live = queue.create_schedule(
+        tenant_id="live-mx",
+        interval_seconds=60,
+        payload={"ok": True},
+        name="live",
+    )
+    key = SchedulesCrudMixin._mutex_lock_key("hold-mx", "g")
+    held = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def locker() -> None:
+        try:
+            with queue._pool.connection() as conn:
+                conn.execute(
+                    "SELECT pg_advisory_lock(%s, hashtext(%s))",
+                    (_SCHED_MUTEX_LOCK_CLASS, key),
+                )
+                conn.commit()
+                held.set()
+                release.wait(5)
+                conn.execute(
+                    "SELECT pg_advisory_unlock(%s, hashtext(%s))",
+                    (_SCHED_MUTEX_LOCK_CLASS, key),
+                )
+                conn.commit()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            held.set()
+
+    t = threading.Thread(target=locker)
+    t.start()
+    assert held.wait(2)
+    start = time.monotonic()
+    fires = queue.process_due_schedules()
+    elapsed = time.monotonic() - start
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert errors == []
+    assert elapsed < 0.5
+    assert [f.schedule.id for f in fires] == [live.id]
+    assert queue.count(tenant_id="hold-mx") == 0
+    assert queue.count(tenant_id="live-mx") == 1

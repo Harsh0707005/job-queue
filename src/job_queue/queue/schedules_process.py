@@ -64,12 +64,13 @@ class SchedulesProcessMixin:
         ``next_run_at`` is left unchanged so the schedule remains due.
 
         **Mutex groups:** schedules that share ``mutex_group`` on a tenant
-        are exclusive. Two due members racing (or two coordinators) take
-        one advisory lock in sorted group order, then at most one tick
-        materializes. The blocked member keeps ``next_run_at`` overdue so
-        skip / catch_up_one / catch_up run when the group is free — no
-        backlog dump. Pause and delete only lock their own row
-        (``SKIP LOCKED`` here), so they cannot deadlock the tenant.
+        are exclusive. Two due members racing take a *non-blocking*
+        per-tenant advisory lock; the loser skips and leaves
+        ``next_run_at`` overdue so skip / catch_up_one / catch_up run
+        when the group is free — no backlog dump. The lock is
+        ``pg_try_advisory_xact_lock`` so a busy group cannot stall
+        other tenants in the same ``process_due`` batch. Pause and
+        delete only lock their own row (``SKIP LOCKED`` here).
 
         Returns a list of ``ScheduleFire`` (updated schedule + enqueued job).
         """
@@ -131,8 +132,6 @@ class SchedulesProcessMixin:
                     (now, now, limit),
                 ).fetchall()
 
-            self._lock_claimed_mutex_groups(conn, due)
-
             for sched_row in due:
                 # Race: tenant paused / breaker opened / blackout set after SELECT.
                 if self._tenant_claims_blocked(
@@ -172,7 +171,12 @@ class SchedulesProcessMixin:
                 # or a mutex-group peer still holds the exclusive tick.
                 group = sched_row.get("mutex_group")
                 if group:
-                    blocked = self._schedule_mutex_blocked(
+                    locked = self._try_lock_schedule_mutex_group(
+                        conn,
+                        str(sched_row["tenant_id"]),
+                        str(group),
+                    )
+                    blocked = (not locked) or self._schedule_mutex_blocked(
                         conn,
                         tenant_id=str(sched_row["tenant_id"]),
                         mutex_group=str(group),

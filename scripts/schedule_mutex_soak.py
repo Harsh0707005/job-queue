@@ -138,6 +138,7 @@ def create_sched(
     policy: str = "catch_up_one",
     prep_ms: int | None = None,
     ms: int | None = None,
+    enabled: bool = True,
 ) -> str:
     job_ms = ms if ms is not None else JOB_MS
     root_ms = prep_ms if prep_ms is not None else job_ms
@@ -148,6 +149,7 @@ def create_sched(
         "payload": {"kind": "render", "ms": job_ms, "name": name},
         "misfire_policy": policy,
         "catch_up_max": 3,
+        "enabled": enabled,
     }
     if group is not None:
         body["mutex_group"] = group
@@ -182,6 +184,17 @@ def delete(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
 
 def pause(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
     return http_json("POST", f"/v1/schedules/{sid}/pause", {"tenant_id": tid})
+
+
+def resume(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
+    return http_json("POST", f"/v1/schedules/{sid}/resume", {"tenant_id": tid})
+
+
+def list_schedules(tid: str) -> list[dict[str, Any]]:
+    code, body = http_json("GET", f"/v1/schedules?tenant_id={tid}&limit=100")
+    if code != 200:
+        raise RuntimeError(f"list schedules {tid} {code} {body}")
+    return list(body.get("schedules") or [])
 
 
 def fire(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
@@ -272,6 +285,67 @@ def main() -> int:
     )
     create_sched(peer_t, name="peer", group="blue")
     create_sched(live_t, name="live")
+
+    # Export/restore must keep mutex_group. Dest starts disabled so the
+    # source cannot race the snapshot; after restore we resume both.
+    ex_t, im_t = "sg-ex", "sg-im"
+    create_sched(ex_t, name="ex-a", group="pack", enabled=False, ms=2000)
+    create_sched(ex_t, name="ex-b", group="pack", enabled=False, ms=2000)
+    code, exp = http_json("POST", f"/v1/tenants/{ex_t}/export", {})
+    if code != 200:
+        raise RuntimeError(f"export {code} {exp}")
+    snap_id = str((exp.get("snapshot") or {}).get("id") or "")
+    if not snap_id:
+        raise RuntimeError(f"export missing snapshot {exp}")
+    code, rst = http_json(
+        "POST",
+        f"/v1/tenants/{im_t}/restore",
+        {"snapshot_id": snap_id, "run_until_complete": True, "batch_size": 50},
+        timeout=60.0,
+    )
+    if code != 200:
+        raise RuntimeError(f"restore {code} {rst}")
+    if (rst.get("restore") or {}).get("status") != "complete":
+        raise RuntimeError(f"restore not complete {rst}")
+    imported = list_schedules(im_t)
+    if len(imported) != 2:
+        raise RuntimeError(f"restore schedules {imported}")
+    if {s.get("mutex_group") for s in imported} != {"pack"}:
+        raise RuntimeError(f"restore dropped mutex_group {imported}")
+    for sched in imported:
+        r_code, r_body = resume(im_t, str(sched["id"]))
+        if r_code != 200:
+            raise RuntimeError(f"resume imported {r_code} {r_body}")
+    im_ids = [str(s["id"]) for s in imported]
+    im_win, im_first = wait_group_winner(im_t, im_ids, 1, timeout=10)
+    hold_im = im_first[0]
+    fz_code, fz_body = http_json(
+        "POST",
+        f"/v1/jobs/{hold_im['id']}/freeze",
+        {"tenant_id": im_t, "reason": "hold restored"},
+    )
+    if fz_code != 200 or (fz_body.get("job") or {}).get("status") != "frozen":
+        raise RuntimeError(f"freeze restored {fz_code} {fz_body}")
+    for sid in im_ids:
+        p_code, p_body = pause(im_t, sid)
+        if p_code != 200:
+            raise RuntimeError(f"pause imported {sid} {p_code} {p_body}")
+    im_jobs = list_jobs(im_t)
+    im_by: dict[str, int] = {}
+    for job in im_jobs:
+        sid = str(job.get("schedule_id") or "")
+        im_by[sid] = im_by.get(sid, 0) + 1
+    if len(im_by) != 1 or im_win not in im_by:
+        raise RuntimeError(f"restore lost exclusivity {im_by} winner={im_win}")
+    im_waiter = next(sid for sid in im_ids if sid != im_win)
+    f_code, f_body = fire(im_t, im_waiter)
+    if f_code != 409:
+        raise RuntimeError(f"restored waiter fire {f_code} {f_body}")
+    logger.info(
+        "restored mutex pack winner=%s n=%d waiter_fire=409",
+        im_win,
+        im_by[im_win],
+    )
 
     winner, held_nodes = wait_group_winner(held_t, [held_a, held_b], DIAMOND)
     waiter = held_b if winner == held_a else held_a
@@ -373,15 +447,20 @@ def main() -> int:
             last = now
         time.sleep(0.2)
 
+    min_live = max(2, HOLD // CRON_EVERY - 1)
     sib_mid = len(by_sched(list_jobs(held_t), sib_id))
-    if sib_mid < 1:
-        raise RuntimeError("ungrouped sibling stalled while mutex held")
+    if sib_mid < min_live:
+        raise RuntimeError(
+            f"ungrouped sibling stalled while mutex held sib={sib_mid}"
+        )
     peer_mid = completed(list_jobs(peer_t))
-    if peer_mid < 1:
-        raise RuntimeError("other tenant same group name stalled")
+    if peer_mid < min_live:
+        raise RuntimeError(
+            f"other tenant same group name stalled peer={peer_mid}"
+        )
     live_mid = completed(list_jobs(live_t))
-    if live_mid < 1:
-        raise RuntimeError("live tenant stalled")
+    if live_mid < min_live:
+        raise RuntimeError(f"live tenant stalled completed={live_mid}")
     logger.info(
         "refuse window sib=%d peer=%d live=%d", sib_mid, peer_mid, live_mid
     )
@@ -464,11 +543,12 @@ def main() -> int:
         raise RuntimeError("sibling went backwards")
 
     logger.info(
-        "schedule mutex soak OK sib=%d peer=%d live=%d extra_one=%d",
+        "schedule mutex soak OK sib=%d peer=%d live=%d extra_one=%d restored=%s",
         sib_after,
         peer_after,
         live_after,
         extra_one,
+        im_by,
     )
     return 0
 
