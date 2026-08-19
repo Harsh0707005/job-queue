@@ -311,6 +311,12 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/schedules/")
+            and path.endswith("/move")
+        ):
+            return self._move_schedule(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
             and path.endswith("/delete")
         ):
             return self._delete_schedule(path, body)

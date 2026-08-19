@@ -233,6 +233,42 @@ class SchedulesApiMixin:
             return 404, {"error": str(exc)}
         return 200, {"schedule": schedule_to_dict(sched)}
 
+    def _move_schedule(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        dest = body.get("to_tenant_id", body.get("dest_tenant_id"))
+        if dest is None or str(dest).strip() == "":
+            return 400, {"error": "to_tenant_id is required"}
+        try:
+            sched = self.queue.move_schedule(
+                UUID(sid),
+                tenant_id=str(tenant_id),
+                to_tenant_id=str(dest),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except SpendCapError as exc:
+            return 429, {
+                "error": str(exc),
+                "code": "spend_capped",
+                "tenant_id": exc.tenant_id,
+            }
+        except ScheduleError as exc:
+            msg = str(exc)
+            if "not found" in msg:
+                return 404, {"error": msg, "code": "schedule_error"}
+            return 409, {"error": msg, "code": "schedule_error"}
+        return 200, {"schedule": schedule_to_dict(sched, include_payload=True)}
+
     def _delete_schedule(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:

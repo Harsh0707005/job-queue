@@ -472,6 +472,21 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def move_schedule(
+        self,
+        schedule_id: str | UUID,
+        *,
+        tenant_id: str,
+        to_tenant_id: str,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/move",
+            {"tenant_id": tenant_id, "to_tenant_id": to_tenant_id},
+        )
+        assert payload is not None
+        return payload["schedule"]
+
     def create_schedule(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request("POST", "/v1/schedules", kwargs)
         assert payload is not None
