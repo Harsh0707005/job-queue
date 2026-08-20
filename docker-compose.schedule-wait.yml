@@ -28,8 +28,8 @@ services:
     command: ["python", "scripts/schedule_wait_soak.py"]
     environment:
       COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
-      HOLD_SECONDS: "8"
-      CRON_EVERY_SEC: "2"
+      HOLD_SECONDS: "10"
+      CRON_EVERY_SEC: "5"
       JOB_MS: "20"
       MAX_WALL_SECONDS: "180"
       LOG_LEVEL: INFO

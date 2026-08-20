@@ -284,3 +284,101 @@ def test_wait_http_roundtrip(queue: JobQueue):
         client.fire_schedule(down["id"], tenant_id="http-w")
     finally:
         server.shutdown()
+
+
+def test_both_due_fires_upstream_before_downstream(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "up"},
+        name="up",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "down"},
+        name="down",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    # Downstream more overdue so ORDER BY next_run_at would claim it first.
+    _backdate(queue, down.id, seconds=10)
+    _backdate(queue, up.id, seconds=1)
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    fires = queue.process_due_schedules(tenant_id="t1")
+    assert [f.schedule.id for f in fires] == [up.id]
+    assert queue.count(tenant_id="t1") == 1
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert _finish(queue, "t1", 1) == 1
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id
+
+
+def test_move_live_upstream_still_blocks_downstream(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"who": "up"},
+        name="up",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"who": "down"},
+        name="down",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="src")
+    queue.freeze(fire.job.id, tenant_id="src", reason="hold")
+    moved = queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
+    assert moved.tenant_id == "dst"
+    assert queue.get_schedule(up.id, tenant_id="src") is None
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="src") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="src")
+    queue.unfreeze(fire.job.id, tenant_id="dst")
+    assert _finish(queue, "dst", 1) == 1
+    later = queue.process_due_schedules(tenant_id="src")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id
+
+
+def test_deleted_upstream_row_still_blocks_while_tick_live(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "up"},
+        name="up",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "down"},
+        name="down",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    with pytest.raises(ScheduleError, match="in-flight"):
+        queue.delete_schedule(up.id, tenant_id="t1")
+    # Row gone, tick still live — waiter must not treat that as clear.
+    with queue._pool.connection() as conn:
+        conn.execute("DELETE FROM schedules WHERE id = %s", (up.id,))
+        conn.commit()
+    assert queue.get_schedule(up.id, tenant_id="t1") is None
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    assert _finish(queue, "t1", 1) == 1
+    assert queue.get(fire.job.id, tenant_id="t1").status == JobStatus.COMPLETED
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id

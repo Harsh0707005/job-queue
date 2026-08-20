@@ -7,6 +7,12 @@ Dual coordinators + dual schedulers + four workers:
   * sw-up / sw-one   — same window; catch_up_one is a single pickup.
   * sw-pipe          — upstream in mutex group 'pipe'; paused peer blocks
                        the waiter. Resume peer, waiter may fire once.
+  * sw-due           — both due every cron; downstream never beats a
+                       tick the upstream has not started or finished.
+  * sw-mv            — freeze upstream, move it off the tenant; waiter
+                       stays blocked until that tick completes on dest.
+  * sw-del           — freeze upstream; delete is 409 and the waiter
+                       stays blocked while the tick is live.
   * sw-live          — other tenant keeps completing.
 """
 
@@ -35,8 +41,8 @@ COORDS = [
     ).split(",")
     if u.strip()
 ]
-HOLD = int(os.environ.get("HOLD_SECONDS", "8") or "8")
-CRON_EVERY = int(os.environ.get("CRON_EVERY_SEC", "2") or "2")
+HOLD = int(os.environ.get("HOLD_SECONDS", "10") or "10")
+CRON_EVERY = int(os.environ.get("CRON_EVERY_SEC", "5") or "5")
 JOB_MS = int(os.environ.get("JOB_MS", "20") or "20")
 MAX_WALL = int(os.environ.get("MAX_WALL_SECONDS", "180") or "180")
 _rr = 0
@@ -166,6 +172,44 @@ def fire(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
     return http_json("POST", f"/v1/schedules/{sid}/fire", {"tenant_id": tid})
 
 
+def move(tid: str, sid: str, dest: str) -> tuple[int, dict[str, Any]]:
+    return http_json(
+        "POST",
+        f"/v1/schedules/{sid}/move",
+        {"tenant_id": tid, "to_tenant_id": dest},
+    )
+
+
+def delete(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
+    return http_json(
+        "POST", f"/v1/schedules/{sid}/delete", {"tenant_id": tid}
+    )
+
+
+def assert_down_after_up(up_jobs: list[dict[str, Any]], down_jobs: list[dict[str, Any]]) -> None:
+    """Each downstream tick must follow a finished upstream tick."""
+    ups = sorted(up_jobs, key=lambda j: str(j.get("created_at") or ""))
+    downs = sorted(down_jobs, key=lambda j: str(j.get("created_at") or ""))
+    finished = [
+        j
+        for j in ups
+        if j.get("status") == "completed" and j.get("completed_at")
+    ]
+    for i, down in enumerate(downs):
+        if i >= len(finished):
+            raise RuntimeError(
+                f"downstream tick {i} exists before upstream tick {i} finished "
+                f"(up={len(ups)} done={len(finished)} down={len(downs)})"
+            )
+        created = str(down.get("created_at") or "")
+        done_at = str(finished[i].get("completed_at") or "")
+        if created < done_at:
+            raise RuntimeError(
+                "downstream created before the matching upstream tick finished "
+                f"({created} < {done_at})"
+            )
+
+
 def wait_n(
     tid: str,
     n: int,
@@ -189,6 +233,7 @@ def main() -> int:
     logger.info("schedule wait soak hold=%ds cron=every %ds", HOLD, CRON_EVERY)
     wait_coords()
     skip_t, one_t, pipe_t, live_t = "sw-skip", "sw-one", "sw-pipe", "sw-live"
+    due_t, mv_t, mv_dst, del_t = "sw-due", "sw-mv", "sw-mv-dst", "sw-del"
     skip_up = create_sched(skip_t, name="up", ms=2500)
     skip_down = create_sched(
         skip_t, name="down", waits_on=[skip_up], policy="skip"
@@ -202,15 +247,25 @@ def main() -> int:
         pipe_t, name="peer", group="pipe", enabled=False
     )
     pipe_down = create_sched(pipe_t, name="down", waits_on=[pipe_up])
+    due_up = create_sched(due_t, name="up")
+    due_down = create_sched(due_t, name="down", waits_on=[due_up])
+    mv_up = create_sched(mv_t, name="up", ms=2500)
+    mv_down = create_sched(mv_t, name="down", waits_on=[mv_up])
+    del_up = create_sched(del_t, name="up", ms=2500)
+    del_down = create_sched(del_t, name="down", waits_on=[del_up])
     create_sched(live_t, name="live")
 
     skip_jobs = wait_n(skip_t, 1, schedule_id=skip_up)
     one_jobs = wait_n(one_t, 1, schedule_id=one_up)
     pipe_jobs = wait_n(pipe_t, 1, schedule_id=pipe_up)
+    mv_jobs = wait_n(mv_t, 1, schedule_id=mv_up)
+    del_jobs = wait_n(del_t, 1, schedule_id=del_up)
     for tid, job, reason in (
         (skip_t, skip_jobs[0], "hold skip"),
         (one_t, one_jobs[0], "hold one"),
         (pipe_t, pipe_jobs[0], "hold pipe"),
+        (mv_t, mv_jobs[0], "hold move"),
+        (del_t, del_jobs[0], "hold delete"),
     ):
         code, body = http_json(
             "POST",
@@ -220,11 +275,26 @@ def main() -> int:
         if code != 200:
             raise RuntimeError(f"freeze {tid} {code} {body}")
 
+    code, body = move(mv_t, mv_up, mv_dst)
+    if code != 200:
+        raise RuntimeError(f"move live upstream {code} {body}")
+    code, body = delete(del_t, del_up)
+    if code != 409:
+        raise RuntimeError(f"delete live upstream expected 409 got {code} {body}")
+
     skip_at = len(list_jobs(skip_t))
     one_at = len(list_jobs(one_t))
     pipe_at = len(by_sched(list_jobs(pipe_t), pipe_down))
+    mv_at = len(by_sched(list_jobs(mv_t), mv_down))
+    del_at = len(by_sched(list_jobs(del_t), del_down))
 
-    for tid, sid in ((skip_t, skip_down), (one_t, one_down), (pipe_t, pipe_down)):
+    for tid, sid in (
+        (skip_t, skip_down),
+        (one_t, one_down),
+        (pipe_t, pipe_down),
+        (mv_t, mv_down),
+        (del_t, del_down),
+    ):
         code, body = fire(tid, sid)
         if code != 409:
             raise RuntimeError(f"waiter fire {tid} expected 409 got {code} {body}")
@@ -238,13 +308,29 @@ def main() -> int:
             raise RuntimeError("catch_up_one downstream fired while upstream live")
         if len(by_sched(list_jobs(pipe_t), pipe_down)) != pipe_at:
             raise RuntimeError("pipe waiter fired while peer paused / up live")
+        if len(by_sched(list_jobs(mv_t), mv_down)) != mv_at:
+            raise RuntimeError("move waiter fired while dest tick still live")
+        if len(by_sched(list_jobs(del_t), del_down)) != del_at:
+            raise RuntimeError("delete waiter fired while upstream tick live")
+        code, body = delete(del_t, del_up)
+        if code != 409:
+            raise RuntimeError(
+                f"delete live upstream during hold expected 409 got {code} {body}"
+            )
+        due_jobs = list_jobs(due_t)
+        assert_down_after_up(by_sched(due_jobs, due_up), by_sched(due_jobs, due_down))
         now = time.time()
         if now - last >= 2:
             logger.info(
-                "hold skip=%d one=%d pipe_down=%d live=%d",
+                "hold skip=%d one=%d pipe_down=%d due_up=%d due_down=%d "
+                "mv_down=%d del_down=%d live=%d",
                 len(list_jobs(skip_t)),
                 len(list_jobs(one_t)),
                 len(by_sched(list_jobs(pipe_t), pipe_down)),
+                len(by_sched(due_jobs, due_up)),
+                len(by_sched(due_jobs, due_down)),
+                len(by_sched(list_jobs(mv_t), mv_down)),
+                len(by_sched(list_jobs(del_t), del_down)),
                 completed(list_jobs(live_t)),
             )
             last = now
@@ -254,13 +340,29 @@ def main() -> int:
     if live_mid < 1:
         raise RuntimeError("live tenant stalled during wait hold")
 
+    pause(due_t, due_down)
+    pause(due_t, due_up)
+    due_jobs = list_jobs(due_t)
+    assert_down_after_up(by_sched(due_jobs, due_up), by_sched(due_jobs, due_down))
+    if not by_sched(due_jobs, due_up):
+        raise RuntimeError("due-order tenant never fired the upstream")
+
+    # Stop dest / source upstreams from starting another tick after
+    # release. A paused same-tenant upstream still blocks the waiter
+    # until delete; dest pause does not, once the moved job completes.
+    pause(mv_dst, mv_up)
+    pause(del_t, del_up)
+
     # Unfreeze upstreams and let those ticks finish. Do not pause them
     # first — a paused upstream also blocks the waiter. Pipe peer stays
-    # paused so pipe_down remains blocked after up goes idle.
+    # paused so pipe_down remains blocked after up goes idle. Moved
+    # tick is frozen on dest; deleted-row tick stays on the source.
     for tid, jid in (
         (skip_t, skip_jobs[0]["id"]),
         (one_t, one_jobs[0]["id"]),
         (pipe_t, pipe_jobs[0]["id"]),
+        (mv_dst, mv_jobs[0]["id"]),
+        (del_t, del_jobs[0]["id"]),
     ):
         code, body = http_json(
             "POST", f"/v1/jobs/{jid}/unfreeze", {"tenant_id": tid}
@@ -271,7 +373,7 @@ def main() -> int:
     # Upstream ticks finish; skip/one waiters are overdue. Pipe peer is
     # still paused so pipe_down stays blocked.
     expected = max(1, HOLD // CRON_EVERY)
-    deadline = time.time() + 10
+    deadline = time.time() + 16
     skip_sched: dict[str, Any] = {}
     extra_one = 0
     while time.time() < deadline:
@@ -295,9 +397,47 @@ def main() -> int:
     if extra_one > expected:
         raise RuntimeError(f"catch_up_one flooded {extra_one}")
 
+    deadline = time.time() + 10
+    dest_done = 0
+    del_done = 0
+    while time.time() < deadline:
+        dest_done = completed(by_sched(list_jobs(mv_dst), mv_up))
+        del_done = completed(by_sched(list_jobs(del_t), del_up))
+        if dest_done >= 1 and del_done >= 1:
+            break
+        time.sleep(0.15)
+    if dest_done < 1:
+        raise RuntimeError("moved upstream tick never finished on dest")
+    if del_done < 1:
+        raise RuntimeError("delete-tenant upstream tick never finished")
+    if by_sched(list_jobs(del_t), del_down):
+        raise RuntimeError("delete waiter fired while paused upstream still exists")
+
+    code, body = delete(del_t, del_up)
+    if code != 200:
+        raise RuntimeError(f"delete idle upstream after tick expected 200 got {code} {body}")
+
+    deadline = time.time() + 16
+    while time.time() < deadline:
+        if by_sched(list_jobs(mv_t), mv_down) and by_sched(list_jobs(del_t), del_down):
+            break
+        time.sleep(0.15)
+    pause(mv_t, mv_down)
+    pause(del_t, del_down)
+    mv_extra = len(by_sched(list_jobs(mv_t), mv_down))
+    del_extra = len(by_sched(list_jobs(del_t), del_down))
+    if mv_extra < 1:
+        raise RuntimeError("move waiter did not fire after dest tick finished")
+    if mv_extra > expected:
+        raise RuntimeError(f"move waiter flooded {mv_extra}")
+    if del_extra < 1:
+        raise RuntimeError("delete waiter did not fire after upstream was removed")
+    if del_extra > expected:
+        raise RuntimeError(f"delete waiter flooded {del_extra}")
+
     resume(pipe_t, pipe_peer)
     resume(pipe_t, pipe_up)
-    deadline = time.time() + 8
+    deadline = time.time() + 16
     while time.time() < deadline:
         if by_sched(list_jobs(pipe_t), pipe_down):
             break
@@ -313,10 +453,15 @@ def main() -> int:
     if live_after < live_mid:
         raise RuntimeError("live tenant went backwards")
     logger.info(
-        "schedule wait soak OK extra_skip=%d extra_one=%d pipe=%d missed=%s live=%d",
+        "schedule wait soak OK extra_skip=%d extra_one=%d pipe=%d "
+        "due_up=%d due_down=%d mv=%d del=%d missed=%s live=%d",
         extra_skip,
         extra_one,
         pipe_extra,
+        len(by_sched(due_jobs, due_up)),
+        len(by_sched(due_jobs, due_down)),
+        mv_extra,
+        del_extra,
         skip_sched.get("missed_ticks"),
         live_after,
     )

@@ -960,55 +960,62 @@ class SchedulesCrudMixin:
         *,
         tenant_id: str,
         waits_on: Sequence[UUID] | None,
+        now: datetime | None = None,
     ) -> bool:
-        """True if an upstream tick, pause, or paused/inflight mutex peer blocks."""
+        """True if an upstream tick, due slot, pause, or mutex peer blocks.
+
+        Live jobs are matched by ``schedule_id`` on any tenant so a
+        delete or a move cannot hide an in-flight tick from the waiter.
+        An enabled upstream that is already due also blocks, even before
+        it has materialized a job — otherwise ``process_due`` (ordered
+        by ``next_run_at``) can fire a more-overdue downstream first.
+        """
         ids = list(waits_on or [])
         if not ids:
             return False
+        at = now if now is not None else _utcnow()
+        inflight = list(_SCHEDULE_INFLIGHT_STATUSES)
         row = conn.execute(
             """
             SELECT 1
-            FROM schedules u
-            WHERE u.tenant_id = %s
-              AND u.id = ANY(%s)
-              AND (
-                u.enabled = FALSE
-                OR EXISTS (
-                    SELECT 1
-                    FROM jobs j
-                    WHERE j.schedule_id = u.id
-                      AND j.tenant_id = u.tenant_id
-                      AND j.status = ANY(%s)
-                )
-                OR (
-                    u.mutex_group IS NOT NULL
-                    AND EXISTS (
-                        SELECT 1
-                        FROM schedules p
-                        WHERE p.tenant_id = u.tenant_id
-                          AND p.mutex_group = u.mutex_group
-                          AND p.id <> u.id
-                          AND (
-                            p.enabled = FALSE
-                            OR EXISTS (
-                                SELECT 1
-                                FROM jobs j
-                                WHERE j.schedule_id = p.id
-                                  AND j.tenant_id = p.tenant_id
-                                  AND j.status = ANY(%s)
-                            )
-                          )
+            WHERE EXISTS (
+                SELECT 1
+                FROM jobs j
+                WHERE j.schedule_id = ANY(%s)
+                  AND j.status = ANY(%s)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM schedules u
+                WHERE u.tenant_id = %s
+                  AND u.id = ANY(%s)
+                  AND (
+                    u.enabled = FALSE
+                    OR u.next_run_at <= %s
+                    OR (
+                        u.mutex_group IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1
+                            FROM schedules p
+                            WHERE p.tenant_id = u.tenant_id
+                              AND p.mutex_group = u.mutex_group
+                              AND p.id <> u.id
+                              AND (
+                                p.enabled = FALSE
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM jobs j
+                                    WHERE j.schedule_id = p.id
+                                      AND j.status = ANY(%s)
+                                )
+                              )
+                        )
                     )
                 )
-              )
+            )
             LIMIT 1
             """,
-            (
-                tenant_id,
-                ids,
-                list(_SCHEDULE_INFLIGHT_STATUSES),
-                list(_SCHEDULE_INFLIGHT_STATUSES),
-            ),
+            (ids, inflight, tenant_id, ids, at, inflight),
         ).fetchone()
         return row is not None
 

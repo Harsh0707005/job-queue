@@ -259,9 +259,9 @@ class Schedule:
     may have a tick or DAG in flight. Missed ticks while blocked follow
     ``misfire_policy`` instead of dumping a backlog.
     ``waits_on`` lists upstream schedule ids. This schedule will not fire
-    while any of those has a live tick, is paused, or has a paused /
-    inflight mutex-group peer. Missed ticks while waiting follow
-    ``misfire_policy``.
+    while any of those has a live tick (any tenant), is due but has not
+    started that tick, is paused, or has a paused / inflight mutex-group
+    peer. Missed ticks while waiting follow ``misfire_policy``.
     """
 
     id: UUID

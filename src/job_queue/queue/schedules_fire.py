@@ -112,6 +112,7 @@ class SchedulesFireMixin:
                 conn,
                 tenant_id=tenant_id,
                 waits_on=list(sched_row.get("waits_on") or []),
+                now=now,
             ):
                 raise ScheduleError(
                     f"schedule {schedule_id} is waiting on an upstream tick"
