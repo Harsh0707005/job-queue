@@ -813,6 +813,16 @@ CREATE INDEX IF NOT EXISTS idx_schedules_mutex_group
     ON schedules (tenant_id, mutex_group)
     WHERE mutex_group IS NOT NULL;
 
+-- Downstream schedule waits until each waits_on tick (and any paused /
+-- inflight mutex peer of those upstreams) is clear. Missed ticks stay
+-- overdue so misfire_policy runs instead of dumping a backlog.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS waits_on UUID[];
+UPDATE schedules SET waits_on = '{}' WHERE waits_on IS NULL;
+ALTER TABLE schedules ALTER COLUMN waits_on SET DEFAULT '{}';
+ALTER TABLE schedules ALTER COLUMN waits_on SET NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_schedules_waits_on
+    ON schedules USING GIN (waits_on);
+
 ALTER TABLE job_dag_batches ADD COLUMN IF NOT EXISTS schedule_id UUID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_job_dag_batches_schedule_key

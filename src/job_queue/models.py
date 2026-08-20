@@ -258,6 +258,10 @@ class Schedule:
     ``mutex_group`` names a per-tenant exclusive set: at most one member
     may have a tick or DAG in flight. Missed ticks while blocked follow
     ``misfire_policy`` instead of dumping a backlog.
+    ``waits_on`` lists upstream schedule ids. This schedule will not fire
+    while any of those has a live tick, is paused, or has a paused /
+    inflight mutex-group peer. Missed ticks while waiting follow
+    ``misfire_policy``.
     """
 
     id: UUID
@@ -285,6 +289,7 @@ class Schedule:
     catch_up_remaining: int | None = None
     dag_jobs: tuple[dict[str, Any], ...] = ()
     mutex_group: str | None = None
+    waits_on: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

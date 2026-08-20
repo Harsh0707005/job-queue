@@ -618,14 +618,14 @@ class TenantsRestoreMixin:
                 cron_expr, timezone, priority, max_attempts,
                 visibility_timeout_seconds, enabled, next_run_at,
                 last_enqueued_at, created_at, updated_at, labels, payload_key_id,
-                required_skills, dag_jobs, mutex_group,
+                required_skills, dag_jobs, mutex_group, waits_on,
                 misfire_policy, catch_up_max, missed_ticks,
                 last_misfire_at, catch_up_remaining
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s
             )
             ON CONFLICT (id) DO NOTHING
@@ -652,6 +652,14 @@ class TenantsRestoreMixin:
                 list(raw.get("required_skills") or []),
                 Jsonb(raw.get("dag_jobs")) if raw.get("dag_jobs") else None,
                 raw.get("mutex_group") or None,
+                [
+                    mid
+                    for mid in (
+                        self._map_id(id_map, "schedules", uid)
+                        for uid in (raw.get("waits_on") or [])
+                    )
+                    if mid is not None
+                ],
                 str(raw.get("misfire_policy") or "catch_up_one"),
                 int(raw.get("catch_up_max") or 8),
                 int(raw.get("missed_ticks") or 0),

@@ -72,6 +72,11 @@ class SchedulesProcessMixin:
         other tenants in the same ``process_due`` batch. Pause and
         delete only lock their own row (``SKIP LOCKED`` here).
 
+        **Waits-on:** a schedule that lists upstream ids will not fire
+        while any of those has a live tick, is paused, or has a paused
+        / inflight mutex-group peer. ``next_run_at`` stays overdue so
+        skip / catch_up_one / catch_up run when the upstream is clear.
+
         Returns a list of ``ScheduleFire`` (updated schedule + enqueued job).
         """
         if limit < 1:
@@ -198,6 +203,13 @@ class SchedulesProcessMixin:
                     ).fetchone()
                     blocked = active is not None
                     skip_metric = "schedule_skip" if blocked else None
+                if not blocked and self._schedule_waits_blocked(
+                    conn,
+                    tenant_id=str(sched_row["tenant_id"]),
+                    waits_on=list(sched_row.get("waits_on") or []),
+                ):
+                    blocked = True
+                    skip_metric = "schedule_wait"
                 if blocked:
                     self._record_metric(
                         conn,

@@ -379,6 +379,7 @@ def schedule_to_dict(
         "catch_up_remaining": getattr(sched, "catch_up_remaining", None),
         "dag_jobs": [dict(n) for n in (getattr(sched, "dag_jobs", ()) or ())],
         "mutex_group": getattr(sched, "mutex_group", None),
+        "waits_on": [str(u) for u in (getattr(sched, "waits_on", ()) or ())],
     }
 
 

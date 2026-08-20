@@ -108,6 +108,14 @@ class SchedulesFireMixin:
                     raise ScheduleError(
                         f"schedule {schedule_id} already has an in-flight job"
                     )
+            if self._schedule_waits_blocked(
+                conn,
+                tenant_id=tenant_id,
+                waits_on=list(sched_row.get("waits_on") or []),
+            ):
+                raise ScheduleError(
+                    f"schedule {schedule_id} is waiting on an upstream tick"
+                )
 
             try:
                 first, jobs, refs, batch_id, batch_key = (

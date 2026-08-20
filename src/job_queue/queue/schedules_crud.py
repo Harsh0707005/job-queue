@@ -66,6 +66,32 @@ def normalize_catch_up_max(raw: int | None) -> int:
 
 _MAX_SCHEDULE_DAG_JOBS = 200
 _MAX_MUTEX_GROUP_LEN = 128
+_MAX_WAITS_ON = 32
+
+
+def normalize_waits_on(
+    raw: Sequence[UUID | str] | UUID | str | None,
+) -> list[UUID]:
+    """Same-tenant upstream schedule ids. Empty / None → []."""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, (UUID, str)):
+        items: Sequence[UUID | str] = [raw]
+    else:
+        items = raw
+    out: list[UUID] = []
+    seen: set[UUID] = set()
+    for item in items:
+        if item is None or item == "":
+            continue
+        uid = item if isinstance(item, UUID) else UUID(str(item))
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(uid)
+    if len(out) > _MAX_WAITS_ON:
+        raise ValueError(f"waits_on can list at most {_MAX_WAITS_ON} schedules")
+    return out
 
 
 def normalize_mutex_group(raw: str | None) -> str | None:
@@ -167,6 +193,7 @@ class SchedulesCrudMixin:
         catch_up_max: int | None = None,
         dag_jobs: Sequence[dict[str, Any]] | None = None,
         mutex_group: str | None = None,
+        waits_on: Sequence[UUID | str] | UUID | str | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -208,6 +235,11 @@ class SchedulesCrudMixin:
             Optional per-tenant exclusive group name. At most one
             member may have a tick or DAG in flight. Missed ticks
             while the group is busy follow ``misfire_policy``.
+        waits_on:
+            Upstream schedule ids on this tenant. This schedule will
+            not fire while any of those has a live tick, is paused, or
+            has a paused / inflight mutex-group peer. Missed ticks
+            while waiting follow ``misfire_policy``.
         """
         from job_queue.cronutil import next_cron_fire, validate_cron, validate_timezone
 
@@ -232,6 +264,7 @@ class SchedulesCrudMixin:
         catch_max = normalize_catch_up_max(catch_up_max)
         dag_list = normalize_schedule_dag_jobs(dag_jobs)
         group = normalize_mutex_group(mutex_group)
+        wait_ids = normalize_waits_on(waits_on)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -249,6 +282,9 @@ class SchedulesCrudMixin:
                     f"tenant {tenant_id!r} is offboarding; "
                     "schedule registration is rejected"
                 )
+            self._assert_waits_on_ok(
+                conn, tenant_id=tenant_id, schedule_id=sid, waits_on=wait_ids
+            )
             try:
                 sealed, payload_key_id = self._seal_schedule_payload(
                     conn,
@@ -266,14 +302,14 @@ class SchedulesCrudMixin:
                         labels, created_at, updated_at, payload_key_id,
                         required_skills,
                         misfire_policy, catch_up_max, dag_jobs,
-                        mutex_group
+                        mutex_group, waits_on
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -300,6 +336,7 @@ class SchedulesCrudMixin:
                         catch_max,
                         Jsonb(dag_list) if dag_list else None,
                         group,
+                        wait_ids,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:
@@ -619,6 +656,7 @@ class SchedulesCrudMixin:
         misfire_policy: Any = _UNSET,
         catch_up_max: Any = _UNSET,
         mutex_group: Any = _UNSET,
+        waits_on: Any = _UNSET,
     ) -> Schedule:
         """Edit a live schedule without deleting it.
 
@@ -648,6 +686,7 @@ class SchedulesCrudMixin:
             misfire_policy,
             catch_up_max,
             mutex_group,
+            waits_on,
         )
         if all(f is _UNSET for f in fields):
             raise ValueError("pass at least one field to update")
@@ -737,6 +776,15 @@ class SchedulesCrudMixin:
             group = row.get("mutex_group")
             if mutex_group is not _UNSET:
                 group = normalize_mutex_group(mutex_group)
+            wait_ids = list(row.get("waits_on") or [])
+            if waits_on is not _UNSET:
+                wait_ids = normalize_waits_on(waits_on)
+                self._assert_waits_on_ok(
+                    conn,
+                    tenant_id=tenant_id,
+                    schedule_id=schedule_id,
+                    waits_on=wait_ids,
+                )
 
             dag_val = row.get("dag_jobs")
             if dag_jobs is not _UNSET:
@@ -787,6 +835,7 @@ class SchedulesCrudMixin:
                         misfire_policy = %s,
                         catch_up_max = %s,
                         mutex_group = %s,
+                        waits_on = %s,
                         next_run_at = %s,
                         catch_up_remaining = %s,
                         updated_at = %s
@@ -810,6 +859,7 @@ class SchedulesCrudMixin:
                         policy,
                         catch_max,
                         group,
+                        wait_ids,
                         next_run,
                         catch_remaining,
                         now,
@@ -846,6 +896,121 @@ class SchedulesCrudMixin:
             ),
         ).fetchone()
         return bool(row and row["locked"])
+
+    @staticmethod
+    def _assert_waits_on_ok(
+        conn: Any,
+        *,
+        tenant_id: str,
+        schedule_id: UUID,
+        waits_on: Sequence[UUID],
+    ) -> None:
+        if not waits_on:
+            return
+        if schedule_id in waits_on:
+            raise ValueError("schedule cannot wait on itself")
+        rows = conn.execute(
+            """
+            SELECT id, waits_on
+            FROM schedules
+            WHERE tenant_id = %s AND id = ANY(%s)
+            ORDER BY id
+            FOR UPDATE
+            """,
+            (tenant_id, list(waits_on)),
+        ).fetchall()
+        found = {row["id"] for row in rows}
+        missing = [uid for uid in waits_on if uid not in found]
+        if missing:
+            raise ValueError(
+                f"waits_on schedule {missing[0]} not found for tenant "
+                f"{tenant_id!r}"
+            )
+        graph_rows = conn.execute(
+            """
+            SELECT id, waits_on
+            FROM schedules
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchall()
+        graph: dict[UUID, list[UUID]] = {}
+        for row in graph_rows:
+            graph[row["id"]] = list(row.get("waits_on") or [])
+        graph[schedule_id] = list(waits_on)
+        seen: set[UUID] = set()
+        stack: set[UUID] = set()
+
+        def visit(node: UUID) -> None:
+            if node in stack:
+                raise ValueError("waits_on contains a cycle")
+            if node in seen:
+                return
+            stack.add(node)
+            for nxt in graph.get(node) or []:
+                visit(nxt)
+            stack.remove(node)
+            seen.add(node)
+
+        visit(schedule_id)
+
+    @staticmethod
+    def _schedule_waits_blocked(
+        conn: Any,
+        *,
+        tenant_id: str,
+        waits_on: Sequence[UUID] | None,
+    ) -> bool:
+        """True if an upstream tick, pause, or paused/inflight mutex peer blocks."""
+        ids = list(waits_on or [])
+        if not ids:
+            return False
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM schedules u
+            WHERE u.tenant_id = %s
+              AND u.id = ANY(%s)
+              AND (
+                u.enabled = FALSE
+                OR EXISTS (
+                    SELECT 1
+                    FROM jobs j
+                    WHERE j.schedule_id = u.id
+                      AND j.tenant_id = u.tenant_id
+                      AND j.status = ANY(%s)
+                )
+                OR (
+                    u.mutex_group IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM schedules p
+                        WHERE p.tenant_id = u.tenant_id
+                          AND p.mutex_group = u.mutex_group
+                          AND p.id <> u.id
+                          AND (
+                            p.enabled = FALSE
+                            OR EXISTS (
+                                SELECT 1
+                                FROM jobs j
+                                WHERE j.schedule_id = p.id
+                                  AND j.tenant_id = p.tenant_id
+                                  AND j.status = ANY(%s)
+                            )
+                          )
+                    )
+                )
+              )
+            LIMIT 1
+            """,
+            (
+                tenant_id,
+                ids,
+                list(_SCHEDULE_INFLIGHT_STATUSES),
+                list(_SCHEDULE_INFLIGHT_STATUSES),
+            ),
+        ).fetchone()
+        return row is not None
 
     @staticmethod
     def _schedule_mutex_blocked(
