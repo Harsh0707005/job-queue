@@ -155,6 +155,106 @@ def test_move_mutex_stays_exclusive_on_dest_and_frees_source(queue: JobQueue):
     assert queue.count(tenant_id="src") == 1
 
 
+def test_move_refuses_foreign_dependent_and_does_not_decrypt_on_dest(
+    queue: JobQueue,
+):
+    sched = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"secret": "tick"},
+        name="tick",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(sched.id, tenant_id="src")
+    extra = queue.enqueue(
+        tenant_id="src",
+        payload={"secret": "foreign", "role": "hook"},
+        depends_on=fire.job.id,
+    )
+    with pytest.raises(ScheduleError, match="still depends"):
+        queue.move_schedule(sched.id, tenant_id="src", to_tenant_id="dst")
+    assert queue.get_schedule(sched.id, tenant_id="src") is not None
+    assert queue.get_schedule(sched.id, tenant_id="dst") is None
+    assert queue.get(fire.job.id, tenant_id="src") is not None
+    assert queue.get(extra.id, tenant_id="src") is not None
+    assert extra.tenant_id == "src"
+    assert queue.get(extra.id, tenant_id="dst") is None
+    assert queue.get(fire.job.id, tenant_id="dst") is None
+
+
+def test_move_refuses_when_it_would_drag_another_schedule_tick(queue: JobQueue):
+    held = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"who": "held"},
+        name="held",
+        mutex_group="blue",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    sib = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=60,
+        payload={"who": "sib"},
+        name="sib",
+        mutex_group="blue",
+    )
+    fire = queue.fire_schedule(held.id, tenant_id="src")
+    hooked = queue.enqueue(
+        tenant_id="src",
+        payload={"who": "other-tick"},
+        depends_on=fire.job.id,
+    )
+    with queue._pool.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET schedule_id = %s WHERE id = %s",
+            (sib.id, hooked.id),
+        )
+        conn.commit()
+    with pytest.raises(ScheduleError, match="still depends"):
+        queue.move_schedule(held.id, tenant_id="src", to_tenant_id="dst")
+    assert queue.get(fire.job.id, tenant_id="src") is not None
+    assert queue.get(hooked.id, tenant_id="src") is not None
+    assert queue.get(hooked.id, tenant_id="dst") is None
+    assert queue.process_due_schedules(tenant_id="src") == []
+    assert queue.count(tenant_id="src") == 2
+    assert queue.get_schedule(held.id, tenant_id="src") is not None
+
+
+def test_move_takes_spawn_children_of_the_tick(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"n": 1},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(sched.id, tenant_id="src")
+    leased = queue.lease(tenant_id="src", worker_id="w")
+    assert leased is not None and leased.id == fire.job.id
+    assert leased.lease_token is not None
+    spawned = queue.spawn_children(
+        leased.id,
+        tenant_id="src",
+        worker_id="w",
+        lease_token=leased.lease_token,
+        children=[{"payload": {"role": "child", "secret": "kid"}}],
+    )
+    assert spawned.parent.status == JobStatus.AWAITING_CHILDREN
+    parent = queue.get(leased.id, tenant_id="src")
+    assert parent is not None
+    assert parent.status == JobStatus.AWAITING_CHILDREN
+    kids = [j for j in queue.list_jobs(tenant_id="src") if j.id != parent.id]
+    assert len(kids) == 1
+    moved = queue.move_schedule(sched.id, tenant_id="src", to_tenant_id="dst")
+    assert moved.tenant_id == "dst"
+    dest = queue.list_jobs(tenant_id="dst")
+    assert {j.id for j in dest} == {parent.id, kids[0].id}
+    child = queue.get(kids[0].id, tenant_id="dst")
+    assert child is not None
+    assert child.payload == {"role": "child", "secret": "kid"}
+    assert child.parent_job_id == parent.id
+    assert queue.list_jobs(tenant_id="src") == []
+
+
 def test_move_same_tenant_is_noop(queue: JobQueue):
     sched = queue.create_schedule(
         tenant_id="t1", interval_seconds=60, payload={"n": 1}

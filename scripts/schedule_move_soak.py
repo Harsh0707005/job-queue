@@ -10,6 +10,9 @@ Dual coordinators + dual schedulers + four workers:
                 schedule does move.
   * sm-race   — due schedule hammered by move + process-due; dest has at
                 most one tick.
+  * sm-hook   — a source job (and a mutex sibling's tagged tick) depends
+                on the held tick; move refuses, dest cannot see that
+                work, sibling does not fire while the original is live.
   * sm-live   — other tenant keeps completing through the moves.
 """
 
@@ -223,6 +226,11 @@ def main() -> int:
     mx_in = create_sched(mx_src, name="incoming", group="blue")
     mx_sib = create_sched(mx_src, name="sib", group="blue")
     mx_red = create_sched(mx_src, name="red", group="red", enabled=False)
+    hook_src, hook_dst = "sm-hook-src", "sm-hook-dst"
+    hook_held = create_sched(
+        hook_src, name="hook-held", group="navy", ms=2500, secret="held-secret"
+    )
+    hook_sib = create_sched(hook_src, name="hook-sib", group="navy")
     race_id = create_sched(race_src, name="race")
     create_sched(live_t, name="live")
 
@@ -290,6 +298,59 @@ def main() -> int:
         raise RuntimeError(f"dest dag refire {f_code} {f_body}")
     logger.info("moved frozen dag; dest decrypts; no second tick")
 
+    hook_ids = [hook_held, hook_sib]
+    deadline = time.time() + 15
+    hook_win = ""
+    hook_jobs: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        jobs = list_jobs(hook_src)
+        for sid in hook_ids:
+            owned = by_sched(jobs, sid)
+            if owned:
+                hook_win = sid
+                hook_jobs = owned
+                break
+        if hook_win:
+            break
+        time.sleep(0.1)
+    if not hook_win:
+        raise RuntimeError("hook tenant never produced a tick")
+    hook_peer = hook_sib if hook_win == hook_held else hook_held
+    code, body = http_json(
+        "POST",
+        f"/v1/jobs/{hook_jobs[0]['id']}/freeze",
+        {"tenant_id": hook_src, "reason": "hold hook"},
+    )
+    if code != 200:
+        raise RuntimeError(f"freeze hook {code} {body}")
+    e_code, e_body = http_json(
+        "POST",
+        "/v1/jobs",
+        {
+            "tenant_id": hook_src,
+            "payload": {"secret": "foreign-hook", "role": "hook"},
+            "depends_on": [hook_jobs[0]["id"]],
+        },
+    )
+    if e_code not in (200, 201):
+        raise RuntimeError(f"enqueue hook {e_code} {e_body}")
+    hook_id = str((e_body.get("job") or {}).get("id") or "")
+    if not hook_id:
+        raise RuntimeError(f"hook enqueue missing id {e_body}")
+    h_code, h_body = move(hook_src, hook_win, hook_dst)
+    if h_code != 409:
+        raise RuntimeError(f"hooked tick move should 409, got {h_code} {h_body}")
+    code, _ = get_sched(hook_win, hook_src)
+    if code != 200:
+        raise RuntimeError("hooked schedule left source")
+    if list_jobs(hook_dst):
+        raise RuntimeError("dest decrypted or received hooked work")
+    src_hook_ids = {str(j.get("id")) for j in list_jobs(hook_src)}
+    if hook_id not in src_hook_ids:
+        raise RuntimeError("foreign dependent was dragged off source")
+    hook_sib_at = len(by_sched(list_jobs(hook_src), hook_peer))
+    logger.info("refused hooked move; foreign job stayed on source")
+
     wait_n(mx_src, 1, schedule_id=mx_sib)
     live_mid = completed(list_jobs(live_t))
 
@@ -337,6 +398,10 @@ def main() -> int:
             raise RuntimeError("dest dag double-fired after move")
         if list_jobs(dag_src):
             raise RuntimeError("source dag grew after move")
+        if list_jobs(hook_dst):
+            raise RuntimeError("hook dest gained jobs after refused move")
+        if len(by_sched(list_jobs(hook_src), hook_peer)) != hook_sib_at:
+            raise RuntimeError("mutex sibling fired while hooked tick still live")
         time.sleep(0.25)
 
     sib_jobs = by_sched(list_jobs(mx_src), mx_sib)

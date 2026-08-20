@@ -30,11 +30,15 @@ class SchedulesMoveMixin:
         """Transfer a live schedule to *to_tenant_id* in place.
 
         Same schedule id. The in-flight tick (one job or a whole DAG, plus
-        spawn children that close the graph) moves with it. Payloads and
-        results are re-sealed under the destination tenant so dest can
-        decrypt. ``mutex_group`` stays on the row: exclusivity is
-        ``(tenant, group)``, so dest peers still serialize and the source
-        group is no longer blocked by this member.
+        spawn children of those jobs) moves with it. Payloads and results
+        are re-sealed under the destination tenant so dest can decrypt.
+        ``mutex_group`` stays on the row: exclusivity is ``(tenant, group)``.
+
+        Fail-closed if any *other* source job depends on the tick (another
+        schedule's live tick, or a hand-enqueued dependent). Dragging those
+        would let dest decrypt foreign work and would drop the source
+        mutex hold so a sibling could fire while the original tick still
+        runs.
 
         Serializes with ``process_due`` / ``fire`` via ``FOR UPDATE`` on
         the schedule row. Dual schedulers cannot enqueue a second tick
@@ -97,7 +101,7 @@ class SchedulesMoveMixin:
                         "in-flight work"
                     )
 
-            job_ids = self._schedule_graph_job_ids(
+            job_ids = self._schedule_owned_job_ids(
                 conn, tenant_id=tenant_id, schedule_id=schedule_id
             )
             jobs = []
@@ -308,16 +312,27 @@ class SchedulesMoveMixin:
             )
             return self._schedule(updated)
 
-    @staticmethod
-    def _schedule_graph_job_ids(
-        conn: Any, *, tenant_id: str, schedule_id: UUID
+    def _schedule_owned_job_ids(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        schedule_id: UUID,
     ) -> list[UUID]:
-        """Jobs that must move with the schedule to keep a closed graph."""
+        """Jobs owned by this schedule, or refuse if the graph is not closed.
+
+        Seed is ``schedule_id``. Spawn children (``parent_job_id`` in the
+        set and no other schedule) come along. Any other source job that
+        depends on, waits on, or parents a member is a blocker — we do
+        not drag foreign work or another schedule's tick.
+        """
         seed = conn.execute(
             """
             SELECT id
             FROM jobs
             WHERE tenant_id = %s AND schedule_id = %s
+            ORDER BY id
+            FOR UPDATE
             """,
             (tenant_id, schedule_id),
         ).fetchall()
@@ -327,45 +342,77 @@ class SchedulesMoveMixin:
         while True:
             extra = conn.execute(
                 """
-                SELECT id
+                SELECT id, schedule_id
                 FROM jobs
                 WHERE tenant_id = %s
+                  AND parent_job_id = ANY(%s)
                   AND NOT (id = ANY(%s))
-                  AND (
-                    parent_job_id = ANY(%s)
-                    OR depends_on && %s::uuid[]
-                    OR waiting_on && %s::uuid[]
-                    OR id = ANY(
-                        SELECT UNNEST(COALESCE(depends_on, '{}'::uuid[]))
-                        FROM jobs
-                        WHERE id = ANY(%s)
-                    )
-                    OR id = ANY(
-                        SELECT UNNEST(COALESCE(waiting_on, '{}'::uuid[]))
-                        FROM jobs
-                        WHERE id = ANY(%s)
-                    )
-                    OR id IN (
-                        SELECT parent_job_id
-                        FROM jobs
-                        WHERE id = ANY(%s)
-                          AND parent_job_id IS NOT NULL
-                    )
-                  )
+                ORDER BY id
+                FOR UPDATE
                 """,
-                (
-                    tenant_id,
-                    list(ids),
-                    list(ids),
-                    list(ids),
-                    list(ids),
-                    list(ids),
-                    list(ids),
-                    list(ids),
-                ),
+                (tenant_id, list(ids), list(ids)),
             ).fetchall()
-            found = {row["id"] for row in extra}
-            if not found:
+            if not extra:
                 break
-            ids |= found
+            for row in extra:
+                other = row.get("schedule_id")
+                if other is not None and other != schedule_id:
+                    raise ScheduleError(
+                        f"schedule {schedule_id} cannot move: job "
+                        f"{row['id']} is a child of this tick but belongs "
+                        f"to schedule {other}"
+                    )
+                ids.add(row["id"])
+        owned = list(ids)
+        outsider = conn.execute(
+            """
+            SELECT id, schedule_id
+            FROM jobs
+            WHERE tenant_id = %s
+              AND NOT (id = ANY(%s))
+              AND (
+                depends_on && %s::uuid[]
+                OR waiting_on && %s::uuid[]
+                OR parent_job_id = ANY(%s)
+              )
+            ORDER BY id
+            LIMIT 1
+            """,
+            (tenant_id, owned, owned, owned, owned),
+        ).fetchone()
+        if outsider is not None:
+            other = outsider.get("schedule_id")
+            extra = (
+                f" (schedule {other})"
+                if other is not None
+                else ""
+            )
+            raise ScheduleError(
+                f"schedule {schedule_id} cannot move: job "
+                f"{outsider['id']}{extra} on {tenant_id!r} still "
+                "depends on this tick"
+            )
+        members = conn.execute(
+            """
+            SELECT id, depends_on, waiting_on, parent_job_id
+            FROM jobs
+            WHERE id = ANY(%s)
+            """,
+            (owned,),
+        ).fetchall()
+        owned_set = set(owned)
+        for row in members:
+            deps = list(row.get("depends_on") or [])
+            waits = list(row.get("waiting_on") or [])
+            parent = row.get("parent_job_id")
+            missing = [d for d in deps if d not in owned_set]
+            missing.extend(w for w in waits if w not in owned_set)
+            if parent is not None and parent not in owned_set:
+                missing.append(parent)
+            if missing:
+                raise ScheduleError(
+                    f"schedule {schedule_id} cannot move: job "
+                    f"{row['id']} still links to {missing[0]} "
+                    f"on {tenant_id!r}"
+                )
         return sorted(ids)
