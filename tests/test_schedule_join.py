@@ -264,6 +264,38 @@ def test_join_catch_up_drains_one_generation(queue: JobQueue):
     assert second[0].schedule.tick_iteration == 2
 
 
+def test_join_catch_up_respects_max(queue: JobQueue):
+    up, w1, w2, join = _pipe(queue)
+    queue.update_schedule(
+        join.id, tenant_id="t1", misfire_policy="catch_up", catch_up_max=2
+    )
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE schedules
+            SET last_completed_iteration = 10, tick_iteration = 10
+            WHERE id = ANY(%s)
+            """,
+            ([w1.id, w2.id],),
+        )
+        conn.commit()
+    _make_due(queue, join.id)
+    first = queue.process_due_schedules(tenant_id="t1")
+    assert len(first) == 1
+    assert first[0].schedule.tick_iteration == 1
+    assert first[0].schedule.catch_up_remaining == 1
+    assert first[0].schedule.missed_ticks >= 8
+    assert _finish(queue, "t1", 1) == 1
+    second = queue.process_due_schedules(tenant_id="t1")
+    assert len(second) == 1
+    assert second[0].schedule.tick_iteration == 10
+    assert second[0].schedule.catch_up_remaining is None
+    assert _finish(queue, "t1", 1) == 1
+    _make_due(queue, join.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert queue.count(tenant_id="t1") == 2
+
+
 def test_other_tenant_keeps_firing_while_join_blocked(queue: JobQueue):
     _pipe(queue, "t1")
     live = queue.create_schedule(

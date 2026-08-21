@@ -7,6 +7,8 @@ Dual coordinators + dual schedulers + four workers:
   * sj-pause  — pause a waiter; join stays blocked until resume + complete.
   * sj-mutex  — waiter shares a mutex with a paused peer; join stays blocked.
   * sj-skip   — join skip does not dump after waiters finish a long hold.
+  * sj-cup    — join catch_up behind many waiter generations; at most
+                catch_up_max ticks, extras recorded as misses.
   * sj-live   — other tenant keeps completing.
 """
 
@@ -116,17 +118,20 @@ def create_sched(
     waits_on: list[str] | None = None,
     joins_on: list[str] | None = None,
     policy: str = "catch_up_one",
+    catch_up_max: int = 3,
+    cron_every: int | None = None,
     ms: int | None = None,
     enabled: bool = True,
 ) -> str:
     job_ms = ms if ms is not None else JOB_MS
+    every = cron_every if cron_every is not None else CRON_EVERY
     body: dict[str, Any] = {
         "tenant_id": tid,
         "name": name,
-        "cron": f"*/{CRON_EVERY} * * * * *",
+        "cron": f"*/{every} * * * * *",
         "payload": {"kind": "render", "ms": job_ms, "name": name},
         "misfire_policy": policy,
-        "catch_up_max": 3,
+        "catch_up_max": catch_up_max,
         "enabled": enabled,
     }
     if group is not None:
@@ -159,6 +164,13 @@ def resume(tid: str, sid: str) -> None:
 
 def fire(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
     return http_json("POST", f"/v1/schedules/{sid}/fire", {"tenant_id": tid})
+
+
+def get_sched(sid: str, tid: str) -> dict[str, Any]:
+    code, body = http_json("GET", f"/v1/schedules/{sid}?tenant_id={tid}")
+    if code != 200:
+        raise RuntimeError(f"get {sid} {code} {body}")
+    return body.get("schedule") or {}
 
 
 def wait_n(
@@ -214,11 +226,12 @@ def assert_join_after_waiters(
 def main() -> int:
     logger.info("schedule join soak hold=%ds cron=every %ds", HOLD, CRON_EVERY)
     wait_coords()
-    hold_t, pause_t, mutex_t, skip_t, live_t = (
+    hold_t, pause_t, mutex_t, skip_t, cup_t, live_t = (
         "sj-hold",
         "sj-pause",
         "sj-mutex",
         "sj-skip",
+        "sj-cup",
         "sj-live",
     )
 
@@ -250,6 +263,22 @@ def main() -> int:
         mutex_t, name="join", joins_on=[mutex_w1, mutex_w2]
     )
     skip_up, skip_w1, skip_w2, skip_j = pipe(skip_t, policy="skip")
+    cup_up = create_sched(cup_t, name="up", cron_every=1, ms=JOB_MS)
+    cup_w1 = create_sched(
+        cup_t, name="w1", waits_on=[cup_up], cron_every=1, ms=JOB_MS
+    )
+    cup_w2 = create_sched(
+        cup_t, name="w2", waits_on=[cup_up], cron_every=1, ms=JOB_MS
+    )
+    cup_j = create_sched(
+        cup_t,
+        name="join",
+        joins_on=[cup_w1, cup_w2],
+        policy="catch_up",
+        catch_up_max=3,
+        cron_every=1,
+        enabled=False,
+    )
     create_sched(live_t, name="live")
 
     def wait_live(tid: str, sid: str) -> dict[str, Any]:
@@ -301,11 +330,15 @@ def main() -> int:
         now = time.time()
         if now - last >= 2:
             logger.info(
-                "hold join=%d pause=%d mutex=%d skip=%d live=%d",
+                "hold join=%d pause=%d mutex=%d skip=%d cup_w=%d live=%d",
                 hold_at,
                 pause_at,
                 mutex_at,
                 skip_at,
+                min(
+                    completed(by_sched(list_jobs(cup_t), cup_w1)),
+                    completed(by_sched(list_jobs(cup_t), cup_w2)),
+                ),
                 completed(list_jobs(live_t)),
             )
             last = now
@@ -319,6 +352,7 @@ def main() -> int:
     unfreeze(skip_t, skip_job["id"])
     unfreeze(mutex_t, peer_job["id"])
     resume(pause_t, pause_w2)
+    resume(cup_t, cup_j)
     pause(mutex_t, mutex_peer)
 
     expected = max(1, HOLD // CRON_EVERY)
@@ -328,6 +362,7 @@ def main() -> int:
             by_sched(list_jobs(hold_t), hold_j)
             and by_sched(list_jobs(pause_t), pause_j)
             and by_sched(list_jobs(mutex_t), mutex_j)
+            and len(by_sched(list_jobs(cup_t), cup_j)) >= 3
         ):
             break
         time.sleep(0.15)
@@ -335,6 +370,10 @@ def main() -> int:
     pause(pause_t, pause_j)
     pause(mutex_t, mutex_j)
     pause(skip_t, skip_j)
+    pause(cup_t, cup_j)
+    pause(cup_t, cup_up)
+    pause(cup_t, cup_w1)
+    pause(cup_t, cup_w2)
     hold_extra = len(by_sched(list_jobs(hold_t), hold_j))
     pause_extra = len(by_sched(list_jobs(pause_t), pause_j))
     mutex_extra = len(by_sched(list_jobs(mutex_t), mutex_j))
@@ -349,6 +388,30 @@ def main() -> int:
         raise RuntimeError(f"skip join dumped {skip_extra}")
     if hold_extra > expected + 1:
         raise RuntimeError(f"hold join flooded {hold_extra}")
+    cup_jobs = list_jobs(cup_t)
+    cup_extra = len(by_sched(cup_jobs, cup_j))
+    cup_ready = min(
+        completed(by_sched(cup_jobs, cup_w1)),
+        completed(by_sched(cup_jobs, cup_w2)),
+    )
+    if cup_ready < 6:
+        raise RuntimeError(
+            f"catch_up join not far enough behind waiters (ready={cup_ready})"
+        )
+    if cup_extra > 3:
+        raise RuntimeError(
+            f"catch_up join dumped {cup_extra} ticks past catch_up_max=3 "
+            f"(waiters completed {cup_ready})"
+        )
+    if cup_extra < 1:
+        raise RuntimeError("catch_up join produced no pickup after resume")
+    cup_sched = get_sched(cup_j, cup_t)
+    missed = int(cup_sched.get("missed_ticks") or 0)
+    if missed < cup_ready - 3:
+        raise RuntimeError(
+            f"catch_up join missed {missed}, expected at least {cup_ready - 3} "
+            f"leftover generations"
+        )
     jobs = list_jobs(hold_t)
     assert_join_after_waiters(
         by_sched(jobs, hold_w1), by_sched(jobs, hold_w2), by_sched(jobs, hold_j)
@@ -357,11 +420,15 @@ def main() -> int:
     if live_after < live_mid:
         raise RuntimeError("live tenant went backwards")
     logger.info(
-        "schedule join soak OK hold=%d pause=%d mutex=%d skip=%d live=%d",
+        "schedule join soak OK hold=%d pause=%d mutex=%d skip=%d "
+        "cup=%d cup_ready=%d missed=%d live=%d",
         hold_extra,
         pause_extra,
         mutex_extra,
         skip_extra,
+        cup_extra,
+        cup_ready,
+        missed,
         live_after,
     )
     return 0

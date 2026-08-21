@@ -85,6 +85,9 @@ class SchedulesProcessMixin:
         iteration. A paused waiter or one stuck behind a mutex peer
         keeps the join blocked. ``next_run_at`` stays overdue so
         skip / catch_up_one / catch_up run when the set is clear.
+        ``catch_up`` drains at most ``catch_up_max`` generations;
+        leftover ready generations are recorded as missed, not
+        dumped one-at-a-time.
 
         Returns a list of ``ScheduleFire`` (updated schedule + enqueued job).
         """
@@ -297,6 +300,7 @@ class SchedulesProcessMixin:
                 )
                 current_iter = int(sched_row.get("tick_iteration") or 0)
                 extra_join = max(0, watermark - current_iter - 1)
+                stored_remaining = sched_row.get("catch_up_remaining")
 
                 if not slots:
                     consume = watermark if join_ids else current_iter
@@ -336,6 +340,16 @@ class SchedulesProcessMixin:
                     continue
 
                 new_remaining = None
+                join_budget = 0
+                extra_join_skip = 0
+                if join_ids and policy == MISFIRE_CATCH_UP:
+                    ready = max(0, watermark - current_iter)
+                    if stored_remaining is None:
+                        cap = int(sched_row.get("catch_up_max") or 8)
+                        join_budget = min(cap, ready)
+                        extra_join_skip = max(0, ready - join_budget)
+                    else:
+                        join_budget = max(0, int(stored_remaining))
                 if policy == MISFIRE_CATCH_UP and remaining is not None:
                     left = int(remaining) - 1
                     if left > 0:
@@ -349,15 +363,17 @@ class SchedulesProcessMixin:
                         next_run = future
                 else:
                     next_run = future
-                if (
-                    join_ids
-                    and policy == MISFIRE_CATCH_UP
-                    and extra_join > 0
-                    and next_run > now
-                ):
-                    # More generations are ready; keep the join due so
-                    # catch_up drains one tick at a time.
-                    next_run = now
+                if join_ids and policy == MISFIRE_CATCH_UP and join_budget > 0:
+                    left = join_budget - 1
+                    if left > 0:
+                        # Drain at most catch_up_max generations, one
+                        # tick at a time. Do not snap next_run to now
+                        # for leftover generations past the cap.
+                        next_run = now
+                        new_remaining = left
+                    else:
+                        next_run = future
+                        new_remaining = None
 
                 try:
                     # Intentionally no pending-cap / enqueue-rate checks:
@@ -366,8 +382,12 @@ class SchedulesProcessMixin:
                     # enqueues and must not bypass a tenant quota.
                     iteration = self._resolve_tick_iteration(conn, sched_row)
                     stamp_iter = iteration
-                    extra_skip = skipped
-                    if join_ids and policy != MISFIRE_CATCH_UP and extra_join:
+                    extra_skip = skipped + extra_join_skip
+                    if join_ids and policy == MISFIRE_CATCH_UP:
+                        if join_budget <= 1:
+                            # Last budgeted tick: skip leftover generations.
+                            stamp_iter = max(iteration, watermark)
+                    elif join_ids and extra_join:
                         # skip / catch_up_one: one pickup, consume the rest.
                         stamp_iter = watermark
                         extra_skip += extra_join
