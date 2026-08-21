@@ -382,3 +382,162 @@ def test_deleted_upstream_row_still_blocks_while_tick_live(queue: JobQueue):
     later = queue.process_due_schedules(tenant_id="t1")
     assert len(later) == 1
     assert later[0].schedule.id == down.id
+
+
+def test_cancelled_upstream_tick_still_blocks_until_success(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "up"},
+        name="up",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "down"},
+        name="down",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    cancelled = queue.cancel(fire.job.id, tenant_id="t1")
+    assert cancelled.status == JobStatus.CANCELLED
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    again = queue.fire_schedule(up.id, tenant_id="t1")
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert _finish(queue, "t1", 1) == 1
+    assert queue.get(again.job.id, tenant_id="t1").status == JobStatus.COMPLETED
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id
+
+
+def test_dead_lettered_upstream_tick_still_blocks_until_success(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "up"},
+        name="up",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "down"},
+        name="down",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    queue.freeze(fire.job.id, tenant_id="t1", reason="hold")
+    dead = queue.dead_letter_frozen(fire.job.id, tenant_id="t1", error="nope")
+    assert dead.status == JobStatus.DEAD
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    again = queue.fire_schedule(up.id, tenant_id="t1")
+    assert _finish(queue, "t1", 1) == 1
+    assert queue.get(again.job.id, tenant_id="t1").status == JobStatus.COMPLETED
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id
+
+
+def test_cancelled_dag_tick_blocks_until_next_completes(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        name="up",
+        dag_jobs=_diamond(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 2},
+        name="down",
+        waits_on=[up.id],
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    queue.cancel(fire.jobs[0].id, tenant_id="t1")
+    for job in fire.jobs[1:]:
+        current = queue.get(job.id, tenant_id="t1")
+        if current is not None and current.status not in (
+            JobStatus.CANCELLED,
+            JobStatus.COMPLETED,
+            JobStatus.DEAD,
+        ):
+            queue.cancel(job.id, tenant_id="t1")
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    queue.fire_schedule(up.id, tenant_id="t1")
+    assert _finish(queue, "t1", 4) == 4
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id
+
+
+def test_cancel_after_move_or_delete_still_blocks(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"who": "up"},
+        name="up",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"who": "down"},
+        name="down",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="src")
+    queue.freeze(fire.job.id, tenant_id="src", reason="hold")
+    queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
+    queue.cancel(fire.job.id, tenant_id="dst")
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="src") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(down.id, tenant_id="src")
+    again = queue.fire_schedule(up.id, tenant_id="dst")
+    assert _finish(queue, "dst", 1) == 1
+    assert queue.get(again.job.id, tenant_id="dst").status == JobStatus.COMPLETED
+    later = queue.process_due_schedules(tenant_id="src")
+    assert len(later) == 1
+    assert later[0].schedule.id == down.id
+
+    other = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "up2"},
+        name="up2",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    waiter = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "down2"},
+        name="down2",
+        waits_on=other.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    gone = queue.fire_schedule(other.id, tenant_id="t1")
+    with queue._pool.connection() as conn:
+        conn.execute("DELETE FROM schedules WHERE id = %s", (other.id,))
+        conn.commit()
+    queue.cancel(gone.job.id, tenant_id="t1")
+    _make_due(queue, waiter.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+        queue.fire_schedule(waiter.id, tenant_id="t1")

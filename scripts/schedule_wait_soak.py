@@ -13,6 +13,9 @@ Dual coordinators + dual schedulers + four workers:
                        stays blocked until that tick completes on dest.
   * sw-del           — freeze upstream; delete is 409 and the waiter
                        stays blocked while the tick is live.
+  * sw-can           — cancel the upstream tick; waiter stays blocked
+                       until a later tick completes successfully.
+  * sw-dead          — dead-letter the frozen upstream tick; same gate.
   * sw-live          — other tenant keeps completing.
 """
 
@@ -25,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from typing import Any
 
 logging.basicConfig(
@@ -186,27 +190,52 @@ def delete(tid: str, sid: str) -> tuple[int, dict[str, Any]]:
     )
 
 
+def cancel_job(tid: str, jid: str) -> tuple[int, dict[str, Any]]:
+    return http_json("POST", f"/v1/jobs/{jid}/cancel", {"tenant_id": tid})
+
+
+def dead_letter(tid: str, jid: str) -> tuple[int, dict[str, Any]]:
+    return http_json(
+        "POST",
+        f"/v1/jobs/{jid}/freeze/dead",
+        {"tenant_id": tid, "reason": "soak dead-letter"},
+    )
+
+
+def _ts(raw: Any) -> float:
+    if not raw:
+        return 0.0
+    text = str(raw).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def assert_down_after_up(up_jobs: list[dict[str, Any]], down_jobs: list[dict[str, Any]]) -> None:
-    """Each downstream tick must follow a finished upstream tick."""
-    ups = sorted(up_jobs, key=lambda j: str(j.get("created_at") or ""))
+    """Each downstream tick must follow a successfully completed upstream tick."""
     downs = sorted(down_jobs, key=lambda j: str(j.get("created_at") or ""))
-    finished = [
-        j
-        for j in ups
-        if j.get("status") == "completed" and j.get("completed_at")
-    ]
+    finished = sorted(
+        (
+            j
+            for j in up_jobs
+            if j.get("status") == "completed" and j.get("completed_at")
+        ),
+        key=lambda j: str(j.get("completed_at") or ""),
+    )
+    if len(downs) > len(finished):
+        raise RuntimeError(
+            "downstream tick exists without a successful upstream complete "
+            f"(up={len(up_jobs)} done={len(finished)} down={len(downs)})"
+        )
+    # Dual schedulers can commit a waiter a few ms around the upstream
+    # ack; require a completed tick, not a microsecond wall-clock order.
+    slack = 0.05
     for i, down in enumerate(downs):
-        if i >= len(finished):
-            raise RuntimeError(
-                f"downstream tick {i} exists before upstream tick {i} finished "
-                f"(up={len(ups)} done={len(finished)} down={len(downs)})"
-            )
-        created = str(down.get("created_at") or "")
-        done_at = str(finished[i].get("completed_at") or "")
-        if created < done_at:
+        if _ts(down.get("created_at")) + slack < _ts(finished[i].get("completed_at")):
             raise RuntimeError(
                 "downstream created before the matching upstream tick finished "
-                f"({created} < {done_at})"
+                f"({down.get('created_at')} < {finished[i].get('completed_at')})"
             )
 
 
@@ -234,6 +263,7 @@ def main() -> int:
     wait_coords()
     skip_t, one_t, pipe_t, live_t = "sw-skip", "sw-one", "sw-pipe", "sw-live"
     due_t, mv_t, mv_dst, del_t = "sw-due", "sw-mv", "sw-mv-dst", "sw-del"
+    can_t, dead_t = "sw-can", "sw-dead"
     skip_up = create_sched(skip_t, name="up", ms=2500)
     skip_down = create_sched(
         skip_t, name="down", waits_on=[skip_up], policy="skip"
@@ -253,6 +283,10 @@ def main() -> int:
     mv_down = create_sched(mv_t, name="down", waits_on=[mv_up])
     del_up = create_sched(del_t, name="up", ms=2500)
     del_down = create_sched(del_t, name="down", waits_on=[del_up])
+    can_up = create_sched(can_t, name="up", ms=2500)
+    can_down = create_sched(can_t, name="down", waits_on=[can_up])
+    dead_up = create_sched(dead_t, name="up", ms=2500)
+    dead_down = create_sched(dead_t, name="down", waits_on=[dead_up])
     create_sched(live_t, name="live")
 
     skip_jobs = wait_n(skip_t, 1, schedule_id=skip_up)
@@ -260,12 +294,16 @@ def main() -> int:
     pipe_jobs = wait_n(pipe_t, 1, schedule_id=pipe_up)
     mv_jobs = wait_n(mv_t, 1, schedule_id=mv_up)
     del_jobs = wait_n(del_t, 1, schedule_id=del_up)
+    can_jobs = wait_n(can_t, 1, schedule_id=can_up)
+    dead_jobs = wait_n(dead_t, 1, schedule_id=dead_up)
     for tid, job, reason in (
         (skip_t, skip_jobs[0], "hold skip"),
         (one_t, one_jobs[0], "hold one"),
         (pipe_t, pipe_jobs[0], "hold pipe"),
         (mv_t, mv_jobs[0], "hold move"),
         (del_t, del_jobs[0], "hold delete"),
+        (can_t, can_jobs[0], "hold cancel"),
+        (dead_t, dead_jobs[0], "hold dead"),
     ):
         code, body = http_json(
             "POST",
@@ -274,6 +312,13 @@ def main() -> int:
         )
         if code != 200:
             raise RuntimeError(f"freeze {tid} {code} {body}")
+
+    code, body = cancel_job(can_t, can_jobs[0]["id"])
+    if code != 200:
+        raise RuntimeError(f"cancel upstream {code} {body}")
+    code, body = dead_letter(dead_t, dead_jobs[0]["id"])
+    if code != 200:
+        raise RuntimeError(f"dead-letter upstream {code} {body}")
 
     code, body = move(mv_t, mv_up, mv_dst)
     if code != 200:
@@ -294,6 +339,8 @@ def main() -> int:
         (pipe_t, pipe_down),
         (mv_t, mv_down),
         (del_t, del_down),
+        (can_t, can_down),
+        (dead_t, dead_down),
     ):
         code, body = fire(tid, sid)
         if code != 409:
@@ -319,11 +366,15 @@ def main() -> int:
             )
         due_jobs = list_jobs(due_t)
         assert_down_after_up(by_sched(due_jobs, due_up), by_sched(due_jobs, due_down))
+        can_all = list_jobs(can_t)
+        dead_all = list_jobs(dead_t)
+        assert_down_after_up(by_sched(can_all, can_up), by_sched(can_all, can_down))
+        assert_down_after_up(by_sched(dead_all, dead_up), by_sched(dead_all, dead_down))
         now = time.time()
         if now - last >= 2:
             logger.info(
                 "hold skip=%d one=%d pipe_down=%d due_up=%d due_down=%d "
-                "mv_down=%d del_down=%d live=%d",
+                "mv_down=%d del_down=%d can_down=%d dead_down=%d live=%d",
                 len(list_jobs(skip_t)),
                 len(list_jobs(one_t)),
                 len(by_sched(list_jobs(pipe_t), pipe_down)),
@@ -331,6 +382,8 @@ def main() -> int:
                 len(by_sched(due_jobs, due_down)),
                 len(by_sched(list_jobs(mv_t), mv_down)),
                 len(by_sched(list_jobs(del_t), del_down)),
+                len(by_sched(can_all, can_down)),
+                len(by_sched(dead_all, dead_down)),
                 completed(list_jobs(live_t)),
             )
             last = now
@@ -346,6 +399,24 @@ def main() -> int:
     assert_down_after_up(by_sched(due_jobs, due_up), by_sched(due_jobs, due_down))
     if not by_sched(due_jobs, due_up):
         raise RuntimeError("due-order tenant never fired the upstream")
+
+    can_all = list_jobs(can_t)
+    dead_all = list_jobs(dead_t)
+    assert_down_after_up(by_sched(can_all, can_up), by_sched(can_all, can_down))
+    assert_down_after_up(by_sched(dead_all, dead_up), by_sched(dead_all, dead_down))
+    live_up = {"pending", "leased", "frozen", "awaiting_approval",
+               "awaiting_children", "awaiting_skills"}
+    for tid, sid, jobs in (
+        (can_t, can_up, by_sched(can_all, can_up)),
+        (dead_t, dead_up, by_sched(dead_all, dead_up)),
+    ):
+        if any(j.get("status") == "completed" for j in jobs):
+            continue
+        if any(j.get("status") in live_up for j in jobs):
+            continue
+        code, body = fire(tid, sid)
+        if code != 200:
+            raise RuntimeError(f"fire {tid} upstream after fail {code} {body}")
 
     # Stop dest / source upstreams from starting another tick after
     # release. A paused same-tenant upstream still blocks the waiter
@@ -418,12 +489,17 @@ def main() -> int:
         raise RuntimeError(f"delete idle upstream after tick expected 200 got {code} {body}")
 
     deadline = time.time() + 16
+    mv_ready = del_ready = False
     while time.time() < deadline:
-        if by_sched(list_jobs(mv_t), mv_down) and by_sched(list_jobs(del_t), del_down):
+        if not mv_ready and by_sched(list_jobs(mv_t), mv_down):
+            pause(mv_t, mv_down)
+            mv_ready = True
+        if not del_ready and by_sched(list_jobs(del_t), del_down):
+            pause(del_t, del_down)
+            del_ready = True
+        if mv_ready and del_ready:
             break
         time.sleep(0.15)
-    pause(mv_t, mv_down)
-    pause(del_t, del_down)
     mv_extra = len(by_sched(list_jobs(mv_t), mv_down))
     del_extra = len(by_sched(list_jobs(del_t), del_down))
     if mv_extra < 1:
@@ -449,12 +525,39 @@ def main() -> int:
     if pipe_extra > expected:
         raise RuntimeError(f"pipe waiter flooded {pipe_extra}")
 
+    deadline = time.time() + 16
+    can_ready = dead_ready = False
+    while time.time() < deadline:
+        can_all = list_jobs(can_t)
+        dead_all = list_jobs(dead_t)
+        assert_down_after_up(by_sched(can_all, can_up), by_sched(can_all, can_down))
+        assert_down_after_up(by_sched(dead_all, dead_up), by_sched(dead_all, dead_down))
+        if not can_ready and by_sched(can_all, can_down):
+            pause(can_t, can_down)
+            can_ready = True
+        if not dead_ready and by_sched(dead_all, dead_down):
+            pause(dead_t, dead_down)
+            dead_ready = True
+        if can_ready and dead_ready:
+            break
+        time.sleep(0.15)
+    can_extra = len(by_sched(list_jobs(can_t), can_down))
+    dead_extra = len(by_sched(list_jobs(dead_t), dead_down))
+    if can_extra < 1:
+        raise RuntimeError("cancel waiter did not fire after a successful tick")
+    if can_extra > expected:
+        raise RuntimeError(f"cancel waiter flooded {can_extra}")
+    if dead_extra < 1:
+        raise RuntimeError("dead-letter waiter did not fire after a successful tick")
+    if dead_extra > expected:
+        raise RuntimeError(f"dead-letter waiter flooded {dead_extra}")
+
     live_after = completed(list_jobs(live_t))
     if live_after < live_mid:
         raise RuntimeError("live tenant went backwards")
     logger.info(
         "schedule wait soak OK extra_skip=%d extra_one=%d pipe=%d "
-        "due_up=%d due_down=%d mv=%d del=%d missed=%s live=%d",
+        "due_up=%d due_down=%d mv=%d del=%d can=%d dead=%d missed=%s live=%d",
         extra_skip,
         extra_one,
         pipe_extra,
@@ -462,6 +565,8 @@ def main() -> int:
         len(by_sched(due_jobs, due_down)),
         mv_extra,
         del_extra,
+        can_extra,
+        dead_extra,
         skip_sched.get("missed_ticks"),
         live_after,
     )

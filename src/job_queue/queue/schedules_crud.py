@@ -13,12 +13,14 @@ from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
 from job_queue.models import (
+    JobStatus,
     Schedule,
 )
 from job_queue.queue._common import (
     _SCHED_MUTEX_LOCK_CLASS,
     _SCHEDULE_COLUMNS,
     _SCHEDULE_INFLIGHT_STATUSES,
+    _SCHEDULE_TICK_FAILED_STATUSES,
     _UNSET,
     ScheduleError,
     _as_utc,
@@ -966,15 +968,19 @@ class SchedulesCrudMixin:
 
         Live jobs are matched by ``schedule_id`` on any tenant so a
         delete or a move cannot hide an in-flight tick from the waiter.
-        An enabled upstream that is already due also blocks, even before
-        it has materialized a job — otherwise ``process_due`` (ordered
-        by ``next_run_at``) can fire a more-overdue downstream first.
+        A cancelled, dead-lettered, or failed tick also stays blocking
+        until a later job for that schedule_id is completed — vanishing
+        is not success. An enabled upstream that is already due blocks
+        even before it has materialized a job, otherwise ``process_due``
+        (ordered by ``next_run_at``) can fire a more-overdue downstream
+        first.
         """
         ids = list(waits_on or [])
         if not ids:
             return False
         at = now if now is not None else _utcnow()
         inflight = list(_SCHEDULE_INFLIGHT_STATUSES)
+        failed = list(_SCHEDULE_TICK_FAILED_STATUSES)
         row = conn.execute(
             """
             SELECT 1
@@ -983,6 +989,23 @@ class SchedulesCrudMixin:
                 FROM jobs j
                 WHERE j.schedule_id = ANY(%s)
                   AND j.status = ANY(%s)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM (
+                    SELECT j.schedule_id,
+                           MAX(j.created_at) FILTER (
+                               WHERE j.status = %s
+                           ) AS last_ok,
+                           MAX(j.created_at) FILTER (
+                               WHERE j.status = ANY(%s)
+                           ) AS last_bad
+                    FROM jobs j
+                    WHERE j.schedule_id = ANY(%s)
+                    GROUP BY j.schedule_id
+                ) t
+                WHERE t.last_bad IS NOT NULL
+                  AND (t.last_ok IS NULL OR t.last_bad >= t.last_ok)
             )
             OR EXISTS (
                 SELECT 1
@@ -1015,7 +1038,17 @@ class SchedulesCrudMixin:
             )
             LIMIT 1
             """,
-            (ids, inflight, tenant_id, ids, at, inflight),
+            (
+                ids,
+                inflight,
+                JobStatus.COMPLETED.value,
+                failed,
+                ids,
+                tenant_id,
+                ids,
+                at,
+                inflight,
+            ),
         ).fetchone()
         return row is not None
 

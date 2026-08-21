@@ -80,6 +80,15 @@ _SCHEDULE_INFLIGHT_STATUSES = (
     JobStatus.FROZEN.value,
 )
 
+# A waits_on tick that ended without success. The waiter stays blocked
+# until a later job for that schedule_id is completed.
+_SCHEDULE_TICK_FAILED_STATUSES = (
+    JobStatus.CANCELLED.value,
+    JobStatus.DEAD.value,
+    JobStatus.FAILED.value,
+    JobStatus.QUARANTINED.value,
+)
+
 
 class FreezeError(Exception):
     """Raised when a job cannot be frozen / unfrozen / dead-lettered."""
