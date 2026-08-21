@@ -193,7 +193,8 @@ _SCHEDULE_COLUMNS = """
     next_run_at, last_enqueued_at, created_at, updated_at, labels,
     payload_key_id, required_skills,
     misfire_policy, catch_up_max, missed_ticks, last_misfire_at,
-    catch_up_remaining, dag_jobs, mutex_group, waits_on
+    catch_up_remaining, dag_jobs, mutex_group, waits_on, joins_on,
+    tick_iteration, last_completed_iteration
 """
 
 _CANCEL_MATCHING_BATCH_DEFAULT = 500
@@ -606,6 +607,13 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
             else str(row["mutex_group"])
         ),
         waits_on=_uuid_tuple_from_row(row.get("waits_on")),
+        joins_on=_uuid_tuple_from_row(row.get("joins_on")),
+        tick_iteration=int(row.get("tick_iteration") or 0),
+        last_completed_iteration=(
+            None
+            if row.get("last_completed_iteration") is None
+            else int(row["last_completed_iteration"])
+        ),
     )
 
 

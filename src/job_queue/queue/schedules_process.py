@@ -80,6 +80,12 @@ class SchedulesProcessMixin:
         ``next_run_at`` stays overdue so skip / catch_up_one / catch_up
         run when the upstream is clear.
 
+        **Joins-on:** a schedule that lists waiter ids fires one tick
+        per generation after every waiter has completed that same
+        iteration. A paused waiter or one stuck behind a mutex peer
+        keeps the join blocked. ``next_run_at`` stays overdue so
+        skip / catch_up_one / catch_up run when the set is clear.
+
         Returns a list of ``ScheduleFire`` (updated schedule + enqueued job).
         """
         if limit < 1:
@@ -214,6 +220,15 @@ class SchedulesProcessMixin:
                 ):
                     blocked = True
                     skip_metric = "schedule_wait"
+                if not blocked and self._schedule_join_blocked(
+                    conn,
+                    tenant_id=str(sched_row["tenant_id"]),
+                    joins_on=list(sched_row.get("joins_on") or []),
+                    tick_iteration=sched_row.get("tick_iteration"),
+                    now=now,
+                ):
+                    blocked = True
+                    skip_metric = "schedule_join"
                 if blocked:
                     self._record_metric(
                         conn,
@@ -274,11 +289,23 @@ class SchedulesProcessMixin:
                     )
                     continue
 
+                join_ids = list(sched_row.get("joins_on") or [])
+                watermark = (
+                    self._join_ready_watermark(conn, join_ids)
+                    if join_ids
+                    else 0
+                )
+                current_iter = int(sched_row.get("tick_iteration") or 0)
+                extra_join = max(0, watermark - current_iter - 1)
+
                 if not slots:
+                    consume = watermark if join_ids else current_iter
+                    missed = skipped + extra_join
                     conn.execute(
                         f"""
                         UPDATE schedules
                         SET next_run_at = %s,
+                            tick_iteration = %s,
                             missed_ticks = missed_ticks + %s,
                             last_misfire_at = CASE
                                 WHEN %s > 0 THEN %s
@@ -290,19 +317,20 @@ class SchedulesProcessMixin:
                         """,
                         (
                             future,
-                            skipped,
-                            skipped,
+                            consume,
+                            missed,
+                            missed,
                             now,
                             now,
                             sched_row["id"],
                         ),
                     )
-                    if skipped:
+                    if missed:
                         self._record_metric(
                             conn,
                             tenant_id=str(sched_row["tenant_id"]),
                             metric="schedule_miss",
-                            count=skipped,
+                            count=missed,
                             now=now,
                         )
                     continue
@@ -321,12 +349,28 @@ class SchedulesProcessMixin:
                         next_run = future
                 else:
                     next_run = future
+                if (
+                    join_ids
+                    and policy == MISFIRE_CATCH_UP
+                    and extra_join > 0
+                    and next_run > now
+                ):
+                    # More generations are ready; keep the join due so
+                    # catch_up drains one tick at a time.
+                    next_run = now
 
                 try:
                     # Intentionally no pending-cap / enqueue-rate checks:
                     # schedule materialization is system-timed work.
                     # Spend caps still apply — scheduled jobs are billed
                     # enqueues and must not bypass a tenant quota.
+                    iteration = self._resolve_tick_iteration(conn, sched_row)
+                    stamp_iter = iteration
+                    extra_skip = skipped
+                    if join_ids and policy != MISFIRE_CATCH_UP and extra_join:
+                        # skip / catch_up_one: one pickup, consume the rest.
+                        stamp_iter = watermark
+                        extra_skip += extra_join
                     first_job, tick_jobs, tick_refs, batch_id, batch_key = (
                         self._materialize_schedule_tick(
                             conn,
@@ -334,7 +378,7 @@ class SchedulesProcessMixin:
                             now=now,
                             scheduled_for=slots[0],
                             policy=policy,
-                            skipped=skipped,
+                            skipped=extra_skip,
                         )
                     )
                 except UniqueViolation:
@@ -350,6 +394,7 @@ class SchedulesProcessMixin:
                     UPDATE schedules
                     SET next_run_at = %s,
                         last_enqueued_at = %s,
+                        tick_iteration = %s,
                         missed_ticks = missed_ticks + %s,
                         last_misfire_at = CASE
                             WHEN %s > 0 THEN %s
@@ -363,8 +408,9 @@ class SchedulesProcessMixin:
                     (
                         next_run,
                         now,
-                        skipped,
-                        skipped,
+                        stamp_iter,
+                        extra_skip,
+                        extra_skip,
                         now,
                         new_remaining,
                         now,

@@ -823,6 +823,22 @@ ALTER TABLE schedules ALTER COLUMN waits_on SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_schedules_waits_on
     ON schedules USING GIN (waits_on);
 
+-- Fan-out / join: a join schedule lists waiter ids. It fires one tick
+-- per generation after every waiter has completed that same iteration.
+-- tick_iteration is the last enqueued generation; last_completed_iteration
+-- advances only when that generation's jobs all complete successfully.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS joins_on UUID[];
+UPDATE schedules SET joins_on = '{}' WHERE joins_on IS NULL;
+ALTER TABLE schedules ALTER COLUMN joins_on SET DEFAULT '{}';
+ALTER TABLE schedules ALTER COLUMN joins_on SET NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_schedules_joins_on
+    ON schedules USING GIN (joins_on);
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS tick_iteration BIGINT;
+UPDATE schedules SET tick_iteration = 0 WHERE tick_iteration IS NULL;
+ALTER TABLE schedules ALTER COLUMN tick_iteration SET DEFAULT 0;
+ALTER TABLE schedules ALTER COLUMN tick_iteration SET NOT NULL;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_completed_iteration BIGINT;
+
 ALTER TABLE job_dag_batches ADD COLUMN IF NOT EXISTS schedule_id UUID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_job_dag_batches_schedule_key

@@ -380,6 +380,11 @@ def schedule_to_dict(
         "dag_jobs": [dict(n) for n in (getattr(sched, "dag_jobs", ()) or ())],
         "mutex_group": getattr(sched, "mutex_group", None),
         "waits_on": [str(u) for u in (getattr(sched, "waits_on", ()) or ())],
+        "joins_on": [str(u) for u in (getattr(sched, "joins_on", ()) or ())],
+        "tick_iteration": int(getattr(sched, "tick_iteration", 0) or 0),
+        "last_completed_iteration": getattr(
+            sched, "last_completed_iteration", None
+        ),
     }
 
 

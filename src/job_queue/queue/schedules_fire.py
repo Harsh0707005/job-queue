@@ -117,8 +117,19 @@ class SchedulesFireMixin:
                 raise ScheduleError(
                     f"schedule {schedule_id} is waiting on an upstream tick"
                 )
+            if self._schedule_join_blocked(
+                conn,
+                tenant_id=tenant_id,
+                joins_on=list(sched_row.get("joins_on") or []),
+                tick_iteration=sched_row.get("tick_iteration"),
+                now=now,
+            ):
+                raise ScheduleError(
+                    f"schedule {schedule_id} is waiting on a join set"
+                )
 
             try:
+                iteration = self._resolve_tick_iteration(conn, sched_row)
                 first, jobs, refs, batch_id, batch_key = (
                     self._materialize_schedule_tick(
                         conn,
@@ -144,11 +155,12 @@ class SchedulesFireMixin:
                 f"""
                 UPDATE schedules
                 SET last_enqueued_at = %s,
+                    tick_iteration = %s,
                     updated_at = %s
                 WHERE id = %s AND tenant_id = %s
                 RETURNING {_SCHEDULE_COLUMNS}
                 """,
-                (now, now, schedule_id, tenant_id),
+                (now, iteration, now, schedule_id, tenant_id),
             ).fetchone()
             assert updated is not None
             self._record_metric(

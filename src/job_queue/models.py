@@ -263,6 +263,12 @@ class Schedule:
     dead-lettered / failed tick with no later completed job, is due but
     has not started that tick, is paused, or has a paused / inflight
     mutex-group peer. Missed ticks while waiting follow ``misfire_policy``.
+    ``joins_on`` lists waiter schedule ids. This schedule fires one tick
+    per generation after every waiter has completed that same iteration.
+    A paused waiter or one stuck behind a mutex peer keeps the join
+    blocked. Missed join ticks follow ``misfire_policy``.
+    ``tick_iteration`` is the last enqueued generation; ``last_completed_iteration``
+    advances only when that generation finishes successfully.
     """
 
     id: UUID
@@ -291,6 +297,9 @@ class Schedule:
     dag_jobs: tuple[dict[str, Any], ...] = ()
     mutex_group: str | None = None
     waits_on: tuple[UUID, ...] = ()
+    joins_on: tuple[UUID, ...] = ()
+    tick_iteration: int = 0
+    last_completed_iteration: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -69,6 +69,7 @@ def normalize_catch_up_max(raw: int | None) -> int:
 _MAX_SCHEDULE_DAG_JOBS = 200
 _MAX_MUTEX_GROUP_LEN = 128
 _MAX_WAITS_ON = 32
+_MAX_JOINS_ON = 32
 
 
 def normalize_waits_on(
@@ -93,6 +94,31 @@ def normalize_waits_on(
         out.append(uid)
     if len(out) > _MAX_WAITS_ON:
         raise ValueError(f"waits_on can list at most {_MAX_WAITS_ON} schedules")
+    return out
+
+
+def normalize_joins_on(
+    raw: Sequence[UUID | str] | UUID | str | None,
+) -> list[UUID]:
+    """Same-tenant waiter schedule ids a join waits for. Empty / None → []."""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, (UUID, str)):
+        items: Sequence[UUID | str] = [raw]
+    else:
+        items = raw
+    out: list[UUID] = []
+    seen: set[UUID] = set()
+    for item in items:
+        if item is None or item == "":
+            continue
+        uid = item if isinstance(item, UUID) else UUID(str(item))
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(uid)
+    if len(out) > _MAX_JOINS_ON:
+        raise ValueError(f"joins_on can list at most {_MAX_JOINS_ON} schedules")
     return out
 
 
@@ -196,6 +222,7 @@ class SchedulesCrudMixin:
         dag_jobs: Sequence[dict[str, Any]] | None = None,
         mutex_group: str | None = None,
         waits_on: Sequence[UUID | str] | UUID | str | None = None,
+        joins_on: Sequence[UUID | str] | UUID | str | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -242,6 +269,12 @@ class SchedulesCrudMixin:
             not fire while any of those has a live tick, is paused, or
             has a paused / inflight mutex-group peer. Missed ticks
             while waiting follow ``misfire_policy``.
+        joins_on:
+            Waiter schedule ids on this tenant. This schedule fires
+            one tick per generation after every waiter has completed
+            that same iteration. A paused waiter or one stuck behind
+            a mutex peer keeps the join blocked. Missed ticks follow
+            ``misfire_policy``.
         """
         from job_queue.cronutil import next_cron_fire, validate_cron, validate_timezone
 
@@ -267,6 +300,7 @@ class SchedulesCrudMixin:
         dag_list = normalize_schedule_dag_jobs(dag_jobs)
         group = normalize_mutex_group(mutex_group)
         wait_ids = normalize_waits_on(waits_on)
+        join_ids = normalize_joins_on(joins_on)
         now = _utcnow()
         base = _as_utc(start_at) if start_at is not None else now
         if cron_expr is not None:
@@ -287,6 +321,9 @@ class SchedulesCrudMixin:
             self._assert_waits_on_ok(
                 conn, tenant_id=tenant_id, schedule_id=sid, waits_on=wait_ids
             )
+            self._assert_joins_on_ok(
+                conn, tenant_id=tenant_id, schedule_id=sid, joins_on=join_ids
+            )
             try:
                 sealed, payload_key_id = self._seal_schedule_payload(
                     conn,
@@ -304,14 +341,14 @@ class SchedulesCrudMixin:
                         labels, created_at, updated_at, payload_key_id,
                         required_skills,
                         misfire_policy, catch_up_max, dag_jobs,
-                        mutex_group, waits_on
+                        mutex_group, waits_on, joins_on
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -339,6 +376,7 @@ class SchedulesCrudMixin:
                         Jsonb(dag_list) if dag_list else None,
                         group,
                         wait_ids,
+                        join_ids,
                     ),
                 ).fetchone()
             except UniqueViolation as exc:
@@ -659,6 +697,7 @@ class SchedulesCrudMixin:
         catch_up_max: Any = _UNSET,
         mutex_group: Any = _UNSET,
         waits_on: Any = _UNSET,
+        joins_on: Any = _UNSET,
     ) -> Schedule:
         """Edit a live schedule without deleting it.
 
@@ -689,6 +728,7 @@ class SchedulesCrudMixin:
             catch_up_max,
             mutex_group,
             waits_on,
+            joins_on,
         )
         if all(f is _UNSET for f in fields):
             raise ValueError("pass at least one field to update")
@@ -787,6 +827,15 @@ class SchedulesCrudMixin:
                     schedule_id=schedule_id,
                     waits_on=wait_ids,
                 )
+            join_ids = list(row.get("joins_on") or [])
+            if joins_on is not _UNSET:
+                join_ids = normalize_joins_on(joins_on)
+                self._assert_joins_on_ok(
+                    conn,
+                    tenant_id=tenant_id,
+                    schedule_id=schedule_id,
+                    joins_on=join_ids,
+                )
 
             dag_val = row.get("dag_jobs")
             if dag_jobs is not _UNSET:
@@ -838,6 +887,7 @@ class SchedulesCrudMixin:
                         catch_up_max = %s,
                         mutex_group = %s,
                         waits_on = %s,
+                        joins_on = %s,
                         next_run_at = %s,
                         catch_up_remaining = %s,
                         updated_at = %s
@@ -862,6 +912,7 @@ class SchedulesCrudMixin:
                         catch_max,
                         group,
                         wait_ids,
+                        join_ids,
                         next_run,
                         catch_remaining,
                         now,
@@ -955,6 +1006,203 @@ class SchedulesCrudMixin:
             seen.add(node)
 
         visit(schedule_id)
+
+    @staticmethod
+    def _assert_joins_on_ok(
+        conn: Any,
+        *,
+        tenant_id: str,
+        schedule_id: UUID,
+        joins_on: Sequence[UUID],
+    ) -> None:
+        if not joins_on:
+            return
+        if schedule_id in joins_on:
+            raise ValueError("schedule cannot join on itself")
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM schedules
+            WHERE tenant_id = %s AND id = ANY(%s)
+            ORDER BY id
+            FOR UPDATE
+            """,
+            (tenant_id, list(joins_on)),
+        ).fetchall()
+        found = {row["id"] for row in rows}
+        missing = [uid for uid in joins_on if uid not in found]
+        if missing:
+            raise ValueError(
+                f"joins_on schedule {missing[0]} not found for tenant "
+                f"{tenant_id!r}"
+            )
+
+    @staticmethod
+    def _resolve_tick_iteration(conn: Any, sched_row: Any) -> int:
+        """Next generation for this fire: inherit waits_on, else increment."""
+        current = int(sched_row.get("tick_iteration") or 0)
+        joins = list(sched_row.get("joins_on") or [])
+        if joins:
+            return current + 1
+        waits = list(sched_row.get("waits_on") or [])
+        if waits:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(tick_iteration), 0) AS n
+                FROM schedules
+                WHERE id = ANY(%s)
+                """,
+                (waits,),
+            ).fetchone()
+            inherited = int((row or {}).get("n") or 0)
+            return inherited if inherited > 0 else current + 1
+        return current + 1
+
+    @staticmethod
+    def _maybe_advance_schedule_completed(
+        conn: Any,
+        *,
+        schedule_id: UUID | None,
+    ) -> None:
+        """Record last_completed_iteration when a generation fully succeeds."""
+        if schedule_id is None:
+            return
+        inflight = list(_SCHEDULE_INFLIGHT_STATUSES)
+        failed = list(_SCHEDULE_TICK_FAILED_STATUSES)
+        live = conn.execute(
+            """
+            SELECT 1
+            FROM jobs
+            WHERE schedule_id = %s
+              AND status = ANY(%s)
+            LIMIT 1
+            """,
+            (schedule_id, inflight),
+        ).fetchone()
+        if live is not None:
+            return
+        failed_row = conn.execute(
+            """
+            SELECT 1
+            FROM (
+                SELECT MAX(created_at) FILTER (
+                           WHERE status = %s
+                       ) AS last_ok,
+                       MAX(created_at) FILTER (
+                           WHERE status = ANY(%s)
+                       ) AS last_bad
+                FROM jobs
+                WHERE schedule_id = %s
+            ) t
+            WHERE t.last_bad IS NOT NULL
+              AND (t.last_ok IS NULL OR t.last_bad >= t.last_ok)
+            """,
+            (JobStatus.COMPLETED.value, failed, schedule_id),
+        ).fetchone()
+        if failed_row is not None:
+            return
+        conn.execute(
+            """
+            UPDATE schedules
+            SET last_completed_iteration = tick_iteration,
+                updated_at = NOW()
+            WHERE id = %s
+              AND tick_iteration > 0
+              AND (
+                last_completed_iteration IS NULL
+                OR tick_iteration > last_completed_iteration
+              )
+            """,
+            (schedule_id,),
+        )
+
+    @staticmethod
+    def _join_ready_watermark(
+        conn: Any,
+        joins_on: Sequence[UUID] | None,
+    ) -> int:
+        """Lowest last_completed_iteration across the join set (0 if empty)."""
+        ids = list(joins_on or [])
+        if not ids:
+            return 0
+        row = conn.execute(
+            """
+            SELECT COALESCE(MIN(last_completed_iteration), 0) AS n
+            FROM schedules
+            WHERE id = ANY(%s)
+            """,
+            (ids,),
+        ).fetchone()
+        return int((row or {}).get("n") or 0)
+
+    @staticmethod
+    def _schedule_join_blocked(
+        conn: Any,
+        *,
+        tenant_id: str,
+        joins_on: Sequence[UUID] | None,
+        tick_iteration: int | None,
+        now: datetime | None = None,
+    ) -> bool:
+        """True until every waiter finished the next join generation.
+
+        A paused waiter, or one whose mutex peer is paused / inflight,
+        keeps the join blocked for a generation it has not completed.
+        Missing waiter rows (delete / move) also fail closed.
+        """
+        ids = list(joins_on or [])
+        if not ids:
+            return False
+        needed = int(tick_iteration or 0) + 1
+        inflight = list(_SCHEDULE_INFLIGHT_STATUSES)
+        found = conn.execute(
+            """
+            SELECT id, tenant_id, enabled, last_completed_iteration,
+                   mutex_group
+            FROM schedules
+            WHERE id = ANY(%s)
+            """,
+            (ids,),
+        ).fetchall()
+        if len(found) < len(ids):
+            return True
+        for waiter in found:
+            completed = waiter.get("last_completed_iteration")
+            if completed is not None and int(completed) >= needed:
+                continue
+            if not bool(waiter["enabled"]):
+                return True
+            group = waiter.get("mutex_group")
+            if group:
+                peer = conn.execute(
+                    """
+                    SELECT 1
+                    FROM schedules p
+                    WHERE p.tenant_id = %s
+                      AND p.mutex_group = %s
+                      AND p.id <> %s
+                      AND (
+                        p.enabled = FALSE
+                        OR EXISTS (
+                            SELECT 1
+                            FROM jobs j
+                            WHERE j.schedule_id = p.id
+                              AND j.status = ANY(%s)
+                        )
+                    )
+                    LIMIT 1
+                    """,
+                    (
+                        waiter["tenant_id"],
+                        str(group),
+                        waiter["id"],
+                        inflight,
+                    ),
+                ).fetchone()
+                if peer is not None:
+                    return True
+            return True
+        return False
 
     @staticmethod
     def _schedule_waits_blocked(

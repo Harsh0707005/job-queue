@@ -51,6 +51,7 @@ class SchedulesApiMixin:
                 dag_jobs=body.get("dag_jobs"),
                 mutex_group=body.get("mutex_group"),
                 waits_on=body.get("waits_on"),
+                joins_on=body.get("joins_on"),
             )
         except (KeyError, ValueError, ScheduleError) as exc:
             return 400, {"error": str(exc)}
@@ -194,6 +195,8 @@ class SchedulesApiMixin:
             kwargs["mutex_group"] = body.get("mutex_group")
         if "waits_on" in body:
             kwargs["waits_on"] = body.get("waits_on")
+        if "joins_on" in body:
+            kwargs["joins_on"] = body.get("joins_on")
         try:
             sched = self.queue.update_schedule(
                 UUID(sid), tenant_id=str(tenant_id), **kwargs
