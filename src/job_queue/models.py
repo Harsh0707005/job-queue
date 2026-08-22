@@ -38,6 +38,7 @@ class WorkflowStepStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     COMPENSATED = "compensated"
+    AWAITING_SIGNAL = "awaiting_signal"
 
 
 class WorkflowStepDirection(str, Enum):
@@ -899,6 +900,19 @@ class WorkflowStepRun:
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    deadline_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSignal:
+    """Named latch on a workflow run. First write wins; tenant-scoped."""
+
+    id: UUID
+    run_id: UUID
+    tenant_id: str
+    name: str
+    payload: dict[str, Any]
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

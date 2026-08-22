@@ -1315,7 +1315,7 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     CONSTRAINT workflow_step_runs_status_check CHECK (
         status IN (
             'pending', 'running', 'completed', 'failed',
-            'skipped', 'compensated'
+            'skipped', 'compensated', 'awaiting_signal'
         )
     ),
     CONSTRAINT workflow_step_runs_index_check CHECK (step_index >= 0),
@@ -1324,6 +1324,15 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
 );
 
 ALTER TABLE workflow_step_runs ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflow_step_runs ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ;
+
+ALTER TABLE workflow_step_runs DROP CONSTRAINT IF EXISTS workflow_step_runs_status_check;
+ALTER TABLE workflow_step_runs ADD CONSTRAINT workflow_step_runs_status_check CHECK (
+    status IN (
+        'pending', 'running', 'completed', 'failed',
+        'skipped', 'compensated', 'awaiting_signal'
+    )
+);
 
 -- Per-run cap for redriving failed/killed compensate jobs (not job max_attempts).
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS max_compensate_retries INTEGER NOT NULL DEFAULT 5;
@@ -1341,6 +1350,32 @@ CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_job
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_compensating
     ON workflow_runs (status, updated_at)
     WHERE status = 'compensating';
+
+CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_awaiting_signal
+    ON workflow_step_runs (deadline_at)
+    WHERE status = 'awaiting_signal' AND deadline_at IS NOT NULL;
+
+-- Named signals latch per (run, name). Early send still counts; tenant_id
+-- is required on every read/write so one tenant cannot consume another.
+CREATE TABLE IF NOT EXISTS workflow_signals (
+    id              UUID PRIMARY KEY,
+    run_id          UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    tenant_id       TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    payload         JSONB,
+    payload_key_id  UUID,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT workflow_signals_name_check CHECK (
+        char_length(name) BETWEEN 1 AND 128
+    ),
+    CONSTRAINT workflow_signals_unique UNIQUE (run_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_signals_tenant_run
+    ON workflow_signals (tenant_id, run_id);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_signals_tenant_name
+    ON workflow_signals (tenant_id, name);
 
 -- Per-tenant envelope encryption keys (DEK wrapped by external KEK).
 CREATE TABLE IF NOT EXISTS tenant_payload_keys (

@@ -16,6 +16,7 @@ from job_queue.crypto import (
     result_aad,
     schedule_aad,
     schedule_generation_aad,
+    workflow_signal_aad,
     workflow_steps_aad,
 )
 from job_queue.db import transaction
@@ -840,6 +841,52 @@ class TenantsRestoreMixin:
             ),
         )
 
+    def _restore_workflow_signals(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        old_id = _parse_uuid(raw.get("id"))
+        new_id = self._map_id(id_map, "workflow_signals", old_id)
+        old_run = _parse_uuid(raw.get("run_id"))
+        new_run = self._mapped(id_map, "workflow_runs", old_run)
+        name = str(raw.get("name") or "").strip()
+        if not name or new_run is None:
+            return
+        payload = raw.get("payload")
+        sealed = None
+        kid = None
+        if payload is not None:
+            opened = self._open_dict(
+                payload,
+                tenant_id=target,
+                aad=workflow_signal_aad(old_run, name),
+                conn=conn,
+            )
+            if not isinstance(opened, dict):
+                opened = {}
+            sealed, kid = self._seal_dict(
+                conn,
+                tenant_id=target,
+                plaintext=opened,
+                aad=workflow_signal_aad(new_run, name),
+            )
+        conn.execute(
+            """
+            INSERT INTO workflow_signals (
+                id, run_id, tenant_id, name, payload, payload_key_id, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, name) DO NOTHING
+            """,
+            (
+                new_id,
+                new_run,
+                target,
+                name,
+                None if sealed is None else Jsonb(sealed),
+                kid,
+                _parse_dt(raw.get("created_at")) or _utcnow(),
+            ),
+        )
+
     def _restore_jobs(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:
@@ -1039,11 +1086,11 @@ class TenantsRestoreMixin:
             INSERT INTO workflow_step_runs (
                 id, run_id, tenant_id, step_index, name, direction, status,
                 job_id, result, error, idempotency_key, retry_count,
-                started_at, completed_at, created_at, updated_at
+                started_at, completed_at, created_at, updated_at, deadline_at
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s, %s, %s, %s
+                %s, %s, %s, %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -1064,6 +1111,7 @@ class TenantsRestoreMixin:
                 _parse_dt(raw.get("completed_at")),
                 _parse_dt(raw.get("created_at")) or _utcnow(),
                 _parse_dt(raw.get("updated_at")) or _utcnow(),
+                _parse_dt(raw.get("deadline_at")),
             ),
         )
 

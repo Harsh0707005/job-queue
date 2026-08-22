@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from job_queue.crypto import redact_payload
-from job_queue.models import WorkflowRun, WorkflowStepRun
+from job_queue.models import WorkflowRun, WorkflowSignal, WorkflowStepRun
 from job_queue.queue._common import CancelError, QueueDrainError, RateLimitError
 
 
@@ -61,6 +61,18 @@ def _step_to_dict(s: WorkflowStepRun) -> dict[str, Any]:
         "completed_at": s.completed_at.isoformat() if s.completed_at else None,
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        "deadline_at": s.deadline_at.isoformat() if s.deadline_at else None,
+    }
+
+
+def _signal_to_dict(s: WorkflowSignal) -> dict[str, Any]:
+    return {
+        "id": str(s.id),
+        "run_id": str(s.run_id),
+        "tenant_id": s.tenant_id,
+        "name": s.name,
+        "payload": redact_payload(s.payload),
+        "created_at": s.created_at.isoformat() if s.created_at else None,
     }
 
 
@@ -225,3 +237,82 @@ class WorkflowsApiMixin:
             "compensate": out.get("compensate", True),
             "reason": out["reason"],
         }
+
+    def _send_workflow_signal(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # /v1/workflows/{id}/signals
+        if len(parts) < 4:
+            return 400, {"error": "invalid workflow signal path"}
+        try:
+            rid = UUID(parts[2])
+        except ValueError:
+            return 400, {"error": "invalid workflow id"}
+        tenant = body.get("tenant_id")
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        name = body.get("name")
+        if name is None or not str(name).strip():
+            return 400, {"error": "name is required"}
+        payload = body.get("payload")
+        if payload is not None and not isinstance(payload, dict):
+            return 400, {"error": "payload must be an object"}
+        try:
+            out = self.queue.send_workflow_signal(
+                rid,
+                tenant_id=str(tenant),
+                name=str(name),
+                payload=payload,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "not found" in msg:
+                return 404, {"error": msg}
+            return 400, {"error": msg}
+        code = 201 if out.get("created") else 200
+        return code, {
+            "signal": _signal_to_dict(out["signal"]),
+            "created": bool(out.get("created")),
+            "unblocked": int(out.get("unblocked") or 0),
+        }
+
+    def _list_workflow_signals(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) < 4:
+            return 400, {"error": "invalid workflow signals path"}
+        try:
+            rid = UUID(parts[2])
+        except ValueError:
+            return 400, {"error": "invalid workflow id"}
+        tenant = (query.get("tenant_id") or [None])[0]
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            signals = self.queue.list_workflow_signals(rid, tenant_id=str(tenant))
+        except ValueError as exc:
+            msg = str(exc)
+            if "not found" in msg:
+                return 404, {"error": msg}
+            return 400, {"error": msg}
+        return 200, {
+            "signals": [_signal_to_dict(s) for s in signals],
+            "count": len(signals),
+            "tenant_id": str(tenant),
+        }
+
+    def _process_workflow_signal_timeouts(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            n = self.queue.process_workflow_signal_timeouts(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 50),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"timed_out": n}

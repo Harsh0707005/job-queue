@@ -118,6 +118,10 @@ def workflow_steps_aad(run_id: UUID | str) -> bytes:
     return f"job-queue:v1:workflow-steps:{run_id}".encode()
 
 
+def workflow_signal_aad(run_id: UUID | str, name: str) -> bytes:
+    return f"job-queue:v1:workflow-signal:{run_id}:{name}".encode()
+
+
 def result_aad(job_id: UUID | str) -> bytes:
     return f"job-queue:v1:job-result:{job_id}".encode()
 

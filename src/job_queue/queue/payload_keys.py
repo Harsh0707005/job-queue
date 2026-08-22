@@ -13,6 +13,7 @@ from job_queue.crypto import (
     job_aad,
     result_aad,
     schedule_aad,
+    workflow_signal_aad,
     workflow_steps_aad,
 )
 from job_queue.db import transaction
@@ -258,6 +259,12 @@ class PayloadKeysMixin:
                         to_key_id=active["key_id"],
                         limit=batch_size,
                     )
+                    self._reencrypt_workflow_signals_batch(
+                        conn,
+                        tenant_id=tenant_id,
+                        to_key_id=active["key_id"],
+                        limit=batch_size,
+                    )
                     self._retire_unreferenced_keys(conn, tenant_id=tenant_id)
                     synthetic = {
                         "id": uuid4(),
@@ -298,6 +305,12 @@ class PayloadKeysMixin:
                 limit=batch_size,
             )
             self._reencrypt_workflow_runs_batch(
+                conn,
+                tenant_id=tenant_id,
+                to_key_id=to_key_id,
+                limit=batch_size,
+            )
+            self._reencrypt_workflow_signals_batch(
                 conn,
                 tenant_id=tenant_id,
                 to_key_id=to_key_id,
@@ -387,6 +400,17 @@ class PayloadKeysMixin:
                 (tenant_id, active_key_id),
             ).fetchone()
             total += int(row["n"] if row else 0)
+        sig = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM workflow_signals
+            WHERE tenant_id = %s
+              AND payload IS NOT NULL
+              AND (payload_key_id IS DISTINCT FROM %s)
+            """,
+            (tenant_id, active_key_id),
+        ).fetchone()
+        total += int(sig["n"] if sig else 0)
         return total
 
     def _reencrypt_jobs_batch(
@@ -606,6 +630,58 @@ class PayloadKeysMixin:
             n += 1
         return n
 
+    def _reencrypt_workflow_signals_batch(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        to_key_id: UUID,
+        limit: int,
+    ) -> int:
+        rec = self._ensure_active_key(conn, tenant_id)
+        if rec.key_id != to_key_id:
+            to_key_id = rec.key_id
+        rows = conn.execute(
+            """
+            SELECT id, run_id, tenant_id, name, payload, payload_key_id
+            FROM workflow_signals
+            WHERE tenant_id = %s
+              AND payload IS NOT NULL
+              AND (payload_key_id IS DISTINCT FROM %s)
+            ORDER BY created_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (tenant_id, to_key_id, limit),
+        ).fetchall()
+        n = 0
+        for row in rows:
+            opened = self._open_dict(
+                row.get("payload"),
+                tenant_id=tenant_id,
+                aad=workflow_signal_aad(row["run_id"], str(row["name"])),
+                conn=conn,
+            )
+            if not isinstance(opened, dict):
+                opened = {}
+            env, kid = self._seal_dict(
+                conn,
+                tenant_id=tenant_id,
+                plaintext=opened,
+                aad=workflow_signal_aad(row["run_id"], str(row["name"])),
+            )
+            conn.execute(
+                """
+                UPDATE workflow_signals
+                SET payload = %s,
+                    payload_key_id = %s
+                WHERE id = %s AND tenant_id = %s
+                """,
+                (Jsonb(env), kid, row["id"], tenant_id),
+            )
+            n += 1
+        return n
+
     def _retire_unreferenced_keys(self, conn: Any, *, tenant_id: str) -> int:
         """Zeroize wrapped DEKs that no ciphertext still names.
 
@@ -692,6 +768,16 @@ class PayloadKeysMixin:
                 (tenant_id, kid),
             ).fetchone()
             if wf_ref is not None:
+                continue
+            sig_ref = conn.execute(
+                """
+                SELECT 1 FROM workflow_signals
+                WHERE tenant_id = %s AND payload_key_id = %s
+                LIMIT 1
+                """,
+                (tenant_id, kid),
+            ).fetchone()
+            if sig_ref is not None:
                 continue
             conn.execute(
                 """

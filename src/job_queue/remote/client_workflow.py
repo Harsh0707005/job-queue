@@ -45,6 +45,45 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def send_workflow_signal(
+        self,
+        run_id: str | UUID,
+        *,
+        tenant_id: str,
+        name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id, "name": name}
+        if payload is not None:
+            body["payload"] = payload
+        payload_out = self._request(
+            "POST", f"/v1/workflows/{run_id}/signals", body
+        )
+        assert payload_out is not None
+        return payload_out
+
+    def list_workflow_signals(
+        self, run_id: str | UUID, *, tenant_id: str
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"tenant_id": tenant_id})
+        payload = self._request("GET", f"/v1/workflows/{run_id}/signals?{q}")
+        assert payload is not None
+        return payload
+
+    def process_workflow_signal_timeouts(
+        self, *, tenant_id: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request(
+            "POST", "/v1/workflows/process-signal-timeouts", body
+        )
+        assert payload is not None
+        return payload
+
     def cancel_workflow(
         self,
         run_id: str | UUID,

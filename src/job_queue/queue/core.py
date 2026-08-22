@@ -18,6 +18,7 @@ from job_queue.queue.metrics import MetricsMixin
 from job_queue.queue.usage import UsageMixin
 from job_queue.queue.alerts import AlertsMixin
 from job_queue.queue.workflows import WorkflowsMixin
+from job_queue.queue.workflows_signals import WorkflowSignalsMixin
 from job_queue.queue.partitions import PartitionsMixin
 from job_queue.queue.misc import MiscMixin
 
@@ -39,6 +40,7 @@ class JobQueue(
     UsageMixin,
     AlertsMixin,
     WorkflowsMixin,
+    WorkflowSignalsMixin,
     PartitionsMixin,
     MiscMixin,
 ):

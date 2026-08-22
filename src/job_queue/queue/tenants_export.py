@@ -35,6 +35,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "schedules",
     "schedule_blackouts",
     "workflow_runs",
+    "workflow_signals",
     "jobs",
     "schedule_generations",
     "job_dag_batches",
@@ -102,6 +103,10 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "updated_at, completed_at, payload_key_id, schedule_id, tick_iteration",
         "workflow_runs",
     ),
+    "workflow_signals": (
+        "id, run_id, tenant_id, name, payload, payload_key_id, created_at",
+        "workflow_signals",
+    ),
     "jobs": (_JOB_COLUMNS.strip().replace("\n", " "), "jobs"),
     "job_dag_batches": (
         "id, tenant_id, queue_name, batch_key, job_ids, refs, created_at, "
@@ -111,7 +116,7 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     "workflow_step_runs": (
         "id, run_id, tenant_id, step_index, name, direction, status, job_id, "
         "result, error, idempotency_key, retry_count, started_at, completed_at, "
-        "created_at, updated_at",
+        "created_at, updated_at, deadline_at",
         "workflow_step_runs",
     ),
     "job_side_effects": (

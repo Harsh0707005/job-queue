@@ -47,7 +47,7 @@ _RUN_COLUMNS = """
 _STEP_COLUMNS = """
     id, run_id, tenant_id, step_index, name, direction, status, job_id,
     result, error, idempotency_key, retry_count, started_at, completed_at,
-    created_at, updated_at
+    created_at, updated_at, deadline_at
 """
 
 # Default redrives when a compensate job dies (crash / timeout / nack).
@@ -457,6 +457,7 @@ class WorkflowsMixin:
             run["id"],
             WorkflowStepStatus.PENDING.value,
             WorkflowStepStatus.RUNNING.value,
+            WorkflowStepStatus.AWAITING_SIGNAL.value,
         ]
         if only_directions:
             dir_sql = "AND direction = ANY(%s)"
@@ -466,7 +467,7 @@ class WorkflowsMixin:
             SELECT {_STEP_COLUMNS}
             FROM workflow_step_runs
             WHERE run_id = %s
-              AND status IN (%s, %s)
+              AND status IN (%s, %s, %s)
               {dir_sql}
             FOR UPDATE
             """,
@@ -1304,7 +1305,7 @@ class WorkflowsMixin:
             FROM workflow_step_runs
             WHERE run_id = %s
               AND direction = 'forward'
-              AND status IN (%s, %s)
+              AND status IN (%s, %s, %s)
               AND id <> %s
             FOR UPDATE
             """,
@@ -1312,6 +1313,7 @@ class WorkflowsMixin:
                 run["id"],
                 WorkflowStepStatus.PENDING.value,
                 WorkflowStepStatus.RUNNING.value,
+                WorkflowStepStatus.AWAITING_SIGNAL.value,
                 failed_step_id,
             ),
         ).fetchall()
@@ -1390,7 +1392,20 @@ class WorkflowsMixin:
             """,
             (run_id,),
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        waiting = conn.execute(
+            """
+            SELECT 1
+            FROM workflow_step_runs
+            WHERE run_id = %s
+              AND direction = 'forward'
+              AND status = %s
+            LIMIT 1
+            """,
+            (run_id, WorkflowStepStatus.AWAITING_SIGNAL.value),
+        ).fetchone()
+        return waiting is not None
 
     def _try_start_compensate_if_settled(
         self,
@@ -1984,6 +1999,21 @@ class WorkflowsMixin:
         assert step_row is not None
         if step_row["job_id"] is not None:
             return step_row
+        if (
+            direction == WorkflowStepDirection.FORWARD.value
+            and str(sdef.get("kind") or "") == "wait_signal"
+        ):
+            return self._park_or_complete_wait_signal(
+                conn,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                step_row=step_row,
+                steps_def=steps_def,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
         return self._enqueue_job_for_step(
             conn,
             run_id=run_id,
@@ -2467,6 +2497,25 @@ class WorkflowsMixin:
             "payload": dict(payload),
             "depends_on_indices": [],
         }
+        if kind == "wait_signal":
+            from job_queue.queue.workflows_signals import normalize_signal_name
+
+            out["signal"] = normalize_signal_name(
+                raw.get("signal") or raw.get("signal_name"),
+                label=f"{label}.signal",
+            )
+            if raw.get("timeout_seconds") is not None:
+                try:
+                    timeout = float(raw["timeout_seconds"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{label}.timeout_seconds must be a number"
+                    ) from exc
+                if timeout < 0:
+                    raise ValueError(f"{label}.timeout_seconds must be >= 0")
+                out["timeout_seconds"] = timeout
+            if raw.get("deadline_at") is not None:
+                out["deadline_at"] = raw["deadline_at"]
         if raw.get("fail"):
             out["fail"] = True
             if raw.get("fail_error") is not None:
@@ -2475,8 +2524,11 @@ class WorkflowsMixin:
         if comp is not None:
             if not isinstance(comp, dict):
                 raise ValueError(f"{label}.compensate must be an object")
+            ckind = str(comp.get("kind") or "effect").strip()
+            if ckind == "wait_signal":
+                raise ValueError(f"{label}.compensate cannot wait for a signal")
             out["compensate"] = {
-                "kind": str(comp.get("kind") or "effect").strip(),
+                "kind": ckind,
                 "payload": dict(comp.get("payload") or {}),
             }
         # Preserve explicit name-based depends_on for post-pass resolution.
@@ -2552,4 +2604,5 @@ class WorkflowsMixin:
             completed_at=row.get("completed_at"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            deadline_at=row.get("deadline_at"),
         )

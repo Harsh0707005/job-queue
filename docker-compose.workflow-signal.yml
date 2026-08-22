@@ -1,0 +1,47 @@
+# Named wait_signal steps on the multi-worker workflow fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.workflow-signal.yml down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.workflow-signal.yml up --build \
+#     --abort-on-container-exit --exit-code-from workflow-soak workflow-soak
+
+services:
+  worker-1:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-2:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-3:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-4:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-5:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-6:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-7:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-8:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+
+  workflow-soak:
+    command: ["python", "scripts/workflow_signal_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      TENANTS: "4"
+      EARLY_PER_TENANT: "3"
+      LATE_PER_TENANT: "3"
+      DEADLINE_PER_TENANT: "2"
+      ISO_PAIRS: "4"
+      SIGNAL_TIMEOUT_SECONDS: "4"
+      MAX_WALL_SECONDS: "240"
+      LOG_LEVEL: INFO
