@@ -245,6 +245,8 @@ def test_join_catch_up_one_consumes_extra_generations(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.update_schedule(join.id, tenant_id="t1", misfire_policy="catch_up_one")
     _seed_generations(queue, up.id, "t1", 3)
+    _seed_generations(queue, w1.id, "t1", 3)
+    _seed_generations(queue, w2.id, "t1", 3)
     with queue._pool.connection() as conn:
         conn.execute(
             """
@@ -269,6 +271,8 @@ def test_join_catch_up_drains_one_generation(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.update_schedule(join.id, tenant_id="t1", misfire_policy="catch_up")
     _seed_generations(queue, up.id, "t1", 3)
+    _seed_generations(queue, w1.id, "t1", 3)
+    _seed_generations(queue, w2.id, "t1", 3)
     with queue._pool.connection() as conn:
         conn.execute(
             """
@@ -295,6 +299,8 @@ def test_join_catch_up_respects_max(queue: JobQueue):
         join.id, tenant_id="t1", misfire_policy="catch_up", catch_up_max=2
     )
     _seed_generations(queue, up.id, "t1", 10)
+    _seed_generations(queue, w1.id, "t1", 10)
+    _seed_generations(queue, w2.id, "t1", 10)
     with queue._pool.connection() as conn:
         conn.execute(
             """

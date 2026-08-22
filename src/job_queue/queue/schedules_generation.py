@@ -274,6 +274,59 @@ class SchedulesGenerationMixin:
             common = ids if common is None else (common & ids)
         return list(common or [])
 
+    def _generation_source_ids(
+        self,
+        conn: Any,
+        sched_row: Any,
+    ) -> list[UUID] | None:
+        """Ids whose closed generation this tick must attach.
+
+        Waiters attach the upstream tick. A join attaches every waiter
+        in ``joins_on`` for the same iteration. Missing same-tenant
+        waiters fail closed (``None``) so a moved/deleted member cannot
+        produce a partial join.
+        """
+        joins = list(sched_row.get("joins_on") or [])
+        if joins:
+            tenant_id = str(sched_row["tenant_id"])
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM schedules
+                WHERE tenant_id = %s AND id = ANY(%s)
+                """,
+                (tenant_id, list(joins)),
+            ).fetchall()
+            if len(rows) != len(joins):
+                return None
+            return sorted((r["id"] for r in rows), key=str)
+        waits = list(sched_row.get("waits_on") or [])
+        if waits:
+            return list(waits)
+        return []
+
+    def _collect_schedule_generations(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        schedule_ids: list[UUID],
+        iteration: int,
+    ) -> list[dict[str, Any]] | None:
+        """All completed same-tenant gens, or None if any member is missing."""
+        collected: list[dict[str, Any]] = []
+        for uid in schedule_ids:
+            opened = self._open_schedule_generation(
+                conn,
+                tenant_id=tenant_id,
+                schedule_id=uid,
+                iteration=iteration,
+            )
+            if opened is None:
+                return None
+            collected.append(opened)
+        return collected
+
     def _schedule_generation_blocked(
         self,
         conn: Any,
@@ -283,29 +336,28 @@ class SchedulesGenerationMixin:
     ) -> bool:
         """True when a waiter/join cannot attach a same-tenant closed payload.
 
-        A waiter or join with upstreams must open a completed generation for
-        this iteration. If the upstream has never run, is not due, or that
-        generation failed / cancelled / cannot be decrypted on this tenant,
-        the tick stays blocked. Independent fire without a payload is not
-        allowed.
+        Waiters need the upstream generation. A join needs every waiter's
+        generation for this iteration. If any waiter failed, was cancelled,
+        is on another tenant, or cannot be decrypted, the join stays
+        blocked with no partial payload.
         """
-        ups = self._upstream_ids_for_generation(conn, sched_row)
-        if ups is None:
+        ids = self._generation_source_ids(conn, sched_row)
+        if ids is None:
             return True
-        if not ups:
+        if not ids:
             return False
         if iteration < 1:
             return True
         tenant_id = str(sched_row["tenant_id"])
-        for uid in ups:
-            if self._open_schedule_generation(
+        return (
+            self._collect_schedule_generations(
                 conn,
                 tenant_id=tenant_id,
-                schedule_id=uid,
+                schedule_ids=ids,
                 iteration=iteration,
-            ) is None:
-                return True
-        return False
+            )
+            is None
+        )
 
     def _attach_generation_payload(
         self,
@@ -315,25 +367,35 @@ class SchedulesGenerationMixin:
         *,
         iteration: int,
     ) -> dict[str, Any]:
-        ups = self._upstream_ids_for_generation(conn, sched_row)
-        if not ups:
+        ids = self._generation_source_ids(conn, sched_row)
+        if not ids:
             return payload
         tenant_id = str(sched_row["tenant_id"])
-        attached: list[dict[str, Any]] = []
-        for uid in ups:
-            opened = self._open_schedule_generation(
-                conn,
-                tenant_id=tenant_id,
-                schedule_id=uid,
-                iteration=iteration,
-            )
-            if opened is None:
-                continue
-            attached.append(opened)
-        if not attached:
+        collected = self._collect_schedule_generations(
+            conn,
+            tenant_id=tenant_id,
+            schedule_ids=ids,
+            iteration=iteration,
+        )
+        if collected is None:
             return payload
         out = dict(payload)
-        out["upstream"] = attached[0] if len(attached) == 1 else attached
+        if list(sched_row.get("joins_on") or []):
+            out["waiters"] = collected
+            ups = self._upstream_ids_for_generation(conn, sched_row)
+            if ups:
+                upstream = self._collect_schedule_generations(
+                    conn,
+                    tenant_id=tenant_id,
+                    schedule_ids=list(ups),
+                    iteration=iteration,
+                )
+                if upstream is not None:
+                    out["upstream"] = (
+                        upstream[0] if len(upstream) == 1 else upstream
+                    )
+        else:
+            out["upstream"] = collected[0] if len(collected) == 1 else collected
         return out
 
     def _reseal_schedule_generations(

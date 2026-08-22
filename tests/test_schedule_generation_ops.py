@@ -175,6 +175,10 @@ def test_replay_generation_rebrings_closed_set(queue: JobQueue):
     later = queue.process_due_schedules(tenant_id="t1")
     assert [f.schedule.id for f in later] == [join.id]
     assert later[0].job.tick_iteration == 1
+    waiters_payload = later[0].job.payload.get("waiters") or []
+    assert len(waiters_payload) == 2
+    assert sorted((w.get("result") or {})["w"] for w in waiters_payload) == [1, 2]
+    assert all(w.get("iteration") == 1 for w in waiters_payload)
     assert (later[0].job.payload.get("upstream") or {}).get("result") == {
         "secret": "new"
     }
