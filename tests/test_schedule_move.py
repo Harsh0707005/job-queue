@@ -10,6 +10,8 @@ from uuid import uuid4
 import pytest
 
 from job_queue import JobQueue, JobStatus, ScheduleError
+from job_queue.crypto import schedule_generation_aad
+from job_queue.models import WorkflowRunStatus, WorkflowStepStatus
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.queue._common import _utcnow
 from job_queue.remote import CoordinatorClient
@@ -355,3 +357,144 @@ def test_move_http_roundtrip(queue: JobQueue):
             )
     finally:
         server.shutdown()
+
+
+def _wf_wait_steps():
+    return {
+        "name": "tick-wf",
+        "steps": [
+            {
+                "name": "reserve",
+                "payload": {"op": "reserve"},
+                "compensate": {"payload": {"op": "release"}},
+            },
+            {
+                "name": "gate",
+                "kind": "wait_signal",
+                "signal": "go",
+                "timeout_seconds": 60,
+            },
+            {"name": "ship", "payload": {"op": "ship"}},
+        ],
+    }
+
+
+def test_move_live_workflow_tick_run_steps_signals_and_gens(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"kind": "wf"},
+        workflow=_wf_wait_steps(),
+        name="live-wf",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(sched.id, tenant_id="src")
+    assert fire.workflow_run_id is not None
+    rid = fire.workflow_run_id
+    queue.send_workflow_signal(rid, tenant_id="src", name="early", payload={"n": 1})
+    leased = queue.lease(tenant_id="src", worker_id="w1")
+    assert leased is not None
+    assert leased.payload.get("step_name") == "reserve"
+    assert leased.schedule_id == sched.id
+
+    moved = queue.move_schedule(sched.id, tenant_id="src", to_tenant_id="dst")
+    assert moved.tenant_id == "dst"
+    assert queue.get_schedule(sched.id, tenant_id="src") is None
+    assert queue.get_workflow(rid, tenant_id="src") is None
+    run = queue.get_workflow(rid, tenant_id="dst")
+    assert run is not None
+    assert run.tenant_id == "dst"
+    assert run.schedule_id == sched.id
+    assert run.status == WorkflowRunStatus.RUNNING.value
+    steps = queue.list_workflow_steps(rid, tenant_id="dst")
+    assert [s.name for s in steps if s.direction == "forward"] == ["reserve"]
+    assert queue.get(leased.id, tenant_id="src") is None
+    held = queue.get(leased.id, tenant_id="dst")
+    assert held is not None and held.status == JobStatus.LEASED
+    assert held.lease_tenant_id == "src"
+    sigs = queue.list_workflow_signals(rid, tenant_id="dst")
+    assert [s.name for s in sigs] == ["early"]
+    assert sigs[0].payload == {"n": 1}
+
+    acked = queue.ack(
+        leased.id,
+        tenant_id="src",
+        worker_id="w1",
+        lease_token=leased.lease_token,
+        result={"ok": "reserve"},
+    )
+    assert acked.tenant_id == "dst"
+    parked = queue.list_workflow_steps(rid, tenant_id="dst")
+    gate = next(s for s in parked if s.name == "gate")
+    assert gate.status == WorkflowStepStatus.AWAITING_SIGNAL.value
+    with pytest.raises(ValueError, match="not found"):
+        queue.send_workflow_signal(rid, tenant_id="src", name="go")
+    out = queue.send_workflow_signal(
+        rid, tenant_id="dst", name="go", payload={"who": "dst"}
+    )
+    assert out["created"] is True
+    ship = queue.lease(tenant_id="dst", worker_id="w2")
+    assert ship is not None
+    assert ship.payload.get("step_name") == "ship"
+    assert ship.tenant_id == "dst"
+    assert ship.schedule_id == sched.id
+    _ack(queue, ship, "w2", result={"ok": "ship"})
+    done = queue.get_workflow(rid, tenant_id="dst")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+    got = queue.get_schedule(sched.id, tenant_id="dst")
+    assert got is not None
+    assert got.last_completed_iteration == 1
+
+    with queue._pool.connection() as conn:
+        gen = conn.execute(
+            """
+            SELECT tenant_id, status, payload
+            FROM schedule_generations
+            WHERE schedule_id = %s AND iteration = 1
+            """,
+            (sched.id,),
+        ).fetchone()
+        assert gen is not None
+        assert gen["tenant_id"] == "dst"
+        assert gen["status"] == "completed"
+        opened = queue._open_dict(
+            gen["payload"],
+            tenant_id="dst",
+            aad=schedule_generation_aad(sched.id, 1, tenant_id="dst"),
+            conn=conn,
+        )
+        assert opened.get("iteration") == 1
+        assert (
+            queue._open_schedule_generation(
+                conn, tenant_id="src", schedule_id=sched.id, iteration=1
+            )
+            is None
+        )
+
+
+def test_move_live_workflow_refuses_when_source_waiter_needs_pending_gen(
+    queue: JobQueue,
+):
+    up = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_wf_wait_steps(),
+        name="up-wf",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    waiter = queue.create_schedule(
+        tenant_id="src",
+        interval_seconds=3600,
+        payload={"n": 2},
+        name="w-wf",
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    queue.fire_schedule(up.id, tenant_id="src")
+    with pytest.raises(ScheduleError, match="fan-out generation is still live"):
+        queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
+    assert queue.get_schedule(up.id, tenant_id="src") is not None
+    assert queue.get_schedule(waiter.id, tenant_id="src") is not None
+    _ = waiter

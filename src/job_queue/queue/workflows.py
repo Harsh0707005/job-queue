@@ -28,6 +28,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     CancelError,
     QueueDrainError,
+    ScheduleError,
     _JOB_COLUMNS,
     _SCHEDULE_COLUMNS,
     _as_utc,
@@ -2606,3 +2607,151 @@ class WorkflowsMixin:
             updated_at=row["updated_at"],
             deadline_at=row.get("deadline_at"),
         )
+
+    def _workflow_run_ids_for_schedule(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        schedule_id: UUID,
+    ) -> list[UUID]:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM workflow_runs
+            WHERE schedule_id = %s AND tenant_id = %s
+            ORDER BY created_at ASC, id ASC
+            """,
+            (schedule_id, tenant_id),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def _workflow_step_job_ids(
+        self, conn: Any, *, run_ids: list[UUID]
+    ) -> list[UUID]:
+        if not run_ids:
+            return []
+        rows = conn.execute(
+            """
+            SELECT job_id
+            FROM workflow_step_runs
+            WHERE run_id = ANY(%s) AND job_id IS NOT NULL
+            ORDER BY job_id
+            """,
+            (run_ids,),
+        ).fetchall()
+        return [r["job_id"] for r in rows]
+
+    def _move_workflow_runs_for_schedule(
+        self,
+        conn: Any,
+        *,
+        schedule_id: UUID,
+        from_tenant: str,
+        to_tenant: str,
+        now: Any,
+    ) -> int:
+        """Move this schedule's runs, steps, and signals onto *to_tenant*.
+
+        ``steps_def`` and signal payloads are resealed under dest so dest
+        can decrypt after the source DEK rows stay behind.
+        """
+        runs = conn.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM workflow_runs
+            WHERE schedule_id = %s AND tenant_id = %s
+            ORDER BY created_at ASC, id ASC
+            FOR UPDATE
+            """,
+            (schedule_id, from_tenant),
+        ).fetchall()
+        if not runs:
+            return 0
+        run_ids = [r["id"] for r in runs]
+        for run in runs:
+            steps = self._parse_steps_def(run, conn)
+            sealed, kid = self._seal_dict(
+                conn,
+                tenant_id=to_tenant,
+                plaintext={"steps": steps},
+                aad=workflow_steps_aad(run["id"]),
+            )
+            updated = conn.execute(
+                f"""
+                UPDATE workflow_runs
+                SET tenant_id = %s,
+                    steps_def = %s,
+                    payload_key_id = %s,
+                    updated_at = %s
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id
+                """,
+                (to_tenant, Jsonb(sealed), kid, now, run["id"], from_tenant),
+            ).fetchone()
+            if updated is None:
+                raise ScheduleError(
+                    f"schedule {schedule_id} cannot move: workflow run "
+                    f"{run['id']} raced"
+                )
+        conn.execute(
+            """
+            UPDATE workflow_step_runs
+            SET tenant_id = %s,
+                updated_at = %s
+            WHERE run_id = ANY(%s) AND tenant_id = %s
+            """,
+            (to_tenant, now, run_ids, from_tenant),
+        )
+        if hasattr(self, "_seal_signal_payload"):
+            sigs = conn.execute(
+                """
+                SELECT id, run_id, tenant_id, name, payload
+                FROM workflow_signals
+                WHERE run_id = ANY(%s) AND tenant_id = %s
+                FOR UPDATE
+                """,
+                (run_ids, from_tenant),
+            ).fetchall()
+            for sig in sigs:
+                opened = self._open_signal_payload(
+                    sig.get("payload"),
+                    tenant_id=from_tenant,
+                    run_id=sig["run_id"],
+                    name=str(sig["name"]),
+                    conn=conn,
+                )
+                sealed, kid = self._seal_signal_payload(
+                    conn,
+                    tenant_id=to_tenant,
+                    run_id=sig["run_id"],
+                    name=str(sig["name"]),
+                    payload=opened,
+                )
+                conn.execute(
+                    """
+                    UPDATE workflow_signals
+                    SET tenant_id = %s,
+                        payload = %s,
+                        payload_key_id = %s
+                    WHERE id = %s AND tenant_id = %s
+                    """,
+                    (
+                        to_tenant,
+                        None if sealed is None else Jsonb(sealed),
+                        kid,
+                        sig["id"],
+                        from_tenant,
+                    ),
+                )
+        else:
+            conn.execute(
+                """
+                UPDATE workflow_signals
+                SET tenant_id = %s
+                WHERE run_id = ANY(%s) AND tenant_id = %s
+                """,
+                (to_tenant, run_ids, from_tenant),
+            )
+        return len(runs)
+

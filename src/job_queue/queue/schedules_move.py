@@ -29,9 +29,11 @@ class SchedulesMoveMixin:
     ) -> Schedule:
         """Transfer a live schedule to *to_tenant_id* in place.
 
-        Same schedule id. The in-flight tick (one job or a whole DAG, plus
-        spawn children of those jobs) moves with it. Payloads and results
-        are re-sealed under the destination tenant so dest can decrypt.
+        Same schedule id. The in-flight tick (one job, a whole DAG, or a
+        multi-step workflow run plus its steps and signals, plus spawn
+        children of those jobs) moves with it. Payloads, results, and
+        sealed generation / workflow envelopes are re-sealed under the
+        destination tenant so dest can decrypt.
         ``mutex_group`` stays on the row: exclusivity is ``(tenant, group)``.
 
         Fail-closed if any *other* source job depends on the tick (another
@@ -135,6 +137,63 @@ class SchedulesMoveMixin:
             job_ids = self._schedule_owned_job_ids(
                 conn, tenant_id=tenant_id, schedule_id=schedule_id
             )
+            run_ids: list[UUID] = []
+            for _ in range(8):
+                if hasattr(self, "_workflow_run_ids_for_schedule"):
+                    run_ids = self._workflow_run_ids_for_schedule(
+                        conn, tenant_id=tenant_id, schedule_id=schedule_id
+                    )
+                extra: list[UUID] = []
+                if run_ids and hasattr(self, "_workflow_step_job_ids"):
+                    extra = [
+                        jid
+                        for jid in self._workflow_step_job_ids(
+                            conn, run_ids=run_ids
+                        )
+                        if jid not in set(job_ids)
+                    ]
+                if extra:
+                    foreign = conn.execute(
+                        """
+                        SELECT id, schedule_id
+                        FROM jobs
+                        WHERE id = ANY(%s)
+                          AND schedule_id IS NOT NULL
+                          AND schedule_id <> %s
+                        LIMIT 1
+                        """,
+                        (extra, schedule_id),
+                    ).fetchone()
+                    if foreign is not None:
+                        raise ScheduleError(
+                            f"schedule {schedule_id} cannot move: job "
+                            f"{foreign['id']} belongs to a workflow for "
+                            f"schedule {foreign['schedule_id']}"
+                        )
+                combined = sorted(set(job_ids) | set(extra))
+                live = [
+                    r["id"]
+                    for r in conn.execute(
+                        """
+                        SELECT id
+                        FROM jobs
+                        WHERE tenant_id = %s AND schedule_id = %s
+                        ORDER BY id
+                        """,
+                        (tenant_id, schedule_id),
+                    ).fetchall()
+                ]
+                if set(live) <= set(combined):
+                    job_ids = combined
+                    break
+                job_ids = self._schedule_owned_job_ids(
+                    conn, tenant_id=tenant_id, schedule_id=schedule_id
+                )
+            else:
+                raise ScheduleError(
+                    f"schedule {schedule_id} cannot move: tick graph "
+                    "kept changing"
+                )
             jobs = []
             if job_ids:
                 jobs = conn.execute(
@@ -152,20 +211,6 @@ class SchedulesMoveMixin:
                     raise ScheduleError(
                         f"schedule {schedule_id} cannot move: graph changed "
                         "during lock"
-                    )
-                wf = conn.execute(
-                    """
-                    SELECT job_id
-                    FROM workflow_step_runs
-                    WHERE job_id = ANY(%s)
-                    LIMIT 1
-                    """,
-                    (job_ids,),
-                ).fetchone()
-                if wf is not None:
-                    raise ScheduleError(
-                        f"schedule {schedule_id} cannot move: job "
-                        f"{wf['job_id']} belongs to a workflow"
                     )
                 pending_extra = sum(
                     1
@@ -341,6 +386,14 @@ class SchedulesMoveMixin:
                 """,
                 (dest, now, schedule_id, tenant_id),
             )
+            if hasattr(self, "_move_workflow_runs_for_schedule"):
+                self._move_workflow_runs_for_schedule(
+                    conn,
+                    schedule_id=schedule_id,
+                    from_tenant=tenant_id,
+                    to_tenant=dest,
+                    now=now,
+                )
             if hasattr(self, "_reseal_schedule_generations"):
                 self._reseal_schedule_generations(
                     conn,
