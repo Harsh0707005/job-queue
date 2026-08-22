@@ -7,6 +7,7 @@ from job_queue.queue.schedules_process import SchedulesProcessMixin
 from job_queue.queue.schedules_blackout import SchedulesBlackoutMixin
 from job_queue.queue.schedules_fire import SchedulesFireMixin
 from job_queue.queue.schedules_move import SchedulesMoveMixin
+from job_queue.queue.schedules_generation import SchedulesGenerationMixin
 
 
 class SchedulesMixin(
@@ -15,6 +16,7 @@ class SchedulesMixin(
     SchedulesBlackoutMixin,
     SchedulesFireMixin,
     SchedulesMoveMixin,
+    SchedulesGenerationMixin,
 ):
     """Aggregated SchedulesMixin (split for maintainability)."""
 

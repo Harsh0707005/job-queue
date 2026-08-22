@@ -15,6 +15,7 @@ from job_queue.crypto import (
     job_aad,
     result_aad,
     schedule_aad,
+    schedule_generation_aad,
     workflow_steps_aad,
 )
 from job_queue.db import transaction
@@ -684,6 +685,64 @@ class TenantsRestoreMixin:
                     if raw.get("catch_up_remaining") is None
                     else int(raw["catch_up_remaining"])
                 ),
+            ),
+        )
+
+    def _restore_schedule_generations(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        old_sid = _parse_uuid(raw.get("schedule_id"))
+        new_sid = self._mapped(id_map, "schedules", old_sid) if old_sid else None
+        if new_sid is None:
+            return
+        iteration = int(raw.get("iteration") or 0)
+        status = str(raw.get("status") or "failed")
+        sealed = None
+        kid = None
+        if status == "completed" and raw.get("payload") is not None:
+            src = str(raw.get("tenant_id") or target)
+            opened = self._open_dict(
+                raw["payload"],
+                tenant_id=src,
+                aad=schedule_generation_aad(
+                    old_sid, iteration, tenant_id=src
+                ),
+                conn=conn,
+            )
+            sealed, kid = self._seal_dict(
+                conn,
+                tenant_id=target,
+                plaintext=opened if isinstance(opened, dict) else {},
+                aad=schedule_generation_aad(
+                    new_sid, iteration, tenant_id=target
+                ),
+            )
+        job_ids = [
+            mid
+            for mid in (
+                self._map_id(id_map, "jobs", jid)
+                for jid in (raw.get("source_job_ids") or [])
+            )
+            if mid is not None
+        ]
+        conn.execute(
+            """
+            INSERT INTO schedule_generations (
+                schedule_id, iteration, tenant_id, status, payload,
+                payload_key_id, source_job_ids, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (schedule_id, iteration) DO NOTHING
+            """,
+            (
+                new_sid,
+                iteration,
+                target,
+                status,
+                None if sealed is None else Jsonb(sealed),
+                kid,
+                job_ids,
+                _parse_dt(raw.get("created_at")) or _utcnow(),
+                _parse_dt(raw.get("updated_at")) or _utcnow(),
             ),
         )
 

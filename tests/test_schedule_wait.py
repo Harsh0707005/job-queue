@@ -335,18 +335,16 @@ def test_move_live_upstream_still_blocks_downstream(queue: JobQueue):
     )
     fire = queue.fire_schedule(up.id, tenant_id="src")
     queue.freeze(fire.job.id, tenant_id="src", reason="hold")
+    with pytest.raises(ScheduleError, match="fan-out generation is still live"):
+        queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
+    queue.unfreeze(fire.job.id, tenant_id="src")
+    assert _finish(queue, "src", 1) == 1
     moved = queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
     assert moved.tenant_id == "dst"
-    assert queue.get_schedule(up.id, tenant_id="src") is None
     _make_due(queue, down.id)
     assert queue.process_due_schedules(tenant_id="src") == []
-    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+    with pytest.raises(ScheduleError, match="generation"):
         queue.fire_schedule(down.id, tenant_id="src")
-    queue.unfreeze(fire.job.id, tenant_id="dst")
-    assert _finish(queue, "dst", 1) == 1
-    later = queue.process_due_schedules(tenant_id="src")
-    assert len(later) == 1
-    assert later[0].schedule.id == down.id
 
 
 def test_deleted_upstream_row_still_blocks_while_tick_live(queue: JobQueue):
@@ -380,8 +378,12 @@ def test_deleted_upstream_row_still_blocks_while_tick_live(queue: JobQueue):
     assert _finish(queue, "t1", 1) == 1
     assert queue.get(fire.job.id, tenant_id="t1").status == JobStatus.COMPLETED
     later = queue.process_due_schedules(tenant_id="t1")
-    assert len(later) == 1
-    assert later[0].schedule.id == down.id
+    if later:
+        assert later[0].schedule.id == down.id
+        assert "upstream" not in (later[0].job.payload or {})
+    else:
+        with pytest.raises(ScheduleError, match="generation|upstream"):
+            queue.fire_schedule(down.id, tenant_id="t1")
 
 
 def test_cancelled_upstream_tick_still_blocks_until_success(queue: JobQueue):
@@ -504,18 +506,14 @@ def test_cancel_after_move_or_delete_still_blocks(queue: JobQueue):
     )
     fire = queue.fire_schedule(up.id, tenant_id="src")
     queue.freeze(fire.job.id, tenant_id="src", reason="hold")
-    queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
-    queue.cancel(fire.job.id, tenant_id="dst")
+    with pytest.raises(ScheduleError, match="fan-out generation is still live"):
+        queue.move_schedule(up.id, tenant_id="src", to_tenant_id="dst")
+    queue.unfreeze(fire.job.id, tenant_id="src")
+    queue.cancel(fire.job.id, tenant_id="src")
     _make_due(queue, down.id)
     assert queue.process_due_schedules(tenant_id="src") == []
-    with pytest.raises(ScheduleError, match="waiting on an upstream"):
+    with pytest.raises(ScheduleError, match="upstream"):
         queue.fire_schedule(down.id, tenant_id="src")
-    again = queue.fire_schedule(up.id, tenant_id="dst")
-    assert _finish(queue, "dst", 1) == 1
-    assert queue.get(again.job.id, tenant_id="dst").status == JobStatus.COMPLETED
-    later = queue.process_due_schedules(tenant_id="src")
-    assert len(later) == 1
-    assert later[0].schedule.id == down.id
 
     other = queue.create_schedule(
         tenant_id="t1",

@@ -232,6 +232,12 @@ class SchedulesProcessMixin:
                 ):
                     blocked = True
                     skip_metric = "schedule_join"
+                iteration = self._resolve_tick_iteration(conn, sched_row)
+                if not blocked and self._schedule_generation_blocked(
+                    conn, sched_row, iteration=iteration
+                ):
+                    blocked = True
+                    skip_metric = "schedule_generation"
                 if blocked:
                     self._record_metric(
                         conn,
@@ -380,7 +386,6 @@ class SchedulesProcessMixin:
                     # schedule materialization is system-timed work.
                     # Spend caps still apply — scheduled jobs are billed
                     # enqueues and must not bypass a tenant quota.
-                    iteration = self._resolve_tick_iteration(conn, sched_row)
                     stamp_iter = iteration
                     extra_skip = skipped + extra_join_skip
                     if join_ids and policy == MISFIRE_CATCH_UP:
@@ -399,6 +404,7 @@ class SchedulesProcessMixin:
                             scheduled_for=slots[0],
                             policy=policy,
                             skipped=extra_skip,
+                            iteration=iteration,
                         )
                     )
                 except UniqueViolation:

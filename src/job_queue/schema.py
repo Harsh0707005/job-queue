@@ -839,6 +839,29 @@ ALTER TABLE schedules ALTER COLUMN tick_iteration SET DEFAULT 0;
 ALTER TABLE schedules ALTER COLUMN tick_iteration SET NOT NULL;
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_completed_iteration BIGINT;
 
+-- Closed per-generation payload published when an upstream tick succeeds.
+-- Waiters and the join for that iteration attach it. Failed / cancelled
+-- ticks stay failed with no payload. tenant_id + AAD bind the ciphertext
+-- so a mid-generation move cannot leak another tenant's result.
+CREATE TABLE IF NOT EXISTS schedule_generations (
+    schedule_id     UUID NOT NULL,
+    iteration       BIGINT NOT NULL,
+    tenant_id       TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    payload         JSONB,
+    payload_key_id  UUID,
+    source_job_ids  UUID[] NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (schedule_id, iteration),
+    FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
+);
+ALTER TABLE schedule_generations DROP CONSTRAINT IF EXISTS schedule_generations_status_check;
+ALTER TABLE schedule_generations ADD CONSTRAINT schedule_generations_status_check
+    CHECK (status IN ('pending', 'completed', 'failed'));
+CREATE INDEX IF NOT EXISTS idx_schedule_generations_tenant
+    ON schedule_generations (tenant_id, schedule_id);
+
 ALTER TABLE job_dag_batches ADD COLUMN IF NOT EXISTS schedule_id UUID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_job_dag_batches_schedule_key

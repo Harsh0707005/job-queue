@@ -127,9 +127,16 @@ class SchedulesFireMixin:
                 raise ScheduleError(
                     f"schedule {schedule_id} is waiting on a join set"
                 )
+            iteration = self._resolve_tick_iteration(conn, sched_row)
+            if self._schedule_generation_blocked(
+                conn, sched_row, iteration=iteration
+            ):
+                raise ScheduleError(
+                    f"schedule {schedule_id} has no closed upstream "
+                    "generation payload"
+                )
 
             try:
-                iteration = self._resolve_tick_iteration(conn, sched_row)
                 first, jobs, refs, batch_id, batch_key = (
                     self._materialize_schedule_tick(
                         conn,
@@ -142,6 +149,7 @@ class SchedulesFireMixin:
                         skipped=0,
                         extra_detail={"fire": "manual"},
                         tick_kind="manual",
+                        iteration=iteration,
                     )
                 )
             except UniqueViolation as exc:
@@ -203,6 +211,7 @@ class SchedulesFireMixin:
         skipped: int,
         extra_detail: dict[str, Any] | None = None,
         tick_kind: str = "tick",
+        iteration: int | None = None,
     ) -> tuple[Job, tuple[Job, ...], tuple[str, ...], UUID | None, str | None]:
         """Enqueue one job or one whole DAG. Caller holds the schedule lock."""
         dag = _dag_jobs_from_row(sched_row.get("dag_jobs"))
@@ -215,8 +224,17 @@ class SchedulesFireMixin:
                 policy=policy,
                 skipped=skipped,
                 extra_detail=extra_detail,
+                iteration=iteration,
             )
             job = self._job(row)
+            if iteration and hasattr(self, "_begin_schedule_generation"):
+                self._begin_schedule_generation(
+                    conn,
+                    tenant_id=str(sched_row["tenant_id"]),
+                    schedule_id=sched_row["id"],
+                    iteration=int(iteration),
+                    job_ids=[job.id],
+                )
             return job, (job,), (), None, None
 
         default_payload = self._open_schedule_payload(
@@ -225,11 +243,19 @@ class SchedulesFireMixin:
             schedule_id=sched_row["id"],
             conn=conn,
         )
+        if iteration and hasattr(self, "_attach_generation_payload"):
+            default_payload = self._attach_generation_payload(
+                conn, sched_row, default_payload, iteration=int(iteration)
+            )
         jobs_spec: list[dict[str, Any]] = []
         for node in dag:
             payload = node.get("payload")
             if payload is None:
                 payload = dict(default_payload)
+            elif iteration and hasattr(self, "_attach_generation_payload"):
+                payload = self._attach_generation_payload(
+                    conn, sched_row, dict(payload), iteration=int(iteration)
+                )
             jobs_spec.append(
                 {
                     "ref": node["ref"],
@@ -287,6 +313,14 @@ class SchedulesFireMixin:
                 extra_audit=detail,
             )
         first = result.jobs[0]
+        if iteration and hasattr(self, "_begin_schedule_generation"):
+            self._begin_schedule_generation(
+                conn,
+                tenant_id=str(sched_row["tenant_id"]),
+                schedule_id=sched_row["id"],
+                iteration=int(iteration),
+                job_ids=[j.id for j in result.jobs],
+            )
         return first, result.jobs, result.refs, result.batch_id, result.batch_key
 
     def _insert_schedule_job(
@@ -299,6 +333,7 @@ class SchedulesFireMixin:
         policy: str,
         skipped: int,
         extra_detail: dict[str, Any] | None = None,
+        iteration: int | None = None,
     ) -> Any:
         """Insert one schedule-materialized job. Caller holds the schedule lock.
 
@@ -311,6 +346,10 @@ class SchedulesFireMixin:
             schedule_id=sched_row["id"],
             conn=conn,
         )
+        if iteration and hasattr(self, "_attach_generation_payload"):
+            payload = self._attach_generation_payload(
+                conn, sched_row, payload, iteration=int(iteration)
+            )
         with conn.transaction():
             if hasattr(self, "_consume_spend_enqueues"):
                 self._consume_spend_enqueues(

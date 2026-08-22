@@ -218,9 +218,33 @@ def test_joins_on_rejects_self_and_missing(queue: JobQueue):
     assert join.joins_on == (up.id,)
 
 
+def _seed_generations(queue: JobQueue, schedule_id, tenant_id: str, n: int) -> None:
+    with queue._pool.connection() as conn:
+        for i in range(1, n + 1):
+            conn.execute(
+                """
+                INSERT INTO schedule_generations (
+                    schedule_id, iteration, tenant_id, status, payload
+                ) VALUES (
+                    %s, %s, %s, 'completed',
+                    %s::jsonb
+                )
+                ON CONFLICT (schedule_id, iteration) DO NOTHING
+                """,
+                (
+                    schedule_id,
+                    i,
+                    tenant_id,
+                    f'{{"schedule_id": "{schedule_id}", "iteration": {i}, "result": {{"n": {i}}}}}',
+                ),
+            )
+        conn.commit()
+
+
 def test_join_catch_up_one_consumes_extra_generations(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.update_schedule(join.id, tenant_id="t1", misfire_policy="catch_up_one")
+    _seed_generations(queue, up.id, "t1", 3)
     with queue._pool.connection() as conn:
         conn.execute(
             """
@@ -244,6 +268,7 @@ def test_join_catch_up_one_consumes_extra_generations(queue: JobQueue):
 def test_join_catch_up_drains_one_generation(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.update_schedule(join.id, tenant_id="t1", misfire_policy="catch_up")
+    _seed_generations(queue, up.id, "t1", 3)
     with queue._pool.connection() as conn:
         conn.execute(
             """
@@ -269,6 +294,7 @@ def test_join_catch_up_respects_max(queue: JobQueue):
     queue.update_schedule(
         join.id, tenant_id="t1", misfire_policy="catch_up", catch_up_max=2
     )
+    _seed_generations(queue, up.id, "t1", 10)
     with queue._pool.connection() as conn:
         conn.execute(
             """

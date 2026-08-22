@@ -9,6 +9,9 @@ Dual coordinators + dual schedulers + four workers:
   * sj-skip   — join skip does not dump after waiters finish a long hold.
   * sj-cup    — join catch_up behind many waiter generations; at most
                 catch_up_max ticks, extras recorded as misses.
+  * sj-can    — cancel the upstream tick; that generation gives waiters
+                and the join nothing.
+  * sj-mv     — move of a live fan-out upstream is refused (no leak).
   * sj-live   — other tenant keeps completing.
 """
 
@@ -226,12 +229,14 @@ def assert_join_after_waiters(
 def main() -> int:
     logger.info("schedule join soak hold=%ds cron=every %ds", HOLD, CRON_EVERY)
     wait_coords()
-    hold_t, pause_t, mutex_t, skip_t, cup_t, live_t = (
+    hold_t, pause_t, mutex_t, skip_t, cup_t, can_t, mv_t, live_t = (
         "sj-hold",
         "sj-pause",
         "sj-mutex",
         "sj-skip",
         "sj-cup",
+        "sj-can",
+        "sj-mv",
         "sj-live",
     )
 
@@ -279,6 +284,14 @@ def main() -> int:
         cron_every=1,
         enabled=False,
     )
+    can_up = create_sched(can_t, name="up", ms=2500)
+    can_w1 = create_sched(can_t, name="w1", waits_on=[can_up])
+    can_w2 = create_sched(can_t, name="w2", waits_on=[can_up])
+    can_j = create_sched(can_t, name="join", joins_on=[can_w1, can_w2])
+    mv_up = create_sched(mv_t, name="up", ms=2500)
+    mv_w1 = create_sched(mv_t, name="w1", waits_on=[mv_up])
+    mv_w2 = create_sched(mv_t, name="w2", waits_on=[mv_up])
+    mv_j = create_sched(mv_t, name="join", joins_on=[mv_w1, mv_w2])
     create_sched(live_t, name="live")
 
     def wait_live(tid: str, sid: str) -> dict[str, Any]:
@@ -300,12 +313,32 @@ def main() -> int:
     freeze(skip_t, skip_job["id"], "skip waiter")
     peer_job = wait_live(mutex_t, mutex_peer)
     freeze(mutex_t, peer_job["id"], "mutex peer")
+    can_job = wait_live(can_t, can_up)
+    freeze(can_t, can_job["id"], "cancel up")
+    code, body = http_json(
+        "POST", f"/v1/jobs/{can_job['id']}/cancel", {"tenant_id": can_t}
+    )
+    if code != 200:
+        raise RuntimeError(f"cancel upstream {code} {body}")
+    pause(can_t, can_up)
+    mv_job = wait_live(mv_t, mv_up)
+    freeze(mv_t, mv_job["id"], "move up")
+    code, body = http_json(
+        "POST",
+        f"/v1/schedules/{mv_up}/move",
+        {"tenant_id": mv_t, "to_tenant_id": "sj-mv-dst"},
+    )
+    if code != 409:
+        raise RuntimeError(f"move live fan-out expected 409 got {code} {body}")
 
     for tid, sid in (
         (hold_t, hold_j),
         (pause_t, pause_j),
         (mutex_t, mutex_j),
         (skip_t, skip_j),
+        (can_t, can_w1),
+        (can_t, can_j),
+        (mv_t, mv_j),
     ):
         code, body = fire(tid, sid)
         if code != 409:
@@ -315,6 +348,10 @@ def main() -> int:
     pause_at = len(by_sched(list_jobs(pause_t), pause_j))
     mutex_at = len(by_sched(list_jobs(mutex_t), mutex_j))
     skip_at = len(by_sched(list_jobs(skip_t), skip_j))
+    can_w_at = len(by_sched(list_jobs(can_t), can_w1)) + len(
+        by_sched(list_jobs(can_t), can_w2)
+    )
+    can_j_at = len(by_sched(list_jobs(can_t), can_j))
 
     deadline = time.time() + HOLD
     last = 0.0
@@ -327,6 +364,22 @@ def main() -> int:
             raise RuntimeError("mutex join fired while a waiter was stuck")
         if len(by_sched(list_jobs(skip_t), skip_j)) != skip_at:
             raise RuntimeError("skip join fired while a waiter was frozen")
+        can_now = len(by_sched(list_jobs(can_t), can_w1)) + len(
+            by_sched(list_jobs(can_t), can_w2)
+        )
+        if can_now != can_w_at:
+            raise RuntimeError("cancelled generation produced waiter jobs")
+        if len(by_sched(list_jobs(can_t), can_j)) != can_j_at:
+            raise RuntimeError("cancelled generation produced a join job")
+        code, body = http_json(
+            "POST",
+            f"/v1/schedules/{mv_up}/move",
+            {"tenant_id": mv_t, "to_tenant_id": "sj-mv-dst"},
+        )
+        if code != 409:
+            raise RuntimeError(
+                f"move live fan-out during hold expected 409 got {code} {body}"
+            )
         now = time.time()
         if now - last >= 2:
             logger.info(

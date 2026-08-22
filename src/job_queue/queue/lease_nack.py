@@ -199,6 +199,8 @@ class LeaseNackMixin:
                 )
             # Terminal workflow step failure triggers reverse compensation.
             if new_status in (JobStatus.DEAD.value, JobStatus.FAILED.value):
+                if hasattr(self, "_fail_schedule_generation_for_job"):
+                    self._fail_schedule_generation_for_job(conn, updated)
                 if hasattr(self, "_on_workflow_step_terminal"):
                     self._on_workflow_step_terminal(
                         conn,

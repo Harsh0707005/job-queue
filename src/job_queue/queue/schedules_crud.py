@@ -1058,11 +1058,12 @@ class SchedulesCrudMixin:
             return inherited if inherited > 0 else current + 1
         return current + 1
 
-    @staticmethod
     def _maybe_advance_schedule_completed(
+        self,
         conn: Any,
         *,
         schedule_id: UUID | None,
+        tenant_id: str | None = None,
     ) -> None:
         """Record last_completed_iteration when a generation fully succeeds."""
         if schedule_id is None:
@@ -1115,6 +1116,10 @@ class SchedulesCrudMixin:
             """,
             (schedule_id,),
         )
+        if tenant_id and hasattr(self, "_complete_schedule_generation"):
+            self._complete_schedule_generation(
+                conn, schedule_id=schedule_id, tenant_id=tenant_id
+            )
 
     @staticmethod
     def _join_ready_watermark(
@@ -1160,9 +1165,10 @@ class SchedulesCrudMixin:
             SELECT id, tenant_id, enabled, last_completed_iteration,
                    mutex_group
             FROM schedules
-            WHERE id = ANY(%s)
+            WHERE tenant_id = %s
+              AND id = ANY(%s)
             """,
-            (ids,),
+            (tenant_id, ids),
         ).fetchall()
         if len(found) < len(ids):
             return True

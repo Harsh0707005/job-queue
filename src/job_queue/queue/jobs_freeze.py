@@ -328,6 +328,8 @@ class JobsFreezeMixin:
                     tenant_id=tenant_id,
                     now=now,
                 )
+            if hasattr(self, "_fail_schedule_generation_for_job"):
+                self._fail_schedule_generation_for_job(conn, updated)
             if hasattr(self, "_on_workflow_step_terminal"):
                 self._on_workflow_step_terminal(
                     conn, updated, success=False, error=err, now=now

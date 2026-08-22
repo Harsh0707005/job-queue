@@ -81,6 +81,37 @@ class SchedulesMoveMixin:
                 )
             if dest == tenant_id:
                 return self._schedule(row)
+            live_gen = conn.execute(
+                """
+                SELECT 1
+                FROM schedule_generations
+                WHERE schedule_id = %s
+                  AND tenant_id = %s
+                  AND status = 'pending'
+                LIMIT 1
+                """,
+                (schedule_id, tenant_id),
+            ).fetchone()
+            if live_gen is not None:
+                dep = conn.execute(
+                    """
+                    SELECT 1
+                    FROM schedules
+                    WHERE tenant_id = %s
+                      AND id <> %s
+                      AND (
+                        %s = ANY(waits_on)
+                        OR %s = ANY(joins_on)
+                      )
+                    LIMIT 1
+                    """,
+                    (tenant_id, schedule_id, schedule_id, schedule_id),
+                ).fetchone()
+                if dep is not None:
+                    raise ScheduleError(
+                        f"schedule {schedule_id} cannot move: a fan-out "
+                        "generation is still live on the source tenant"
+                    )
 
             qname = str(row["queue_name"])
             if hasattr(self, "_is_queue_draining") and self._is_queue_draining(
@@ -310,6 +341,13 @@ class SchedulesMoveMixin:
                 """,
                 (dest, now, schedule_id, tenant_id),
             )
+            if hasattr(self, "_reseal_schedule_generations"):
+                self._reseal_schedule_generations(
+                    conn,
+                    schedule_id=schedule_id,
+                    from_tenant=tenant_id,
+                    to_tenant=dest,
+                )
             return self._schedule(updated)
 
     def _schedule_owned_job_ids(

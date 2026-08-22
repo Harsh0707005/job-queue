@@ -36,6 +36,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "schedule_blackouts",
     "workflow_runs",
     "jobs",
+    "schedule_generations",
     "job_dag_batches",
     "workflow_step_runs",
     "job_side_effects",
@@ -85,6 +86,11 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "job_worker_affinity",
     ),
     "schedules": (_SCHEDULE_COLUMNS.strip().replace("\n", " "), "schedules"),
+    "schedule_generations": (
+        "schedule_id, iteration, tenant_id, status, payload, payload_key_id, "
+        "source_job_ids, created_at, updated_at",
+        "schedule_generations",
+    ),
     "schedule_blackouts": (
         "id, tenant_id, schedule_id, kind, starts_at, ends_at, "
         "daily_start, daily_end, timezone, reason, created_at, updated_at",

@@ -160,6 +160,8 @@ class JobsCancelOneMixin:
                     tenant_id=tenant_id,
                     now=now,
                 )
+            if hasattr(self, "_fail_schedule_generation_for_job"):
+                self._fail_schedule_generation_for_job(conn, updated)
             self._maybe_finalize_offboard(conn, tenant_id=tenant_id, now=now)
             return self._job(updated)
 

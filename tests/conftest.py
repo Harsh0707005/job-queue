@@ -80,7 +80,7 @@ def queue(postgres_url: str):
         conn.execute("TRUNCATE job_audit_events")
         conn.execute("TRUNCATE tenant_settings")
         conn.execute("TRUNCATE tenant_fairness")
-        conn.execute("TRUNCATE schedule_blackouts, schedules")
+        conn.execute("TRUNCATE schedule_generations, schedule_blackouts, schedules")
         conn.execute("TRUNCATE webhook_deliveries")
         conn.execute("TRUNCATE webhook_endpoints CASCADE")
         conn.execute("TRUNCATE queue_metric_buckets")

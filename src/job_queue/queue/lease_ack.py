@@ -138,7 +138,9 @@ class LeaseAckMixin:
                         )
                 if hasattr(self, "_maybe_advance_schedule_completed"):
                     self._maybe_advance_schedule_completed(
-                        conn, schedule_id=updated.get("schedule_id")
+                        conn,
+                        schedule_id=updated.get("schedule_id"),
+                        tenant_id=str(updated["tenant_id"]),
                     )
                 self._enqueue_job_webhooks(
                     conn, job=job, event=WebhookEvent.JOB_COMPLETED, now=now

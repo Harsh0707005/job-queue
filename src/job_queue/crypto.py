@@ -122,6 +122,17 @@ def result_aad(job_id: UUID | str) -> bytes:
     return f"job-queue:v1:job-result:{job_id}".encode()
 
 
+def schedule_generation_aad(
+    schedule_id: UUID | str,
+    iteration: int,
+    *,
+    tenant_id: str,
+) -> bytes:
+    return (
+        f"job-queue:v1:schedule-gen:{tenant_id}:{schedule_id}:{int(iteration)}"
+    ).encode()
+
+
 def dek_aad(*, tenant_id: str, key_id: UUID | str) -> bytes:
     # Bind wrap to key_id only. tenant_id is intentionally omitted so
     # merge_tenant can move key rows without re-wrapping (live, no stop).
