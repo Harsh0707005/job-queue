@@ -136,6 +136,16 @@ class LeaseAckMixin:
                             worker_id=worker_id,
                             now=now,
                         )
+                # Advance the saga before sealing the schedule generation so
+                # the next step exists (or the run is terminal) first.
+                if hasattr(self, "_on_workflow_step_terminal"):
+                    self._on_workflow_step_terminal(
+                        conn,
+                        updated,
+                        success=True,
+                        result=result,
+                        now=now,
+                    )
                 if hasattr(self, "_maybe_advance_schedule_completed"):
                     self._maybe_advance_schedule_completed(
                         conn,
@@ -151,15 +161,6 @@ class LeaseAckMixin:
                         conn,
                         parent_id=updated["parent_job_id"],
                         tenant_id=updated["tenant_id"],
-                        now=now,
-                    )
-                # Advance multi-step saga when a workflow step job completes.
-                if hasattr(self, "_on_workflow_step_terminal"):
-                    self._on_workflow_step_terminal(
-                        conn,
-                        updated,
-                        success=True,
-                        result=result,
                         now=now,
                     )
                 self._maybe_finalize_offboard(conn, tenant_id=job.tenant_id, now=now)

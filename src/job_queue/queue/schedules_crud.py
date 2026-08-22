@@ -597,7 +597,9 @@ class SchedulesCrudMixin:
                     """,
                     (schedule_id, list(_SCHEDULE_INFLIGHT_STATUSES)),
                 ).fetchone()
-                if active is None:
+                if active is None and not self._schedule_workflow_tick_open(
+                    conn, [schedule_id]
+                ):
                     conn.execute(
                         """
                         DELETE FROM schedules
@@ -607,9 +609,14 @@ class SchedulesCrudMixin:
                     )
                     return True
                 if not wait:
+                    detail = (
+                        f"job {active['id']} is {active['status']}"
+                        if active is not None
+                        else "a workflow run is still live"
+                    )
                     raise ScheduleError(
                         f"schedule {schedule_id} has in-flight work "
-                        f"(job {active['id']} is {active['status']}); "
+                        f"({detail}); "
                         "delete is refused until the tick finishes"
                     )
                 if bool(row["enabled"]):
@@ -1137,6 +1144,8 @@ class SchedulesCrudMixin:
         ).fetchone()
         if live is not None:
             return
+        if self._schedule_workflow_tick_open(conn, [schedule_id]):
+            return
         failed_row = conn.execute(
             """
             SELECT 1
@@ -1301,6 +1310,12 @@ class SchedulesCrudMixin:
             )
             OR EXISTS (
                 SELECT 1
+                FROM workflow_runs wr
+                WHERE wr.schedule_id = ANY(%s)
+                  AND wr.status IN ('running', 'compensating')
+            )
+            OR EXISTS (
+                SELECT 1
                 FROM (
                     SELECT j.schedule_id,
                            MAX(j.created_at) FILTER (
@@ -1350,6 +1365,7 @@ class SchedulesCrudMixin:
             (
                 ids,
                 inflight,
+                ids,
                 JobStatus.COMPLETED.value,
                 failed,
                 ids,
@@ -1358,6 +1374,27 @@ class SchedulesCrudMixin:
                 at,
                 inflight,
             ),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _schedule_workflow_tick_open(
+        conn: Any,
+        schedule_ids: Sequence[UUID],
+    ) -> bool:
+        """True while a schedule-tied workflow run is still running."""
+        ids = list(schedule_ids or [])
+        if not ids:
+            return False
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM workflow_runs
+            WHERE schedule_id = ANY(%s)
+              AND status IN ('running', 'compensating')
+            LIMIT 1
+            """,
+            (ids,),
         ).fetchone()
         return row is not None
 
@@ -1373,16 +1410,34 @@ class SchedulesCrudMixin:
             return False
         row = conn.execute(
             """
-            SELECT j.id
-            FROM jobs j
-            JOIN schedules s ON s.id = j.schedule_id
-            WHERE s.tenant_id = %s
-              AND j.tenant_id = s.tenant_id
-              AND s.mutex_group = %s
-              AND j.status = ANY(%s)
+            SELECT 1
+            WHERE EXISTS (
+                SELECT j.id
+                FROM jobs j
+                JOIN schedules s ON s.id = j.schedule_id
+                WHERE s.tenant_id = %s
+                  AND j.tenant_id = s.tenant_id
+                  AND s.mutex_group = %s
+                  AND j.status = ANY(%s)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM workflow_runs wr
+                JOIN schedules s ON s.id = wr.schedule_id
+                WHERE s.tenant_id = %s
+                  AND wr.tenant_id = s.tenant_id
+                  AND s.mutex_group = %s
+                  AND wr.status IN ('running', 'compensating')
+            )
             LIMIT 1
             """,
-            (tenant_id, mutex_group, list(_SCHEDULE_INFLIGHT_STATUSES)),
+            (
+                tenant_id,
+                mutex_group,
+                list(_SCHEDULE_INFLIGHT_STATUSES),
+                tenant_id,
+                mutex_group,
+            ),
         ).fetchone()
         return row is not None
 

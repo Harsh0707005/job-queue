@@ -105,7 +105,9 @@ class SchedulesFireMixin:
                     """,
                     (schedule_id, list(_SCHEDULE_INFLIGHT_STATUSES)),
                 ).fetchone()
-                if active is not None:
+                if active is not None or self._schedule_workflow_tick_open(
+                    conn, [schedule_id]
+                ):
                     raise ScheduleError(
                         f"schedule {schedule_id} already has an in-flight job"
                     )

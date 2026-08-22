@@ -136,6 +136,59 @@ def test_workflow_tick_blocks_waiter_until_all_steps_complete(queue: JobQueue):
     assert later[0].schedule.id == down.id
     up_payload = later[0].job.payload.get("upstream") or {}
     assert up_payload.get("iteration") == 1
+    results = up_payload.get("result")
+    assert isinstance(results, list)
+    assert len(results) == 2
+
+
+def _gen_status(queue: JobQueue, schedule_id, iteration: int, tenant_id: str):
+    with queue._pool.connection() as conn:
+        return conn.execute(
+            """
+            SELECT status, payload
+            FROM schedule_generations
+            WHERE schedule_id = %s AND iteration = %s AND tenant_id = %s
+            """,
+            (schedule_id, iteration, tenant_id),
+        ).fetchone()
+
+
+def test_workflow_does_not_seal_generation_after_first_step(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 2},
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    queue.fire_schedule(up.id, tenant_id="t1")
+    _drive(queue, "t1", {"ok": "a"})
+    gen = _gen_status(queue, up.id, 1, "t1")
+    assert gen is not None
+    assert gen["status"] == "pending"
+    got = queue.get_schedule(up.id, tenant_id="t1")
+    assert got is not None
+    assert got.last_completed_iteration is None
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="upstream"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    _drive(queue, "t1", {"ok": "b"})
+    sealed = _gen_status(queue, up.id, 1, "t1")
+    assert sealed is not None
+    assert sealed["status"] == "completed"
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    results = (later[0].job.payload.get("upstream") or {}).get("result")
+    assert isinstance(results, list)
+    assert len(results) == 2
 
 
 def test_failed_workflow_tick_blocks_join_no_partial(queue: JobQueue):

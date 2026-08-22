@@ -1165,6 +1165,18 @@ class WorkflowsMixin:
         ):
             return
 
+        if run.get("schedule_id") and hasattr(self, "_fail_schedule_generation"):
+            self._fail_schedule_generation(
+                conn,
+                schedule_id=run["schedule_id"],
+                tenant_id=str(run["tenant_id"]),
+                iteration=(
+                    None
+                    if run.get("tick_iteration") is None
+                    else int(run["tick_iteration"])
+                ),
+                force=True,
+            )
         conn.execute(
             """
             UPDATE workflow_runs

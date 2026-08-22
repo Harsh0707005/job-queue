@@ -162,13 +162,15 @@ class SchedulesGenerationMixin:
         schedule_id: UUID | None,
         tenant_id: str,
         iteration: int | None = None,
+        force: bool = False,
     ) -> None:
         if schedule_id is None:
             return
         now = _utcnow()
+        status_clause = "" if force else "AND status = 'pending'"
         if iteration is None:
             conn.execute(
-                """
+                f"""
                 UPDATE schedule_generations
                 SET status = 'failed',
                     payload = NULL,
@@ -176,13 +178,13 @@ class SchedulesGenerationMixin:
                     updated_at = %s
                 WHERE schedule_id = %s
                   AND tenant_id = %s
-                  AND status = 'pending'
+                  {status_clause}
                 """,
                 (now, schedule_id, tenant_id),
             )
             return
         conn.execute(
-            """
+            f"""
             UPDATE schedule_generations
             SET status = 'failed',
                 payload = NULL,
@@ -191,7 +193,7 @@ class SchedulesGenerationMixin:
             WHERE schedule_id = %s
               AND iteration = %s
               AND tenant_id = %s
-              AND status = 'pending'
+              {status_clause}
             """,
             (now, schedule_id, iteration, tenant_id),
         )

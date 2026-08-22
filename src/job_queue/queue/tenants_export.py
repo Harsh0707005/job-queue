@@ -346,6 +346,7 @@ class TenantsExportMixin:
             "tenant_usage_buckets": "bucket_start ASC",
             "job_dag_batches": "created_at ASC, id ASC",
             "job_audit_events": "event_id ASC",
+            "schedule_generations": "schedule_id ASC, iteration ASC",
         }.get(kind, "id ASC")
         total = 0
         seq = 0

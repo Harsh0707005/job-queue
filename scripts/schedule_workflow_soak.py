@@ -249,13 +249,25 @@ def main() -> int:
     deadline = time.time() + HOLD
     last = 0.0
     while time.time() < deadline:
+        wait_up_jobs = by_sched(list_jobs(wait_t), wait_up)
         wait_up_live = [
             j
-            for j in by_sched(list_jobs(wait_t), wait_up)
+            for j in wait_up_jobs
             if j.get("status") in ("pending", "leased", "frozen")
         ]
+        wait_up_done = completed(wait_up_jobs)
         if wait_up_live and by_sched(list_jobs(wait_t), wait_down):
             raise RuntimeError("waiter fired before workflow finished")
+        if wait_up_done == 1 and wait_up_live and by_sched(list_jobs(wait_t), wait_down):
+            raise RuntimeError(
+                "waiter fired after first workflow step before the next existed"
+            )
+        if wait_up_done == 1 and wait_up_live:
+            code, body = fire(wait_t, wait_down)
+            if code != 409:
+                raise RuntimeError(
+                    f"waiter fire after first step expected 409 got {code} {body}"
+                )
         code, body = fire(mutex_t, mutex_b)
         if code != 409:
             # a may have finished near the end of hold

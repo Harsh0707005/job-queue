@@ -214,7 +214,9 @@ class SchedulesProcessMixin:
                             list(_SCHEDULE_INFLIGHT_STATUSES),
                         ),
                     ).fetchone()
-                    blocked = active is not None
+                    blocked = active is not None or self._schedule_workflow_tick_open(
+                        conn, [sched_row["id"]]
+                    )
                     skip_metric = "schedule_skip" if blocked else None
                 if not blocked and self._schedule_waits_blocked(
                     conn,
