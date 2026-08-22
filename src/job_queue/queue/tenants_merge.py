@@ -26,7 +26,9 @@ class TenantsMergeMixin:
         transaction:
 
         * jobs (pending, leased/running, and terminal history)
-        * schedules
+        * schedules and sealed schedule-generation payloads (resealed
+          under the destination tenant so dest joins can attach them)
+        * workflow runs, step runs, and named signals
         * webhook endpoints and deliveries (including ``delivering``)
 
         Lease fencing tokens, ``leased_by``, and ``lease_tenant_id`` are
@@ -100,6 +102,44 @@ class TenantsMergeMixin:
                         f"({source_pending}+{target_pending} > {target_limit}); "
                         f"raise or clear the target pending limit first"
                     )
+
+            # Closed generations first: reseal dest AAD + dest tenant_id
+            # while source DEKs are still loadable. Joins filter by tenant
+            # and decrypt with dest AAD; doing this after the key move
+            # would orphan ciphertext or leave dest looking at source rows.
+            generations_resealed = 0
+            if hasattr(self, "_reseal_tenant_schedule_generations"):
+                generations_resealed = self._reseal_tenant_schedule_generations(
+                    conn, from_tenant=source, to_tenant=target
+                )
+
+            wf_moved = conn.execute(
+                """
+                UPDATE workflow_runs
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                RETURNING id
+                """,
+                (target, now, source),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE workflow_step_runs
+                SET tenant_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s
+                """,
+                (target, now, source),
+            )
+            conn.execute(
+                """
+                UPDATE workflow_signals
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (target, source),
+            )
 
             # Resolve active dedupe collisions (prefer target's active key).
             dedupe_cleared = conn.execute(
@@ -360,4 +400,6 @@ class TenantsMergeMixin:
                 dedupe_keys_cleared=len(dedupe_cleared),
                 schedule_names_renamed=len(names_renamed),
                 source_empty=True,
+                workflow_runs_moved=len(wf_moved),
+                generations_resealed=int(generations_resealed),
             )

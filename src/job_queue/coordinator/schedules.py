@@ -27,6 +27,12 @@ class SchedulesApiMixin:
             cron = body.get("cron") or body.get("cron_expr")
             interval_raw = body.get("interval_seconds")
             interval = None if interval_raw is None else int(interval_raw)
+            start_raw = body.get("start_at")
+            start_at = None
+            if start_raw is not None and start_raw != "":
+                from datetime import datetime as _dt
+
+                start_at = _dt.fromisoformat(str(start_raw).replace("Z", "+00:00"))
             sched = self.queue.create_schedule(
                 tenant_id=str(body["tenant_id"]),
                 payload=dict(body.get("payload") or {}),
@@ -40,6 +46,7 @@ class SchedulesApiMixin:
                 visibility_timeout_seconds=int(
                     body.get("visibility_timeout_seconds") or 30
                 ),
+                start_at=start_at,
                 enabled=bool(body.get("enabled", True)),
                 labels=body.get("labels"),
                 required_skills=body.get("required_skills"),

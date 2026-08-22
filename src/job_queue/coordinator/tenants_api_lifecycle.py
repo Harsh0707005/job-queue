@@ -180,6 +180,8 @@ class TenantsApiLifecycleMixin:
             "source_empty": result.source_empty,
             "jobs_moved": result.jobs_moved,
             "jobs_leased_moved": result.jobs_leased_moved,
+            "workflow_runs_moved": result.workflow_runs_moved,
+            "generations_resealed": result.generations_resealed,
         }
 
     def _plan_tenant_split(

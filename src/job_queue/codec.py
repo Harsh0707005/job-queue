@@ -692,6 +692,8 @@ def tenant_merge_result_to_dict(result: TenantMergeResult) -> dict[str, Any]:
         "dedupe_keys_cleared": result.dedupe_keys_cleared,
         "schedule_names_renamed": result.schedule_names_renamed,
         "source_empty": result.source_empty,
+        "workflow_runs_moved": result.workflow_runs_moved,
+        "generations_resealed": result.generations_resealed,
     }
 
 

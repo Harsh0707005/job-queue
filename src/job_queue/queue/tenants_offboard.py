@@ -260,6 +260,30 @@ class TenantsOffboardMixin:
         ).fetchone()
         if rots is not None:
             return False
+        gens = conn.execute(
+            "SELECT 1 FROM schedule_generations WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if gens is not None:
+            return False
+        wfr = conn.execute(
+            "SELECT 1 FROM workflow_runs WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if wfr is not None:
+            return False
+        wfs = conn.execute(
+            "SELECT 1 FROM workflow_step_runs WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if wfs is not None:
+            return False
+        sigs = conn.execute(
+            "SELECT 1 FROM workflow_signals WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if sigs is not None:
+            return False
         return True
 
     def _finalize_offboard_locked(
@@ -290,6 +314,22 @@ class TenantsOffboardMixin:
         )
         conn.execute(
             "DELETE FROM schedule_blackouts WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM schedule_generations WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_signals WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_step_runs WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_runs WHERE tenant_id = %s",
             (tenant_id,),
         )
         conn.execute(

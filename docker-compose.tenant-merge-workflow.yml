@@ -1,0 +1,72 @@
+# Merge moves workflow runs + reseals generation payloads on a live fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.tenant-merge-workflow.yml down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.tenant-merge-workflow.yml up --build \
+#     --abort-on-container-exit --exit-code-from tenant-merge-soak \
+#     tenant-merge-soak
+
+services:
+  workflow-soak:
+    profiles: ["disabled"]
+
+  worker-1:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-2:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-3:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-4:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-5:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-6:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-7:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+  worker-8:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+
+  tenant-merge-soak:
+    build: .
+    command: ["python", "scripts/tenant_merge_workflow_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      PAIRS: "2"
+      LOAD_TENANTS: "2"
+      LOAD_JOBS: "12"
+      MAX_WALL_SECONDS: "240"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      effect-sink:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      worker-5:
+        condition: service_started
+      worker-6:
+        condition: service_started
+      worker-7:
+        condition: service_started
+      worker-8:
+        condition: service_started

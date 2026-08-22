@@ -652,6 +652,8 @@ class TenantMergeResult:
     dedupe_keys_cleared: int
     schedule_names_renamed: int
     source_empty: bool
+    workflow_runs_moved: int = 0
+    generations_resealed: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -414,6 +414,42 @@ class SchedulesGenerationMixin:
             out["upstream"] = collected[0] if len(collected) == 1 else collected
         return out
 
+    def _open_generation_plaintext_for_move(
+        self,
+        conn: Any,
+        *,
+        payload: Any,
+        schedule_id: UUID,
+        iteration: int,
+        from_tenant: str,
+        to_tenant: str,
+    ) -> dict[str, Any]:
+        """Decrypt a generation using source keys, or dest if keys already moved.
+
+        AAD stays bound to *from_tenant* until we reseal. After merge moves
+        DEK rows onto dest, load-by-source-tenant would orphan the ciphertext.
+        """
+        last: Exception | None = None
+        aad = schedule_generation_aad(
+            schedule_id, iteration, tenant_id=from_tenant
+        )
+        for load_tid in (from_tenant, to_tenant):
+            try:
+                opened = self._open_dict(
+                    payload,
+                    tenant_id=load_tid,
+                    aad=aad,
+                    conn=conn,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                continue
+            return opened if isinstance(opened, dict) else {}
+        raise RuntimeError(
+            f"cannot open generation {schedule_id} iter {iteration} "
+            f"for tenant move {from_tenant!r}->{to_tenant!r}: {last}"
+        ) from last
+
     def _reseal_schedule_generations(
         self,
         conn: Any,
@@ -421,7 +457,7 @@ class SchedulesGenerationMixin:
         schedule_id: UUID,
         from_tenant: str,
         to_tenant: str,
-    ) -> None:
+    ) -> int:
         rows = conn.execute(
             """
             SELECT iteration, status, payload
@@ -433,17 +469,18 @@ class SchedulesGenerationMixin:
             (schedule_id, from_tenant),
         ).fetchall()
         now = _utcnow()
+        n = 0
         for row in rows:
             sealed = None
             kid = None
             if str(row["status"]) == "completed" and row.get("payload") is not None:
-                opened = self._open_dict(
-                    row["payload"],
-                    tenant_id=from_tenant,
-                    aad=schedule_generation_aad(
-                        schedule_id, int(row["iteration"]), tenant_id=from_tenant
-                    ),
-                    conn=conn,
+                opened = self._open_generation_plaintext_for_move(
+                    conn,
+                    payload=row["payload"],
+                    schedule_id=schedule_id,
+                    iteration=int(row["iteration"]),
+                    from_tenant=from_tenant,
+                    to_tenant=to_tenant,
                 )
                 sealed, kid = self._seal_dict(
                     conn,
@@ -474,3 +511,38 @@ class SchedulesGenerationMixin:
                     from_tenant,
                 ),
             )
+            n += 1
+        return n
+
+    def _reseal_tenant_schedule_generations(
+        self,
+        conn: Any,
+        *,
+        from_tenant: str,
+        to_tenant: str,
+    ) -> int:
+        """Reseal every source generation under dest before joins can see it."""
+        ids = list(
+            dict.fromkeys(
+                r["schedule_id"]
+                for r in conn.execute(
+                    """
+                    SELECT schedule_id
+                    FROM schedule_generations
+                    WHERE tenant_id = %s
+                    ORDER BY schedule_id, iteration
+                    FOR UPDATE
+                    """,
+                    (from_tenant,),
+                ).fetchall()
+            )
+        )
+        n = 0
+        for sid in ids:
+            n += self._reseal_schedule_generations(
+                conn,
+                schedule_id=sid,
+                from_tenant=from_tenant,
+                to_tenant=to_tenant,
+            )
+        return n
