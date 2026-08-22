@@ -507,12 +507,12 @@ class SchedulesGenerationOpsMixin:
                     UPDATE schedules
                     SET last_completed_iteration = CASE
                             WHEN last_completed_iteration IS NULL THEN NULL
-                            WHEN last_completed_iteration >= %s
+                            WHEN last_completed_iteration = %s
                                 THEN NULLIF(%s, 0)
                             ELSE last_completed_iteration
                         END,
                         tick_iteration = CASE
-                            WHEN tick_iteration >= %s THEN %s
+                            WHEN tick_iteration = %s THEN %s
                             ELSE tick_iteration
                         END,
                         updated_at = %s
@@ -534,7 +534,7 @@ class SchedulesGenerationOpsMixin:
                     UPDATE schedules
                     SET last_completed_iteration = CASE
                             WHEN last_completed_iteration IS NULL THEN NULL
-                            WHEN last_completed_iteration >= %s
+                            WHEN last_completed_iteration = %s
                                 THEN NULLIF(%s, 0)
                             ELSE last_completed_iteration
                         END,

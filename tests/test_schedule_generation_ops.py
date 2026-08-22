@@ -59,6 +59,85 @@ def test_cancel_generation_fails_payload_and_cancels_set(queue: JobQueue):
         queue.fire_schedule(join.id, tenant_id="t1")
 
 
+def _watermarks(queue: JobQueue, schedule_id):
+    got = queue.get_schedule(schedule_id, tenant_id="t1")
+    assert got is not None
+    return int(got.tick_iteration), got.last_completed_iteration
+
+
+def _run_pipe_generation(queue: JobQueue, up, w1, w2, join, result: dict) -> None:
+    queue.fire_schedule(up.id, tenant_id="t1")
+    assert _finish_with(queue, "t1", result) == 1
+    _make_due(queue, w1.id)
+    _make_due(queue, w2.id)
+    fired = queue.process_due_schedules(tenant_id="t1")
+    assert {f.schedule.id for f in fired} == {w1.id, w2.id}
+    assert _finish_with(queue, "t1", {"w": 1}) == 1
+    assert _finish_with(queue, "t1", {"w": 2}) == 1
+    _make_due(queue, join.id)
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert [f.schedule.id for f in later] == [join.id]
+    assert _finish_with(queue, "t1", {"j": result.get("n")}) == 1
+
+
+def test_cancel_older_generation_keeps_later_watermark(queue: JobQueue):
+    up, w1, w2, join = _pipe(queue)
+    _run_pipe_generation(queue, up, w1, w2, join, {"secret": "one", "n": 1})
+    _run_pipe_generation(queue, up, w1, w2, join, {"secret": "two", "n": 2})
+    for sid in (up.id, w1.id, w2.id, join.id):
+        tick, done = _watermarks(queue, sid)
+        assert tick == 2
+        assert done == 2
+    first = _gen_status(queue, up.id, 1, "t1")
+    second = _gen_status(queue, up.id, 2, "t1")
+    assert first is not None and first["status"] == "completed"
+    assert second is not None and second["status"] == "completed"
+
+    op = queue.cancel_schedule_generation(up.id, tenant_id="t1", iteration=1)
+    assert op.iteration == 1
+    assert op.cancelled_job_ids == ()
+    voided = _gen_status(queue, up.id, 1, "t1")
+    kept = _gen_status(queue, up.id, 2, "t1")
+    assert voided is not None and voided["status"] == "failed"
+    assert voided["payload"] is None
+    assert kept is not None and kept["status"] == "completed"
+    assert kept["payload"] is not None
+    for sid in (up.id, w1.id, w2.id, join.id):
+        tick, done = _watermarks(queue, sid)
+        assert tick == 2
+        assert done == 2
+    _make_due(queue, join.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="join"):
+        queue.fire_schedule(join.id, tenant_id="t1")
+    join_jobs = [
+        j for j in queue.list_jobs(tenant_id="t1") if j.schedule_id == join.id
+    ]
+    assert len(join_jobs) == 2
+    assert all(j.status == JobStatus.COMPLETED for j in join_jobs)
+    assert {j.tick_iteration for j in join_jobs} == {1, 2}
+
+
+def test_cancel_current_generation_only_rewinds_that_watermark(queue: JobQueue):
+    up, w1, w2, join = _pipe(queue)
+    _run_pipe_generation(queue, up, w1, w2, join, {"secret": "one", "n": 1})
+    _run_pipe_generation(queue, up, w1, w2, join, {"secret": "two", "n": 2})
+    op = queue.cancel_schedule_generation(up.id, tenant_id="t1", iteration=2)
+    assert op.iteration == 2
+    first = _gen_status(queue, up.id, 1, "t1")
+    second = _gen_status(queue, up.id, 2, "t1")
+    assert first is not None and first["status"] == "completed"
+    assert first["payload"] is not None
+    assert second is not None and second["status"] == "failed"
+    assert second["payload"] is None
+    for sid in (up.id, w1.id, w2.id, join.id):
+        tick, done = _watermarks(queue, sid)
+        assert tick == 2
+        assert done == 1
+    _make_due(queue, join.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+
+
 def test_replay_generation_rebrings_closed_set(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.fire_schedule(up.id, tenant_id="t1")
