@@ -568,6 +568,7 @@ class TenantSplitBlocker:
     job_id: UUID
     reason: str
     related_job_id: UUID | None = None
+    schedule_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -583,6 +584,7 @@ class TenantSplitPlan:
     move_job_ids: tuple[UUID, ...]
     stay_leased_ids: tuple[UUID, ...]
     blockers: tuple[TenantSplitBlocker, ...]
+    move_schedule_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,6 +638,8 @@ class TenantSplitResult:
     target_tenant_id: str
     jobs_moved: int
     job_ids: tuple[UUID, ...]
+    schedules_moved: int = 0
+    schedule_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

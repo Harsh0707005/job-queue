@@ -614,6 +614,8 @@ def tenant_split_plan_to_dict(plan: TenantSplitPlan) -> dict[str, Any]:
         "stay_leased_ids": [str(j) for j in plan.stay_leased_ids],
         "blockers": [tenant_split_blocker_to_dict(b) for b in plan.blockers],
         "jobs_to_move": len(plan.move_job_ids),
+        "move_schedule_ids": [str(s) for s in plan.move_schedule_ids],
+        "schedules_to_move": len(plan.move_schedule_ids),
     }
 
 
@@ -624,6 +626,7 @@ def tenant_split_blocker_to_dict(blocker: TenantSplitBlocker) -> dict[str, Any]:
         "related_job_id": (
             str(blocker.related_job_id) if blocker.related_job_id else None
         ),
+        "schedule_id": str(blocker.schedule_id) if blocker.schedule_id else None,
     }
 
 
@@ -676,6 +679,8 @@ def tenant_split_result_to_dict(result: TenantSplitResult) -> dict[str, Any]:
         "target_tenant_id": result.target_tenant_id,
         "jobs_moved": result.jobs_moved,
         "job_ids": [str(j) for j in result.job_ids],
+        "schedules_moved": result.schedules_moved,
+        "schedule_ids": [str(s) for s in result.schedule_ids],
     }
 
 

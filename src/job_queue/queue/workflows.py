@@ -1046,11 +1046,17 @@ class WorkflowsMixin:
             (idx + 1, now, run["id"]),
         )
 
-        job = conn.execute(
-            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-            (step["job_id"],),
-        ).fetchone()
-        qn = job["queue_name"] if job else "default"
+        job = None
+        if step.get("job_id") is not None:
+            job = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (step["job_id"],),
+            ).fetchone()
+        qn = (
+            job["queue_name"]
+            if job
+            else (self._workflow_queue_name(conn, run["id"]) or "default")
+        )
         ma = int(job["max_attempts"]) if job else 3
         vt = int(job["visibility_timeout_seconds"]) if job else 30
 
@@ -1139,11 +1145,17 @@ class WorkflowsMixin:
         fail_idx = int(step["step_index"])
         steps_def = self._parse_steps_def(run, conn)
 
-        job = conn.execute(
-            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
-            (step["job_id"],),
-        ).fetchone()
-        qn = job["queue_name"] if job else "default"
+        job = None
+        if step.get("job_id") is not None:
+            job = conn.execute(
+                f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
+                (step["job_id"],),
+            ).fetchone()
+        qn = (
+            job["queue_name"]
+            if job
+            else (self._workflow_queue_name(conn, run["id"]) or "default")
+        )
         ma = int(job["max_attempts"]) if job else 3
         vt = int(job["visibility_timeout_seconds"]) if job else 30
 
