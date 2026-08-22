@@ -169,6 +169,84 @@ def test_failed_waiter_blocks_join_no_partial(queue: JobQueue):
     assert all(j.schedule_id != join.id for j in queue.list_jobs(tenant_id="t1"))
 
 
+def _ready_join(queue: JobQueue):
+    up, w1, w2, join = _pipe(queue)
+    queue.fire_schedule(up.id, tenant_id="t1")
+    assert _finish_with(queue, "t1", {"secret": "x", "n": 1}) == 1
+    _make_due(queue, w1.id)
+    _make_due(queue, w2.id)
+    queue.process_due_schedules(tenant_id="t1")
+    assert _finish_with(queue, "t1", {"w": 1}) == 1
+    assert _finish_with(queue, "t1", {"w": 2}) == 1
+    _make_due(queue, join.id)
+    return up, w1, w2, join
+
+
+def test_join_attach_races_deleted_waiter_does_not_fire_empty(queue: JobQueue):
+    _up, w1, w2, join = _ready_join(queue)
+    orig = type(queue)._schedule_generation_blocked
+
+    def after_check(self, conn, sched_row, *, iteration):
+        blocked = orig(self, conn, sched_row, iteration=iteration)
+        if not blocked and list(sched_row.get("joins_on") or []):
+            conn.execute("DELETE FROM schedules WHERE id = %s", (w2.id,))
+        return blocked
+
+    queue._schedule_generation_blocked = after_check.__get__(queue, type(queue))
+    with pytest.raises(ScheduleError, match="generation"):
+        queue.fire_schedule(join.id, tenant_id="t1")
+    assert all(j.schedule_id != join.id for j in queue.list_jobs(tenant_id="t1"))
+    leftover = queue.get_schedule(w1.id, tenant_id="t1")
+    assert leftover is not None
+
+
+def test_join_attach_races_moved_waiter_does_not_fire_empty(queue: JobQueue):
+    _up, _w1, w2, join = _ready_join(queue)
+    orig = type(queue)._schedule_generation_blocked
+
+    def after_check(self, conn, sched_row, *, iteration):
+        blocked = orig(self, conn, sched_row, iteration=iteration)
+        if not blocked and list(sched_row.get("joins_on") or []):
+            conn.execute(
+                """
+                UPDATE schedules
+                SET tenant_id = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                ("dst", w2.id),
+            )
+            conn.execute(
+                """
+                UPDATE schedule_generations
+                SET tenant_id = %s, updated_at = NOW()
+                WHERE schedule_id = %s
+                """,
+                ("dst", w2.id),
+            )
+        return blocked
+
+    queue._schedule_generation_blocked = after_check.__get__(queue, type(queue))
+    with pytest.raises(ScheduleError, match="generation"):
+        queue.fire_schedule(join.id, tenant_id="t1")
+    jobs = [j for j in queue.list_jobs(tenant_id="t1") if j.schedule_id == join.id]
+    assert jobs == []
+
+
+def test_join_process_due_races_deleted_waiter_does_not_fire_empty(queue: JobQueue):
+    _up, _w1, w2, join = _ready_join(queue)
+    orig = type(queue)._schedule_generation_blocked
+
+    def after_check(self, conn, sched_row, *, iteration):
+        blocked = orig(self, conn, sched_row, iteration=iteration)
+        if not blocked and list(sched_row.get("joins_on") or []):
+            conn.execute("DELETE FROM schedules WHERE id = %s", (w2.id,))
+        return blocked
+
+    queue._schedule_generation_blocked = after_check.__get__(queue, type(queue))
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    assert all(j.schedule_id != join.id for j in queue.list_jobs(tenant_id="t1"))
+
+
 def test_delete_waiter_blocks_partial_join(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.fire_schedule(up.id, tenant_id="t1")

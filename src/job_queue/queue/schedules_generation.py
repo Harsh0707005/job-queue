@@ -12,6 +12,7 @@ from job_queue.models import JobStatus
 from job_queue.queue._common import (
     _SCHEDULE_INFLIGHT_STATUSES,
     _SCHEDULE_TICK_FAILED_STATUSES,
+    ScheduleError,
     _utcnow,
 )
 
@@ -222,6 +223,7 @@ class SchedulesGenerationMixin:
             SELECT payload, status, tenant_id
             FROM schedule_generations
             WHERE schedule_id = %s AND iteration = %s
+            FOR UPDATE
             """,
             (schedule_id, iteration),
         ).fetchone()
@@ -294,12 +296,14 @@ class SchedulesGenerationMixin:
                 SELECT id
                 FROM schedules
                 WHERE tenant_id = %s AND id = ANY(%s)
+                ORDER BY id
+                FOR UPDATE
                 """,
                 (tenant_id, list(joins)),
             ).fetchall()
             if len(rows) != len(joins):
                 return None
-            return sorted((r["id"] for r in rows), key=str)
+            return [r["id"] for r in rows]
         waits = list(sched_row.get("waits_on") or [])
         if waits:
             return list(waits)
@@ -369,7 +373,15 @@ class SchedulesGenerationMixin:
     ) -> dict[str, Any]:
         ids = self._generation_source_ids(conn, sched_row)
         if not ids:
+            if ids is None:
+                raise ScheduleError(
+                    f"schedule {sched_row['id']} has no closed generation payload"
+                )
             return payload
+        if iteration < 1:
+            raise ScheduleError(
+                f"schedule {sched_row['id']} has no closed generation payload"
+            )
         tenant_id = str(sched_row["tenant_id"])
         collected = self._collect_schedule_generations(
             conn,
@@ -378,7 +390,9 @@ class SchedulesGenerationMixin:
             iteration=iteration,
         )
         if collected is None:
-            return payload
+            raise ScheduleError(
+                f"schedule {sched_row['id']} has no closed generation payload"
+            )
         out = dict(payload)
         if list(sched_row.get("joins_on") or []):
             out["waiters"] = collected

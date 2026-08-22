@@ -11,6 +11,7 @@ from job_queue.models import (
 from job_queue.queue._common import (
     _SCHEDULE_COLUMNS,
     _SCHEDULE_INFLIGHT_STATUSES,
+    ScheduleError,
     SpendCapError,
     _utcnow,
 )
@@ -409,6 +410,17 @@ class SchedulesProcessMixin:
                     )
                 except UniqueViolation:
                     # Race: another ticker inserted an active job for this schedule.
+                    continue
+                except ScheduleError:
+                    # Waiter vanished between the generation check and
+                    # attach — fail closed, do not enqueue an empty join.
+                    self._record_metric(
+                        conn,
+                        tenant_id=str(sched_row["tenant_id"]),
+                        metric="schedule_generation",
+                        count=1,
+                        now=now,
+                    )
                     continue
                 except SpendCapError:
                     # Tenant quota exhausted; leave next_run so it retries
