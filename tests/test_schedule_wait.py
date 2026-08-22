@@ -120,6 +120,12 @@ def test_paused_upstream_blocks_and_mutex_peer_pause_blocks(queue: JobQueue):
     with pytest.raises(ScheduleError, match="waiting on an upstream"):
         queue.fire_schedule(down.id, tenant_id="t1")
     queue.resume_schedule(peer.id, tenant_id="t1")
+    # Pause/mutex cleared, but upstream still has never ticked.
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="generation"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    queue.fire_schedule(up.id, tenant_id="t1")
+    assert _finish(queue, "t1", 1) == 1
     fires = queue.process_due_schedules(tenant_id="t1")
     assert len(fires) == 1
     assert fires[0].schedule.id == down.id
@@ -378,12 +384,9 @@ def test_deleted_upstream_row_still_blocks_while_tick_live(queue: JobQueue):
     assert _finish(queue, "t1", 1) == 1
     assert queue.get(fire.job.id, tenant_id="t1").status == JobStatus.COMPLETED
     later = queue.process_due_schedules(tenant_id="t1")
-    if later:
-        assert later[0].schedule.id == down.id
-        assert "upstream" not in (later[0].job.payload or {})
-    else:
-        with pytest.raises(ScheduleError, match="generation|upstream"):
-            queue.fire_schedule(down.id, tenant_id="t1")
+    assert later == []
+    with pytest.raises(ScheduleError, match="generation"):
+        queue.fire_schedule(down.id, tenant_id="t1")
 
 
 def test_cancelled_upstream_tick_still_blocks_until_success(queue: JobQueue):

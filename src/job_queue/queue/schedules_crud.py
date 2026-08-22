@@ -1055,7 +1055,9 @@ class SchedulesCrudMixin:
                 (waits,),
             ).fetchone()
             inherited = int((row or {}).get("n") or 0)
-            return inherited if inherited > 0 else current + 1
+            # 0 when every upstream is still on generation 0 (never ticked).
+            # Do not invent a waiter-only iteration — that fires empty.
+            return inherited if inherited > 0 else current
         return current + 1
 
     def _maybe_advance_schedule_completed(

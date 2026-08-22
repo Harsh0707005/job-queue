@@ -20,6 +20,39 @@ def _finish_with(
     return 1
 
 
+def test_never_run_upstream_blocks_waiters_and_join(queue: JobQueue):
+    up, w1, w2, join = _pipe(queue)
+    _make_due(queue, w1.id)
+    _make_due(queue, w2.id)
+    _make_due(queue, join.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="generation"):
+        queue.fire_schedule(w1.id, tenant_id="t1")
+    with pytest.raises(ScheduleError, match="join|generation"):
+        queue.fire_schedule(join.id, tenant_id="t1")
+    assert queue.count(tenant_id="t1") == 0
+    queue.fire_schedule(up.id, tenant_id="t1")
+    assert _finish_with(queue, "t1", {"secret": "first", "n": 1}) == 1
+    fired = queue.process_due_schedules(tenant_id="t1")
+    waiters = [f.job for f in fired if f.schedule.id in {w1.id, w2.id}]
+    assert len(waiters) == 2
+    assert all(f.schedule.id != join.id for f in fired)
+    for job in waiters:
+        assert (job.payload.get("upstream") or {}).get("result") == {
+            "secret": "first",
+            "n": 1,
+        }
+    assert _finish_with(queue, "t1", {"w": 1}) == 1
+    assert _finish_with(queue, "t1", {"w": 2}) == 1
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert len(later) == 1
+    assert later[0].schedule.id == join.id
+    assert (later[0].job.payload.get("upstream") or {}).get("result") == {
+        "secret": "first",
+        "n": 1,
+    }
+
+
 def test_waiters_and_join_see_upstream_result(queue: JobQueue):
     up, w1, w2, join = _pipe(queue)
     queue.fire_schedule(up.id, tenant_id="t1")

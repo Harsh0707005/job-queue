@@ -274,24 +274,21 @@ class SchedulesGenerationMixin:
         *,
         iteration: int,
     ) -> bool:
-        """True when a waiter/join cannot attach a same-tenant closed payload."""
+        """True when a waiter/join cannot attach a same-tenant closed payload.
+
+        A waiter or join with upstreams must open a completed generation for
+        this iteration. If the upstream has never run, is not due, or that
+        generation failed / cancelled / cannot be decrypted on this tenant,
+        the tick stays blocked. Independent fire without a payload is not
+        allowed.
+        """
         ups = self._upstream_ids_for_generation(conn, sched_row)
         if ups is None:
             return True
         if not ups:
             return False
         if iteration < 1:
-            return False
-        reached = conn.execute(
-            """
-            SELECT COALESCE(MAX(tick_iteration), 0) AS n
-            FROM schedules
-            WHERE id = ANY(%s)
-            """,
-            (list(ups),),
-        ).fetchone()
-        if int((reached or {}).get("n") or 0) < iteration:
-            return False
+            return True
         tenant_id = str(sched_row["tenant_id"])
         for uid in ups:
             if self._open_schedule_generation(

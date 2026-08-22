@@ -11,6 +11,8 @@ Dual coordinators + dual schedulers + four workers:
                 catch_up_max ticks, extras recorded as misses.
   * sj-can    — cancel the upstream tick; that generation gives waiters
                 and the join nothing.
+  * sj-idle   — upstream never run and not due; waiters and join stay
+                empty (no payload-less ticks).
   * sj-mv     — move of a live fan-out upstream is refused (no leak).
   * sj-live   — other tenant keeps completing.
 """
@@ -123,6 +125,7 @@ def create_sched(
     policy: str = "catch_up_one",
     catch_up_max: int = 3,
     cron_every: int | None = None,
+    cron: str | None = None,
     ms: int | None = None,
     enabled: bool = True,
 ) -> str:
@@ -131,7 +134,7 @@ def create_sched(
     body: dict[str, Any] = {
         "tenant_id": tid,
         "name": name,
-        "cron": f"*/{every} * * * * *",
+        "cron": cron if cron is not None else f"*/{every} * * * * *",
         "payload": {"kind": "render", "ms": job_ms, "name": name},
         "misfire_policy": policy,
         "catch_up_max": catch_up_max,
@@ -229,13 +232,14 @@ def assert_join_after_waiters(
 def main() -> int:
     logger.info("schedule join soak hold=%ds cron=every %ds", HOLD, CRON_EVERY)
     wait_coords()
-    hold_t, pause_t, mutex_t, skip_t, cup_t, can_t, mv_t, live_t = (
+    hold_t, pause_t, mutex_t, skip_t, cup_t, can_t, idle_t, mv_t, live_t = (
         "sj-hold",
         "sj-pause",
         "sj-mutex",
         "sj-skip",
         "sj-cup",
         "sj-can",
+        "sj-idle",
         "sj-mv",
         "sj-live",
     )
@@ -288,6 +292,12 @@ def main() -> int:
     can_w1 = create_sched(can_t, name="w1", waits_on=[can_up])
     can_w2 = create_sched(can_t, name="w2", waits_on=[can_up])
     can_j = create_sched(can_t, name="join", joins_on=[can_w1, can_w2])
+    # Enabled but not due (next fire is Jan 1). Waiters/join stay on the
+    # regular cron so they would dump empty ticks without the generation gate.
+    idle_up = create_sched(idle_t, name="up", cron="0 0 1 1 *")
+    idle_w1 = create_sched(idle_t, name="w1", waits_on=[idle_up])
+    idle_w2 = create_sched(idle_t, name="w2", waits_on=[idle_up])
+    idle_j = create_sched(idle_t, name="join", joins_on=[idle_w1, idle_w2])
     mv_up = create_sched(mv_t, name="up", ms=2500)
     mv_w1 = create_sched(mv_t, name="w1", waits_on=[mv_up])
     mv_w2 = create_sched(mv_t, name="w2", waits_on=[mv_up])
@@ -338,6 +348,8 @@ def main() -> int:
         (skip_t, skip_j),
         (can_t, can_w1),
         (can_t, can_j),
+        (idle_t, idle_w1),
+        (idle_t, idle_j),
         (mv_t, mv_j),
     ):
         code, body = fire(tid, sid)
@@ -371,6 +383,17 @@ def main() -> int:
             raise RuntimeError("cancelled generation produced waiter jobs")
         if len(by_sched(list_jobs(can_t), can_j)) != can_j_at:
             raise RuntimeError("cancelled generation produced a join job")
+        idle_jobs = list_jobs(idle_t)
+        if by_sched(idle_jobs, idle_w1) or by_sched(idle_jobs, idle_w2):
+            raise RuntimeError(
+                "idle upstream (never run, not due) produced waiter jobs"
+            )
+        if by_sched(idle_jobs, idle_j):
+            raise RuntimeError(
+                "idle upstream (never run, not due) produced a join job"
+            )
+        if by_sched(idle_jobs, idle_up):
+            raise RuntimeError("idle upstream fired even though it is not due")
         code, body = http_json(
             "POST",
             f"/v1/schedules/{mv_up}/move",
@@ -383,7 +406,7 @@ def main() -> int:
         now = time.time()
         if now - last >= 2:
             logger.info(
-                "hold join=%d pause=%d mutex=%d skip=%d cup_w=%d live=%d",
+                "hold join=%d pause=%d mutex=%d skip=%d cup_w=%d idle=%d live=%d",
                 hold_at,
                 pause_at,
                 mutex_at,
@@ -392,6 +415,7 @@ def main() -> int:
                     completed(by_sched(list_jobs(cup_t), cup_w1)),
                     completed(by_sched(list_jobs(cup_t), cup_w2)),
                 ),
+                len(list_jobs(idle_t)),
                 completed(list_jobs(live_t)),
             )
             last = now
@@ -400,6 +424,16 @@ def main() -> int:
     live_mid = completed(list_jobs(live_t))
     if live_mid < 1:
         raise RuntimeError("live tenant stalled during join hold")
+    idle_jobs = list_jobs(idle_t)
+    if (
+        by_sched(idle_jobs, idle_up)
+        or by_sched(idle_jobs, idle_w1)
+        or by_sched(idle_jobs, idle_w2)
+        or by_sched(idle_jobs, idle_j)
+    ):
+        raise RuntimeError(
+            "idle tenant leaked jobs while upstream had never run"
+        )
 
     unfreeze(hold_t, hold_job["id"])
     unfreeze(skip_t, skip_job["id"])
@@ -469,12 +503,45 @@ def main() -> int:
     assert_join_after_waiters(
         by_sched(jobs, hold_w1), by_sched(jobs, hold_w2), by_sched(jobs, hold_j)
     )
+    idle_still = list_jobs(idle_t)
+    if (
+        by_sched(idle_still, idle_up)
+        or by_sched(idle_still, idle_w1)
+        or by_sched(idle_still, idle_w2)
+        or by_sched(idle_still, idle_j)
+    ):
+        raise RuntimeError(
+            "idle waiters/join fired after hold without an upstream tick"
+        )
+    code, body = fire(idle_t, idle_up)
+    if code not in (200, 201):
+        raise RuntimeError(f"idle upstream fire expected 201 got {code} {body}")
+    deadline = time.time() + 16
+    while time.time() < deadline:
+        idle_now = list_jobs(idle_t)
+        if by_sched(idle_now, idle_j):
+            break
+        time.sleep(0.15)
+    pause(idle_t, idle_j)
+    pause(idle_t, idle_w1)
+    pause(idle_t, idle_w2)
+    pause(idle_t, idle_up)
+    idle_now = list_jobs(idle_t)
+    if not by_sched(idle_now, idle_w1) or not by_sched(idle_now, idle_w2):
+        raise RuntimeError("idle waiters did not fire after upstream completed")
+    if not by_sched(idle_now, idle_j):
+        raise RuntimeError("idle join did not fire after waiters completed")
+    assert_join_after_waiters(
+        by_sched(idle_now, idle_w1),
+        by_sched(idle_now, idle_w2),
+        by_sched(idle_now, idle_j),
+    )
     live_after = completed(list_jobs(live_t))
     if live_after < live_mid:
         raise RuntimeError("live tenant went backwards")
     logger.info(
         "schedule join soak OK hold=%d pause=%d mutex=%d skip=%d "
-        "cup=%d cup_ready=%d missed=%d live=%d",
+        "cup=%d cup_ready=%d missed=%d idle=%d live=%d",
         hold_extra,
         pause_extra,
         mutex_extra,
@@ -482,6 +549,7 @@ def main() -> int:
         cup_extra,
         cup_ready,
         missed,
+        len(by_sched(idle_now, idle_j)),
         live_after,
     )
     return 0
