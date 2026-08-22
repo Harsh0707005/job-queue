@@ -50,6 +50,7 @@ class SchedulesApiMixin:
                     else int(body["catch_up_max"])
                 ),
                 dag_jobs=body.get("dag_jobs"),
+                workflow=body.get("workflow"),
                 mutex_group=body.get("mutex_group"),
                 waits_on=body.get("waits_on"),
                 joins_on=body.get("joins_on"),
@@ -142,6 +143,9 @@ class SchedulesApiMixin:
             "refs": list(fire.refs or ()),
             "batch_id": str(fire.batch_id) if fire.batch_id else None,
             "batch_key": fire.batch_key,
+            "workflow_run_id": (
+                str(fire.workflow_run_id) if fire.workflow_run_id else None
+            ),
         }
 
     def _update_schedule(
@@ -198,6 +202,10 @@ class SchedulesApiMixin:
             kwargs["waits_on"] = body.get("waits_on")
         if "joins_on" in body:
             kwargs["joins_on"] = body.get("joins_on")
+        if "workflow" in body:
+            kwargs["workflow"] = body.get("workflow")
+        if "dag_jobs" in body:
+            kwargs["dag_jobs"] = body.get("dag_jobs")
         try:
             sched = self.queue.update_schedule(
                 UUID(sid), tenant_id=str(tenant_id), **kwargs

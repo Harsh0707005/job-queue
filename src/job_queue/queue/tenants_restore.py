@@ -619,7 +619,7 @@ class TenantsRestoreMixin:
                 cron_expr, timezone, priority, max_attempts,
                 visibility_timeout_seconds, enabled, next_run_at,
                 last_enqueued_at, created_at, updated_at, labels, payload_key_id,
-                required_skills, dag_jobs, mutex_group, waits_on, joins_on,
+                required_skills, dag_jobs, workflow, mutex_group, waits_on, joins_on,
                 tick_iteration, last_completed_iteration,
                 misfire_policy, catch_up_max, missed_ticks,
                 last_misfire_at, catch_up_remaining
@@ -627,7 +627,7 @@ class TenantsRestoreMixin:
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (id) DO NOTHING
@@ -653,6 +653,7 @@ class TenantsRestoreMixin:
                 kid,
                 list(raw.get("required_skills") or []),
                 Jsonb(raw.get("dag_jobs")) if raw.get("dag_jobs") else None,
+                Jsonb(raw.get("workflow")) if raw.get("workflow") else None,
                 raw.get("mutex_group") or None,
                 [
                     mid
@@ -804,11 +805,13 @@ class TenantsRestoreMixin:
             INSERT INTO workflow_runs (
                 id, tenant_id, name, status, steps_def, current_index,
                 fail_step_index, fail_reason, max_compensate_retries,
-                created_at, updated_at, completed_at, payload_key_id
+                created_at, updated_at, completed_at, payload_key_id,
+                schedule_id, tick_iteration
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s, %s, %s
+                %s, %s, %s, %s,
+                %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -826,6 +829,14 @@ class TenantsRestoreMixin:
                 _parse_dt(raw.get("updated_at")) or _utcnow(),
                 _parse_dt(raw.get("completed_at")),
                 kid,
+                self._map_id(id_map, "schedules", raw.get("schedule_id"))
+                if raw.get("schedule_id")
+                else None,
+                (
+                    None
+                    if raw.get("tick_iteration") is None
+                    else int(raw["tick_iteration"])
+                ),
             ),
         )
 

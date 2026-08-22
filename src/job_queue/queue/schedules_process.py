@@ -397,7 +397,7 @@ class SchedulesProcessMixin:
                         # skip / catch_up_one: one pickup, consume the rest.
                         stamp_iter = watermark
                         extra_skip += extra_join
-                    first_job, tick_jobs, tick_refs, batch_id, batch_key = (
+                    first_job, tick_jobs, tick_refs, batch_id, batch_key, wf_run_id = (
                         self._materialize_schedule_tick(
                             conn,
                             sched_row,
@@ -464,6 +464,7 @@ class SchedulesProcessMixin:
                         refs=tick_refs,
                         batch_id=batch_id,
                         batch_key=batch_key,
+                        workflow_run_id=wf_run_id,
                     )
                 )
                 self._record_metric(

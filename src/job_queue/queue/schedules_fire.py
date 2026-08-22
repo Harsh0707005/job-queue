@@ -21,6 +21,7 @@ from job_queue.queue._common import (
     _as_utc,
     _dag_jobs_from_row,
     _utcnow,
+    _workflow_from_row,
 )
 
 
@@ -137,7 +138,7 @@ class SchedulesFireMixin:
                 )
 
             try:
-                first, jobs, refs, batch_id, batch_key = (
+                first, jobs, refs, batch_id, batch_key, wf_run_id = (
                     self._materialize_schedule_tick(
                         conn,
                         sched_row,
@@ -192,6 +193,7 @@ class SchedulesFireMixin:
                 refs=refs,
                 batch_id=batch_id,
                 batch_key=batch_key,
+                workflow_run_id=wf_run_id,
             )
 
         if any(j.required_skills for j in fire.jobs or (fire.job,)) and hasattr(
@@ -213,7 +215,16 @@ class SchedulesFireMixin:
         tick_kind: str = "tick",
         iteration: int | None = None,
     ) -> tuple[Job, tuple[Job, ...], tuple[str, ...], UUID | None, str | None]:
-        """Enqueue one job or one whole DAG. Caller holds the schedule lock."""
+        """Enqueue one job, DAG, or workflow. Caller holds the schedule lock."""
+        wf = _workflow_from_row(sched_row.get("workflow"))
+        if wf:
+            return self._materialize_schedule_workflow(
+                conn,
+                sched_row,
+                workflow=wf,
+                now=now,
+                iteration=iteration,
+            )
         dag = _dag_jobs_from_row(sched_row.get("dag_jobs"))
         if not dag:
             row = self._insert_schedule_job(
@@ -235,7 +246,7 @@ class SchedulesFireMixin:
                     iteration=int(iteration),
                     job_ids=[job.id],
                 )
-            return job, (job,), (), None, None
+            return job, (job,), (), None, None, None
 
         default_payload = self._open_schedule_payload(
             sched_row["payload"],
@@ -322,7 +333,80 @@ class SchedulesFireMixin:
                 iteration=int(iteration),
                 job_ids=[j.id for j in result.jobs],
             )
-        return first, result.jobs, result.refs, result.batch_id, result.batch_key
+        return (
+            first,
+            result.jobs,
+            result.refs,
+            result.batch_id,
+            result.batch_key,
+            None,
+        )
+
+    def _materialize_schedule_workflow(
+        self,
+        conn: Any,
+        sched_row: Any,
+        *,
+        workflow: dict[str, Any],
+        now: datetime,
+        iteration: int | None,
+    ) -> tuple[Job, tuple[Job, ...], tuple[str, ...], UUID | None, str | None, UUID | None]:
+        steps = list(workflow.get("steps") or [])
+        if not steps:
+            raise ScheduleError(
+                f"schedule {sched_row['id']} workflow.steps is empty"
+            )
+        from job_queue.queue.workflows import WorkflowsMixin
+
+        normalized = WorkflowsMixin._expand_and_normalize_steps(steps)
+        run_row = self._start_workflow_on_conn(
+            conn,
+            tenant_id=str(sched_row["tenant_id"]),
+            normalized=normalized,
+            name=workflow.get("name") or sched_row.get("name"),
+            queue_name=str(sched_row["queue_name"]),
+            max_attempts=int(sched_row["max_attempts"]),
+            visibility_timeout_seconds=int(
+                sched_row["visibility_timeout_seconds"]
+            ),
+            max_compensate_retries=5,
+            run_id=uuid4(),
+            now=now,
+            schedule_id=sched_row["id"],
+            tick_iteration=int(iteration) if iteration else None,
+            lock_tenant=False,
+        )
+        assert run_row is not None
+        job_rows = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE schedule_id = %s
+              AND (
+                tick_iteration IS NOT DISTINCT FROM %s
+              )
+            ORDER BY created_at ASC, id ASC
+            """,
+            (sched_row["id"], int(iteration) if iteration else None),
+        ).fetchall()
+        jobs = tuple(self._job(r) for r in job_rows)
+        if not jobs:
+            raise ScheduleError(
+                f"schedule {sched_row['id']} workflow tick produced no jobs"
+            )
+        refs = tuple(
+            str(j.payload.get("step_name") or f"step-{i}")
+            for i, j in enumerate(jobs)
+        )
+        if iteration and hasattr(self, "_begin_schedule_generation"):
+            self._begin_schedule_generation(
+                conn,
+                tenant_id=str(sched_row["tenant_id"]),
+                schedule_id=sched_row["id"],
+                iteration=int(iteration),
+                job_ids=[j.id for j in jobs],
+            )
+        return jobs[0], jobs, refs, None, None, run_row["id"]
 
     def _insert_schedule_job(
         self,

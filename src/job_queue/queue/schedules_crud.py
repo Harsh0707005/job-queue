@@ -24,9 +24,11 @@ from job_queue.queue._common import (
     _UNSET,
     ScheduleError,
     _as_utc,
+    _dag_jobs_from_row,
     _normalize_labels,
     _normalize_skills,
     _utcnow,
+    _workflow_from_row,
 )
 
 MISFIRE_SKIP = "skip"
@@ -198,6 +200,27 @@ def normalize_schedule_dag_jobs(
     return nodes
 
 
+def normalize_schedule_workflow(
+    raw: Any,
+) -> dict[str, Any] | None:
+    """Validate a schedule workflow template. None / empty → no workflow."""
+    if raw is None or raw == {} or raw == ():
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("workflow must be a dict")
+    steps = raw.get("steps")
+    if not steps or not isinstance(steps, list):
+        raise ValueError("workflow.steps must be a non-empty list")
+    from job_queue.queue.workflows import WorkflowsMixin
+
+    WorkflowsMixin._expand_and_normalize_steps(steps)
+    out: dict[str, Any] = {"steps": [dict(s) if isinstance(s, dict) else s for s in steps]}
+    name = raw.get("name")
+    if name is not None and str(name).strip():
+        out["name"] = str(name).strip()
+    return out
+
+
 class SchedulesCrudMixin:
     def create_schedule(
         self,
@@ -223,6 +246,7 @@ class SchedulesCrudMixin:
         mutex_group: str | None = None,
         waits_on: Sequence[UUID | str] | UUID | str | None = None,
         joins_on: Sequence[UUID | str] | UUID | str | None = None,
+        workflow: dict[str, Any] | None = None,
     ) -> Schedule:
         """Register a recurring schedule (cron and/or fixed interval).
 
@@ -260,6 +284,11 @@ class SchedulesCrudMixin:
         dag_jobs:
             Optional DAG template. When set, each tick enqueues this
             whole graph in one transaction instead of a single job.
+        workflow:
+            Optional multi-step saga template ``{"steps": [...]}``.
+            Each tick starts one workflow run. Mutually exclusive with
+            ``dag_jobs``. Step jobs inherit ``schedule_id`` and
+            ``tick_iteration``.
         mutex_group:
             Optional per-tenant exclusive group name. At most one
             member may have a tick or DAG in flight. Missed ticks
@@ -298,6 +327,9 @@ class SchedulesCrudMixin:
         policy = normalize_misfire_policy(misfire_policy)
         catch_max = normalize_catch_up_max(catch_up_max)
         dag_list = normalize_schedule_dag_jobs(dag_jobs)
+        wf = normalize_schedule_workflow(workflow)
+        if dag_list and wf:
+            raise ValueError("workflow is mutually exclusive with dag_jobs")
         group = normalize_mutex_group(mutex_group)
         wait_ids = normalize_waits_on(waits_on)
         join_ids = normalize_joins_on(joins_on)
@@ -340,7 +372,7 @@ class SchedulesCrudMixin:
                         visibility_timeout_seconds, enabled, next_run_at,
                         labels, created_at, updated_at, payload_key_id,
                         required_skills,
-                        misfire_policy, catch_up_max, dag_jobs,
+                        misfire_policy, catch_up_max, dag_jobs, workflow,
                         mutex_group, waits_on, joins_on
                     ) VALUES (
                         %s, %s, %s, %s, %s,
@@ -348,7 +380,7 @@ class SchedulesCrudMixin:
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s
                     )
                     RETURNING {_SCHEDULE_COLUMNS}
                     """,
@@ -374,6 +406,7 @@ class SchedulesCrudMixin:
                         policy,
                         catch_max,
                         Jsonb(dag_list) if dag_list else None,
+                        Jsonb(wf) if wf else None,
                         group,
                         wait_ids,
                         join_ids,
@@ -686,6 +719,7 @@ class SchedulesCrudMixin:
         timezone: Any = _UNSET,
         payload: Any = _UNSET,
         dag_jobs: Any = _UNSET,
+        workflow: Any = _UNSET,
         queue_name: Any = _UNSET,
         name: Any = _UNSET,
         priority: Any = _UNSET,
@@ -717,6 +751,7 @@ class SchedulesCrudMixin:
             timezone,
             payload,
             dag_jobs,
+            workflow,
             queue_name,
             name,
             priority,
@@ -841,6 +876,22 @@ class SchedulesCrudMixin:
             if dag_jobs is not _UNSET:
                 dag_list = normalize_schedule_dag_jobs(dag_jobs)
                 dag_val = Jsonb(dag_list) if dag_list else None
+            wf_val = row.get("workflow")
+            if workflow is not _UNSET:
+                wf_norm = normalize_schedule_workflow(workflow)
+                wf_val = Jsonb(wf_norm) if wf_norm else None
+            dag_present = (
+                normalize_schedule_dag_jobs(dag_jobs) is not None
+                if dag_jobs is not _UNSET
+                else bool(_dag_jobs_from_row(row.get("dag_jobs")))
+            )
+            wf_present = (
+                normalize_schedule_workflow(workflow) is not None
+                if workflow is not _UNSET
+                else bool(_workflow_from_row(row.get("workflow")))
+            )
+            if dag_present and wf_present:
+                raise ValueError("workflow is mutually exclusive with dag_jobs")
 
             sealed = row["payload"]
             payload_key_id = row.get("payload_key_id")
@@ -876,6 +927,7 @@ class SchedulesCrudMixin:
                         payload = %s,
                         payload_key_id = %s,
                         dag_jobs = %s,
+                        workflow = %s,
                         queue_name = %s,
                         name = %s,
                         priority = %s,
@@ -901,6 +953,7 @@ class SchedulesCrudMixin:
                         Jsonb(sealed) if isinstance(sealed, dict) else sealed,
                         payload_key_id,
                         dag_val,
+                        wf_val,
                         qname,
                         new_name,
                         pri,

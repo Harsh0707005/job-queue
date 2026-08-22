@@ -812,6 +812,10 @@ ALTER TABLE schedules ADD COLUMN IF NOT EXISTS catch_up_remaining INTEGER;
 -- Optional DAG template: each tick materializes the whole graph atomically.
 -- NULL / empty = single-job schedule (payload becomes the one job).
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS dag_jobs JSONB;
+-- Optional multi-step workflow template. Mutually exclusive with dag_jobs.
+-- Each tick starts one workflow run; step jobs carry schedule_id +
+-- tick_iteration so mutex / waits / joins treat the whole run as one tick.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS workflow JSONB;
 
 -- Mutually exclusive schedule groups (per tenant). At most one member may
 -- have a tick / DAG in flight. Membership is a name; NULL means ungrouped.
@@ -1277,6 +1281,16 @@ CREATE INDEX IF NOT EXISTS idx_workflow_runs_tenant_created
 
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_tenant_status
     ON workflow_runs (tenant_id, status);
+
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS schedule_id UUID;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS tick_iteration BIGINT;
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_schedule
+    ON workflow_runs (schedule_id)
+    WHERE schedule_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_runs_schedule_inflight
+    ON workflow_runs (schedule_id)
+    WHERE schedule_id IS NOT NULL
+      AND status IN ('running', 'compensating');
 
 CREATE TABLE IF NOT EXISTS workflow_step_runs (
     id                  UUID PRIMARY KEY,

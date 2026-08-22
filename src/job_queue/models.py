@@ -256,6 +256,11 @@ class Schedule:
     ``missed_ticks`` is a running count of ticks that were not enqueued.
     ``dag_jobs`` is an optional template: when set, each tick enqueues that
     whole DAG atomically instead of a single job.
+    ``workflow`` is an optional multi-step saga template. When set, each
+    tick starts one workflow run instead of a job or DAG. Mutually
+    exclusive with ``dag_jobs``. Step jobs carry ``schedule_id`` and
+    ``tick_iteration`` so mutex, waits, and joins treat the whole run as
+    one tick.
     ``mutex_group`` names a per-tenant exclusive set: at most one member
     may have a tick or DAG in flight. Missed ticks while blocked follow
     ``misfire_policy`` instead of dumping a backlog.
@@ -296,6 +301,7 @@ class Schedule:
     last_misfire_at: datetime | None = None
     catch_up_remaining: int | None = None
     dag_jobs: tuple[dict[str, Any], ...] = ()
+    workflow: dict[str, Any] | None = None
     mutex_group: str | None = None
     waits_on: tuple[UUID, ...] = ()
     joins_on: tuple[UUID, ...] = ()
@@ -363,6 +369,7 @@ class ScheduleFire:
     refs: tuple[str, ...] = ()
     batch_id: UUID | None = None
     batch_key: str | None = None
+    workflow_run_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -868,6 +875,8 @@ class WorkflowRun:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    schedule_id: UUID | None = None
+    tick_iteration: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

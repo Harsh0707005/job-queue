@@ -1,0 +1,98 @@
+# Schedule ticks that start a multi-step workflow.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.schedule-workflow.yml \
+#     up --build --abort-on-container-exit --exit-code-from schedule-workflow-soak \
+#     schedule-workflow-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  effect-sink:
+    build: .
+    command: ["job-queue-effect-sink"]
+    environment:
+      PORT: "8091"
+      LOG_LEVEL: INFO
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  worker-1:
+    environment:
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-2:
+    environment:
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-3:
+    environment:
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+  worker-4:
+    environment:
+      EFFECT_SINK_URL: http://effect-sink:8091
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+    depends_on:
+      effect-sink:
+        condition: service_healthy
+
+  scheduler-2:
+    build: .
+    command: ["job-queue-scheduler-node"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      POLL_INTERVAL: "0.3"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+
+  schedule-workflow-soak:
+    build: .
+    command: ["python", "scripts/schedule_workflow_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      HOLD_SECONDS: "10"
+      CRON_EVERY_SEC: "5"
+      MAX_WALL_SECONDS: "180"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      scheduler:
+        condition: service_started
+      scheduler-2:
+        condition: service_started

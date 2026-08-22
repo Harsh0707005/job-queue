@@ -29,6 +29,7 @@ from job_queue.queue._common import (
     CancelError,
     QueueDrainError,
     _JOB_COLUMNS,
+    _SCHEDULE_COLUMNS,
     _as_utc,
     _normalize_skills,
     _utcnow,
@@ -39,7 +40,8 @@ WORKFLOW_STEP_KIND = "workflow.step"
 _RUN_COLUMNS = """
     id, tenant_id, name, status, steps_def, current_index,
     fail_step_index, fail_reason, max_compensate_retries,
-    created_at, updated_at, completed_at, payload_key_id
+    created_at, updated_at, completed_at, payload_key_id,
+    schedule_id, tick_iteration
 """
 
 _STEP_COLUMNS = """
@@ -67,6 +69,8 @@ class WorkflowsMixin:
         ttl_seconds: float | int | None = None,
         expires_at: Any = None,
         expiry_action: str | None = None,
+        schedule_id: UUID | None = None,
+        tick_iteration: int | None = None,
     ) -> WorkflowRun:
         """Start a multi-step workflow and enqueue the first forward step job.
 
@@ -91,59 +95,96 @@ class WorkflowsMixin:
         now = _utcnow()
         rid = run_id or uuid4()
         with transaction(self._pool) as conn:
+            row = self._start_workflow_on_conn(
+                conn,
+                tenant_id=tenant_id,
+                normalized=normalized,
+                name=name,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                max_compensate_retries=max_compensate_retries,
+                run_id=rid,
+                now=now,
+                schedule_id=schedule_id,
+                tick_iteration=tick_iteration,
+                lock_tenant=True,
+            )
+        assert row is not None
+        return self._row_to_workflow_run(row)
+
+    def _start_workflow_on_conn(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        normalized: list[dict[str, Any]],
+        name: str | None,
+        queue_name: str,
+        max_attempts: int,
+        visibility_timeout_seconds: int,
+        max_compensate_retries: int,
+        run_id: UUID,
+        now: Any,
+        schedule_id: UUID | None = None,
+        tick_iteration: int | None = None,
+        lock_tenant: bool = True,
+    ) -> Any:
+        if lock_tenant:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (tenant_id,),
             )
-            if hasattr(self, "_assert_queue_accepts_enqueue"):
-                self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
-            sealed_steps, steps_key_id = self._seal_dict(
-                conn,
-                tenant_id=tenant_id,
-                plaintext={"steps": normalized},
-                aad=workflow_steps_aad(rid),
+        if hasattr(self, "_assert_queue_accepts_enqueue"):
+            self._assert_queue_accepts_enqueue(conn, tenant_id, queue_name)
+        sealed_steps, steps_key_id = self._seal_dict(
+            conn,
+            tenant_id=tenant_id,
+            plaintext={"steps": normalized},
+            aad=workflow_steps_aad(run_id),
+        )
+        conn.execute(
+            f"""
+            INSERT INTO workflow_runs (
+                id, tenant_id, name, status, steps_def, current_index,
+                fail_step_index, fail_reason, max_compensate_retries,
+                created_at, updated_at, completed_at, payload_key_id,
+                schedule_id, tick_iteration
+            ) VALUES (
+                %s, %s, %s, %s, %s, 0,
+                NULL, NULL, %s,
+                %s, %s, NULL, %s,
+                %s, %s
             )
-            conn.execute(
-                f"""
-                INSERT INTO workflow_runs (
-                    id, tenant_id, name, status, steps_def, current_index,
-                    fail_step_index, fail_reason, max_compensate_retries,
-                    created_at, updated_at, completed_at, payload_key_id
-                ) VALUES (
-                    %s, %s, %s, %s, %s, 0,
-                    NULL, NULL, %s,
-                    %s, %s, NULL, %s
-                )
-                """,
-                (
-                    rid,
-                    tenant_id,
-                    str(name).strip() if name else None,
-                    WorkflowRunStatus.RUNNING.value,
-                    Jsonb(sealed_steps),
-                    int(max_compensate_retries),
-                    now,
-                    now,
-                    steps_key_id,
-                ),
-            )
-            # Fan-out: enqueue every root step (empty depends_on).
-            self._enqueue_ready_forward_steps(
-                conn,
-                run_id=rid,
-                tenant_id=tenant_id,
-                steps_def=normalized,
-                queue_name=queue_name,
-                max_attempts=max_attempts,
-                visibility_timeout_seconds=visibility_timeout_seconds,
-                now=now,
-            )
-            row = conn.execute(
-                f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
-                (rid,),
-            ).fetchone()
-        assert row is not None
-        return self._row_to_workflow_run(row)
+            """,
+            (
+                run_id,
+                tenant_id,
+                str(name).strip() if name else None,
+                WorkflowRunStatus.RUNNING.value,
+                Jsonb(sealed_steps),
+                int(max_compensate_retries),
+                now,
+                now,
+                steps_key_id,
+                schedule_id,
+                int(tick_iteration) if tick_iteration else None,
+            ),
+        )
+        self._enqueue_ready_forward_steps(
+            conn,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            steps_def=normalized,
+            queue_name=queue_name,
+            max_attempts=max_attempts,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+            now=now,
+        )
+        return conn.execute(
+            f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
+            (run_id,),
+        ).fetchone()
 
     def get_workflow(self, run_id: UUID, *, tenant_id: str) -> WorkflowRun | None:
         if not tenant_id or not str(tenant_id).strip():
@@ -1979,6 +2020,16 @@ class WorkflowsMixin:
                 "kind": sdef.get("kind") or "effect",
                 "payload": sdef.get("payload") or {},
             }
+        run_meta = conn.execute(
+            """
+            SELECT schedule_id, tick_iteration, tenant_id
+            FROM workflow_runs
+            WHERE id = %s
+            """,
+            (run_id,),
+        ).fetchone()
+        sched_id = (run_meta or {}).get("schedule_id")
+        stamp_iter = (run_meta or {}).get("tick_iteration")
         job_id = uuid4()
         payload = {
             "kind": WORKFLOW_STEP_KIND,
@@ -1990,6 +2041,26 @@ class WorkflowsMixin:
             "step": action,
             "idempotency_key": step_row["idempotency_key"],
         }
+        if (
+            sched_id
+            and stamp_iter
+            and direction == WorkflowStepDirection.FORWARD.value
+            and hasattr(self, "_attach_generation_payload")
+        ):
+            sched_row = conn.execute(
+                f"SELECT {_SCHEDULE_COLUMNS} FROM schedules WHERE id = %s",
+                (sched_id,),
+            ).fetchone()
+            if sched_row is not None:
+                try:
+                    payload = self._attach_generation_payload(
+                        conn,
+                        sched_row,
+                        payload,
+                        iteration=int(stamp_iter),
+                    )
+                except Exception:
+                    pass
         # Optional fail injection for tests/fleet.
         if direction == WorkflowStepDirection.FORWARD.value and sdef.get("fail"):
             payload["force_fail"] = True
@@ -2029,17 +2100,17 @@ class WorkflowsMixin:
                 labels, required_skills,
                 deadline_at, estimated_duration_seconds, preemptible,
                 created_at, updated_at, partition_id, payload_key_id,
-                expires_at, expiry_action
+                expires_at, expiry_action, tick_iteration
             ) VALUES (
                 %s, %s, %s, %s, %s, 0,
                 0, %s, %s,
                 3600,
                 0, 30,
-                %s, %s, NULL, %s,
+                %s, %s, %s, %s,
                 %s, %s,
                 NULL, NULL, TRUE,
                 %s, %s, %s, %s,
-                %s, %s
+                %s, %s, %s
             )
             """,
             (
@@ -2052,6 +2123,7 @@ class WorkflowsMixin:
                 visibility_timeout_seconds,
                 now,
                 dedupe,
+                sched_id,
                 [],
                 labels,
                 skills,
@@ -2067,8 +2139,34 @@ class WorkflowsMixin:
                 payload_key_id,
                 expires_at,
                 expiry_action,
+                int(stamp_iter) if stamp_iter else None,
             ),
         )
+        if sched_id and stamp_iter:
+            conn.execute(
+                """
+                UPDATE schedule_generations
+                SET source_job_ids = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT unnest(
+                            COALESCE(source_job_ids, '{}') || %s::uuid[]
+                        )
+                    )
+                ),
+                    updated_at = %s
+                WHERE schedule_id = %s
+                  AND iteration = %s
+                  AND tenant_id = %s
+                  AND status = 'pending'
+                """,
+                (
+                    [job_id],
+                    now,
+                    sched_id,
+                    int(stamp_iter),
+                    tenant_id,
+                ),
+            )
         # Keep step status pending until a worker actually leases the job.
         # Marking running here caused process_workflow_compensation to treat
         # healthy pending jobs as stuck and redrive (unique/dedupe conflicts).
@@ -2410,6 +2508,12 @@ class WorkflowsMixin:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row.get("completed_at"),
+            schedule_id=row.get("schedule_id"),
+            tick_iteration=(
+                None
+                if row.get("tick_iteration") is None
+                else int(row["tick_iteration"])
+            ),
         )
 
     @staticmethod

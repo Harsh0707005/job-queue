@@ -194,7 +194,7 @@ _SCHEDULE_COLUMNS = """
     next_run_at, last_enqueued_at, created_at, updated_at, labels,
     payload_key_id, required_skills,
     misfire_policy, catch_up_max, missed_ticks, last_misfire_at,
-    catch_up_remaining, dag_jobs, mutex_group, waits_on, joins_on,
+    catch_up_remaining, dag_jobs, workflow, mutex_group, waits_on, joins_on,
     tick_iteration, last_completed_iteration
 """
 
@@ -607,6 +607,7 @@ def _row_to_schedule(row: dict[str, Any]) -> Schedule:
             else int(row["catch_up_remaining"])
         ),
         dag_jobs=_dag_jobs_from_row(row.get("dag_jobs")),
+        workflow=_workflow_from_row(row.get("workflow")),
         mutex_group=(
             None
             if not row.get("mutex_group")
@@ -644,6 +645,16 @@ def _dag_jobs_from_row(raw: Any) -> tuple[dict[str, Any], ...]:
     if not raw:
         return ()
     return tuple(dict(item) for item in raw)
+
+
+def _workflow_from_row(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if not raw or not isinstance(raw, dict):
+        return None
+    return dict(raw)
 
 
 class LeaseError(Exception):
