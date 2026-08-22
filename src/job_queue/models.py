@@ -162,6 +162,7 @@ class Job:
     payload_kind: str = ""
     cloned_from_job_id: UUID | None = None
     coalesce_key: str | None = None
+    tick_iteration: int | None = None
 
     @property
     def is_leased(self) -> bool:
@@ -362,6 +363,19 @@ class ScheduleFire:
     refs: tuple[str, ...] = ()
     batch_id: UUID | None = None
     batch_key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleGenerationOp:
+    """Cancel or replay one fan-out generation as a closed set."""
+
+    schedule: Schedule
+    iteration: int
+    action: str
+    members: tuple[UUID, ...]
+    cancelled_job_ids: tuple[UUID, ...]
+    job: Job | None = None
+    jobs: tuple[Job, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

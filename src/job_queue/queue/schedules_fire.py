@@ -311,6 +311,7 @@ class SchedulesFireMixin:
                 schedule_id=sched_row["id"],
                 bypass_pending_and_rate=True,
                 extra_audit=detail,
+                tick_iteration=int(iteration) if iteration else None,
             )
         first = result.jobs[0]
         if iteration and hasattr(self, "_begin_schedule_generation"):
@@ -402,7 +403,7 @@ class SchedulesFireMixin:
                     available_at, dedupe_key, schedule_id, depends_on,
                     labels, required_skills,
                     created_at, updated_at, partition_id, payload_key_id,
-                    expires_at, expiry_action
+                    expires_at, expiry_action, tick_iteration
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     0, %s, %s,
@@ -411,7 +412,7 @@ class SchedulesFireMixin:
                     %s, NULL, %s, %s,
                     %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 RETURNING {_JOB_COLUMNS}
                 """,
@@ -435,6 +436,7 @@ class SchedulesFireMixin:
                     payload_key_id,
                     expires,
                     exp_action,
+                    int(iteration) if iteration else None,
                 ),
             ).fetchone()
             assert job_row is not None

@@ -311,6 +311,18 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/schedules/")
+            and path.endswith("/cancel-generation")
+        ):
+            return self._cancel_schedule_generation(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
+            and path.endswith("/replay-generation")
+        ):
+            return self._replay_schedule_generation(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/schedules/")
             and path.endswith("/move")
         ):
             return self._move_schedule(path, body)

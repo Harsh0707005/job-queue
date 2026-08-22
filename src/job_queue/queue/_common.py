@@ -49,7 +49,8 @@ _JOB_COLUMNS = """
     await_children_resolved_at, last_error, partition_id, payload_key_id,
     required_skills, expires_at, expiry_action,
     failed_workers, max_worker_hops, quarantine_action,
-    prefer_last_worker, payload_kind, cloned_from_job_id, coalesce_key
+    prefer_last_worker, payload_kind, cloned_from_job_id, coalesce_key,
+    tick_iteration
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -526,6 +527,11 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         payload_kind=str(row.get("payload_kind") or ""),
         cloned_from_job_id=row.get("cloned_from_job_id"),
         coalesce_key=row.get("coalesce_key"),
+        tick_iteration=(
+            None
+            if row.get("tick_iteration") is None
+            else int(row["tick_iteration"])
+        ),
     )
 
 

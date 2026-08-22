@@ -371,6 +371,13 @@ CREATE INDEX IF NOT EXISTS idx_jobs_schedule_id
     ON jobs (schedule_id)
     WHERE schedule_id IS NOT NULL;
 
+-- Stamp the fan-out generation on every tick job so cancel/replay can
+-- close the set without guessing from created_at.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tick_iteration BIGINT;
+CREATE INDEX IF NOT EXISTS idx_jobs_schedule_iteration
+    ON jobs (schedule_id, tick_iteration)
+    WHERE schedule_id IS NOT NULL AND tick_iteration IS NOT NULL;
+
 -- Find children of a parent quickly (contains / overlap queries).
 CREATE INDEX IF NOT EXISTS idx_jobs_depends_on
     ON jobs USING GIN (depends_on);

@@ -94,6 +94,7 @@ class JobsEnqueueDagMixin:
         schedule_id: UUID | None = None,
         bypass_pending_and_rate: bool = False,
         extra_audit: dict[str, Any] | None = None,
+        tick_iteration: int | None = None,
     ) -> DagEnqueueResult:
         """Materialize a DAG on an already-open transaction.
 
@@ -242,7 +243,7 @@ class JobsEnqueueDagMixin:
                     labels, required_skills,
                     deadline_at, estimated_duration_seconds, preemptible,
                     created_at, updated_at, partition_id, payload_key_id,
-                    expires_at, expiry_action
+                    expires_at, expiry_action, tick_iteration
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     0, %s, %s,
@@ -252,7 +253,7 @@ class JobsEnqueueDagMixin:
                     %s, %s,
                     %s, %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 RETURNING {_JOB_COLUMNS}
                 """,
@@ -283,6 +284,7 @@ class JobsEnqueueDagMixin:
                     payload_key_id,
                     expires,
                     exp_action,
+                    int(tick_iteration) if tick_iteration else None,
                 ),
             ).fetchone()
             assert row is not None

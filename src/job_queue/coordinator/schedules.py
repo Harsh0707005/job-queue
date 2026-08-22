@@ -11,6 +11,7 @@ from uuid import UUID
 
 from job_queue.codec import (
     job_to_dict,
+    schedule_generation_op_to_dict,
     schedule_to_dict,
 )
 from job_queue.models import JobStatus
@@ -274,6 +275,62 @@ class SchedulesApiMixin:
                 return 404, {"error": msg, "code": "schedule_error"}
             return 409, {"error": msg, "code": "schedule_error"}
         return 200, {"schedule": schedule_to_dict(sched, include_payload=True)}
+
+    def _cancel_schedule_generation(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._generation_op(path, body, replay=False)
+
+    def _replay_schedule_generation(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._generation_op(path, body, replay=True)
+
+    def _generation_op(
+        self, path: str, body: dict[str, Any], *, replay: bool
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid schedule path"}
+        sid = parts[2]
+        if not _UUID_RE.match(sid):
+            return 400, {"error": "invalid schedule id"}
+        tenant_id = body.get("tenant_id")
+        if not tenant_id:
+            return 400, {"error": "tenant_id is required"}
+        raw_iter = body.get("iteration")
+        iteration: int | None
+        if raw_iter is None or raw_iter == "":
+            iteration = None
+        else:
+            try:
+                iteration = int(raw_iter)
+            except (TypeError, ValueError):
+                return 400, {"error": "iteration must be an integer"}
+        try:
+            if replay:
+                op = self.queue.replay_schedule_generation(
+                    UUID(sid), tenant_id=str(tenant_id), iteration=iteration
+                )
+            else:
+                op = self.queue.cancel_schedule_generation(
+                    UUID(sid), tenant_id=str(tenant_id), iteration=iteration
+                )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        except SpendCapError as exc:
+            return 429, {
+                "error": str(exc),
+                "code": "spend_capped",
+                "tenant_id": exc.tenant_id,
+            }
+        except ScheduleError as exc:
+            msg = str(exc)
+            if "not found" in msg:
+                return 404, {"error": msg, "code": "schedule_error"}
+            return 409, {"error": msg, "code": "schedule_error"}
+        status = 201 if replay else 200
+        return status, schedule_generation_op_to_dict(op, include_payload=True)
 
     def _delete_schedule(
         self, path: str, body: dict[str, Any]

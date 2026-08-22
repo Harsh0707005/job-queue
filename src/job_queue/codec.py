@@ -126,6 +126,7 @@ def job_to_dict(
         "payload_kind": str(getattr(job, "payload_kind", "") or ""),
         "cloned_from_job_id": _uuid(getattr(job, "cloned_from_job_id", None)),
         "coalesce_key": getattr(job, "coalesce_key", None),
+        "tick_iteration": getattr(job, "tick_iteration", None),
     }
 
 
@@ -214,6 +215,11 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         payload_kind=str(data.get("payload_kind") or ""),
         cloned_from_job_id=parse_uuid("cloned_from_job_id"),
         coalesce_key=data.get("coalesce_key"),
+        tick_iteration=(
+            None
+            if data.get("tick_iteration") is None
+            else int(data["tick_iteration"])
+        ),
     )
 
 
@@ -385,6 +391,28 @@ def schedule_to_dict(
         "last_completed_iteration": getattr(
             sched, "last_completed_iteration", None
         ),
+    }
+
+
+def schedule_generation_op_to_dict(
+    op: Any,
+    *,
+    include_payload: bool = False,
+) -> dict[str, Any]:
+    jobs = list(getattr(op, "jobs", ()) or ())
+    first = getattr(op, "job", None)
+    return {
+        "schedule": schedule_to_dict(op.schedule, include_payload=include_payload),
+        "iteration": int(op.iteration),
+        "action": str(op.action),
+        "members": [str(u) for u in (op.members or ())],
+        "cancelled_job_ids": [str(u) for u in (op.cancelled_job_ids or ())],
+        "job": (
+            None
+            if first is None
+            else job_to_dict(first, include_payload=include_payload)
+        ),
+        "jobs": [job_to_dict(j, include_payload=include_payload) for j in jobs],
     }
 
 

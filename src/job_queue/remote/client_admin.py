@@ -613,6 +613,42 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def cancel_schedule_generation(
+        self,
+        schedule_id: str | UUID,
+        *,
+        tenant_id: str,
+        iteration: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if iteration is not None:
+            body["iteration"] = int(iteration)
+        payload = self._request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/cancel-generation",
+            body,
+        )
+        assert payload is not None
+        return payload
+
+    def replay_schedule_generation(
+        self,
+        schedule_id: str | UUID,
+        *,
+        tenant_id: str,
+        iteration: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if iteration is not None:
+            body["iteration"] = int(iteration)
+        payload = self._request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/replay-generation",
+            body,
+        )
+        assert payload is not None
+        return payload
+
     def set_schedule_misfire(
         self,
         schedule_id: str | UUID,

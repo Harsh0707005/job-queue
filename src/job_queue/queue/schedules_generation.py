@@ -35,7 +35,14 @@ class SchedulesGenerationMixin:
                 schedule_id, iteration, tenant_id, status,
                 source_job_ids, created_at, updated_at
             ) VALUES (%s, %s, %s, 'pending', %s, %s, %s)
-            ON CONFLICT (schedule_id, iteration) DO NOTHING
+            ON CONFLICT (schedule_id, iteration) DO UPDATE
+            SET tenant_id = EXCLUDED.tenant_id,
+                status = 'pending',
+                payload = NULL,
+                payload_key_id = NULL,
+                source_job_ids = EXCLUDED.source_job_ids,
+                updated_at = EXCLUDED.updated_at
+            WHERE schedule_generations.status = 'failed'
             """,
             (schedule_id, iteration, tenant_id, list(job_ids), now, now),
         )
