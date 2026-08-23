@@ -246,6 +246,159 @@ def test_http_process_due_without_control_still_works(queue: JobQueue):
         server.shutdown()
 
 
+def test_old_leader_fenced_after_lease_stolen(queue: JobQueue):
+    """After a steal, the old token must not fire schedules or claim webhooks."""
+    from job_queue import WebhookEvent
+
+    old_tok = uuid4()
+    new_tok = uuid4()
+    held = queue.acquire_or_renew_control_leader(
+        node_id="old", lease_token=old_tok, ttl_seconds=0.2
+    )
+    assert held is not None
+    old_epoch = held.epoch
+
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    queue.register_webhook(
+        tenant_id="t1",
+        url="http://127.0.0.1:9/hook",
+        events=[WebhookEvent.JOB_COMPLETED.value],
+    )
+    job = queue.enqueue(tenant_id="t1", payload={"x": 1})
+    leased = queue.lease(tenant_id="t1", worker_id="w")
+    assert leased is not None
+    _ack(queue, leased, "w")
+    pending_hooks = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+    assert pending_hooks
+
+    time.sleep(0.25)
+    stolen = queue.acquire_or_renew_control_leader(
+        node_id="new", lease_token=new_tok, ttl_seconds=5.0
+    )
+    assert stolen is not None
+    assert stolen.epoch == old_epoch + 1
+    assert stolen.node_id == "new"
+
+    # Simulated stale tick from the deposed leader.
+    assert (
+        queue.process_due_schedules(
+            tenant_id="t1", leader_token=old_tok, leader_epoch=old_epoch
+        )
+        == []
+    )
+    claimed, auto = queue.claim_webhook_deliveries(
+        leader_token=old_tok, leader_epoch=old_epoch
+    )
+    assert claimed == []
+    assert auto == []
+    ev = queue.evaluate_alerts(leader_token=old_tok, leader_epoch=old_epoch)
+    assert ev.fired == []
+    purged = queue.purge_expired_jobs(
+        leader_token=old_tok, leader_epoch=old_epoch
+    )
+    assert purged.total_deleted == 0
+    sched_jobs = [
+        j for j in queue.list_jobs(tenant_id="t1") if j.schedule_id == sched.id
+    ]
+    assert sched_jobs == []
+    still_pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+    assert len(still_pending) == len(pending_hooks)
+
+    # The new leader can still do the work.
+    fires = queue.process_due_schedules(
+        tenant_id="t1", leader_token=new_tok, leader_epoch=stolen.epoch
+    )
+    assert [f.schedule.id for f in fires] == [sched.id]
+    claimed, _ = queue.claim_webhook_deliveries(
+        leader_token=new_tok, leader_epoch=stolen.epoch
+    )
+    assert len(claimed) == len(pending_hooks)
+
+
+def test_control_loop_paused_tick_after_steal_does_not_fire(queue: JobQueue):
+    """Old loop acquires, lease moves, then its delayed tick must no-op."""
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "fenced"},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+
+    paused = threading.Event()
+    resume = threading.Event()
+    old = Coordinator(queue, node_id="stale")
+    new = Coordinator(queue, node_id="fresh")
+
+    def hold_after_acquire(loop, lease) -> None:
+        if loop.node_id != "stale":
+            return
+        if paused.is_set():
+            return
+        paused.set()
+        resume.wait(timeout=5)
+
+    old.start_control(
+        ttl_seconds=0.35,
+        interval_seconds=0.08,
+        before_tick=hold_after_acquire,
+    )
+    try:
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            if paused.is_set():
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("old leader never reached before_tick")
+        assert queue.list_jobs(tenant_id="t1") == []
+
+        time.sleep(0.4)
+        new.start_control(ttl_seconds=2.0, interval_seconds=0.08)
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            if new._control_loop is not None and new._control_loop.is_leader():
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("new leader never took over")
+        lease = queue.get_control_leader()
+        assert lease is not None
+        assert lease.node_id == "fresh"
+        assert lease.epoch >= 2
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            jobs = [
+                j
+                for j in queue.list_jobs(tenant_id="t1")
+                if j.schedule_id == sched.id
+            ]
+            if jobs:
+                break
+            time.sleep(0.05)
+        assert len(jobs) == 1
+
+        resume.set()
+        time.sleep(0.4)
+        later = [
+            j
+            for j in queue.list_jobs(tenant_id="t1")
+            if j.schedule_id == sched.id
+        ]
+        assert len(later) == 1
+    finally:
+        resume.set()
+        old.stop_control()
+        new.stop_control()
+
+
 def test_workers_keep_leasing_while_leader_ticks(queue: JobQueue):
     c1 = Coordinator(queue, node_id="w-lead")
     c1.start_control(ttl_seconds=2.0, interval_seconds=0.1)

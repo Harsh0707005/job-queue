@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+from uuid import UUID
 
 from job_queue.db import transaction
 from job_queue.queue._common import (
@@ -18,6 +19,8 @@ class WebhooksClaimBatchMixin:
         limit: int = 50,
         claim_seconds: float | None = None,
         http_timeout_seconds: float = 10.0,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> tuple[list[Any], list[Any]]:
         """Claim due webhook deliveries without performing HTTP POSTs.
 
@@ -51,6 +54,10 @@ class WebhooksClaimBatchMixin:
         auto_finalized: list[Any] = []
 
         with transaction(self._pool) as conn:
+            if hasattr(self, "_fence_control_leader") and not self._fence_control_leader(
+                conn, lease_token=leader_token, epoch=leader_epoch
+            ):
+                return [], []
             # Cheap gate: only scan offboarding reaper when needed.
             has_offboard = conn.execute(
                 """
@@ -265,6 +272,8 @@ class WebhooksClaimBatchMixin:
         http_timeout_seconds: float = 10.0,
         claim_seconds: float | None = None,
         on_result: Any = None,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> list[Any]:
         """Local orchestrator: claim → POST → finalize (tests / in-process).
 
@@ -278,6 +287,8 @@ class WebhooksClaimBatchMixin:
             limit=limit,
             claim_seconds=claim_seconds,
             http_timeout_seconds=http_timeout_seconds,
+            leader_token=leader_token,
+            leader_epoch=leader_epoch,
         )
         results: list[Any] = list(auto)
         if on_result is not None:

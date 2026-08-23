@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from psycopg.errors import UniqueViolation
 
 from job_queue.db import transaction
@@ -31,6 +33,8 @@ class SchedulesProcessMixin:
         *,
         tenant_id: str | None = None,
         limit: int = 100,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> list[ScheduleFire]:
         """Enqueue jobs for schedules that are due and advance their next run.
 
@@ -118,6 +122,10 @@ class SchedulesProcessMixin:
         """
 
         with transaction(self._pool) as conn:
+            if hasattr(self, "_fence_control_leader") and not self._fence_control_leader(
+                conn, lease_token=leader_token, epoch=leader_epoch
+            ):
+                return []
             if tenant_id is not None:
                 if self._tenant_claims_blocked(conn, tenant_id, now=now):
                     return []

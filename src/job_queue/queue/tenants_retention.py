@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from job_queue.db import transaction
 from job_queue.models import (
@@ -249,6 +250,8 @@ class TenantsRetentionMixin:
         *,
         limit: int = 500,
         tenant_id: str | None = None,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> RetentionPurgeResult:
         """Delete terminal jobs older than their retention window.
 
@@ -271,6 +274,16 @@ class TenantsRetentionMixin:
         now = _utcnow()
         half = max(1, limit // 2)
         with transaction(self._pool) as conn:
+            if hasattr(self, "_fence_control_leader") and not self._fence_control_leader(
+                conn, lease_token=leader_token, epoch=leader_epoch
+            ):
+                return RetentionPurgeResult(
+                    completed_deleted=0,
+                    dead_deleted=0,
+                    side_effects_deleted=0,
+                    metric_buckets_deleted=0,
+                    metric_snapshots_deleted=0,
+                )
             # Ensure global row exists for JOIN.
             conn.execute(
                 """

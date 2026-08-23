@@ -779,11 +779,18 @@ class JobsApiMixin:
         return 200, {"job": job_to_dict(job)}
 
     def _process_due(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        fence = self._control_fence_args()
+        if fence is None:
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            fence = {}
         limit = int(body.get("limit") or 100)
         tenant_id = body.get("tenant_id")
         fires = self.queue.process_due_schedules(
             tenant_id=str(tenant_id) if tenant_id else None,
             limit=limit,
+            **fence,
         )
         return 200, {
             "count": len(fires),

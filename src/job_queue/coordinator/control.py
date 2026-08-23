@@ -31,6 +31,7 @@ class CoordinatorControlLoop:
         webhook_limit: int = 25,
         retention_limit: int = 200,
         webhook_timeout_seconds: float = 5.0,
+        before_tick=None,
     ) -> None:
         self.coordinator = coordinator
         self.queue = coordinator.queue
@@ -46,6 +47,9 @@ class CoordinatorControlLoop:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._holding = False
+        self._epoch: int | None = None
+        # Test hook: called after acquire, before the fenced tick.
+        self.before_tick = before_tick
 
     def is_leader(self) -> bool:
         with self._lock:
@@ -107,6 +111,7 @@ class CoordinatorControlLoop:
             with self._lock:
                 was = self._holding
                 self._holding = lease is not None
+                self._epoch = None if lease is None else int(lease.epoch)
             if lease is not None and not was:
                 logger.info(
                     "became control leader node=%s epoch=%s",
@@ -116,13 +121,23 @@ class CoordinatorControlLoop:
             elif lease is None and was:
                 logger.info("lost control leader node=%s", self.node_id)
             if lease is not None and not self._stop.is_set():
-                self._tick()
+                hook = self.before_tick
+                if hook is not None:
+                    try:
+                        hook(self, lease)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("before_tick hook failed node=%s", self.node_id)
+                if not self._stop.is_set():
+                    self._tick(epoch=int(lease.epoch))
             self._stop.wait(self.interval_seconds)
 
-    def _tick(self) -> None:
+    def _tick(self, *, epoch: int) -> None:
         token = self.lease_token
+        fence = {"leader_token": token, "leader_epoch": epoch}
         try:
-            fires = self.queue.process_due_schedules(limit=self.schedule_limit)
+            fires = self.queue.process_due_schedules(
+                limit=self.schedule_limit, **fence
+            )
             self.queue.bump_control_tick(
                 lease_token=token, kind="schedules", count=1
             )
@@ -133,9 +148,10 @@ class CoordinatorControlLoop:
         if self._stop.is_set() or not self.is_leader():
             return
         try:
-            results = self.queue.process_webhook_deliveries(
+            self.queue.process_webhook_deliveries(
                 limit=self.webhook_limit,
                 http_timeout_seconds=self.webhook_timeout_seconds,
+                **fence,
             )
             self.queue.bump_control_tick(
                 lease_token=token, kind="webhooks", count=1
@@ -145,7 +161,7 @@ class CoordinatorControlLoop:
         if self._stop.is_set() or not self.is_leader():
             return
         try:
-            ev = self.queue.evaluate_alerts()
+            self.queue.evaluate_alerts(**fence)
             self.queue.bump_control_tick(
                 lease_token=token, kind="alerts", count=1
             )
@@ -154,7 +170,7 @@ class CoordinatorControlLoop:
         if self._stop.is_set() or not self.is_leader():
             return
         try:
-            purged = self.queue.purge_expired_jobs(limit=self.retention_limit)
+            self.queue.purge_expired_jobs(limit=self.retention_limit, **fence)
             self.queue.bump_control_tick(
                 lease_token=token,
                 kind="retention",

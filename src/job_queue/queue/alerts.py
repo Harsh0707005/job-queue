@@ -447,7 +447,11 @@ class AlertsMixin:
         return [self._row_to_alert_event(r) for r in rows]
 
     def evaluate_alerts(
-        self, *, now: datetime | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> AlertEvaluationResult:
         """Evaluate all enabled rules; fire on breach, auto-resolve on recovery.
 
@@ -468,6 +472,12 @@ class AlertsMixin:
         flip-flop; set ``recovery_evaluations=0`` to disable auto-resolve.
         """
         ts = now or _utcnow()
+        if leader_token is not None and hasattr(self, "_fence_control_leader"):
+            with transaction(self._pool) as conn:
+                if not self._fence_control_leader(
+                    conn, lease_token=leader_token, epoch=leader_epoch
+                ):
+                    return AlertEvaluationResult(fired=[], resolved=[])
         rules = self.list_alert_rules(enabled_only=True)
         fired: list[AlertEvent] = []
         resolved: list[AlertEvent] = []
@@ -480,14 +490,26 @@ class AlertsMixin:
             v = float(value)
             if self._compare(v, rule.comparator, rule.threshold):
                 # Breach: reset healthy streak, then fire if cooldown allows.
-                self._reset_healthy_progress(rule.id, now=ts)
+                self._reset_healthy_progress(
+                    rule.id,
+                    now=ts,
+                    leader_token=leader_token,
+                    leader_epoch=leader_epoch,
+                )
                 if rule.last_fired_at is not None and rule.cooldown_seconds > 0:
                     cool_until = rule.last_fired_at + timedelta(
                         seconds=rule.cooldown_seconds
                     )
                     if ts < cool_until:
                         continue
-                ev = self._fire_alert(rule, value=v, detail=detail, now=ts)
+                ev = self._fire_alert(
+                    rule,
+                    value=v,
+                    detail=detail,
+                    now=ts,
+                    leader_token=leader_token,
+                    leader_epoch=leader_epoch,
+                )
                 if ev is not None:
                     fired.append(ev)
                 continue
@@ -496,7 +518,11 @@ class AlertsMixin:
             if rule.recovery_evaluations <= 0:
                 continue
             closed = self._record_healthy_and_maybe_resolve(
-                rule, value=v, now=ts
+                rule,
+                value=v,
+                now=ts,
+                leader_token=leader_token,
+                leader_epoch=leader_epoch,
             )
             resolved.extend(closed)
         return AlertEvaluationResult(fired=fired, resolved=resolved)
@@ -529,9 +555,20 @@ class AlertsMixin:
             return value > rec
         return False
 
-    def _reset_healthy_progress(self, rule_id: UUID, *, now: datetime) -> None:
+    def _reset_healthy_progress(
+        self,
+        rule_id: UUID,
+        *,
+        now: datetime,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
+    ) -> None:
         """Clear healthy streak and last tick timestamp (breach / gray zone)."""
         with transaction(self._pool) as conn:
+            if hasattr(self, "_fence_control_leader") and not self._fence_control_leader(
+                conn, lease_token=leader_token, epoch=leader_epoch
+            ):
+                return
             conn.execute(
                 """
                 UPDATE alert_rules
@@ -571,6 +608,8 @@ class AlertsMixin:
         *,
         value: float,
         now: datetime,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> list[AlertEvent]:
         """Atomically update healthy streak; auto-resolve when threshold met.
 
@@ -581,6 +620,10 @@ class AlertsMixin:
         """
         recovered = self._is_recovered(value, rule)
         with transaction(self._pool) as conn:
+            if hasattr(self, "_fence_control_leader") and not self._fence_control_leader(
+                conn, lease_token=leader_token, epoch=leader_epoch
+            ):
+                return []
             locked = conn.execute(
                 f"""
                 SELECT {_ALERT_RULE_COLUMNS}
@@ -790,6 +833,8 @@ class AlertsMixin:
         value: float,
         detail: dict[str, Any],
         now: datetime,
+        leader_token: UUID | None = None,
+        leader_epoch: int | None = None,
     ) -> AlertEvent | None:
         """Atomically claim cooldown + append history + enqueue webhooks.
 
@@ -817,6 +862,10 @@ class AlertsMixin:
             }
         )
         with transaction(self._pool) as conn:
+            if hasattr(self, "_fence_control_leader") and not self._fence_control_leader(
+                conn, lease_token=leader_token, epoch=leader_epoch
+            ):
+                return None
             locked = conn.execute(
                 f"""
                 SELECT {_ALERT_RULE_COLUMNS}

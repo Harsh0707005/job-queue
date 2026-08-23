@@ -61,6 +61,26 @@ class RoutingMixin:
             "leader_epoch": int(lease.epoch) if live else None,
         }
 
+    def _control_fence_args(self) -> dict[str, Any] | None:
+        """Token+epoch for a fenced control POST, or None to refuse.
+
+        ``{}`` means no control loop is running (tests / open HTTP).
+        """
+        loop = getattr(self, "_control_loop", None)
+        if loop is None:
+            return {}
+        if not loop.is_leader():
+            return None
+        lease = None
+        if hasattr(self.queue, "get_control_leader"):
+            lease = self.queue.get_control_leader()
+        if lease is None:
+            return None
+        return {
+            "leader_token": loop.lease_token,
+            "leader_epoch": int(lease.epoch),
+        }
+
     def _control_gate(self) -> tuple[int, dict[str, Any]] | None:
         """Followers refuse control-plane POSTs so only the leader runs them.
 

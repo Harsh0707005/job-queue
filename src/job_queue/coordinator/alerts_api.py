@@ -232,8 +232,14 @@ class AlertsApiMixin:
         return 200, {"event": _event_to_dict(event)}
 
     def _evaluate_alerts(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        fence = self._control_fence_args()
+        if fence is None:
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            fence = {}
         try:
-            result = self.queue.evaluate_alerts()
+            result = self.queue.evaluate_alerts(**fence)
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {

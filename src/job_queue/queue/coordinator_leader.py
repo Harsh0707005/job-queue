@@ -130,6 +130,43 @@ class CoordinatorLeaderMixin:
                 return None
             return _row_to_leader(updated)
 
+    def _fence_control_leader(
+        self,
+        conn: Any,
+        *,
+        lease_token: UUID | None,
+        epoch: int | None,
+        slot: str = CONTROL_LEADER_SLOT,
+    ) -> bool:
+        """True if this txn still holds *lease_token* at *epoch*.
+
+        No token means no fence (tests / HTTP without a control loop).
+        ``FOR SHARE`` so a steal (``FOR UPDATE``) waits until this
+        control txn commits — a tick that started while we were leader
+        finishes, but a tick that starts after the steal sees the new
+        epoch and refuses.
+        """
+        if lease_token is None:
+            return True
+        if epoch is None:
+            return False
+        row = conn.execute(
+            """
+            SELECT lease_token, epoch, expires_at
+            FROM coordinator_leader
+            WHERE slot = %s
+            FOR SHARE
+            """,
+            (slot,),
+        ).fetchone()
+        if row is None:
+            return False
+        return (
+            row["lease_token"] == lease_token
+            and int(row["epoch"]) == int(epoch)
+            and _as_utc(row["expires_at"]) > _utcnow()
+        )
+
     def get_control_leader(
         self, *, slot: str = CONTROL_LEADER_SLOT
     ) -> CoordinatorLeader | None:
