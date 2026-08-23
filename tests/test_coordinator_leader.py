@@ -8,11 +8,13 @@ from datetime import timedelta
 from http.server import ThreadingHTTPServer
 from uuid import uuid4
 
-from job_queue import JobQueue, JobStatus
+from datetime import datetime, timezone
+
+from job_queue import JobQueue, JobStatus, WebhookEvent
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.queue._common import _utcnow
 from job_queue.remote import CoordinatorClient
-from tests.helpers_queue import _ack
+from tests.helpers_queue import _WebhookCapture, _ack
 from tests.test_schedule_dag import _make_due
 
 
@@ -572,6 +574,141 @@ def test_handoff_http_roundtrip(queue: JobQueue):
         s2.shutdown()
         c1.stop_control()
         c2.stop_control()
+
+
+def _seed_webhook_jobs(queue: JobQueue, capture: _WebhookCapture, n: int) -> None:
+    queue.register_webhook(
+        tenant_id="t1",
+        url=capture.url,
+        events=[WebhookEvent.JOB_COMPLETED.value],
+        max_attempts=3,
+    )
+    for i in range(n):
+        queue.enqueue(tenant_id="t1", payload={"i": i})
+        job = queue.lease(tenant_id="t1", worker_id="w")
+        assert job is not None
+        _ack(queue, job, "w", result={"i": i})
+    pending = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+    assert len(pending) == n
+
+
+def test_handoff_mid_webhook_batch_does_not_double_post(queue: JobQueue):
+    """Old leader stops mid-batch; leftovers are posted once by the new leader."""
+    capture = _WebhookCapture()
+    try:
+        _seed_webhook_jobs(queue, capture, 3)
+        old_tok = uuid4()
+        new_tok = uuid4()
+        held = queue.acquire_or_renew_control_leader(
+            node_id="old", lease_token=old_tok, ttl_seconds=30.0
+        )
+        assert held is not None
+        seen: list = []
+
+        def before_post(item) -> None:
+            seen.append(item.delivery.id)
+            if len(seen) == 2:
+                queue.handoff_control_leader("new", handoff_seconds=15.0)
+
+        old_out = queue.process_webhook_deliveries(
+            limit=10,
+            claim_seconds=60,
+            leader_token=old_tok,
+            leader_epoch=held.epoch,
+            on_before_post=before_post,
+        )
+        # First item posted; second aborted at the hook; third never posted.
+        assert len(capture.received) == 1
+        succeeded = [r for r in old_out if r.success]
+        assert len(succeeded) == 1
+        leftover = queue.list_webhook_deliveries(tenant_id="t1", status="pending")
+        assert len(leftover) == 2
+
+        claimed = queue.acquire_or_renew_control_leader(
+            node_id="new", lease_token=new_tok, ttl_seconds=30.0
+        )
+        assert claimed is not None
+        queue.process_webhook_deliveries(
+            limit=10,
+            claim_seconds=60,
+            leader_token=new_tok,
+            leader_epoch=claimed.epoch,
+        )
+        assert len(capture.received) == 3
+        bodies = [r["body"].get("result", r["body"]) for r in capture.received]
+        # Each job result posted exactly once.
+        got_i = sorted(
+            (b.get("i") if isinstance(b, dict) else None) for b in bodies
+        )
+        assert got_i == [0, 1, 2]
+        assert queue.list_webhook_deliveries(tenant_id="t1", status="pending") == []
+        done = queue.list_webhook_deliveries(tenant_id="t1", status="succeeded")
+        assert len(done) == 3
+    finally:
+        capture.stop()
+
+
+def test_posted_then_lost_claim_reclaim_does_not_repost(queue: JobQueue):
+    """2xx evidence survives handoff + claim timeout so reclaim is not a new POST."""
+    capture = _WebhookCapture()
+    try:
+        _seed_webhook_jobs(queue, capture, 1)
+        old_tok = uuid4()
+        new_tok = uuid4()
+        held = queue.acquire_or_renew_control_leader(
+            node_id="old", lease_token=old_tok, ttl_seconds=30.0
+        )
+        assert held is not None
+        claimed, _ = queue.claim_webhook_deliveries(
+            limit=1,
+            claim_seconds=60,
+            leader_token=old_tok,
+            leader_epoch=held.epoch,
+        )
+        assert len(claimed) == 1
+        item = claimed[0]
+        from job_queue.webhooks import post_webhook
+
+        code, _ = post_webhook(
+            item.url,
+            item.delivery.payload,
+            secret=item.secret,
+            idempotency_key=str(item.delivery.id),
+        )
+        assert 200 <= code < 300
+        assert queue.note_webhook_last_status(item.delivery.id, code)
+        assert len(capture.received) == 1
+
+        queue.handoff_control_leader("new", handoff_seconds=15.0)
+        # Simulate the old claim timing out before finalize.
+        with queue._pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET delivering_until = %s
+                WHERE id = %s AND status = 'delivering'
+                """,
+                (datetime.now(timezone.utc) - timedelta(seconds=1), item.delivery.id),
+            )
+            conn.commit()
+
+        stolen = queue.acquire_or_renew_control_leader(
+            node_id="new", lease_token=new_tok, ttl_seconds=30.0
+        )
+        assert stolen is not None
+        results = queue.process_webhook_deliveries(
+            limit=10,
+            claim_seconds=30,
+            leader_token=new_tok,
+            leader_epoch=stolen.epoch,
+        )
+        assert len(capture.received) == 1
+        got = queue.get_webhook_delivery(item.delivery.id, tenant_id="t1")
+        assert got is not None
+        assert got.status == "succeeded"
+        assert any(r.success and r.delivery.id == item.delivery.id for r in results)
+    finally:
+        capture.stop()
 
 
 def test_workers_keep_leasing_while_leader_ticks(queue: JobQueue):

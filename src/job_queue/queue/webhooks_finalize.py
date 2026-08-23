@@ -14,6 +14,63 @@ from job_queue.queue._common import (
 
 
 class WebhooksFinalizeMixin:
+    def note_webhook_last_status(
+        self,
+        delivery_id: UUID,
+        status_code: int,
+    ) -> bool:
+        """Persist HTTP evidence on a live claim so reclaim will not re-POST.
+
+        A crash after POST and before :meth:`finalize_webhook_delivery` leaves
+        ``status=delivering``. Reclaim treats a stored 2xx as already delivered.
+        """
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET last_status_code = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND status = 'delivering'
+                RETURNING id
+                """,
+                (int(status_code), now, delivery_id),
+            ).fetchone()
+        return row is not None
+
+    def release_webhook_claims(
+        self,
+        delivery_ids: list[UUID],
+        *,
+        reason: str = "released after control leader handoff",
+    ) -> int:
+        """Return unposted claims to pending so a new leader can deliver once.
+
+        Attempts are not incremented. Rows that already left ``delivering``
+        are left alone.
+        """
+        ids = [i for i in delivery_ids if i is not None]
+        if not ids:
+            return 0
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            rows = conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status = 'pending',
+                    delivering_until = NULL,
+                    next_attempt_at = %s,
+                    last_error = %s,
+                    updated_at = %s
+                WHERE id = ANY(%s)
+                  AND status = 'delivering'
+                RETURNING id
+                """,
+                (now, reason[:2000], now, ids),
+            ).fetchall()
+        return len(rows)
+
     def finalize_webhook_delivery(
         self,
         delivery_id: UUID,

@@ -287,6 +287,21 @@ class CoordinatorLeaderMixin:
             return None
         return _row_to_leader(row)
 
+    def still_control_leader(
+        self,
+        *,
+        lease_token: UUID | None,
+        epoch: int | None,
+        slot: str = CONTROL_LEADER_SLOT,
+    ) -> bool:
+        """True if *lease_token* still owns *epoch* (short fenced read)."""
+        if lease_token is None:
+            return True
+        with transaction(self._pool) as conn:
+            return self._fence_control_leader(
+                conn, lease_token=lease_token, epoch=epoch, slot=slot
+            )
+
     def holds_control_leader(
         self,
         *,

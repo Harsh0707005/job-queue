@@ -272,6 +272,7 @@ class WebhooksClaimBatchMixin:
         http_timeout_seconds: float = 10.0,
         claim_seconds: float | None = None,
         on_result: Any = None,
+        on_before_post: Any = None,
         leader_token: UUID | None = None,
         leader_epoch: int | None = None,
     ) -> list[Any]:
@@ -280,6 +281,12 @@ class WebhooksClaimBatchMixin:
         Distributed webhook *agents* should call :meth:`claim_webhook_deliveries`
         and :meth:`finalize_webhook_delivery` themselves and never rely on the
         coordinator to POST.
+
+        When *leader_token* / *leader_epoch* are set, each POST is fenced.
+        Losing the lease mid-batch stops further POSTs and releases the
+        remaining claims so a new leader delivers each leftover once.
+        A 2xx is written onto the row before finalize so a crash between
+        POST and succeed cannot be retried as a second POST.
         """
         from job_queue.webhooks import post_webhook
 
@@ -295,7 +302,31 @@ class WebhooksClaimBatchMixin:
             for rec in auto:
                 on_result(rec)
 
-        for item in claimed:
+        def _still_leader() -> bool:
+            if leader_token is None:
+                return True
+            if not hasattr(self, "still_control_leader"):
+                return True
+            return bool(
+                self.still_control_leader(
+                    lease_token=leader_token, epoch=leader_epoch
+                )
+            )
+
+        def _drop_rest(from_index: int) -> None:
+            rest = [claimed[j].delivery.id for j in range(from_index, len(claimed))]
+            if rest and hasattr(self, "release_webhook_claims"):
+                self.release_webhook_claims(rest)
+
+        for i, item in enumerate(claimed):
+            if not _still_leader():
+                _drop_rest(i)
+                break
+            if on_before_post is not None:
+                on_before_post(item)
+                if not _still_leader():
+                    _drop_rest(i)
+                    break
             delivery = item.delivery
             if not item.endpoint_enabled or not item.url:
                 result = self.finalize_webhook_delivery(
@@ -315,6 +346,10 @@ class WebhooksClaimBatchMixin:
                 timeout_seconds=http_timeout_seconds,
                 idempotency_key=str(delivery.id),
             )
+            # Persist 2xx (or the failure code) before the terminal flip so
+            # a reclaim after handoff/timeout will not POST again.
+            if hasattr(self, "note_webhook_last_status"):
+                self.note_webhook_last_status(delivery.id, int(status_code))
             result = self.finalize_webhook_delivery(
                 delivery.id,
                 status_code=status_code,
