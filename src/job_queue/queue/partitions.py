@@ -73,16 +73,22 @@ class PartitionsMixin(SkillsWaitMixin):
         *,
         skills: Sequence[str] | str | None = None,
         heartbeat_ttl_seconds: int | None = None,
+        max_leases: int | None = None,
     ) -> dict[str, Any]:
         """Register or revive a worker and return its owned partitions.
 
         *skills* is the worker's capability set. Jobs listing
         ``required_skills`` are only claimable when that set is a subset.
-        Re-registering replaces the advertised skills.
+        Re-registering replaces the advertised skills. *max_leases* is the
+        inflight cap; omit to keep the current value (NULL = unlimited).
         """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
         wid = str(worker_id).strip()
+        if max_leases is not None:
+            max_leases = int(max_leases)
+            if max_leases < 1:
+                raise ValueError("max_leases must be >= 1")
         skill_list = _normalize_skills(skills) if skills is not None else None
         now = _utcnow()
         ttl = (
@@ -138,7 +144,16 @@ class PartitionsMixin(SkillsWaitMixin):
             self._sync_skills_wait_locked(
                 conn, now=now, worker_skills=skills_out
             )
-            snap = self._worker_snapshot_locked(conn, wid, row=row)
+            if max_leases is not None:
+                conn.execute(
+                    """
+                    UPDATE worker_nodes
+                    SET max_leases = %s, updated_at = %s
+                    WHERE worker_id = %s
+                    """,
+                    (max_leases, now, wid),
+                )
+            snap = self._worker_snapshot_locked(conn, wid)
             snap["partition_count"] = n
             snap["generation"] = self._max_generation_locked(conn)
         self._rescan_awaiting_skills_after_commit()
@@ -222,7 +237,7 @@ class PartitionsMixin(SkillsWaitMixin):
             self._sync_skills_wait_locked(
                 conn, now=now, worker_skills=skills_out
             )
-            snap = self._worker_snapshot_locked(conn, wid, row=row)
+            snap = self._worker_snapshot_locked(conn, wid)
             snap["partition_count"] = n
             snap["generation"] = self._max_generation_locked(conn)
         self._rescan_awaiting_skills_after_commit()
@@ -277,7 +292,8 @@ class PartitionsMixin(SkillsWaitMixin):
         with transaction(self._pool) as conn:
             row = conn.execute(
                 """
-                SELECT worker_id, skills, status, maintenance, last_seen_at
+                SELECT worker_id, skills, status, maintenance, last_seen_at,
+                       max_leases
                 FROM worker_nodes
                 WHERE worker_id = %s
                 FOR UPDATE
@@ -408,7 +424,8 @@ class PartitionsMixin(SkillsWaitMixin):
         with self._pool.connection() as conn:
             row = conn.execute(
                 """
-                SELECT worker_id, skills, status, maintenance, last_seen_at
+                SELECT worker_id, skills, status, maintenance, last_seen_at,
+                       max_leases
                 FROM worker_nodes
                 WHERE worker_id = %s
                 """,
@@ -422,7 +439,8 @@ class PartitionsMixin(SkillsWaitMixin):
         with self._pool.connection() as conn:
             rows = conn.execute(
                 """
-                SELECT worker_id, skills, status, maintenance, last_seen_at
+                SELECT worker_id, skills, status, maintenance, last_seen_at,
+                       max_leases
                 FROM worker_nodes
                 ORDER BY worker_id ASC
                 """
@@ -431,6 +449,60 @@ class PartitionsMixin(SkillsWaitMixin):
                 self._worker_snapshot_locked(conn, str(r["worker_id"]), row=r)
                 for r in rows
             ]
+
+    def set_worker_max_leases(
+        self, worker_id: str, max_leases: int | None
+    ) -> dict[str, Any]:
+        """Set how many jobs this worker may hold at once.
+
+        ``None`` clears the cap (unlimited). Lowering the cap does not
+        release or ack inflight work — the worker just stops taking new
+        leases until it is under the cap again. Raising it lets the next
+        claim take more immediately. Skills, partitions, and maintenance
+        are unchanged.
+        """
+        if not worker_id or not str(worker_id).strip():
+            raise ValueError("worker_id is required")
+        if max_leases is not None:
+            max_leases = int(max_leases)
+            if max_leases < 1:
+                raise ValueError("max_leases must be >= 1 or None")
+        wid = str(worker_id).strip()
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                """
+                SELECT worker_id
+                FROM worker_nodes
+                WHERE worker_id = %s
+                FOR UPDATE
+                """,
+                (wid,),
+            ).fetchone()
+            if row is None:
+                raise WorkerError(
+                    f"worker {wid!r} is not registered",
+                    code="worker_not_found",
+                )
+            conn.execute(
+                """
+                UPDATE worker_nodes
+                SET max_leases = %s, updated_at = %s
+                WHERE worker_id = %s
+                """,
+                (max_leases, now, wid),
+            )
+            return self._worker_snapshot_locked(conn, wid)
+
+    def get_worker_max_leases(self, worker_id: str) -> int | None:
+        snap = self.get_worker(worker_id)
+        if snap is None:
+            raise WorkerError(
+                f"worker {worker_id!r} is not registered",
+                code="worker_not_found",
+            )
+        raw = snap.get("max_leases")
+        return None if raw is None else int(raw)
 
     def list_draining_workers(self) -> list[str]:
         with self._pool.connection() as conn:
@@ -988,7 +1060,8 @@ class PartitionsMixin(SkillsWaitMixin):
         if row is None:
             row = conn.execute(
                 """
-                SELECT worker_id, skills, status, maintenance, last_seen_at
+                SELECT worker_id, skills, status, maintenance, last_seen_at,
+                       max_leases
                 FROM worker_nodes
                 WHERE worker_id = %s
                 """,
@@ -1002,6 +1075,8 @@ class PartitionsMixin(SkillsWaitMixin):
         status = str(row["status"])
         skills = list(row.get("skills") or [])
         last_seen = row.get("last_seen_at")
+        raw_cap = row.get("max_leases")
+        max_leases = None if raw_cap is None else int(raw_cap)
         leased = conn.execute(
             """
             SELECT COUNT(*)::int AS n
@@ -1019,5 +1094,38 @@ class PartitionsMixin(SkillsWaitMixin):
             "skills": skills,
             "partitions": self._owned_partitions_locked(conn, worker_id),
             "leased": int(leased["n"] if leased else 0),
+            "max_leases": max_leases,
             "last_seen_at": last_seen,
         }
+
+    def _worker_lease_remaining_locked(
+        self, conn: Any, worker_id: str
+    ) -> int | None:
+        """Return remaining inflight slots, or None if this worker is uncapped.
+
+        Takes ``FOR UPDATE`` on the registry row so concurrent claims and
+        live cap changes serialize. Unregistered workers are unlimited.
+        """
+        row = conn.execute(
+            """
+            SELECT max_leases
+            FROM worker_nodes
+            WHERE worker_id = %s
+            FOR UPDATE
+            """,
+            (worker_id,),
+        ).fetchone()
+        if row is None or row.get("max_leases") is None:
+            return None
+        cap = int(row["max_leases"])
+        held = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM jobs
+            WHERE leased_by = %s
+              AND status = %s
+            """,
+            (worker_id, JobStatus.LEASED.value),
+        ).fetchone()
+        n = int(held["n"] if held else 0)
+        return max(0, cap - n)

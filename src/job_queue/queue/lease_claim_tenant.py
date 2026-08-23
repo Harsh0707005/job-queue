@@ -80,6 +80,15 @@ class LeaseClaimTenantMixin:
                             conn, worker_id
                         )
         with transaction(self._pool) as conn:
+            # Worker cap lock first, then tenant lock — same order as fair
+            # claim so a capped worker cannot deadlock with a tenant lock.
+            worker_remaining: int | None = None
+            if hasattr(self, "_worker_lease_remaining_locked"):
+                worker_remaining = self._worker_lease_remaining_locked(
+                    conn, worker_id
+                )
+                if worker_remaining is not None and worker_remaining <= 0:
+                    return []
             # Serialize lease decisions for this tenant so concurrency caps
             # cannot be exceeded by racing workers.
             conn.execute(
@@ -127,7 +136,13 @@ class LeaseClaimTenantMixin:
 
             if conc_limit is not None and leased_count >= conc_limit:
                 # Only reclaim expired leases (does not increase concurrent
-                # holders beyond the cap in steady state).
+                # holders beyond the cap in steady state). Still honor the
+                # worker inflight cap so a full worker cannot grow.
+                reclaim_take = limit
+                if worker_remaining is not None:
+                    reclaim_take = min(reclaim_take, worker_remaining)
+                if reclaim_take < 1:
+                    return []
                 candidates = conn.execute(
                     f"""
                     SELECT {_JOB_COLUMNS}
@@ -163,14 +178,17 @@ class LeaseClaimTenantMixin:
                             worker_id,
                             now,
                             now,
-                            limit,
+                            reclaim_take,
                         ]
                     ),
                 ).fetchall()
             else:
                 take = limit
                 if conc_limit is not None:
-                    take = min(limit, conc_limit - leased_count)
+                    take = min(take, conc_limit - leased_count)
+                    take = max(take, 0)
+                if worker_remaining is not None:
+                    take = min(take, worker_remaining)
                     take = max(take, 0)
                 if take < 1:
                     return []

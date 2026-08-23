@@ -51,10 +51,11 @@ class LeaseClaimPublicMixin:
           * status = leased AND lease_expires_at < now()  (orphaned lease)
             AND attempts < max_attempts
 
-        Delayed pending jobs, unmet dependencies, and per-tenant concurrency
-        caps are always enforced. Paused tenants yield no new leases (in-flight
-        work may still complete). Expired leases that already used all
-        attempts are dead-lettered first (dependents cascade-cancelled).
+        Delayed pending jobs, unmet dependencies, per-tenant concurrency
+        caps, and per-worker ``max_leases`` are always enforced. Paused
+        tenants yield no new leases (in-flight work may still complete).
+        Expired leases that already used all attempts are dead-lettered
+        first (dependents cascade-cancelled).
 
         Uses ``FOR UPDATE SKIP LOCKED`` so concurrent workers never claim the
         same row. Each job gets a fresh ``lease_token`` for fencing. Returns

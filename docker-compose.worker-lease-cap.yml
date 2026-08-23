@@ -1,0 +1,76 @@
+# Per-worker inflight lease caps on a multi-tenant multi-worker fleet.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.worker-lease-cap.yml \
+#     up --build --abort-on-container-exit --exit-code-from worker-lease-cap-soak \
+#     worker-lease-cap-soak
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  worker-1: &w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-1
+      WORKER_SKILLS: gpu,cuda
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "45"
+      LOG_LEVEL: INFO
+  worker-2:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-2
+      WORKER_SKILLS: gpu
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "45"
+      LOG_LEVEL: INFO
+  worker-3:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-3
+      WORKER_SKILLS: cpu
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "45"
+      LOG_LEVEL: INFO
+  worker-4:
+    <<: *w
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      WORKER_ID: worker-4
+      WORKER_SKILLS: cpu,highmem
+      BATCH_SIZE: "4"
+      POLL_INTERVAL: "0.1"
+      VISIBILITY_TIMEOUT: "45"
+      LOG_LEVEL: INFO
+
+  worker-lease-cap-soak:
+    build: .
+    command: ["python", "scripts/worker_lease_cap_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      LONG_MS: "900"
+      SHORT_MS: "40"
+      LOAD_TENANTS: "3"
+      JOBS_PER: "16"
+      MAX_WALL_SECONDS: "240"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

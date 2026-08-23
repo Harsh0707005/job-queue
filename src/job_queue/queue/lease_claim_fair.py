@@ -143,6 +143,12 @@ class LeaseClaimFairMixin:
         partition_generations: dict[int, int] | None = None,
     ) -> Job | None:
         token = uuid4()
+        # Worker inflight cap: lock the registry row before the tenant lock
+        # (same order as the scoped path). At cap, stop the batch.
+        if hasattr(self, "_worker_lease_remaining_locked"):
+            remaining = self._worker_lease_remaining_locked(conn, worker_id)
+            if remaining is not None and remaining <= 0:
+                return None
         # Priority lanes first (higher priority always before lower), then
         # weighted virtual time within that lane (never-served = 0). A noisy
         # tenant's high-priority flood still rotates with other tenants at

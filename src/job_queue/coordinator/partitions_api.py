@@ -13,6 +13,12 @@ class PartitionsApiMixin:
         if not wid:
             return 400, {"error": "worker_id is required"}
         try:
+            max_leases = None
+            if body.get("max_leases") is not None:
+                try:
+                    max_leases = int(body["max_leases"])
+                except (TypeError, ValueError) as exc:
+                    return 400, {"error": f"max_leases must be an integer: {exc}"}
             out = self.queue.register_worker(
                 str(wid),
                 skills=body.get("skills"),
@@ -21,6 +27,7 @@ class PartitionsApiMixin:
                     if body.get("heartbeat_ttl_seconds") is not None
                     else None
                 ),
+                max_leases=max_leases,
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
@@ -128,6 +135,7 @@ class PartitionsApiMixin:
             "release_held": bool(row.get("release_held"))
             if row.get("release_held") is not None
             else None,
+            "max_leases": row.get("max_leases"),
         }
 
     def _list_workers(self) -> tuple[int, dict[str, Any]]:
@@ -222,3 +230,26 @@ class PartitionsApiMixin:
             return 400, {"error": "release_held is required"}
         enabled = self.queue.set_worker_drain_release_held(parsed)
         return 200, {"release_held": enabled}
+
+    def _set_worker_max_leases(
+        self, worker_id: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if "max_leases" not in body:
+            return 400, {"error": "max_leases is required"}
+        raw = body.get("max_leases")
+        cap: int | None
+        if raw is None or raw == "":
+            cap = None
+        else:
+            try:
+                cap = int(raw)
+            except (TypeError, ValueError):
+                return 400, {"error": "max_leases must be an integer or null"}
+        try:
+            row = self.queue.set_worker_max_leases(worker_id, cap)
+        except WorkerError as exc:
+            status = 404 if exc.code == "worker_not_found" else 409
+            return status, {"error": str(exc), "code": exc.code}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, self._serialize_worker(row)

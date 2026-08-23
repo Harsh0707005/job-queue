@@ -1102,13 +1102,29 @@ class ClientAdminMixin:
         *,
         skills: list[str] | None = None,
         heartbeat_ttl_seconds: int | None = None,
+        max_leases: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"worker_id": worker_id}
         if skills is not None:
             body["skills"] = skills
         if heartbeat_ttl_seconds is not None:
             body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
+        if max_leases is not None:
+            body["max_leases"] = max_leases
         payload = self._request("POST", "/v1/workers/register", body)
+        assert payload is not None
+        return payload
+
+    def set_worker_max_leases(
+        self, worker_id: str, max_leases: int | None
+    ) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        payload = self._request(
+            "POST",
+            f"/v1/workers/{quote(str(worker_id), safe='')}/max-leases",
+            {"max_leases": max_leases},
+        )
         assert payload is not None
         return payload
 

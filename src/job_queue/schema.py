@@ -456,6 +456,18 @@ ALTER TABLE worker_nodes ADD CONSTRAINT worker_nodes_status_check CHECK (
 -- worker comes back still draining until an explicit resume.
 ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS maintenance BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Per-worker inflight lease cap (NULL = unlimited). Changing this never
+-- releases or acks held work; the worker just stops taking more when full.
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS max_leases INTEGER;
+ALTER TABLE worker_nodes DROP CONSTRAINT IF EXISTS worker_nodes_max_leases_check;
+ALTER TABLE worker_nodes ADD CONSTRAINT worker_nodes_max_leases_check CHECK (
+    max_leases IS NULL OR max_leases >= 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_worker_leased
+    ON jobs (leased_by)
+    WHERE status = 'leased' AND leased_by IS NOT NULL;
+
 -- Capabilities advertised by the worker. Lease requires
 -- jobs.required_skills <@ worker_nodes.skills (empty job skills = any worker).
 ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS skills TEXT[];
