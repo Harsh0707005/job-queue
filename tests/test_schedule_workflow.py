@@ -285,3 +285,116 @@ def test_two_workflow_waiters_join_sees_both(queue: JobQueue):
     assert [f.schedule.id for f in later] == [join.id]
     waiters = later[0].job.payload.get("waiters") or []
     assert len(waiters) == 2
+
+
+def test_cancel_workflow_tick_fails_generation_waiters_and_join_not_stuck(
+    queue: JobQueue,
+):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    w1 = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"w": 1},
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    join = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"j": 1},
+        joins_on=[w1.id],
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    assert fire.workflow_run_id is not None
+    _drive(queue, "t1", {"ok": "a"})
+    assert _gen_status(queue, up.id, 1, "t1")["status"] == "pending"
+
+    out = queue.cancel_workflow(
+        fire.workflow_run_id, tenant_id="t1", compensate=False
+    )
+    assert out["run"].status == WorkflowRunStatus.CANCELLED.value
+    gen = _gen_status(queue, up.id, 1, "t1")
+    assert gen is not None
+    assert gen["status"] == "failed"
+    assert gen["payload"] is None
+
+    _make_due(queue, w1.id)
+    _make_due(queue, join.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="upstream|generation"):
+        queue.fire_schedule(w1.id, tenant_id="t1")
+    with pytest.raises(ScheduleError, match="join|generation"):
+        queue.fire_schedule(join.id, tenant_id="t1")
+
+    # A later successful tick unblocks waiters/joins on the new generation.
+    again = queue.fire_schedule(up.id, tenant_id="t1")
+    assert again.workflow_run_id is not None
+    _drive(queue, "t1", {"ok": "a2"})
+    _drive(queue, "t1", {"ok": "b2"})
+    assert _gen_status(queue, up.id, 1, "t1")["status"] == "failed"
+    sealed = _gen_status(queue, up.id, 2, "t1")
+    assert sealed is not None
+    assert sealed["status"] == "completed"
+    later = queue.process_due_schedules(tenant_id="t1")
+    assert [f.schedule.id for f in later] == [w1.id]
+    assert (later[0].job.payload.get("upstream") or {}).get("iteration") == 2
+    wj = queue.lease(tenant_id="t1", worker_id="w")
+    assert wj is not None and wj.id == later[0].job.id
+    _ack(queue, wj, "w", result={"w": 1})
+    _make_due(queue, join.id)
+    joined = queue.process_due_schedules(tenant_id="t1")
+    assert [f.schedule.id for f in joined] == [join.id]
+    waiters = joined[0].job.payload.get("waiters") or []
+    assert len(waiters) == 1
+    assert waiters[0].get("iteration") == 2
+
+
+def test_cancel_workflow_tick_with_compensate_fails_generation(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow={
+            "steps": [
+                {
+                    "name": "a",
+                    "payload": {"op": "a"},
+                    "compensate": {"payload": {"op": "undo_a"}},
+                },
+                {"name": "b", "payload": {"op": "b"}},
+            ]
+        },
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    down = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 2},
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    _drive(queue, "t1", {"ok": "a"})
+    queue.cancel_workflow(fire.workflow_run_id, tenant_id="t1", compensate=True)
+    assert _gen_status(queue, up.id, 1, "t1")["status"] == "failed"
+    undo = queue.lease(tenant_id="t1", worker_id="w")
+    assert undo is not None
+    assert undo.payload.get("direction") == "compensate"
+    _ack(queue, undo, "w")
+    done = queue.get_workflow(fire.workflow_run_id, tenant_id="t1")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.CANCELLED.value
+    assert _gen_status(queue, up.id, 1, "t1")["status"] == "failed"
+    _make_due(queue, down.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="upstream|generation"):
+        queue.fire_schedule(down.id, tenant_id="t1")
+    _ = JobStatus
+

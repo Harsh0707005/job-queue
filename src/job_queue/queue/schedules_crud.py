@@ -1097,12 +1097,29 @@ class SchedulesCrudMixin:
                 f"{tenant_id!r}"
             )
 
-    @staticmethod
-    def _resolve_tick_iteration(conn: Any, sched_row: Any) -> int:
-        """Next generation for this fire: inherit waits_on, else increment."""
+    def _resolve_tick_iteration(self, conn: Any, sched_row: Any) -> int:
+        """Next generation for this fire: inherit waits_on, else increment.
+
+        A join skips generations no waiter sealed (cancelled/failed upstream
+        tick) and attaches the first closed waiter set after *current*.
+        """
         current = int(sched_row.get("tick_iteration") or 0)
         joins = list(sched_row.get("joins_on") or [])
         if joins:
+            ready = self._join_ready_watermark(conn, joins)
+            if ready <= current:
+                return current + 1
+            tenant_id = str(sched_row["tenant_id"])
+            if hasattr(self, "_collect_schedule_generations"):
+                for it in range(current + 1, ready + 1):
+                    collected = self._collect_schedule_generations(
+                        conn,
+                        tenant_id=tenant_id,
+                        schedule_ids=list(joins),
+                        iteration=it,
+                    )
+                    if collected is not None:
+                        return it
             return current + 1
         waits = list(sched_row.get("waits_on") or [])
         if waits:

@@ -289,6 +289,7 @@ class WorkflowsMixin:
                 )
             status = str(run["status"])
             if status == WorkflowRunStatus.CANCELLED.value:
+                self._fail_schedule_generation_for_workflow_run(conn, run)
                 return self._cancel_workflow_result(
                     conn,
                     run=run,
@@ -341,6 +342,9 @@ class WorkflowsMixin:
             run["fail_reason"] = cancel_reason
             if completed_at is not None:
                 run["completed_at"] = completed_at
+            # A cancelled tick must close its generation as failed. Leaving
+            # it pending forever makes waiters/joins treat the tick as live.
+            self._fail_schedule_generation_for_workflow_run(conn, run)
 
             # Drop pending forwards always. Pending compensate undos only when
             # caller does not want reverse compensation.
@@ -387,6 +391,26 @@ class WorkflowsMixin:
                 compensate=want_compensate,
                 reason=cancel_reason,
             )
+
+    def _fail_schedule_generation_for_workflow_run(
+        self, conn: Any, run: dict[str, Any]
+    ) -> None:
+        """Fail the schedule generation for this tick, if the run is one."""
+        if not run or not run.get("schedule_id"):
+            return
+        if not hasattr(self, "_fail_schedule_generation"):
+            return
+        self._fail_schedule_generation(
+            conn,
+            schedule_id=run["schedule_id"],
+            tenant_id=str(run["tenant_id"]),
+            iteration=(
+                None
+                if run.get("tick_iteration") is None
+                else int(run["tick_iteration"])
+            ),
+            force=True,
+        )
 
     def _cancel_workflow_result(
         self,
