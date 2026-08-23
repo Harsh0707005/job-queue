@@ -398,3 +398,161 @@ def test_cancel_workflow_tick_with_compensate_fails_generation(queue: JobQueue):
         queue.fire_schedule(down.id, tenant_id="t1")
     _ = JobStatus
 
+
+def _inflight(queue: JobQueue, schedule_id, tenant_id: str) -> list:
+    return [
+        j
+        for j in queue.list_jobs(tenant_id=tenant_id)
+        if j.schedule_id == schedule_id
+        and j.status
+        in (
+            JobStatus.PENDING,
+            JobStatus.LEASED,
+            JobStatus.AWAITING_APPROVAL,
+            JobStatus.AWAITING_CHILDREN,
+            JobStatus.AWAITING_SKILLS,
+            JobStatus.FROZEN,
+        )
+    ]
+
+
+def test_delete_mid_workflow_tick_cancels_run(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(sched.id, tenant_id="t1")
+    assert fire.workflow_run_id is not None
+    _drive(queue, "t1", {"ok": "a"})
+    live = queue.get_workflow(fire.workflow_run_id, tenant_id="t1")
+    assert live is not None
+    assert live.status == WorkflowRunStatus.RUNNING.value
+    assert queue.delete_schedule(sched.id, tenant_id="t1") is True
+    assert queue.get_schedule(sched.id, tenant_id="t1") is None
+    done = queue.get_workflow(fire.workflow_run_id, tenant_id="t1")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.CANCELLED.value
+    assert _inflight(queue, sched.id, "t1") == []
+    assert queue.process_due_schedules(tenant_id="t1") == []
+
+
+def test_delete_mid_workflow_tick_fails_generation(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    queue.fire_schedule(sched.id, tenant_id="t1")
+    _drive(queue, "t1", {"ok": "a"})
+    assert _gen_status(queue, sched.id, 1, "t1")["status"] == "pending"
+    assert queue.delete_schedule(sched.id, tenant_id="t1") is True
+    # CASCADE drops the row; it must not remain pending under this id.
+    assert _gen_status(queue, sched.id, 1, "t1") is None
+    with queue._pool.connection() as conn:
+        leftover = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM schedule_generations
+            WHERE schedule_id = %s AND status = 'pending'
+            """,
+            (sched.id,),
+        ).fetchone()
+    assert int(leftover["n"]) == 0
+
+
+def test_delete_mid_workflow_tick_waiters_and_join_not_stuck(queue: JobQueue):
+    up = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    w1 = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"w": 1},
+        waits_on=up.id,
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    join = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"j": 1},
+        joins_on=[w1.id],
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    other = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"ok": True},
+        name="sibling",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(up.id, tenant_id="t1")
+    _drive(queue, "t1", {"ok": "a"})
+    assert queue.delete_schedule(up.id, tenant_id="t1") is True
+    assert queue.get_workflow(fire.workflow_run_id, tenant_id="t1").status == (
+        WorkflowRunStatus.CANCELLED.value
+    )
+    _make_due(queue, w1.id)
+    _make_due(queue, join.id)
+    assert queue.process_due_schedules(tenant_id="t1") == []
+    with pytest.raises(ScheduleError, match="upstream|generation"):
+        queue.fire_schedule(w1.id, tenant_id="t1")
+    with pytest.raises(ScheduleError, match="join|generation"):
+        queue.fire_schedule(join.id, tenant_id="t1")
+    sibling = queue.fire_schedule(other.id, tenant_id="t1")
+    assert sibling.job is not None
+    assert sibling.job.schedule_id == other.id
+
+
+def test_delete_mid_workflow_tick_releases_leased_step(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    fire = queue.fire_schedule(sched.id, tenant_id="t1")
+    leased = queue.lease(tenant_id="t1", worker_id="w")
+    assert leased is not None
+    assert leased.id == fire.job.id
+    assert queue.delete_schedule(sched.id, tenant_id="t1") is True
+    got = queue.get(leased.id, tenant_id="t1")
+    assert got.status == JobStatus.CANCELLED
+    run = queue.get_workflow(fire.workflow_run_id, tenant_id="t1")
+    assert run.status == WorkflowRunStatus.CANCELLED.value
+
+
+def test_delete_mid_workflow_tick_releases_mutex_peer(queue: JobQueue):
+    a = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        workflow=_steps(),
+        mutex_group="pipe",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    b = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 2},
+        workflow=_steps(),
+        mutex_group="pipe",
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    queue.fire_schedule(a.id, tenant_id="t1")
+    _drive(queue, "t1", {"ok": "a"})
+    with pytest.raises(ScheduleError, match="mutex"):
+        queue.fire_schedule(b.id, tenant_id="t1")
+    assert queue.delete_schedule(a.id, tenant_id="t1") is True
+    later = queue.fire_schedule(b.id, tenant_id="t1")
+    assert later.workflow_run_id is not None
+

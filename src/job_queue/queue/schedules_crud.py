@@ -545,12 +545,17 @@ class SchedulesCrudMixin:
 
         Returns True if a row was deleted, False if it was already gone.
 
-        Fails closed with ``ScheduleError`` when any job for this schedule
-        is still in flight (pending, leased, awaiting approval / children
-        / skills, or frozen). Completed, cancelled, and dead-letter jobs
+        A live multi-step workflow tick is cancelled on this connection
+        (no reverse compensation; leased steps released) and its
+        generation is failed so waiters and joins fail closed instead of
+        hanging on a pending tick. The schedule row then drops.
+
+        Regular in-flight jobs (pending, leased, awaiting approval /
+        children / skills, or frozen) still fail closed with
+        ``ScheduleError``. Completed, cancelled, and dead-letter jobs
         keep their ``schedule_id`` as history — there is no FK, so delete
-        does not cascade into the job table. Schedule blackouts CASCADE.
-        Other schedules on the tenant are untouched.
+        does not cascade into the job table. Schedule blackouts and
+        generations CASCADE. Other schedules on the tenant are untouched.
 
         Serializes with ``process_due_schedules`` and ``fire_schedule``
         via ``FOR UPDATE`` on the schedule row: a tick cannot enqueue
@@ -558,8 +563,9 @@ class SchedulesCrudMixin:
         a tick is currently materializing.
 
         Set *wait* to disable the schedule (so no new tick can start)
-        and poll until in-flight work finishes, then delete. On timeout
-        the schedule stays disabled and ``ScheduleError`` is raised.
+        and poll until remaining in-flight jobs finish, then delete. On
+        timeout the schedule stays disabled and ``ScheduleError`` is
+        raised.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -587,6 +593,12 @@ class SchedulesCrudMixin:
                 ).fetchone()
                 if row is None:
                     return False
+                if hasattr(self, "_cancel_open_workflow_ticks_for_schedule"):
+                    self._cancel_open_workflow_ticks_for_schedule(
+                        conn,
+                        schedule_id=schedule_id,
+                        tenant_id=tenant_id,
+                    )
                 active = conn.execute(
                     """
                     SELECT id, status

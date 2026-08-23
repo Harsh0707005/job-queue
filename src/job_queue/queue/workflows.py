@@ -316,81 +316,154 @@ class WorkflowsMixin:
                     f"workflow run {run_id} cannot be cancelled "
                     f"(status={status})"
                 )
-
-            # When undoing, stop new forward work but keep compensate chain.
-            # Without undo, freeze as cancelled immediately.
-            if want_compensate:
-                target_status = WorkflowRunStatus.COMPENSATING.value
-                completed_at = None
-            else:
-                target_status = WorkflowRunStatus.CANCELLED.value
-                completed_at = now
-
-            conn.execute(
-                """
-                UPDATE workflow_runs
-                SET status = %s,
-                    fail_reason = %s,
-                    completed_at = COALESCE(%s, completed_at),
-                    updated_at = %s
-                WHERE id = %s
-                """,
-                (target_status, cancel_reason, completed_at, now, run_id),
-            )
-            run = dict(run)
-            run["status"] = target_status
-            run["fail_reason"] = cancel_reason
-            if completed_at is not None:
-                run["completed_at"] = completed_at
-            # A cancelled tick must close its generation as failed. Leaving
-            # it pending forever makes waiters/joins treat the tick as live.
-            self._fail_schedule_generation_for_workflow_run(conn, run)
-
-            # Drop pending forwards always. Pending compensate undos only when
-            # caller does not want reverse compensation.
-            only_dirs = (
-                (WorkflowStepDirection.FORWARD.value,)
-                if want_compensate
-                else None
-            )
-            cancelled_pending, released, left = self._cancel_workflow_steps_locked(
+            return self._cancel_workflow_locked(
                 conn,
-                run=run,
-                release_in_flight=want_release,
+                run,
                 reason=cancel_reason,
-                now=now,
-                only_directions=only_dirs,
-            )
-
-            if want_compensate:
-                steps_def = self._parse_steps_def(run, conn)
-                self._try_start_compensate_if_settled(
-                    conn,
-                    run=run,
-                    steps_def=list(steps_def),
-                    queue_name="default",
-                    max_attempts=3,
-                    visibility_timeout_seconds=30,
-                    now=now,
-                )
-                # If nothing to undo and no in-flight left, settle to cancelled.
-                row_chk = conn.execute(
-                    f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
-                    (run_id,),
-                ).fetchone()
-                if row_chk is not None:
-                    run = dict(row_chk)
-
-            return self._cancel_workflow_result(
-                conn,
-                run=run,
-                cancelled_pending=cancelled_pending,
-                released_in_flight=released,
-                left_in_flight=left,
                 release_in_flight=want_release,
                 compensate=want_compensate,
-                reason=cancel_reason,
+                now=now,
             )
+
+    def _cancel_workflow_locked(
+        self,
+        conn: Any,
+        run: Any,
+        *,
+        reason: str,
+        release_in_flight: bool,
+        compensate: bool,
+        now: Any | None = None,
+    ) -> dict[str, Any]:
+        """Cancel a locked running/compensating run on *conn*."""
+        now = now if now is not None else _utcnow()
+        run_id = run["id"]
+        cancel_reason = (
+            reason
+            if str(reason).startswith("cancelled")
+            else f"cancelled: {reason}"
+        )
+        # When undoing, stop new forward work but keep compensate chain.
+        # Without undo, freeze as cancelled immediately.
+        if compensate:
+            target_status = WorkflowRunStatus.COMPENSATING.value
+            completed_at = None
+        else:
+            target_status = WorkflowRunStatus.CANCELLED.value
+            completed_at = now
+
+        conn.execute(
+            """
+            UPDATE workflow_runs
+            SET status = %s,
+                fail_reason = %s,
+                completed_at = COALESCE(%s, completed_at),
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (target_status, cancel_reason, completed_at, now, run_id),
+        )
+        run = dict(run)
+        run["status"] = target_status
+        run["fail_reason"] = cancel_reason
+        if completed_at is not None:
+            run["completed_at"] = completed_at
+        # A cancelled tick must close its generation as failed. Leaving
+        # it pending forever makes waiters/joins treat the tick as live.
+        self._fail_schedule_generation_for_workflow_run(conn, run)
+
+        # Drop pending forwards always. Pending compensate undos only when
+        # caller does not want reverse compensation.
+        only_dirs = (
+            (WorkflowStepDirection.FORWARD.value,) if compensate else None
+        )
+        cancelled_pending, released, left = self._cancel_workflow_steps_locked(
+            conn,
+            run=run,
+            release_in_flight=release_in_flight,
+            reason=cancel_reason,
+            now=now,
+            only_directions=only_dirs,
+        )
+
+        if compensate:
+            steps_def = self._parse_steps_def(run, conn)
+            self._try_start_compensate_if_settled(
+                conn,
+                run=run,
+                steps_def=list(steps_def),
+                queue_name="default",
+                max_attempts=3,
+                visibility_timeout_seconds=30,
+                now=now,
+            )
+            # If nothing to undo and no in-flight left, settle to cancelled.
+            row_chk = conn.execute(
+                f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
+                (run_id,),
+            ).fetchone()
+            if row_chk is not None:
+                run = dict(row_chk)
+
+        return self._cancel_workflow_result(
+            conn,
+            run=run,
+            cancelled_pending=cancelled_pending,
+            released_in_flight=released,
+            left_in_flight=left,
+            release_in_flight=release_in_flight,
+            compensate=compensate,
+            reason=cancel_reason,
+        )
+
+    def _cancel_open_workflow_ticks_for_schedule(
+        self,
+        conn: Any,
+        *,
+        schedule_id: UUID,
+        tenant_id: str,
+    ) -> int:
+        """Cancel live ticks for this schedule so delete does not leave them.
+
+        No reverse compensation: the schedule is going away. Leased steps
+        are released so workers cannot keep a deleted tick alive.
+        """
+        rows = conn.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM workflow_runs
+            WHERE schedule_id = %s
+              AND tenant_id = %s
+              AND status IN (%s, %s)
+            FOR UPDATE
+            """,
+            (
+                schedule_id,
+                tenant_id,
+                WorkflowRunStatus.RUNNING.value,
+                WorkflowRunStatus.COMPENSATING.value,
+            ),
+        ).fetchall()
+        n = 0
+        for row in rows:
+            self._cancel_workflow_locked(
+                conn,
+                row,
+                reason="schedule deleted",
+                release_in_flight=True,
+                compensate=False,
+            )
+            n += 1
+        if hasattr(self, "_fail_schedule_generation"):
+            # Belt: any leftover pending generation is failed even if the
+            # run row was already gone.
+            self._fail_schedule_generation(
+                conn,
+                schedule_id=schedule_id,
+                tenant_id=tenant_id,
+                force=False,
+            )
+        return n
 
     def _fail_schedule_generation_for_workflow_run(
         self, conn: Any, run: dict[str, Any]
