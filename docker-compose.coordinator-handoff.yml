@@ -1,0 +1,97 @@
+# Operator handoff: move the control leader without waiting for TTL.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.coordinator-handoff.yml \
+#     down -v --remove-orphans
+#   docker compose -f docker-compose.yml -f docker-compose.coordinator-handoff.yml \
+#     up --build --abort-on-container-exit --exit-code-from handoff-soak handoff-soak
+
+services:
+  chaos:
+    profiles: ["disabled"]
+  soak:
+    profiles: ["disabled"]
+  scheduler:
+    profiles: ["disabled"]
+  webhook-1:
+    profiles: ["disabled"]
+  webhook-2:
+    profiles: ["disabled"]
+
+  coordinator-1:
+    environment:
+      COORDINATOR_CONTROL: "1"
+      COORDINATOR_LEADER_TTL: "30"
+      COORDINATOR_CONTROL_INTERVAL: "0.3"
+  coordinator-2:
+    environment:
+      COORDINATOR_CONTROL: "1"
+      COORDINATOR_LEADER_TTL: "30"
+      COORDINATOR_CONTROL_INTERVAL: "0.3"
+
+  coordinator-3:
+    build: .
+    command: ["job-queue-coordinator", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      COORDINATOR_NODE: coordinator-3
+      LOG_LEVEL: INFO
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      COORDINATOR_CONTROL: "1"
+      COORDINATOR_LEADER_TTL: "30"
+      COORDINATOR_CONTROL_INTERVAL: "0.3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  worker-1:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+  worker-2:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+  worker-3:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+  worker-4:
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+
+  handoff-soak:
+    build: .
+    command: ["python", "scripts/coordinator_handoff_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+      EXPECT_LEADER_TTL: "30"
+      MAX_HANDOFF_SECONDS: "5"
+      LOG_LEVEL: INFO
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      coordinator-3:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

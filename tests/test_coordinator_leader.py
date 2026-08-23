@@ -399,6 +399,181 @@ def test_control_loop_paused_tick_after_steal_does_not_fire(queue: JobQueue):
         new.stop_control()
 
 
+def test_handoff_old_leader_stops_new_claims_immediately(queue: JobQueue):
+    old_tok = uuid4()
+    new_tok = uuid4()
+    other_tok = uuid4()
+    held = queue.acquire_or_renew_control_leader(
+        node_id="old", lease_token=old_tok, ttl_seconds=30.0
+    )
+    assert held is not None
+    old_epoch = held.epoch
+
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+
+    out = queue.handoff_control_leader("new", handoff_seconds=15.0)
+    assert out.handoff_to == "new"
+    assert out.epoch == old_epoch + 1
+    assert not queue.holds_control_leader(node_id="old", lease_token=old_tok)
+
+    # Old holder cannot renew or fire after the operator handoff.
+    assert (
+        queue.acquire_or_renew_control_leader(
+            node_id="old", lease_token=old_tok, ttl_seconds=30.0
+        )
+        is None
+    )
+    assert (
+        queue.process_due_schedules(
+            tenant_id="t1", leader_token=old_tok, leader_epoch=old_epoch
+        )
+        == []
+    )
+    # A third node cannot sneak in while the handoff is pending.
+    assert (
+        queue.acquire_or_renew_control_leader(
+            node_id="other", lease_token=other_tok, ttl_seconds=30.0
+        )
+        is None
+    )
+
+    claimed = queue.acquire_or_renew_control_leader(
+        node_id="new", lease_token=new_tok, ttl_seconds=30.0
+    )
+    assert claimed is not None
+    assert claimed.node_id == "new"
+    assert claimed.handoff_to is None
+    assert claimed.epoch >= old_epoch + 2
+    fires = queue.process_due_schedules(
+        tenant_id="t1",
+        leader_token=new_tok,
+        leader_epoch=claimed.epoch,
+    )
+    assert [f.schedule.id for f in fires] == [sched.id]
+
+
+def test_handoff_to_current_leader_is_noop(queue: JobQueue):
+    tok = uuid4()
+    held = queue.acquire_or_renew_control_leader(
+        node_id="keep", lease_token=tok, ttl_seconds=10.0
+    )
+    assert held is not None
+    again = queue.handoff_control_leader("keep")
+    assert again.node_id == "keep"
+    assert again.epoch == held.epoch
+    assert again.handoff_to is None
+    assert queue.holds_control_leader(node_id="keep", lease_token=tok)
+
+
+def test_handoff_control_loops_old_stops_new_ticks(queue: JobQueue):
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"who": "handoff"},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    old = Coordinator(queue, node_id="coord-old")
+    new = Coordinator(queue, node_id="coord-new")
+    old.start_control(ttl_seconds=30.0, interval_seconds=0.08)
+    new.start_control(ttl_seconds=30.0, interval_seconds=0.08)
+    try:
+        deadline = time.time() + 4
+        lead = follow = None
+        while time.time() < deadline:
+            if old._control_loop is not None and old._control_loop.is_leader():
+                lead, follow = old, new
+                break
+            if new._control_loop is not None and new._control_loop.is_leader():
+                lead, follow = new, old
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("neither coordinator became leader")
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if any(
+                j.schedule_id == sched.id for j in queue.list_jobs(tenant_id="t1")
+            ):
+                break
+            time.sleep(0.05)
+        first_n = len(
+            [j for j in queue.list_jobs(tenant_id="t1") if j.schedule_id == sched.id]
+        )
+        assert first_n == 1
+
+        queue.handoff_control_leader(follow.node_id, handoff_seconds=15.0)
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            if follow._control_loop is not None and follow._control_loop.is_leader():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("handoff target never claimed")
+        assert lead._control_loop is None or not lead._control_loop.is_leader()
+        lease = queue.get_control_leader()
+        assert lease is not None
+        assert lease.node_id == follow.node_id
+        time.sleep(0.4)
+        later = [
+            j for j in queue.list_jobs(tenant_id="t1") if j.schedule_id == sched.id
+        ]
+        assert len(later) == 1
+    finally:
+        old.stop_control()
+        new.stop_control()
+
+
+def test_handoff_http_roundtrip(queue: JobQueue):
+    c1 = Coordinator(queue, node_id="http-a")
+    c2 = Coordinator(queue, node_id="http-b")
+    c1.start_control(ttl_seconds=30.0, interval_seconds=0.1)
+    c2.start_control(ttl_seconds=30.0, interval_seconds=0.1)
+    s1, url1 = _serve(c1)
+    s2, url2 = _serve(c2)
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if c1._control_loop is not None and c1._control_loop.is_leader():
+                lead_url, dest = url1, "http-b"
+                break
+            if c2._control_loop is not None and c2._control_loop.is_leader():
+                lead_url, dest = url2, "http-a"
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("no leader")
+        client = CoordinatorClient([url1, url2])
+        out = client.handoff_leader(dest, handoff_seconds=15.0)
+        assert (out.get("handoff_to") or (out.get("lease") or {}).get("handoff_to")) == dest
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            h = CoordinatorClient(lead_url).health()
+            other = url2 if lead_url == url1 else url1
+            dest_h = CoordinatorClient(other).health()
+            if dest_h.get("leader") is True and dest_h.get("node") == dest:
+                assert h.get("leader") is False
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("http handoff never landed")
+        status, body = (
+            c1 if dest == "http-b" else c2
+        ).handle("POST", "/v1/schedules/process-due", {}, {})
+        assert status == 503
+    finally:
+        s1.shutdown()
+        s2.shutdown()
+        c1.stop_control()
+        c2.stop_control()
+
+
 def test_workers_keep_leasing_while_leader_ticks(queue: JobQueue):
     c1 = Coordinator(queue, node_id="w-lead")
     c1.start_control(ttl_seconds=2.0, interval_seconds=0.1)

@@ -829,4 +829,6 @@ def coordinator_leader_to_dict(lease: CoordinatorLeader) -> dict[str, Any]:
         "last_webhook_at": _dt(lease.last_webhook_at),
         "last_alert_at": _dt(lease.last_alert_at),
         "last_retention_at": _dt(lease.last_retention_at),
+        "handoff_to": lease.handoff_to,
+        "handoff_until": _dt(lease.handoff_until),
     }

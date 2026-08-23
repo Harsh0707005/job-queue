@@ -52,6 +52,11 @@ class RoutingMixin:
             )
         elif live:
             is_leader = lease.node_id == self.node_id
+        handoff_to = None
+        if lease is not None and lease.handoff_to:
+            until = lease.handoff_until
+            if until is None or until > now:
+                handoff_to = lease.handoff_to
         return {
             "ok": True,
             "role": "coordinator",
@@ -59,6 +64,7 @@ class RoutingMixin:
             "leader": is_leader,
             "leader_node": lease.node_id if live else None,
             "leader_epoch": int(lease.epoch) if live else None,
+            "handoff_to": handoff_to,
         }
 
     def _control_fence_args(self) -> dict[str, Any] | None:
@@ -118,6 +124,25 @@ class RoutingMixin:
             payload["lease"] = (
                 None if lease is None else coordinator_leader_to_dict(lease)
             )
+            return 200, payload
+        if method == "POST" and path == "/v1/coordinator/leader/handoff":
+            dest = body.get("to_node_id") or body.get("node_id")
+            if dest is None or not str(dest).strip():
+                return 400, {"error": "to_node_id is required"}
+            timeout_raw = body.get("handoff_seconds")
+            kwargs: dict[str, Any] = {"to_node_id": str(dest).strip()}
+            if timeout_raw is not None and timeout_raw != "":
+                try:
+                    kwargs["handoff_seconds"] = float(timeout_raw)
+                except (TypeError, ValueError):
+                    return 400, {"error": "handoff_seconds must be a number"}
+            try:
+                lease = self.queue.handoff_control_leader(**kwargs)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            payload = self._leader_health()
+            payload["lease"] = coordinator_leader_to_dict(lease)
+            payload["handoff_to"] = lease.handoff_to
             return 200, payload
 
         if method == "POST" and path == "/v1/jobs":

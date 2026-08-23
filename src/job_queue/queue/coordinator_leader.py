@@ -17,7 +17,8 @@ ControlTickKind = Literal["schedules", "webhooks", "alerts", "retention"]
 _LEADER_COLUMNS = """
     slot, node_id, lease_token, epoch, expires_at, acquired_at, renewed_at,
     schedule_ticks, webhook_ticks, alert_ticks, retention_ticks,
-    last_schedule_at, last_webhook_at, last_alert_at, last_retention_at
+    last_schedule_at, last_webhook_at, last_alert_at, last_retention_at,
+    handoff_to, handoff_until
 """
 
 
@@ -46,7 +47,23 @@ def _row_to_leader(row: Any) -> CoordinatorLeader:
         last_retention_at=_as_utc(row["last_retention_at"])
         if row.get("last_retention_at") is not None
         else None,
+        handoff_to=(
+            str(row["handoff_to"]) if row.get("handoff_to") else None
+        ),
+        handoff_until=_as_utc(row["handoff_until"])
+        if row.get("handoff_until") is not None
+        else None,
     )
+
+
+def _handoff_active(row: Any, now: datetime) -> bool:
+    dest = row.get("handoff_to") if row is not None else None
+    if not dest:
+        return False
+    until = row.get("handoff_until")
+    if until is None:
+        return True
+    return _as_utc(until) > now
 
 
 class CoordinatorLeaderMixin:
@@ -95,14 +112,19 @@ class CoordinatorLeaderMixin:
                 str(row["node_id"]) == node_id and held_token == token
             )
             expired = _as_utc(row["expires_at"]) <= now
-            if not same_holder and not expired:
-                return None
-            if same_holder:
+            dest = str(row["handoff_to"]) if row.get("handoff_to") else None
+            handing = _handoff_active(row, now)
+            handoff_for_me = handing and dest == node_id
+            # A live holder may renew only if nobody is handing off away
+            # from them. Otherwise they would undo an operator handoff.
+            if same_holder and not (handing and dest != node_id):
                 updated = conn.execute(
                     f"""
                     UPDATE coordinator_leader
                     SET expires_at = %s,
-                        renewed_at = %s
+                        renewed_at = %s,
+                        handoff_to = NULL,
+                        handoff_until = NULL
                     WHERE slot = %s
                       AND node_id = %s
                       AND lease_token = %s
@@ -110,7 +132,7 @@ class CoordinatorLeaderMixin:
                     """,
                     (expires, now, slot, node_id, token),
                 ).fetchone()
-            else:
+            elif handoff_for_me or (expired and not handing):
                 updated = conn.execute(
                     f"""
                     UPDATE coordinator_leader
@@ -119,15 +141,97 @@ class CoordinatorLeaderMixin:
                         epoch = epoch + 1,
                         expires_at = %s,
                         acquired_at = %s,
-                        renewed_at = %s
+                        renewed_at = %s,
+                        handoff_to = NULL,
+                        handoff_until = NULL
                     WHERE slot = %s
-                      AND expires_at <= %s
                     RETURNING {_LEADER_COLUMNS}
                     """,
-                    (node_id, token, expires, now, now, slot, now),
+                    (node_id, token, expires, now, now, slot),
                 ).fetchone()
+            else:
+                return None
             if updated is None:
                 return None
+            return _row_to_leader(updated)
+
+    def handoff_control_leader(
+        self,
+        to_node_id: str,
+        *,
+        handoff_seconds: float = 15.0,
+        slot: str = CONTROL_LEADER_SLOT,
+    ) -> CoordinatorLeader:
+        """Make *to_node_id* the next leader without waiting for TTL.
+
+        Expires the current lease and bumps epoch so the old holder
+        cannot renew or run another fenced tick. Only *to_node_id* may
+        claim until *handoff_seconds* elapses.
+        """
+        dest = str(to_node_id or "").strip()
+        if not dest:
+            raise ValueError("to_node_id is required")
+        if handoff_seconds <= 0:
+            raise ValueError("handoff_seconds must be > 0")
+        now = _utcnow()
+        until = now + timedelta(seconds=float(handoff_seconds))
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {_LEADER_COLUMNS}
+                FROM coordinator_leader
+                WHERE slot = %s
+                FOR UPDATE
+                """,
+                (slot,),
+            ).fetchone()
+            if row is None:
+                inserted = conn.execute(
+                    f"""
+                    INSERT INTO coordinator_leader (
+                        slot, node_id, lease_token, epoch,
+                        expires_at, acquired_at, renewed_at,
+                        handoff_to, handoff_until
+                    ) VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s)
+                    RETURNING {_LEADER_COLUMNS}
+                    """,
+                    (slot, dest, uuid4(), now, now, now, dest, until),
+                ).fetchone()
+                assert inserted is not None
+                return _row_to_leader(inserted)
+            live = _as_utc(row["expires_at"]) > now
+            if str(row["node_id"]) == dest and live and not _handoff_active(
+                row, now
+            ):
+                return _row_to_leader(row)
+            if str(row["node_id"]) == dest and live:
+                cleared = conn.execute(
+                    f"""
+                    UPDATE coordinator_leader
+                    SET handoff_to = NULL,
+                        handoff_until = NULL,
+                        renewed_at = %s
+                    WHERE slot = %s
+                    RETURNING {_LEADER_COLUMNS}
+                    """,
+                    (now, slot),
+                ).fetchone()
+                assert cleared is not None
+                return _row_to_leader(cleared)
+            updated = conn.execute(
+                f"""
+                UPDATE coordinator_leader
+                SET handoff_to = %s,
+                    handoff_until = %s,
+                    expires_at = %s,
+                    epoch = epoch + 1,
+                    renewed_at = %s
+                WHERE slot = %s
+                RETURNING {_LEADER_COLUMNS}
+                """,
+                (dest, until, now, now, slot),
+            ).fetchone()
+            assert updated is not None
             return _row_to_leader(updated)
 
     def _fence_control_leader(

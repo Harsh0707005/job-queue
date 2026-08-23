@@ -1036,3 +1036,5 @@ class CoordinatorLeader:
     last_webhook_at: datetime | None = None
     last_alert_at: datetime | None = None
     last_retention_at: datetime | None = None
+    handoff_to: str | None = None
+    handoff_until: datetime | None = None

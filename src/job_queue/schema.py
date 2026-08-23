@@ -1570,11 +1570,16 @@ CREATE TABLE IF NOT EXISTS coordinator_leader (
     last_webhook_at     TIMESTAMPTZ,
     last_alert_at       TIMESTAMPTZ,
     last_retention_at   TIMESTAMPTZ,
+    handoff_to          TEXT,
+    handoff_until       TIMESTAMPTZ,
     CONSTRAINT coordinator_leader_epoch_check CHECK (epoch >= 1),
     CONSTRAINT coordinator_leader_schedule_ticks_check CHECK (schedule_ticks >= 0),
     CONSTRAINT coordinator_leader_webhook_ticks_check CHECK (webhook_ticks >= 0),
     CONSTRAINT coordinator_leader_alert_ticks_check CHECK (alert_ticks >= 0),
     CONSTRAINT coordinator_leader_retention_ticks_check CHECK (retention_ticks >= 0)
 );
+
+ALTER TABLE coordinator_leader ADD COLUMN IF NOT EXISTS handoff_to TEXT;
+ALTER TABLE coordinator_leader ADD COLUMN IF NOT EXISTS handoff_until TIMESTAMPTZ;
 
 """

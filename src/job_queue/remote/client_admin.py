@@ -226,6 +226,24 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def handoff_leader(
+        self,
+        to_node_id: str,
+        *,
+        handoff_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"to_node_id": to_node_id}
+        if handoff_seconds is not None:
+            body["handoff_seconds"] = handoff_seconds
+        payload = self._request("POST", "/v1/coordinator/leader/handoff", body)
+        assert payload is not None
+        return payload
+
+    def get_leader(self) -> dict[str, Any]:
+        payload = self._request("GET", "/v1/coordinator/leader")
+        assert payload is not None
+        return payload
+
     def process_due_schedules(
         self, *, tenant_id: str | None = None, limit: int = 100
     ) -> int:
