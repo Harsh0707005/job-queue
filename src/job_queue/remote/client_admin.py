@@ -1135,11 +1135,18 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
-    def drain_worker(self, worker_id: str) -> dict[str, Any]:
+    def drain_worker(
+        self, worker_id: str, *, release_held: bool | None = None
+    ) -> dict[str, Any]:
         from urllib.parse import quote
 
+        body: dict[str, Any] | None = None
+        if release_held is not None:
+            body = {"release_held": bool(release_held)}
         payload = self._request(
-            "POST", f"/v1/workers/{quote(str(worker_id), safe='')}/drain"
+            "POST",
+            f"/v1/workers/{quote(str(worker_id), safe='')}/drain",
+            body,
         )
         assert payload is not None
         return payload
@@ -1149,6 +1156,28 @@ class ClientAdminMixin:
 
         payload = self._request(
             "POST", f"/v1/workers/{quote(str(worker_id), safe='')}/resume"
+        )
+        assert payload is not None
+        return payload
+
+    def release_worker_held(self, worker_id: str) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        payload = self._request(
+            "POST",
+            f"/v1/workers/{quote(str(worker_id), safe='')}/release-held",
+        )
+        assert payload is not None
+        return payload
+
+    def get_worker_drain_policy(self) -> dict[str, Any]:
+        payload = self._request("GET", "/v1/workers/maintenance")
+        assert payload is not None
+        return payload
+
+    def set_worker_drain_policy(self, *, release_held: bool) -> dict[str, Any]:
+        payload = self._request(
+            "POST", "/v1/workers/maintenance", {"release_held": bool(release_held)}
         )
         assert payload is not None
         return payload

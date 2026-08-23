@@ -22,6 +22,7 @@ from job_queue.queue._common import (
     DEFAULT_PARTITION_COUNT,
     WORKER_HEARTBEAT_TTL_SECONDS,
     WorkerError,
+    _JOB_COLUMNS,
     _normalize_skills,
     _utcnow,
 )
@@ -248,19 +249,31 @@ class PartitionsMixin(SkillsWaitMixin):
         return {"worker_id": wid, "status": "dead"}
 
     def set_worker_maintenance(
-        self, worker_id: str, *, draining: bool
+        self,
+        worker_id: str,
+        *,
+        draining: bool,
+        release_held: bool | None = None,
     ) -> dict[str, Any]:
         """Stop or resume new leases for a registered worker.
 
-        Draining workers keep heartbeating, keep their skills, and may finish
-        jobs they already hold. They are dropped from partition assignment so
-        peers take new shard work. Resume clears the flag and they start
-        leasing again without re-registering.
+        Draining workers keep heartbeating, keep their skills, and take no new
+        work. They are dropped from partition assignment so peers take new
+        shard work. By default they finish jobs they already hold. Pass
+        ``release_held=True`` (or enable the queue default) to return those
+        leases to ``pending`` immediately so another worker can claim them.
+        The old lease token is cleared, so a late ack/heartbeat from the
+        draining worker fails closed (no double-complete, no nack-loss).
+        ``release_held=None`` inherits :meth:`get_worker_drain_release_held`.
+        Resume clears the flag and they start leasing again without
+        re-registering.
         """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
         wid = str(worker_id).strip()
         now = _utcnow()
+        released: list[dict[str, Any]] = []
+        want_release = False
         with transaction(self._pool) as conn:
             row = conn.execute(
                 """
@@ -292,6 +305,14 @@ class PartitionsMixin(SkillsWaitMixin):
                     """,
                     (now, wid),
                 )
+                if release_held is None:
+                    want_release = self._worker_drain_release_held_locked(conn)
+                else:
+                    want_release = bool(release_held)
+                if want_release:
+                    released = self._release_worker_held_leases_locked(
+                        conn, wid, now=now
+                    )
             else:
                 conn.execute(
                     """
@@ -311,8 +332,64 @@ class PartitionsMixin(SkillsWaitMixin):
             snap = self._worker_snapshot_locked(conn, wid)
             snap["partition_count"] = self._partition_count(conn)
             snap["generation"] = self._max_generation_locked(conn)
+            snap["released"] = len(released)
+            snap["released_job_ids"] = [str(r["id"]) for r in released]
+            snap["release_held"] = bool(want_release)
         self._rescan_awaiting_skills_after_commit()
         return snap
+
+    def release_worker_held_leases(self, worker_id: str) -> dict[str, Any]:
+        """Return every job this worker currently holds to ``pending``.
+
+        Does not change maintenance status. Intended for a draining worker
+        whose inflight work should not block peers. Safe vs concurrent ack:
+        the lease token is cleared under ``FOR UPDATE``, so a late ack fails
+        with :class:`LeaseError` instead of completing twice.
+        """
+        if not worker_id or not str(worker_id).strip():
+            raise ValueError("worker_id is required")
+        wid = str(worker_id).strip()
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                """
+                SELECT worker_id FROM worker_nodes
+                WHERE worker_id = %s
+                FOR UPDATE
+                """,
+                (wid,),
+            ).fetchone()
+            if row is None:
+                raise WorkerError(
+                    f"worker {wid!r} is not registered",
+                    code="worker_not_found",
+                )
+            released = self._release_worker_held_leases_locked(
+                conn, wid, now=now
+            )
+            snap = self._worker_snapshot_locked(conn, wid)
+        snap["released"] = len(released)
+        snap["released_job_ids"] = [str(r["id"]) for r in released]
+        return snap
+
+    def get_worker_drain_release_held(self) -> bool:
+        with self._pool.connection() as conn:
+            return self._worker_drain_release_held_locked(conn)
+
+    def set_worker_drain_release_held(self, enabled: bool) -> bool:
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO queue_settings (id, worker_drain_release_held, updated_at)
+                VALUES (1, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET worker_drain_release_held = EXCLUDED.worker_drain_release_held,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (bool(enabled), now),
+            )
+            return self._worker_drain_release_held_locked(conn)
 
     def get_worker(self, worker_id: str) -> dict[str, Any] | None:
         if not worker_id or not str(worker_id).strip():
@@ -788,6 +865,93 @@ class PartitionsMixin(SkillsWaitMixin):
             "SELECT COALESCE(MAX(generation), 0)::bigint AS g FROM partition_assignments"
         ).fetchone()
         return int(row["g"] if row else 0)
+
+    @staticmethod
+    def _worker_drain_release_held_locked(conn: Any) -> bool:
+        row = conn.execute(
+            """
+            SELECT worker_drain_release_held
+            FROM queue_settings
+            WHERE id = 1
+            """
+        ).fetchone()
+        if row is None or row.get("worker_drain_release_held") is None:
+            return False
+        return bool(row["worker_drain_release_held"])
+
+    def _release_worker_held_leases_locked(
+        self, conn: Any, worker_id: str, *, now: datetime
+    ) -> list[dict[str, Any]]:
+        """Fence-clear every live lease for *worker_id* back to pending.
+
+        ``FOR UPDATE`` serializes with ack/heartbeat. Jobs that already
+        completed under the same lock are skipped (not lost, not doubled).
+        """
+        locked = conn.execute(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE leased_by = %s
+              AND status = %s
+            FOR UPDATE
+            """,
+            (worker_id, JobStatus.LEASED.value),
+        ).fetchall()
+        if not locked:
+            return []
+        released: list[dict[str, Any]] = []
+        tenants: set[str] = set()
+        for row in locked:
+            updated = conn.execute(
+                f"""
+                UPDATE jobs
+                SET status = %s,
+                    leased_by = NULL,
+                    lease_token = NULL,
+                    lease_tenant_id = NULL,
+                    lease_expires_at = NULL,
+                    lease_started_at = NULL,
+                    available_at = %s,
+                    last_error = COALESCE(%s, last_error),
+                    updated_at = %s
+                WHERE id = %s
+                  AND lease_token = %s
+                  AND status = %s
+                RETURNING {_JOB_COLUMNS}
+                """,
+                (
+                    JobStatus.PENDING.value,
+                    now,
+                    "maintenance_release",
+                    now,
+                    row["id"],
+                    row["lease_token"],
+                    JobStatus.LEASED.value,
+                ),
+            ).fetchone()
+            if updated is None:
+                # Concurrent ack won the row; job is completed, not lost.
+                continue
+            if hasattr(self, "_append_job_audit"):
+                self._append_job_audit(
+                    conn,
+                    job_row=updated,
+                    event_type="released",
+                    from_status=JobStatus.LEASED.value,
+                    actor=worker_id,
+                    detail={"reason": "maintenance_release"},
+                    now=now,
+                )
+            if hasattr(self, "_record_lease_end_usage"):
+                self._record_lease_end_usage(
+                    conn, row, now=now, releases=1
+                )
+            tenants.add(str(updated["tenant_id"]))
+            released.append(dict(updated))
+        if hasattr(self, "_maybe_finalize_offboard"):
+            for tid in tenants:
+                self._maybe_finalize_offboard(conn, tenant_id=tid, now=now)
+        return released
 
     @staticmethod
     def _worker_is_draining_locked(conn: Any, worker_id: str) -> bool:

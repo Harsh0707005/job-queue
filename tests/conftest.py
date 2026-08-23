@@ -105,7 +105,9 @@ def queue(postgres_url: str):
         conn.execute(
             """
             UPDATE queue_settings
-            SET partition_count = 32, updated_at = NOW()
+            SET partition_count = 32,
+                worker_drain_release_held = FALSE,
+                updated_at = NOW()
             WHERE id = 1
             """
         )

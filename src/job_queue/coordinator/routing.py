@@ -815,6 +815,10 @@ class RoutingMixin:
             return self._set_partition_count(body)
         if method == "GET" and path == "/v1/workers":
             return self._list_workers()
+        if method == "GET" and path == "/v1/workers/maintenance":
+            return self._get_worker_drain_policy()
+        if method == "POST" and path == "/v1/workers/maintenance":
+            return self._set_worker_drain_policy(body)
         if path.startswith("/v1/workers/"):
             rest = path[len("/v1/workers/") :].strip("/")
             parts = [p for p in rest.split("/") if p]
@@ -824,14 +828,25 @@ class RoutingMixin:
                 "deregister",
                 "partitions",
                 "process-timeouts",
+                "maintenance",
             }:
                 wid = parts[0]
                 if method == "GET" and len(parts) == 1:
                     return self._get_worker(wid)
                 if method == "POST" and len(parts) == 2 and parts[1] == "drain":
-                    return self._set_worker_maintenance(wid, draining=True)
+                    return self._set_worker_maintenance(
+                        wid, draining=True, body=body, query=query
+                    )
                 if method == "POST" and len(parts) == 2 and parts[1] == "resume":
-                    return self._set_worker_maintenance(wid, draining=False)
+                    return self._set_worker_maintenance(
+                        wid, draining=False, body=body, query=query
+                    )
+                if (
+                    method == "POST"
+                    and len(parts) == 2
+                    and parts[1] == "release-held"
+                ):
+                    return self._release_worker_held(wid)
 
         # Multi-step saga workflows.
         if method == "POST" and path == "/v1/workflows":

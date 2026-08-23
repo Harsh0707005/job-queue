@@ -130,6 +130,15 @@ def completed_by(tid: str, job_id: str) -> str | None:
     return None
 
 
+def completed_event_count(tid: str, job_id: str) -> int:
+    body = http_json("GET", f"/v1/jobs/{job_id}/audit?tenant_id={tid}&limit=200")
+    return sum(
+        1
+        for ev in (body.get("events") or [])
+        if ev.get("event_type") == "completed"
+    )
+
+
 def enqueue(
     tenant_id: str,
     payload: dict[str, Any],
@@ -348,6 +357,94 @@ def main() -> int:
     if leftover:
         raise RuntimeError(f"workers still draining: {leftover}")
     assert_skills_intact()
+
+    # --- Stage 4: release held leases so peers pick up long work ---
+    drop = "worker-2"
+    rel_tid = "maint-rel"
+    logger.info("stage4: drain %s with release_held", drop)
+    rel_ids = []
+    for n in range(STAGE1_JOBS):
+        rel_ids.append(
+            enqueue(
+                rel_tid,
+                {"kind": "gpu", "n": n, "ms": LONG_MS, "stage": 4},
+                required_skills=["gpu"],
+            )["id"]
+        )
+    wait_until(
+        lambda: any(j.get("leased_by") == drop for j in list_jobs(rel_tid)),
+        timeout=20,
+        msg="worker-2 never leased stage4 gpu work",
+    )
+    held_then = {
+        str(j["id"])
+        for j in list_jobs(rel_tid)
+        if j.get("leased_by") == drop and j.get("status") == "leased"
+    }
+    if not held_then:
+        raise RuntimeError("no inflight gpu jobs on worker-2 at release drain")
+    dropped = http_json(
+        "POST", f"/v1/workers/{drop}/drain", {"release_held": True}
+    )
+    if dropped.get("status") != "draining":
+        raise RuntimeError(f"release drain failed: {dropped}")
+    if int(dropped.get("released") or 0) < 1:
+        raise RuntimeError(f"expected released>0: {dropped}")
+    released_ids = {str(x) for x in (dropped.get("released_job_ids") or [])}
+    if not released_ids:
+        raise RuntimeError(f"no released_job_ids: {dropped}")
+    after = {str(j["id"]): j for j in list_jobs(rel_tid)}
+    for jid in released_ids:
+        row = after.get(jid)
+        if row is None:
+            raise RuntimeError(f"released job {jid} disappeared")
+        if row.get("status") == "completed":
+            raise RuntimeError(f"released job {jid} completed by the drop")
+        if row.get("leased_by") == drop:
+            raise RuntimeError(f"released job {jid} still held by {drop}")
+        if row.get("status") not in ("pending", "leased"):
+            raise RuntimeError(f"released job {jid} status={row.get('status')}")
+    extra_rel = enqueue(
+        rel_tid,
+        {"kind": "gpu", "n": 99, "ms": SHORT_MS, "stage": "4b"},
+        required_skills=["gpu"],
+    )["id"]
+    time.sleep(0.6)
+    extra_row = next(j for j in list_jobs(rel_tid) if str(j["id"]) == str(extra_rel))
+    if extra_row.get("leased_by") == drop:
+        raise RuntimeError("draining worker took a new lease after release")
+    wait_until(
+        lambda: all(j.get("status") == "completed" for j in list_jobs(rel_tid)),
+        timeout=40,
+        msg="released gpu jobs did not finish on peers",
+    )
+    for j in list_jobs(rel_tid):
+        jid = str(j["id"])
+        n_done = completed_event_count(rel_tid, jid)
+        if n_done != 1:
+            raise RuntimeError(f"job {jid} completed {n_done} times")
+        if jid in released_ids:
+            by = completed_by(rel_tid, jid)
+            if by == drop:
+                raise RuntimeError(f"released job {jid} completed by draining {drop}")
+            if by not in {"worker-1", "worker-2"}:
+                raise RuntimeError(f"gpu job {jid} completed by {by}")
+            if by == "worker-2":
+                raise RuntimeError(f"released job completed by {drop}")
+    resumed = http_json("POST", f"/v1/workers/{drop}/resume")
+    if resumed.get("status") != "active":
+        raise RuntimeError(f"stage4 resume failed: {resumed}")
+    if set(resumed.get("skills") or []) != EXPECTED_SKILLS[drop]:
+        raise RuntimeError(f"stage4 resume lost skills: {resumed}")
+    logger.info(
+        "stage4 ok released=%d extras_completed_on_peer",
+        len(released_ids),
+    )
+
+    leftover = health_draining()
+    if leftover:
+        raise RuntimeError(f"workers still draining: {leftover}")
+    assert_skills_intact()
     live = {w["worker_id"]: w for w in http_json("GET", "/v1/workers").get("workers") or []}
     for wid in ALL_WORKERS:
         if live[wid].get("status") != "active":
@@ -356,7 +453,7 @@ def main() -> int:
     logger.info(
         "worker maintenance soak ok in %.1fs jobs=%d",
         time.time() - started,
-        STAGE1_JOBS * 2 + expected,
+        STAGE1_JOBS * 2 + expected + STAGE1_JOBS + 1,
     )
     return 0
 

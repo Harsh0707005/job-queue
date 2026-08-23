@@ -8,7 +8,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from job_queue import JobQueue, JobStatus, WorkerError
+from job_queue import JobQueue, JobStatus, LeaseError, WorkerError
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack, _hb
@@ -254,6 +254,208 @@ def test_inprocess_worker_idles_while_draining_then_resumes(queue: JobQueue):
     worker.stop()
     t.join(timeout=3)
     assert seen == [1]
+
+
+def test_drain_release_held_returns_jobs_for_peer(queue: JobQueue):
+    queue.register_worker("hold", skills=["cpu"])
+    queue.register_worker("peer", skills=["cpu"])
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    held = queue.lease(tenant_id="t1", worker_id="hold")
+    assert held is not None and held.id == job.id
+    token = held.lease_token
+    attempts = held.attempts
+
+    out = queue.set_worker_maintenance("hold", draining=True, release_held=True)
+    assert out["status"] == "draining"
+    assert out["release_held"] is True
+    assert out["released"] == 1
+    assert str(job.id) in out["released_job_ids"]
+    assert out["leased"] == 0
+    assert out["skills"] == ["cpu"]
+
+    got = queue.get(job.id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.PENDING
+    assert got.leased_by is None
+    assert got.lease_token is None
+    assert got.attempts == attempts
+
+    with pytest.raises(LeaseError):
+        queue.ack(
+            held.id,
+            tenant_id="t1",
+            worker_id="hold",
+            lease_token=token,  # type: ignore[arg-type]
+            result={"stolen": True},
+        )
+    still = queue.get(job.id, tenant_id="t1")
+    assert still is not None and still.status == JobStatus.PENDING
+
+    peer = queue.lease(tenant_id="t1", worker_id="peer")
+    assert peer is not None and peer.id == job.id
+    assert peer.leased_by == "peer"
+    done = _ack(queue, peer, "peer", result={"ok": True})
+    assert done.status == JobStatus.COMPLETED
+    with pytest.raises(LeaseError):
+        queue.ack(
+            held.id,
+            tenant_id="t1",
+            worker_id="hold",
+            lease_token=token,  # type: ignore[arg-type]
+            result={"late": True},
+        )
+    final = queue.get(job.id, tenant_id="t1")
+    assert final is not None and final.status == JobStatus.COMPLETED
+    assert final.result == {"ok": True}
+
+
+def test_drain_without_release_keeps_held_lease(queue: JobQueue):
+    queue.register_worker("keep", skills=["cpu"])
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    held = queue.lease(tenant_id="t1", worker_id="keep")
+    assert held is not None
+    out = queue.set_worker_maintenance("keep", draining=True, release_held=False)
+    assert out["released"] == 0
+    still = queue.get(job.id, tenant_id="t1")
+    assert still is not None and still.status == JobStatus.LEASED
+    assert still.leased_by == "keep"
+    _ack(queue, held, "keep")
+
+
+def test_release_held_after_drain_and_queue_default(queue: JobQueue):
+    queue.register_worker("late", skills=["cpu"])
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    held = queue.lease(tenant_id="t1", worker_id="late")
+    assert held is not None
+    queue.set_worker_maintenance("late", draining=True, release_held=False)
+    assert queue.get(job.id, tenant_id="t1").status == JobStatus.LEASED
+
+    dropped = queue.release_worker_held_leases("late")
+    assert dropped["released"] == 1
+    assert queue.get(job.id, tenant_id="t1").status == JobStatus.PENDING
+    assert queue.get_worker("late")["status"] == "draining"
+    peer = queue.lease(tenant_id="t1", worker_id="peer")
+    assert peer is not None and peer.id == job.id
+    _ack(queue, peer, "peer")
+
+    job2 = queue.enqueue(tenant_id="t1", payload={"n": 2})
+    # Default off: omit release_held, job stays (but worker is draining so
+    # it cannot lease job2). Register a second worker and use the setting.
+    queue.register_worker("defw", skills=["cpu"])
+    held2 = queue.lease(tenant_id="t1", worker_id="defw")
+    assert held2 is not None and held2.id == job2.id
+    assert queue.get_worker_drain_release_held() is False
+    queue.set_worker_drain_release_held(True)
+    assert queue.get_worker_drain_release_held() is True
+    inherited = queue.set_worker_maintenance("defw", draining=True)
+    assert inherited["release_held"] is True
+    assert inherited["released"] == 1
+    assert queue.get(job2.id, tenant_id="t1").status == JobStatus.PENDING
+    queue.set_worker_drain_release_held(False)
+
+
+def test_release_held_does_not_lose_raced_ack(queue: JobQueue):
+    queue.register_worker("race", skills=["cpu"])
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    held = queue.lease(tenant_id="t1", worker_id="race")
+    assert held is not None and held.lease_token is not None
+    # Complete first, then release: already-acked job must stay completed.
+    _ack(queue, held, "race", result={"first": True})
+    out = queue.set_worker_maintenance("race", draining=True, release_held=True)
+    assert out["released"] == 0
+    done = queue.get(job.id, tenant_id="t1")
+    assert done is not None
+    assert done.status == JobStatus.COMPLETED
+    assert done.result == {"first": True}
+
+
+def test_http_drain_release_held_roundtrip(queue: JobQueue):
+    from job_queue import LeaseError
+
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = CoordinatorClient(f"http://127.0.0.1:{port}")
+        client.register_worker("http-hold", skills=["gpu"])
+        client.register_worker("http-peer", skills=["gpu"])
+        job = client.enqueue(tenant_id="http-rel", payload={"n": 1})
+        held = client.lease(worker_id="http-hold", tenant_id="http-rel")
+        assert held is not None
+        token = held.lease_token
+        policy = client.get_worker_drain_policy()
+        assert policy["release_held"] is False
+        drained = client.drain_worker("http-hold", release_held=True)
+        assert drained["status"] == "draining"
+        assert drained["released"] == 1
+        assert client.lease(worker_id="http-hold", tenant_id="http-rel") is None
+        with pytest.raises(LeaseError):
+            client.ack(
+                held.id,
+                tenant_id="http-rel",
+                worker_id="http-hold",
+                lease_token=token,  # type: ignore[arg-type]
+                result={"nope": True},
+            )
+        peer = client.lease(worker_id="http-peer", tenant_id="http-rel")
+        assert peer is not None and peer.id == job.id
+        _ack(queue, peer, "http-peer")
+        client.set_worker_drain_policy(release_held=True)
+        assert client.get_worker_drain_policy()["release_held"] is True
+        client.set_worker_drain_policy(release_held=False)
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_inprocess_worker_drops_held_on_release(queue: JobQueue):
+    from job_queue import Worker
+
+    started = threading.Event()
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="drop-w",
+        poll_interval_seconds=0.05,
+        heartbeat_interval_seconds=0.1,
+        visibility_timeout_seconds=30,
+        skills=["cpu"],
+    )
+    queue.register_worker("drop-w", skills=["cpu"])
+
+    @worker.handler
+    def _handle(job, lease):
+        started.set()
+        for _ in range(80):
+            lease.ensure_held()
+            time.sleep(0.05)
+        return {"should_not": True}
+
+    queue.enqueue(tenant_id="t1", payload={"n": 1})
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    assert started.wait(5)
+    out = queue.set_worker_maintenance(
+        "drop-w", draining=True, release_held=True
+    )
+    assert out["released"] >= 1
+    peer_job = None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        peer_job = queue.lease(tenant_id="t1", worker_id="peer")
+        if peer_job is not None:
+            break
+        time.sleep(0.05)
+    assert peer_job is not None
+    _ack(queue, peer_job, "peer", result={"peer": True})
+    worker.stop()
+    t.join(timeout=3)
+    final = queue.get(peer_job.id, tenant_id="t1")
+    assert final is not None
+    assert final.status == JobStatus.COMPLETED
+    assert final.result == {"peer": True}
 
 
 def test_drain_is_idempotent_and_resume_is_idempotent(queue: JobQueue):

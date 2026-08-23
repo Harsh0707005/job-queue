@@ -423,6 +423,11 @@ ALTER TABLE queue_settings ADD CONSTRAINT queue_settings_partition_count_check C
     partition_count >= 1 AND partition_count <= 4096
 );
 
+-- Default for worker maintenance drain: drop inflight leases so peers
+-- can reclaim immediately. Per-call release_held overrides this.
+ALTER TABLE queue_settings ADD COLUMN IF NOT EXISTS
+    worker_drain_release_held BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Shard key on jobs (assigned at enqueue; claim filters by owned partitions).
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS partition_id INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_partition_id_check;

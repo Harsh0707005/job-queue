@@ -123,6 +123,11 @@ class PartitionsApiMixin:
             ),
             "partition_count": row.get("partition_count"),
             "generation": row.get("generation"),
+            "released": row.get("released"),
+            "released_job_ids": list(row.get("released_job_ids") or []),
+            "release_held": bool(row.get("release_held"))
+            if row.get("release_held") is not None
+            else None,
         }
 
     def _list_workers(self) -> tuple[int, dict[str, Any]]:
@@ -147,14 +152,73 @@ class PartitionsApiMixin:
             }
         return 200, self._serialize_worker(row)
 
+    @staticmethod
+    def _parse_optional_bool(raw: Any) -> bool | None:
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, bool):
+            return raw
+        s = str(raw).strip().lower()
+        if s in {"1", "true", "yes", "on"}:
+            return True
+        if s in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError("boolean value required")
+
     def _set_worker_maintenance(
-        self, worker_id: str, *, draining: bool
+        self,
+        worker_id: str,
+        *,
+        draining: bool,
+        body: dict[str, Any] | None = None,
+        query: dict[str, list[str]] | None = None,
     ) -> tuple[int, dict[str, Any]]:
+        body = body or {}
+        query = query or {}
         try:
-            row = self.queue.set_worker_maintenance(worker_id, draining=draining)
+            release_held = None
+            if draining:
+                raw = body.get("release_held")
+                if raw is None:
+                    raw = (query.get("release_held") or [None])[0]
+                release_held = self._parse_optional_bool(raw)
+            row = self.queue.set_worker_maintenance(
+                worker_id, draining=draining, release_held=release_held
+            )
         except WorkerError as exc:
             status = 404 if exc.code == "worker_not_found" else 409
             return status, {"error": str(exc), "code": exc.code}
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, self._serialize_worker(row)
+
+    def _release_worker_held(
+        self, worker_id: str
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            row = self.queue.release_worker_held_leases(worker_id)
+        except WorkerError as exc:
+            status = 404 if exc.code == "worker_not_found" else 409
+            return status, {"error": str(exc), "code": exc.code}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, self._serialize_worker(row)
+
+    def _get_worker_drain_policy(self) -> tuple[int, dict[str, Any]]:
+        return 200, {
+            "release_held": self.queue.get_worker_drain_release_held()
+        }
+
+    def _set_worker_drain_policy(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if "release_held" not in body:
+            return 400, {"error": "release_held is required"}
+        try:
+            parsed = self._parse_optional_bool(body.get("release_held"))
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        if parsed is None:
+            return 400, {"error": "release_held is required"}
+        enabled = self.queue.set_worker_drain_release_held(parsed)
+        return 200, {"release_held": enabled}
