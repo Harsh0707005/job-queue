@@ -244,6 +244,11 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def cancel_leader_handoff(self) -> dict[str, Any]:
+        payload = self._request("POST", "/v1/coordinator/leader/handoff/cancel", {})
+        assert payload is not None
+        return payload
+
     def process_due_schedules(
         self, *, tenant_id: str | None = None, limit: int = 100
     ) -> int:

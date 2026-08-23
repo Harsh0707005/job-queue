@@ -101,6 +101,7 @@ def queue(postgres_url: str):
         conn.execute("TRUNCATE tenant_restores CASCADE")
         conn.execute("TRUNCATE tenant_snapshots CASCADE")
         conn.execute("TRUNCATE coordinator_leader")
+        conn.execute("TRUNCATE coordinator_nodes")
         conn.execute(
             """
             UPDATE queue_settings

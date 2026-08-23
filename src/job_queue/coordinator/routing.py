@@ -14,6 +14,7 @@ from job_queue.queue import (
     JobQueue,
 )
 from job_queue.queue._common import _utcnow
+from job_queue.queue.coordinator_leader import HandoffError
 
 
 class RoutingMixin:
@@ -124,6 +125,16 @@ class RoutingMixin:
             payload["lease"] = (
                 None if lease is None else coordinator_leader_to_dict(lease)
             )
+            if hasattr(self.queue, "list_live_control_nodes"):
+                payload["live_nodes"] = self.queue.list_live_control_nodes()
+            return 200, payload
+        if method == "POST" and path == "/v1/coordinator/leader/handoff/cancel":
+            lease = self.queue.cancel_control_leader_handoff()
+            payload = self._leader_health()
+            payload["lease"] = (
+                None if lease is None else coordinator_leader_to_dict(lease)
+            )
+            payload["cancelled"] = True
             return 200, payload
         if method == "POST" and path == "/v1/coordinator/leader/handoff":
             dest = body.get("to_node_id") or body.get("node_id")
@@ -138,6 +149,16 @@ class RoutingMixin:
                     return 400, {"error": "handoff_seconds must be a number"}
             try:
                 lease = self.queue.handoff_control_leader(**kwargs)
+            except HandoffError as exc:
+                return 409, {
+                    "error": str(exc),
+                    "code": exc.code,
+                    "live_nodes": (
+                        self.queue.list_live_control_nodes()
+                        if hasattr(self.queue, "list_live_control_nodes")
+                        else []
+                    ),
+                }
             except ValueError as exc:
                 return 400, {"error": str(exc)}
             payload = self._leader_health()

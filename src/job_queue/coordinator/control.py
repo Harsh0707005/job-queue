@@ -71,6 +71,13 @@ class CoordinatorControlLoop:
             name=f"coord-control-{self.node_id}",
             daemon=True,
         )
+        if hasattr(self.queue, "touch_control_node"):
+            try:
+                self.queue.touch_control_node(self.node_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "control node heartbeat failed node=%s", self.node_id
+                )
         self._thread.start()
         logger.info(
             "control loop starting node=%s ttl=%.2fs interval=%.2fs",
@@ -99,6 +106,11 @@ class CoordinatorControlLoop:
         # row locks on jobs / coordinator_leader.
         self._stop.wait(min(0.4, self.interval_seconds))
         while not self._stop.is_set():
+            try:
+                if hasattr(self.queue, "touch_control_node"):
+                    self.queue.touch_control_node(self.node_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("control node heartbeat failed node=%s", self.node_id)
             try:
                 lease = self.queue.acquire_or_renew_control_leader(
                     node_id=self.node_id,

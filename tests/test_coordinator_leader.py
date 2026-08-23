@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from uuid import uuid4
 
-from datetime import datetime, timezone
+import pytest
 
 from job_queue import JobQueue, JobStatus, WebhookEvent
+from job_queue.queue.coordinator_leader import HandoffError
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.queue._common import _utcnow
 from job_queue.remote import CoordinatorClient
@@ -418,6 +419,7 @@ def test_handoff_old_leader_stops_new_claims_immediately(queue: JobQueue):
         start_at=_utcnow() + timedelta(hours=1),
     )
     _make_due(queue, sched.id)
+    queue.touch_control_node("new")
 
     out = queue.handoff_control_leader("new", handoff_seconds=15.0)
     assert out.handoff_to == "new"
@@ -471,6 +473,146 @@ def test_handoff_to_current_leader_is_noop(queue: JobQueue):
     assert again.epoch == held.epoch
     assert again.handoff_to is None
     assert queue.holds_control_leader(node_id="keep", lease_token=tok)
+
+
+def test_handoff_unknown_node_refused_leader_keeps_ticking(queue: JobQueue):
+    tok = uuid4()
+    held = queue.acquire_or_renew_control_leader(
+        node_id="old", lease_token=tok, ttl_seconds=30.0
+    )
+    assert held is not None
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    with pytest.raises(HandoffError, match="not a live coordinator") as ei:
+        queue.handoff_control_leader("no-such-node", handoff_seconds=30.0)
+    assert ei.value.code == "handoff_target_down"
+    lease = queue.get_control_leader()
+    assert lease is not None
+    assert lease.handoff_to is None
+    assert lease.epoch == held.epoch
+    assert queue.holds_control_leader(node_id="old", lease_token=tok)
+    fires = queue.process_due_schedules(
+        tenant_id="t1", leader_token=tok, leader_epoch=held.epoch
+    )
+    assert [f.schedule.id for f in fires] == [sched.id]
+
+
+def test_cancel_handoff_to_missing_target_lets_old_leader_resume(queue: JobQueue):
+    old_tok = uuid4()
+    held = queue.acquire_or_renew_control_leader(
+        node_id="old", lease_token=old_tok, ttl_seconds=30.0
+    )
+    assert held is not None
+    sched = queue.create_schedule(
+        tenant_id="t1",
+        interval_seconds=3600,
+        payload={"n": 1},
+        start_at=_utcnow() + timedelta(hours=1),
+    )
+    _make_due(queue, sched.id)
+    # Dest looked live, then never claimed (down / name that went stale).
+    queue.touch_control_node("ghost")
+    parked = queue.handoff_control_leader("ghost", handoff_seconds=30.0)
+    assert parked.handoff_to == "ghost"
+    assert (
+        queue.process_due_schedules(
+            tenant_id="t1", leader_token=old_tok, leader_epoch=held.epoch
+        )
+        == []
+    )
+
+    cleared = queue.cancel_control_leader_handoff()
+    assert cleared is not None
+    assert cleared.handoff_to is None
+    again = queue.acquire_or_renew_control_leader(
+        node_id="old", lease_token=old_tok, ttl_seconds=30.0
+    )
+    assert again is not None
+    assert again.node_id == "old"
+    fires = queue.process_due_schedules(
+        tenant_id="t1", leader_token=old_tok, leader_epoch=again.epoch
+    )
+    assert [f.schedule.id for f in fires] == [sched.id]
+
+
+def test_cancel_handoff_lets_other_live_node_take_over(queue: JobQueue):
+    old_tok = uuid4()
+    other_tok = uuid4()
+    held = queue.acquire_or_renew_control_leader(
+        node_id="old", lease_token=old_tok, ttl_seconds=30.0
+    )
+    assert held is not None
+    queue.touch_control_node("ghost")
+    queue.handoff_control_leader("ghost", handoff_seconds=30.0)
+    assert (
+        queue.acquire_or_renew_control_leader(
+            node_id="other", lease_token=other_tok, ttl_seconds=30.0
+        )
+        is None
+    )
+    queue.cancel_control_leader_handoff()
+    stolen = queue.acquire_or_renew_control_leader(
+        node_id="other", lease_token=other_tok, ttl_seconds=30.0
+    )
+    assert stolen is not None
+    assert stolen.node_id == "other"
+    assert stolen.handoff_to is None
+
+
+def test_http_handoff_unknown_is_409_and_cancel_unblocks(queue: JobQueue):
+    lead = Coordinator(queue, node_id="http-keep")
+    lead.start_control(ttl_seconds=30.0, interval_seconds=0.1)
+    server, url = _serve(lead)
+    try:
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            if lead._control_loop is not None and lead._control_loop.is_leader():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("leader not elected")
+        status, body = lead.handle(
+            "POST",
+            "/v1/coordinator/leader/handoff",
+            {"to_node_id": "typo-node", "handoff_seconds": 30},
+            {},
+        )
+        assert status == 409
+        assert body.get("code") == "handoff_target_down"
+        assert lead._control_loop.is_leader()
+
+        queue.touch_control_node("ghost")
+        status, body = lead.handle(
+            "POST",
+            "/v1/coordinator/leader/handoff",
+            {"to_node_id": "ghost", "handoff_seconds": 30},
+            {},
+        )
+        assert status == 200
+        assert body.get("handoff_to") == "ghost"
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if not lead._control_loop.is_leader():
+                break
+            time.sleep(0.05)
+        client = CoordinatorClient(url)
+        cancelled = client.cancel_leader_handoff()
+        assert cancelled.get("cancelled") is True
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            if lead._control_loop.is_leader():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("leader did not resume after cancel")
+    finally:
+        server.shutdown()
+        lead.stop_control()
 
 
 def test_handoff_control_loops_old_stops_new_ticks(queue: JobQueue):
@@ -608,6 +750,7 @@ def test_handoff_mid_webhook_batch_does_not_double_post(queue: JobQueue):
         def before_post(item) -> None:
             seen.append(item.delivery.id)
             if len(seen) == 2:
+                queue.touch_control_node("new")
                 queue.handoff_control_leader("new", handoff_seconds=15.0)
 
         old_out = queue.process_webhook_deliveries(
@@ -679,6 +822,7 @@ def test_posted_then_lost_claim_reclaim_does_not_repost(queue: JobQueue):
         assert queue.note_webhook_last_status(item.delivery.id, code)
         assert len(capture.received) == 1
 
+        queue.touch_control_node("new")
         queue.handoff_control_leader("new", handoff_seconds=15.0)
         # Simulate the old claim timing out before finalize.
         with queue._pool.connection() as conn:

@@ -1582,4 +1582,11 @@ CREATE TABLE IF NOT EXISTS coordinator_leader (
 ALTER TABLE coordinator_leader ADD COLUMN IF NOT EXISTS handoff_to TEXT;
 ALTER TABLE coordinator_leader ADD COLUMN IF NOT EXISTS handoff_until TIMESTAMPTZ;
 
+-- Live coordinator heartbeats. Handoff refuses a dest that has not
+-- checked in recently so a typo cannot freeze control work.
+CREATE TABLE IF NOT EXISTS coordinator_nodes (
+    node_id         TEXT PRIMARY KEY,
+    last_seen_at    TIMESTAMPTZ NOT NULL
+);
+
 """

@@ -12,6 +12,17 @@ from job_queue.queue._common import _as_utc, _utcnow
 
 CONTROL_LEADER_SLOT = "control"
 
+# Dest must have heartbeated within this window to be a valid handoff target.
+_DEFAULT_LIVE_SECONDS = 5.0
+
+
+class HandoffError(Exception):
+    """Raised when a control-leader handoff cannot proceed."""
+
+    def __init__(self, message: str, *, code: str = "handoff_error") -> None:
+        super().__init__(message)
+        self.code = code
+
 ControlTickKind = Literal["schedules", "webhooks", "alerts", "retention"]
 
 _LEADER_COLUMNS = """
@@ -155,11 +166,58 @@ class CoordinatorLeaderMixin:
                 return None
             return _row_to_leader(updated)
 
+    def touch_control_node(self, node_id: str) -> None:
+        """Record that *node_id* is alive (follower heartbeats count)."""
+        nid = str(node_id or "").strip()
+        if not nid:
+            raise ValueError("node_id is required")
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            conn.execute(
+                """
+                INSERT INTO coordinator_nodes (node_id, last_seen_at)
+                VALUES (%s, %s)
+                ON CONFLICT (node_id) DO UPDATE
+                SET last_seen_at = EXCLUDED.last_seen_at
+                """,
+                (nid, now),
+            )
+
+    def list_live_control_nodes(
+        self, *, live_seconds: float = _DEFAULT_LIVE_SECONDS
+    ) -> list[str]:
+        if live_seconds <= 0:
+            raise ValueError("live_seconds must be > 0")
+        cutoff = _utcnow() - timedelta(seconds=float(live_seconds))
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT node_id
+                FROM coordinator_nodes
+                WHERE last_seen_at > %s
+                ORDER BY node_id
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [str(r["node_id"]) for r in rows]
+
+    def is_live_control_node(
+        self,
+        node_id: str,
+        *,
+        live_seconds: float = _DEFAULT_LIVE_SECONDS,
+    ) -> bool:
+        nid = str(node_id or "").strip()
+        if not nid:
+            return False
+        return nid in self.list_live_control_nodes(live_seconds=live_seconds)
+
     def handoff_control_leader(
         self,
         to_node_id: str,
         *,
         handoff_seconds: float = 15.0,
+        live_seconds: float = _DEFAULT_LIVE_SECONDS,
         slot: str = CONTROL_LEADER_SLOT,
     ) -> CoordinatorLeader:
         """Make *to_node_id* the next leader without waiting for TTL.
@@ -167,6 +225,9 @@ class CoordinatorLeaderMixin:
         Expires the current lease and bumps epoch so the old holder
         cannot renew or run another fenced tick. Only *to_node_id* may
         claim until *handoff_seconds* elapses.
+
+        Fail-closed: a dest that has not heartbeated recently is refused
+        so a typo cannot freeze control work until the window times out.
         """
         dest = str(to_node_id or "").strip()
         if not dest:
@@ -185,6 +246,15 @@ class CoordinatorLeaderMixin:
                 """,
                 (slot,),
             ).fetchone()
+            live_holder = (
+                row is not None
+                and str(row["node_id"]) == dest
+                and _as_utc(row["expires_at"]) > now
+            )
+            if not live_holder:
+                self._require_live_control_node(
+                    conn, dest, live_seconds=live_seconds, now=now
+                )
             if row is None:
                 inserted = conn.execute(
                     f"""
@@ -233,6 +303,73 @@ class CoordinatorLeaderMixin:
             ).fetchone()
             assert updated is not None
             return _row_to_leader(updated)
+
+    def cancel_control_leader_handoff(
+        self, *, slot: str = CONTROL_LEADER_SLOT
+    ) -> CoordinatorLeader | None:
+        """Abort a pending handoff so a live node can lead again.
+
+        Clears the exclusive claim window. The previous holder can renew
+        on the next tick; any other live node can steal the expired lease.
+        Idempotent when no handoff is pending.
+        """
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {_LEADER_COLUMNS}
+                FROM coordinator_leader
+                WHERE slot = %s
+                FOR UPDATE
+                """,
+                (slot,),
+            ).fetchone()
+            if row is None:
+                return None
+            if not _handoff_active(row, now):
+                return _row_to_leader(row)
+            updated = conn.execute(
+                f"""
+                UPDATE coordinator_leader
+                SET handoff_to = NULL,
+                    handoff_until = NULL,
+                    renewed_at = %s
+                WHERE slot = %s
+                RETURNING {_LEADER_COLUMNS}
+                """,
+                (now, slot),
+            ).fetchone()
+            assert updated is not None
+            return _row_to_leader(updated)
+
+    @staticmethod
+    def _require_live_control_node(
+        conn: Any,
+        node_id: str,
+        *,
+        live_seconds: float,
+        now: datetime,
+    ) -> None:
+        if live_seconds <= 0:
+            raise ValueError("live_seconds must be > 0")
+        cutoff = now - timedelta(seconds=float(live_seconds))
+        rows = conn.execute(
+            """
+            SELECT node_id
+            FROM coordinator_nodes
+            WHERE last_seen_at > %s
+            ORDER BY node_id
+            """,
+            (cutoff,),
+        ).fetchall()
+        live = [str(r["node_id"]) for r in rows]
+        if node_id in live:
+            return
+        raise HandoffError(
+            f"handoff target {node_id!r} is not a live coordinator "
+            f"(live={live})",
+            code="handoff_target_down",
+        )
 
     def _fence_control_leader(
         self,
