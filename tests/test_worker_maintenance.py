@@ -458,6 +458,121 @@ def test_inprocess_worker_drops_held_on_release(queue: JobQueue):
     assert final.result == {"peer": True}
 
 
+def test_release_held_refused_when_worker_is_active(queue: JobQueue):
+    queue.register_worker("live", skills=["cpu"])
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    held = queue.lease(tenant_id="t1", worker_id="live")
+    assert held is not None and held.lease_token is not None
+    with pytest.raises(WorkerError) as exc:
+        queue.release_worker_held_leases("live")
+    assert exc.value.code == "worker_not_draining"
+    still = queue.get(job.id, tenant_id="t1")
+    assert still is not None
+    assert still.status == JobStatus.LEASED
+    assert still.leased_by == "live"
+    assert still.lease_token == held.lease_token
+    # Same active worker must not be able to claim a second copy.
+    assert queue.lease(tenant_id="t1", worker_id="live") is None
+    _ack(queue, held, "live", result={"once": True})
+    done = queue.get(job.id, tenant_id="t1")
+    assert done is not None and done.status == JobStatus.COMPLETED
+    assert done.result == {"once": True}
+
+
+def test_active_worker_cannot_double_run_after_refused_release(queue: JobQueue):
+    from job_queue import Worker
+
+    started = threading.Event()
+    runs: list[int] = []
+    worker = Worker(
+        queue,
+        tenant_id="t1",
+        worker_id="dup-w",
+        poll_interval_seconds=0.05,
+        heartbeat_interval_seconds=0.1,
+        visibility_timeout_seconds=30,
+        skills=["cpu"],
+    )
+    queue.register_worker("dup-w", skills=["cpu"])
+
+    @worker.handler
+    def _handle(job, lease):
+        runs.append(int(job.payload["n"]))
+        started.set()
+        time.sleep(0.4)
+        lease.ensure_held()
+        return {"run": len(runs)}
+
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    assert started.wait(5)
+    with pytest.raises(WorkerError) as exc:
+        queue.release_worker_held_leases("dup-w")
+    assert exc.value.code == "worker_not_draining"
+    held = queue.get(job.id, tenant_id="t1")
+    assert held is not None and held.status == JobStatus.LEASED
+    assert held.leased_by == "dup-w"
+    assert queue.lease(tenant_id="t1", worker_id="dup-w") is None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        got = queue.get(job.id, tenant_id="t1")
+        if got is not None and got.status == JobStatus.COMPLETED:
+            break
+        time.sleep(0.05)
+    worker.stop()
+    t.join(timeout=3)
+    final = queue.get(job.id, tenant_id="t1")
+    assert final is not None
+    assert final.status == JobStatus.COMPLETED
+    assert runs == [1]
+    assert final.result == {"run": 1}
+
+
+def test_http_release_held_refused_on_active_worker(queue: JobQueue):
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = CoordinatorClient(f"http://127.0.0.1:{port}")
+        client.register_worker("http-live", skills=["cpu"])
+        job = client.enqueue(tenant_id="http-live", payload={"n": 1})
+        held = client.lease(worker_id="http-live", tenant_id="http-live")
+        assert held is not None
+        with pytest.raises(WorkerError) as exc:
+            client.release_worker_held("http-live")
+        assert exc.value.code == "worker_not_draining"
+        still = queue.get(job.id, tenant_id="http-live")
+        assert still is not None and still.status == JobStatus.LEASED
+        assert still.leased_by == "http-live"
+        client.drain_worker("http-live")
+        dropped = client.release_worker_held("http-live")
+        assert dropped["released"] == 1
+        pending = queue.get(job.id, tenant_id="http-live")
+        assert pending is not None and pending.status == JobStatus.PENDING
+        assert client.lease(worker_id="http-live", tenant_id="http-live") is None
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_release_held_refused_after_resume(queue: JobQueue):
+    queue.register_worker("back", skills=["cpu"])
+    queue.set_worker_maintenance("back", draining=True)
+    queue.set_worker_maintenance("back", draining=False)
+    job = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    held = queue.lease(tenant_id="t1", worker_id="back")
+    assert held is not None
+    with pytest.raises(WorkerError) as exc:
+        queue.release_worker_held_leases("back")
+    assert exc.value.code == "worker_not_draining"
+    still = queue.get(job.id, tenant_id="t1")
+    assert still is not None and still.status == JobStatus.LEASED
+    _ack(queue, held, "back")
+
+
 def test_drain_is_idempotent_and_resume_is_idempotent(queue: JobQueue):
     queue.register_worker("idemp", skills=["cpu"])
     a = queue.set_worker_maintenance("idemp", draining=True)

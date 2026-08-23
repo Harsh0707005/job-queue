@@ -376,6 +376,18 @@ def main() -> int:
         timeout=20,
         msg="worker-2 never leased stage4 gpu work",
     )
+    # Active worker must not drop leases — it would reclaim them and
+    # run the same job twice while the old handler is still going.
+    refused = http_json("POST", f"/v1/workers/{drop}/release-held")
+    if refused.get("_http") != 409 or refused.get("code") != "worker_not_draining":
+        raise RuntimeError(f"active release-held must 409: {refused}")
+    still_held = [
+        j
+        for j in list_jobs(rel_tid)
+        if j.get("leased_by") == drop and j.get("status") == "leased"
+    ]
+    if not still_held:
+        raise RuntimeError("active release-held dropped inflight jobs")
     held_then = {
         str(j["id"])
         for j in list_jobs(rel_tid)

@@ -341,10 +341,11 @@ class PartitionsMixin(SkillsWaitMixin):
     def release_worker_held_leases(self, worker_id: str) -> dict[str, Any]:
         """Return every job this worker currently holds to ``pending``.
 
-        Does not change maintenance status. Intended for a draining worker
-        whose inflight work should not block peers. Safe vs concurrent ack:
-        the lease token is cleared under ``FOR UPDATE``, so a late ack fails
-        with :class:`LeaseError` instead of completing twice.
+        Only a worker already in maintenance may drop inflight leases.
+        Dropping them on an *active* worker would let the same process
+        reclaim the jobs while its old handler is still running.
+        The lease token is cleared under ``FOR UPDATE``, so a late ack
+        from the draining worker fails with :class:`LeaseError`.
         """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
@@ -353,7 +354,8 @@ class PartitionsMixin(SkillsWaitMixin):
         with transaction(self._pool) as conn:
             row = conn.execute(
                 """
-                SELECT worker_id FROM worker_nodes
+                SELECT worker_id, status, maintenance
+                FROM worker_nodes
                 WHERE worker_id = %s
                 FOR UPDATE
                 """,
@@ -363,6 +365,14 @@ class PartitionsMixin(SkillsWaitMixin):
                 raise WorkerError(
                     f"worker {wid!r} is not registered",
                     code="worker_not_found",
+                )
+            if not (
+                str(row["status"]) == "draining" or bool(row.get("maintenance"))
+            ):
+                raise WorkerError(
+                    f"worker {wid!r} is not in maintenance; "
+                    "drain it before releasing held leases",
+                    code="worker_not_draining",
                 )
             released = self._release_worker_held_leases_locked(
                 conn, wid, now=now

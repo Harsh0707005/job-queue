@@ -217,7 +217,11 @@ class ClientCoreMixin:
                     raise CoalesceError(
                         payload.get("error") or "coalesce error"
                     ) from exc
-                if payload.get("code") in {"worker_not_found", "worker_dead"} and exc.code in (
+                if payload.get("code") in {
+                    "worker_not_found",
+                    "worker_dead",
+                    "worker_not_draining",
+                } and exc.code in (
                     404,
                     409,
                 ):
