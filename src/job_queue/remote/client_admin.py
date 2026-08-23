@@ -1135,6 +1135,38 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def drain_worker(self, worker_id: str) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        payload = self._request(
+            "POST", f"/v1/workers/{quote(str(worker_id), safe='')}/drain"
+        )
+        assert payload is not None
+        return payload
+
+    def resume_worker(self, worker_id: str) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        payload = self._request(
+            "POST", f"/v1/workers/{quote(str(worker_id), safe='')}/resume"
+        )
+        assert payload is not None
+        return payload
+
+    def get_worker(self, worker_id: str) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        payload = self._request(
+            "GET", f"/v1/workers/{quote(str(worker_id), safe='')}"
+        )
+        assert payload is not None
+        return payload
+
+    def list_workers(self) -> dict[str, Any]:
+        payload = self._request("GET", "/v1/workers")
+        assert payload is not None
+        return payload
+
     def list_worker_partitions(self, worker_id: str) -> dict[str, Any]:
         from urllib.parse import urlencode
 

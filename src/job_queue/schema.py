@@ -438,8 +438,18 @@ CREATE TABLE IF NOT EXISTS worker_nodes (
     last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT worker_nodes_status_check CHECK (status IN ('active', 'dead'))
+    CONSTRAINT worker_nodes_status_check CHECK (status IN ('active', 'draining', 'dead'))
 );
+
+ALTER TABLE worker_nodes DROP CONSTRAINT IF EXISTS worker_nodes_status_check;
+ALTER TABLE worker_nodes ADD CONSTRAINT worker_nodes_status_check CHECK (
+    status IN ('active', 'draining', 'dead')
+);
+
+-- Operator maintenance: stop new leases, keep skills / registry data.
+-- Survives expire-to-dead and heartbeat revive so a crashed-in-maintenance
+-- worker comes back still draining until an explicit resume.
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS maintenance BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Capabilities advertised by the worker. Lease requires
 -- jobs.required_skills <@ worker_nodes.skills (empty job skills = any worker).

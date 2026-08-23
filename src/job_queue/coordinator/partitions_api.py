@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from job_queue.queue import WorkerError
+
 
 class PartitionsApiMixin:
     def _register_worker(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -105,3 +107,54 @@ class PartitionsApiMixin:
         except (TypeError, ValueError) as exc:
             return 400, {"error": str(exc)}
         return 200, {"partition_count": n}
+
+    def _serialize_worker(self, row: dict[str, Any]) -> dict[str, Any]:
+        last_seen = row.get("last_seen_at")
+        return {
+            "worker_id": row["worker_id"],
+            "status": row["status"],
+            "draining": bool(row.get("draining")),
+            "maintenance": bool(row.get("maintenance")),
+            "skills": list(row.get("skills") or []),
+            "partitions": list(row.get("partitions") or []),
+            "leased": int(row.get("leased") or 0),
+            "last_seen_at": (
+                last_seen.isoformat() if hasattr(last_seen, "isoformat") else last_seen
+            ),
+            "partition_count": row.get("partition_count"),
+            "generation": row.get("generation"),
+        }
+
+    def _list_workers(self) -> tuple[int, dict[str, Any]]:
+        rows = self.queue.list_workers()
+        workers = [self._serialize_worker(r) for r in rows]
+        draining = [w["worker_id"] for w in workers if w["draining"]]
+        return 200, {
+            "workers": workers,
+            "count": len(workers),
+            "draining_workers": draining,
+        }
+
+    def _get_worker(self, worker_id: str) -> tuple[int, dict[str, Any]]:
+        try:
+            row = self.queue.get_worker(worker_id)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        if row is None:
+            return 404, {
+                "error": f"worker {worker_id!r} is not registered",
+                "code": "worker_not_found",
+            }
+        return 200, self._serialize_worker(row)
+
+    def _set_worker_maintenance(
+        self, worker_id: str, *, draining: bool
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            row = self.queue.set_worker_maintenance(worker_id, draining=draining)
+        except WorkerError as exc:
+            status = 404 if exc.code == "worker_not_found" else 409
+            return status, {"error": str(exc), "code": exc.code}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, self._serialize_worker(row)

@@ -69,6 +69,13 @@ class LeaseClaimPublicMixin:
         if limit > 500:
             raise ValueError("limit must be <= 500")
 
+        # Durable maintenance: refuse new claims even when partition
+        # registration is off (unit tests) or the worker still holds shards.
+        if hasattr(self, "worker_is_draining") and self.worker_is_draining(
+            worker_id
+        ):
+            return []
+
         jobs = self._lease_batch_once(
             worker_id=worker_id,
             limit=limit,

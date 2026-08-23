@@ -58,6 +58,9 @@ class RoutingMixin:
             until = lease.handoff_until
             if until is None or until > now:
                 handoff_to = lease.handoff_to
+        draining: list[str] = []
+        if hasattr(self.queue, "list_draining_workers"):
+            draining = list(self.queue.list_draining_workers())
         return {
             "ok": True,
             "role": "coordinator",
@@ -66,6 +69,7 @@ class RoutingMixin:
             "leader_node": lease.node_id if live else None,
             "leader_epoch": int(lease.epoch) if live else None,
             "handoff_to": handoff_to,
+            "draining_workers": draining,
         }
 
     def _control_fence_args(self) -> dict[str, Any] | None:
@@ -809,6 +813,25 @@ class RoutingMixin:
             return self._process_worker_timeouts(body)
         if method == "POST" and path == "/v1/partitions/count":
             return self._set_partition_count(body)
+        if method == "GET" and path == "/v1/workers":
+            return self._list_workers()
+        if path.startswith("/v1/workers/"):
+            rest = path[len("/v1/workers/") :].strip("/")
+            parts = [p for p in rest.split("/") if p]
+            if parts and parts[0] not in {
+                "register",
+                "heartbeat",
+                "deregister",
+                "partitions",
+                "process-timeouts",
+            }:
+                wid = parts[0]
+                if method == "GET" and len(parts) == 1:
+                    return self._get_worker(wid)
+                if method == "POST" and len(parts) == 2 and parts[1] == "drain":
+                    return self._set_worker_maintenance(wid, draining=True)
+                if method == "POST" and len(parts) == 2 and parts[1] == "resume":
+                    return self._set_worker_maintenance(wid, draining=False)
 
         # Multi-step saga workflows.
         if method == "POST" and path == "/v1/workflows":

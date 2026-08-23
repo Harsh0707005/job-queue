@@ -56,6 +56,8 @@ class RemoteWorkerLoopMixin:
         self._queue_rr = 0
         self._stop = threading.Event()
         self._draining = threading.Event()
+        # Coordinator maintenance: skip new leases, keep heartbeating / finishing.
+        self._maintenance = threading.Event()
         self._active: dict[Any, _ActiveRemoteJob] = {}
         self._held: dict[Any, Job] = {}
         self._lease_lock = threading.Lock()
@@ -70,6 +72,7 @@ class RemoteWorkerLoopMixin:
                 self.worker_id, skills=self.skills or None
             )
             self._partitions = list(out.get("partitions") or [])
+            self._apply_maintenance_status(out)
             self._partitioned = True
             logger.info(
                 "worker %s registered partitions=%s (n=%s)",
@@ -89,10 +92,27 @@ class RemoteWorkerLoopMixin:
                 self.worker_id, skills=self.skills or None
             )
             self._partitions = list(out.get("partitions") or [])
+            self._apply_maintenance_status(out)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "worker partition heartbeat failed worker=%s", self.worker_id
             )
+
+    def _apply_maintenance_status(self, out: dict[str, Any]) -> None:
+        draining = bool(out.get("draining")) or str(out.get("status") or "") == "draining"
+        if draining:
+            if not self._maintenance.is_set():
+                logger.info(
+                    "worker %s entered maintenance; skipping new leases",
+                    self.worker_id,
+                )
+            self._maintenance.set()
+        elif self._maintenance.is_set():
+            logger.info(
+                "worker %s left maintenance; leasing again",
+                self.worker_id,
+            )
+            self._maintenance.clear()
 
     def stop(self) -> None:
         """Stop the run loop without waiting. Prefer :meth:`drain` for deploys."""
@@ -189,6 +209,9 @@ class RemoteWorkerLoopMixin:
             ):
                 self._heartbeat_partitions()
                 last_part_hb = time.monotonic()
+            if self._maintenance.is_set():
+                self._stop.wait(self.poll_interval_seconds)
+                continue
             try:
                 jobs = []
                 for _ in range(len(self.queue_names)):

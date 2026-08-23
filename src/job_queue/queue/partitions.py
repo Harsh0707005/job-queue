@@ -21,6 +21,7 @@ from job_queue.models import JobStatus
 from job_queue.queue._common import (
     DEFAULT_PARTITION_COUNT,
     WORKER_HEARTBEAT_TTL_SECONDS,
+    WorkerError,
     _normalize_skills,
     _utcnow,
 )
@@ -98,10 +99,13 @@ class PartitionsMixin(SkillsWaitMixin):
                     )
                     VALUES (%s, 'active', %s, %s, %s, '{}'::text[])
                     ON CONFLICT (worker_id) DO UPDATE
-                    SET status = 'active',
+                    SET status = CASE
+                            WHEN worker_nodes.maintenance THEN 'draining'
+                            ELSE 'active'
+                        END,
                         last_seen_at = EXCLUDED.last_seen_at,
                         updated_at = EXCLUDED.updated_at
-                    RETURNING skills
+                    RETURNING worker_id, skills, status, maintenance, last_seen_at
                     """,
                     (wid, now, now, now),
                 ).fetchone()
@@ -114,11 +118,14 @@ class PartitionsMixin(SkillsWaitMixin):
                     )
                     VALUES (%s, 'active', %s, %s, %s, %s)
                     ON CONFLICT (worker_id) DO UPDATE
-                    SET status = 'active',
+                    SET status = CASE
+                            WHEN worker_nodes.maintenance THEN 'draining'
+                            ELSE 'active'
+                        END,
                         last_seen_at = EXCLUDED.last_seen_at,
                         updated_at = EXCLUDED.updated_at,
                         skills = EXCLUDED.skills
-                    RETURNING skills
+                    RETURNING worker_id, skills, status, maintenance, last_seen_at
                     """,
                     (wid, now, now, now, skill_list),
                 ).fetchone()
@@ -126,20 +133,15 @@ class PartitionsMixin(SkillsWaitMixin):
             n = self._partition_count(conn)
             self._ensure_partition_rows(conn, n, now=now)
             self._rebalance_partitions_locked(conn, now=now)
-            parts = self._owned_partitions_locked(conn, wid)
             skills_out = list((row or {}).get("skills") or skill_list or [])
             self._sync_skills_wait_locked(
                 conn, now=now, worker_skills=skills_out
             )
+            snap = self._worker_snapshot_locked(conn, wid, row=row)
+            snap["partition_count"] = n
+            snap["generation"] = self._max_generation_locked(conn)
         self._rescan_awaiting_skills_after_commit()
-        return {
-            "worker_id": wid,
-            "status": "active",
-            "skills": skills_out,
-            "partitions": parts,
-            "partition_count": self.get_partition_count(),
-            "generation": self._max_generation(),
-        }
+        return snap
 
     def worker_heartbeat(
         self,
@@ -171,11 +173,14 @@ class PartitionsMixin(SkillsWaitMixin):
                     """
                     UPDATE worker_nodes
                     SET last_seen_at = %s,
-                        status = 'active',
+                        status = CASE
+                            WHEN maintenance THEN 'draining'
+                            ELSE 'active'
+                        END,
                         updated_at = %s,
                         skills = %s
                     WHERE worker_id = %s
-                    RETURNING worker_id, skills
+                    RETURNING worker_id, skills, status, maintenance, last_seen_at
                     """,
                     (now, now, skill_list, wid),
                 ).fetchone()
@@ -184,10 +189,13 @@ class PartitionsMixin(SkillsWaitMixin):
                     """
                     UPDATE worker_nodes
                     SET last_seen_at = %s,
-                        status = 'active',
+                        status = CASE
+                            WHEN maintenance THEN 'draining'
+                            ELSE 'active'
+                        END,
                         updated_at = %s
                     WHERE worker_id = %s
-                    RETURNING worker_id, skills
+                    RETURNING worker_id, skills, status, maintenance, last_seen_at
                     """,
                     (now, now, wid),
                 ).fetchone()
@@ -200,7 +208,7 @@ class PartitionsMixin(SkillsWaitMixin):
                         skills
                     )
                     VALUES (%s, 'active', %s, %s, %s, %s)
-                    RETURNING worker_id, skills
+                    RETURNING worker_id, skills, status, maintenance, last_seen_at
                     """,
                     (wid, now, now, now, skill_list or []),
                 ).fetchone()
@@ -209,23 +217,15 @@ class PartitionsMixin(SkillsWaitMixin):
             n = self._partition_count(conn)
             self._ensure_partition_rows(conn, n, now=now)
             self._rebalance_partitions_locked(conn, now=now)
-            parts = self._owned_partitions_locked(conn, wid)
-            gen = conn.execute(
-                "SELECT COALESCE(MAX(generation), 0)::bigint AS g FROM partition_assignments"
-            ).fetchone()
             skills_out = list((row or {}).get("skills") or skill_list or [])
             self._sync_skills_wait_locked(
                 conn, now=now, worker_skills=skills_out
             )
+            snap = self._worker_snapshot_locked(conn, wid, row=row)
+            snap["partition_count"] = n
+            snap["generation"] = self._max_generation_locked(conn)
         self._rescan_awaiting_skills_after_commit()
-        return {
-            "worker_id": wid,
-            "status": "active",
-            "skills": skills_out,
-            "partitions": parts,
-            "partition_count": n,
-            "generation": int(gen["g"] if gen else 0),
-        }
+        return snap
 
     def deregister_worker(self, worker_id: str) -> dict[str, Any]:
         """Mark worker dead and rebalance its partitions to survivors."""
@@ -246,6 +246,122 @@ class PartitionsMixin(SkillsWaitMixin):
             self._sync_skills_wait_locked(conn, now=now)
         self._rescan_awaiting_skills_after_commit()
         return {"worker_id": wid, "status": "dead"}
+
+    def set_worker_maintenance(
+        self, worker_id: str, *, draining: bool
+    ) -> dict[str, Any]:
+        """Stop or resume new leases for a registered worker.
+
+        Draining workers keep heartbeating, keep their skills, and may finish
+        jobs they already hold. They are dropped from partition assignment so
+        peers take new shard work. Resume clears the flag and they start
+        leasing again without re-registering.
+        """
+        if not worker_id or not str(worker_id).strip():
+            raise ValueError("worker_id is required")
+        wid = str(worker_id).strip()
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                """
+                SELECT worker_id, skills, status, maintenance, last_seen_at
+                FROM worker_nodes
+                WHERE worker_id = %s
+                FOR UPDATE
+                """,
+                (wid,),
+            ).fetchone()
+            if row is None:
+                raise WorkerError(
+                    f"worker {wid!r} is not registered",
+                    code="worker_not_found",
+                )
+            # Dead rows keep their liveness; only flip the operator flag so a
+            # later heartbeat revives as draining (or active) with skills intact.
+            if draining:
+                conn.execute(
+                    """
+                    UPDATE worker_nodes
+                    SET maintenance = TRUE,
+                        status = CASE
+                            WHEN status = 'dead' THEN 'dead'
+                            ELSE 'draining'
+                        END,
+                        updated_at = %s
+                    WHERE worker_id = %s
+                    """,
+                    (now, wid),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE worker_nodes
+                    SET maintenance = FALSE,
+                        status = CASE
+                            WHEN status = 'dead' THEN 'dead'
+                            ELSE 'active'
+                        END,
+                        updated_at = %s
+                    WHERE worker_id = %s
+                    """,
+                    (now, wid),
+                )
+            self._rebalance_partitions_locked(conn, now=now)
+            self._sync_skills_wait_locked(conn, now=now)
+            snap = self._worker_snapshot_locked(conn, wid)
+            snap["partition_count"] = self._partition_count(conn)
+            snap["generation"] = self._max_generation_locked(conn)
+        self._rescan_awaiting_skills_after_commit()
+        return snap
+
+    def get_worker(self, worker_id: str) -> dict[str, Any] | None:
+        if not worker_id or not str(worker_id).strip():
+            raise ValueError("worker_id is required")
+        wid = str(worker_id).strip()
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT worker_id, skills, status, maintenance, last_seen_at
+                FROM worker_nodes
+                WHERE worker_id = %s
+                """,
+                (wid,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._worker_snapshot_locked(conn, wid, row=row)
+
+    def list_workers(self) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT worker_id, skills, status, maintenance, last_seen_at
+                FROM worker_nodes
+                ORDER BY worker_id ASC
+                """
+            ).fetchall()
+            return [
+                self._worker_snapshot_locked(conn, str(r["worker_id"]), row=r)
+                for r in rows
+            ]
+
+    def list_draining_workers(self) -> list[str]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT worker_id
+                FROM worker_nodes
+                WHERE status = 'draining'
+                ORDER BY worker_id ASC
+                """
+            ).fetchall()
+        return [str(r["worker_id"]) for r in rows]
+
+    def worker_is_draining(self, worker_id: str) -> bool:
+        if not worker_id or not str(worker_id).strip():
+            return False
+        with self._pool.connection() as conn:
+            return self._worker_is_draining_locked(conn, str(worker_id).strip())
 
     def list_worker_partitions(self, worker_id: str) -> list[int]:
         if not worker_id or not str(worker_id).strip():
@@ -367,7 +483,7 @@ class PartitionsMixin(SkillsWaitMixin):
             """
             UPDATE worker_nodes
             SET status = 'dead', updated_at = %s
-            WHERE status = 'active'
+            WHERE status IN ('active', 'draining')
               AND last_seen_at < %s
             RETURNING worker_id
             """,
@@ -499,7 +615,18 @@ class PartitionsMixin(SkillsWaitMixin):
         workers still match nothing.
         """
         if owned_parts is None:
-            return "", []
+            # Open/unpartitioned test mode: still refuse maintenance.
+            return (
+                """
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM worker_nodes wn
+                    WHERE wn.worker_id = %s
+                      AND (wn.status = 'draining' OR wn.maintenance)
+              )
+                """,
+                [worker_id],
+            )
         skills_arr = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
         unskilled = f"{skills_arr} = '{{}}'::text[]"
         skilled = f"{skills_arr} <> '{{}}'::text[]"
@@ -653,7 +780,70 @@ class PartitionsMixin(SkillsWaitMixin):
 
     def _max_generation(self) -> int:
         with self._pool.connection() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(generation), 0)::bigint AS g FROM partition_assignments"
-            ).fetchone()
+            return self._max_generation_locked(conn)
+
+    @staticmethod
+    def _max_generation_locked(conn: Any) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(generation), 0)::bigint AS g FROM partition_assignments"
+        ).fetchone()
         return int(row["g"] if row else 0)
+
+    @staticmethod
+    def _worker_is_draining_locked(conn: Any, worker_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT status, maintenance
+            FROM worker_nodes
+            WHERE worker_id = %s
+            LIMIT 1
+            """,
+            (worker_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return str(row["status"]) == "draining" or bool(row.get("maintenance"))
+
+    def _worker_snapshot_locked(
+        self,
+        conn: Any,
+        worker_id: str,
+        *,
+        row: Any | None = None,
+    ) -> dict[str, Any]:
+        if row is None:
+            row = conn.execute(
+                """
+                SELECT worker_id, skills, status, maintenance, last_seen_at
+                FROM worker_nodes
+                WHERE worker_id = %s
+                """,
+                (worker_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkerError(
+                f"worker {worker_id!r} is not registered",
+                code="worker_not_found",
+            )
+        status = str(row["status"])
+        skills = list(row.get("skills") or [])
+        last_seen = row.get("last_seen_at")
+        leased = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM jobs
+            WHERE leased_by = %s
+              AND status = %s
+            """,
+            (worker_id, JobStatus.LEASED.value),
+        ).fetchone()
+        return {
+            "worker_id": str(row["worker_id"]),
+            "status": status,
+            "draining": status == "draining",
+            "maintenance": bool(row.get("maintenance")),
+            "skills": skills,
+            "partitions": self._owned_partitions_locked(conn, worker_id),
+            "leased": int(leased["n"] if leased else 0),
+            "last_seen_at": last_seen,
+        }

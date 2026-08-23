@@ -169,6 +169,14 @@ class QueueDrainError(Exception):
         self.tenant_id = tenant_id
         self.queue_name = queue_name
 
+
+class WorkerError(Exception):
+    """Raised when a worker maintenance / registry operation cannot proceed."""
+
+    def __init__(self, message: str, *, code: str = "worker_error") -> None:
+        super().__init__(message)
+        self.code = code
+
 _NOT_TTL_EXPIRED_SQL = "AND (expires_at IS NULL OR expires_at > %s)"
 
 _DEPS_SATISFIED_SQL = """
