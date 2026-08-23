@@ -8,6 +8,7 @@ from uuid import UUID
 
 from job_queue.crypto import redact_payload
 from job_queue.models import (
+    CoordinatorLeader,
     AuditConsistencyReport,
     BulkCancelResult,
     BulkFreezeResult,
@@ -808,4 +809,24 @@ def claimed_webhook_to_dict(c: ClaimedWebhook) -> dict[str, Any]:
         "url": c.url,
         "secret": c.secret,
         "endpoint_enabled": c.endpoint_enabled,
+    }
+
+
+def coordinator_leader_to_dict(lease: CoordinatorLeader) -> dict[str, Any]:
+    return {
+        "slot": lease.slot,
+        "node_id": lease.node_id,
+        "lease_token": str(lease.lease_token),
+        "epoch": int(lease.epoch),
+        "expires_at": _dt(lease.expires_at),
+        "acquired_at": _dt(lease.acquired_at),
+        "renewed_at": _dt(lease.renewed_at),
+        "schedule_ticks": int(lease.schedule_ticks),
+        "webhook_ticks": int(lease.webhook_ticks),
+        "alert_ticks": int(lease.alert_ticks),
+        "retention_ticks": int(lease.retention_ticks),
+        "last_schedule_at": _dt(lease.last_schedule_at),
+        "last_webhook_at": _dt(lease.last_webhook_at),
+        "last_alert_at": _dt(lease.last_alert_at),
+        "last_retention_at": _dt(lease.last_retention_at),
     }

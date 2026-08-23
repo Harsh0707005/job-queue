@@ -1010,3 +1010,29 @@ class JobProgressEvent:
     actor: str | None
     ts: datetime
     snapshot: bool = False  # True for initial snapshot on subscribe
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinatorLeader:
+    """The coordinator that currently owns control-plane ticks.
+
+    ``slot`` is the singleton key (``control``). ``epoch`` increments each
+    time a different node steals the lease. Tick counters are how soaks
+    prove only the leader ran schedules / webhooks / alerts / retention.
+    """
+
+    slot: str
+    node_id: str
+    lease_token: UUID
+    epoch: int
+    expires_at: datetime
+    acquired_at: datetime
+    renewed_at: datetime
+    schedule_ticks: int = 0
+    webhook_ticks: int = 0
+    alert_ticks: int = 0
+    retention_ticks: int = 0
+    last_schedule_at: datetime | None = None
+    last_webhook_at: datetime | None = None
+    last_alert_at: datetime | None = None
+    last_retention_at: datetime | None = None

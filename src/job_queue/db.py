@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from psycopg import Connection
-from psycopg.errors import UniqueViolation
+from psycopg.errors import DeadlockDetected, UniqueViolation
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -45,8 +45,10 @@ def init_schema(conn: Connection) -> None:
                 conn.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK_KEY,))
                 conn.commit()
             return
-        except UniqueViolation as exc:
-            # Concurrent bootstrap that slipped past IF NOT EXISTS race.
+        except (UniqueViolation, DeadlockDetected) as exc:
+            # Concurrent bootstrap that slipped past IF NOT EXISTS, or a
+            # live peer already using tables while ALTER TABLE wants
+            # AccessExclusiveLock (three coordinators booting at once).
             last_exc = exc
             conn.rollback()
             time.sleep(0.05 * (attempt + 1))

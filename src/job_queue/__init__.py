@@ -1,6 +1,7 @@
 """Multi-tenant job queue with lease, heartbeat, and visibility timeout."""
 
 from job_queue.models import (
+    CoordinatorLeader,
     AuditConsistencyReport,
     BulkCancelResult,
     BulkFreezeResult,
@@ -119,6 +120,7 @@ __all__ = [
     "CloneError",
     "CoalesceError",
     "CoalesceResult",
+    "CoordinatorLeader",
     "ReplayGraphBlocker",
     "ReplayGraphPlan",
     "ReplayGraphResult",

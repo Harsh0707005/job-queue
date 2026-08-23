@@ -58,7 +58,22 @@ class Coordinator(
 ):
     """Thin HTTP façade over JobQueue (handlers split by domain)."""
 
-    pass
+    def start_control(self, **kwargs: Any) -> Any:
+        """Elect a control leader and run schedule/webhook/alert/retention ticks."""
+        from job_queue.coordinator.control import CoordinatorControlLoop
+
+        if self._control_loop is not None:
+            return self._control_loop
+        loop = CoordinatorControlLoop(self, **kwargs)
+        self._control_loop = loop
+        loop.start()
+        return loop
+
+    def stop_control(self) -> None:
+        loop = self._control_loop
+        self._control_loop = None
+        if loop is not None:
+            loop.stop()
 
 
 def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
@@ -336,14 +351,33 @@ def serve_coordinator(
     max_size: int = 20,
 ) -> None:
     """Bind ThreadingHTTPServer and serve forever."""
+    from job_queue.coordinator.control import _env_flag
+
     queue = JobQueue.connect(dsn, min_size=min_size, max_size=max_size)
-    coordinator = Coordinator(queue)
+    node = os.environ.get("COORDINATOR_NODE") or f"{host}:{port}"
+    coordinator = Coordinator(queue, node_id=node)
+    if _env_flag("COORDINATOR_CONTROL", "1"):
+        coordinator.start_control(
+            ttl_seconds=float(
+                os.environ.get("COORDINATOR_LEADER_TTL", "3") or "3"
+            ),
+            interval_seconds=float(
+                os.environ.get("COORDINATOR_CONTROL_INTERVAL", "0.5") or "0.5"
+            ),
+        )
     handler = _make_handler(coordinator)
     server = ThreadingHTTPServer((host, port), handler)
-    logger.info("coordinator listening on http://%s:%s", host, port)
+    logger.info(
+        "coordinator listening on http://%s:%s node=%s control=%s",
+        host,
+        port,
+        coordinator.node_id,
+        coordinator._control_loop is not None,
+    )
     try:
         server.serve_forever()
     finally:
+        coordinator.stop_control()
         server.server_close()
         queue.close()
 

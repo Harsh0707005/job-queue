@@ -1551,4 +1551,30 @@ CREATE TABLE IF NOT EXISTS tenant_usage_buckets (
 CREATE INDEX IF NOT EXISTS idx_tenant_usage_buckets_tenant_time
     ON tenant_usage_buckets (tenant_id, bucket_start DESC);
 
+-- Single-row control-plane leader lease. Coordinators renew this; the
+-- holder runs schedules / webhooks / alerts / retention. Followers serve
+-- worker HTTP only. An expired lease is stolen on the next acquire.
+CREATE TABLE IF NOT EXISTS coordinator_leader (
+    slot                TEXT PRIMARY KEY,
+    node_id             TEXT NOT NULL,
+    lease_token         UUID NOT NULL,
+    epoch               BIGINT NOT NULL,
+    expires_at          TIMESTAMPTZ NOT NULL,
+    acquired_at         TIMESTAMPTZ NOT NULL,
+    renewed_at          TIMESTAMPTZ NOT NULL,
+    schedule_ticks      BIGINT NOT NULL DEFAULT 0,
+    webhook_ticks       BIGINT NOT NULL DEFAULT 0,
+    alert_ticks         BIGINT NOT NULL DEFAULT 0,
+    retention_ticks     BIGINT NOT NULL DEFAULT 0,
+    last_schedule_at    TIMESTAMPTZ,
+    last_webhook_at     TIMESTAMPTZ,
+    last_alert_at       TIMESTAMPTZ,
+    last_retention_at   TIMESTAMPTZ,
+    CONSTRAINT coordinator_leader_epoch_check CHECK (epoch >= 1),
+    CONSTRAINT coordinator_leader_schedule_ticks_check CHECK (schedule_ticks >= 0),
+    CONSTRAINT coordinator_leader_webhook_ticks_check CHECK (webhook_ticks >= 0),
+    CONSTRAINT coordinator_leader_alert_ticks_check CHECK (alert_ticks >= 0),
+    CONSTRAINT coordinator_leader_retention_ticks_check CHECK (retention_ticks >= 0)
+);
+
 """

@@ -9,9 +9,11 @@ from job_queue.coordinator.auth import (
 import os
 from typing import Any
 
+from job_queue.codec import coordinator_leader_to_dict
 from job_queue.queue import (
     JobQueue,
 )
+from job_queue.queue._common import _utcnow
 
 
 class RoutingMixin:
@@ -20,6 +22,7 @@ class RoutingMixin:
         queue: JobQueue,
         *,
         api_token: str | None = None,
+        node_id: str | None = None,
     ) -> None:
         self.queue = queue
         # Explicit token wins; else env; None means auth disabled.
@@ -27,6 +30,57 @@ class RoutingMixin:
             self.api_token = api_token or None
         else:
             self.api_token = _configured_api_token()
+        self.node_id = (
+            str(node_id).strip()
+            if node_id is not None and str(node_id).strip()
+            else (os.environ.get("COORDINATOR_NODE") or "default")
+        )
+        self._control_loop = None
+
+    def _leader_health(self) -> dict[str, Any]:
+        lease = None
+        if hasattr(self.queue, "get_control_leader"):
+            lease = self.queue.get_control_leader()
+        now = _utcnow()
+        live = lease is not None and lease.expires_at > now
+        is_leader = False
+        loop = getattr(self, "_control_loop", None)
+        if live and loop is not None:
+            is_leader = bool(
+                lease.node_id == self.node_id
+                and lease.lease_token == loop.lease_token
+            )
+        elif live:
+            is_leader = lease.node_id == self.node_id
+        return {
+            "ok": True,
+            "role": "coordinator",
+            "node": self.node_id,
+            "leader": is_leader,
+            "leader_node": lease.node_id if live else None,
+            "leader_epoch": int(lease.epoch) if live else None,
+        }
+
+    def _control_gate(self) -> tuple[int, dict[str, Any]] | None:
+        """Followers refuse control-plane POSTs so only the leader runs them.
+
+        Tests that never start a control loop keep the old open behavior.
+        """
+        loop = getattr(self, "_control_loop", None)
+        if loop is None:
+            return None
+        if loop.is_leader():
+            return None
+        lease = None
+        if hasattr(self.queue, "get_control_leader"):
+            lease = self.queue.get_control_leader()
+        live = lease is not None and lease.expires_at > _utcnow()
+        return 503, {
+            "error": "not the control leader",
+            "code": "not_leader",
+            "node": self.node_id,
+            "leader_node": lease.node_id if live else None,
+        }
 
     def handle(
         self,
@@ -37,11 +91,14 @@ class RoutingMixin:
     ) -> tuple[int, dict[str, Any]]:
         body = body or {}
         if method == "GET" and path == "/health":
-            return 200, {
-                "ok": True,
-                "role": "coordinator",
-                "node": os.environ.get("COORDINATOR_NODE", "default"),
-            }
+            return 200, self._leader_health()
+        if method == "GET" and path == "/v1/coordinator/leader":
+            lease = self.queue.get_control_leader()
+            payload = self._leader_health()
+            payload["lease"] = (
+                None if lease is None else coordinator_leader_to_dict(lease)
+            )
+            return 200, payload
 
         if method == "POST" and path == "/v1/jobs":
             return self._enqueue(body)
@@ -237,6 +294,9 @@ class RoutingMixin:
             return self._get_job(path, query)
 
         if method == "POST" and path == "/v1/schedules/process-due":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._process_due(body)
         if method == "POST" and path == "/v1/webhooks/claim":
             return self._claim_webhooks(body)
@@ -625,6 +685,9 @@ class RoutingMixin:
         if method == "GET" and path == "/v1/admin/retention":
             return self._get_retention()
         if method == "POST" and path == "/v1/admin/purge-expired-jobs":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._purge_expired_jobs(body)
         if method == "GET" and path == "/v1/admin/backlog":
             return self._backlog()
@@ -741,6 +804,9 @@ class RoutingMixin:
         ):
             return self._resolve_alert_event(path, body)
         if method == "POST" and path == "/v1/alerts/evaluate":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._evaluate_alerts(body)
 
         return 404, {"error": f"unknown route {method} {path}"}
