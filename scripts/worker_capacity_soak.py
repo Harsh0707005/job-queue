@@ -4,6 +4,8 @@
   * Tiny workers fill up and stop; larger peers keep leasing.
   * Live raise / lower never drops inflight jobs or tokens.
   * Mixed tenants and skilled work still drain.
+  * Jobs no active worker can cover park as awaiting_capacity, then
+    revive when advertised capacity arrives.
 """
 
 from __future__ import annotations
@@ -311,6 +313,70 @@ def main() -> int:
     )
     if done < expected:
         raise RuntimeError(f"lost work: completed={done} expected={expected}")
+
+    logger.info("stage4: uncoverable cost parks then revives")
+    apply_caps(CAPS)
+    impossible = "impossible"
+    over = {"cpu": 64, "memory": 65536}
+    parked_ids: list[str] = []
+    for n in range(6):
+        job = enqueue(
+            impossible,
+            {"kind": "oversize", "n": n, "ms": 200, "cost": over},
+            resource_cost=over,
+            # highmem is only on worker-4 so revived work can hop to the
+            # one node that will advertise enough cpu/memory.
+            required_skills=["highmem"],
+        )
+        parked_ids.append(str(job["id"]))
+        if job.get("status") != "awaiting_capacity":
+            raise RuntimeError(f"oversize enqueue not parked: {job}")
+    wait_until(
+        lambda: all(
+            j.get("status") == "awaiting_capacity"
+            for j in list_jobs(impossible)
+        )
+        and len(list_jobs(impossible)) == len(parked_ids),
+        timeout=20.0,
+        msg="oversize jobs did not park as awaiting_capacity",
+    )
+    if any(j.get("status") in ("pending", "leased") for j in list_jobs(impossible)):
+        raise RuntimeError("oversize job stayed pending/leased")
+    logger.info("stage4 parked=%d", len(parked_ids))
+    apply_caps({**CAPS, "worker-4": {"cpu": 64, "memory": 65536}})
+
+    def _oversize_done() -> bool:
+        rows = list_jobs(impossible)
+        if len(rows) != len(parked_ids):
+            return False
+        leftover = [
+            f"{j.get('id')}:{j.get('status')}:{j.get('leased_by')}"
+            for j in rows
+            if j.get("status") != "completed"
+        ]
+        if leftover:
+            logger.info("stage4 leftover %s", leftover[:6])
+            return False
+        return True
+
+    wait_until(
+        _oversize_done,
+        timeout=max(30.0, MAX_WALL - (time.time() - started)),
+        msg="parked oversize jobs did not revive and finish",
+    )
+    expected += len(parked_ids)
+    done = sum(
+        1
+        for tid in tenants + [impossible]
+        for j in list_jobs(tid)
+        if j.get("status") == "completed"
+    )
+    if done < expected:
+        raise RuntimeError(
+            f"lost parked work: completed={done} expected={expected}"
+        )
+    apply_caps(CAPS)
+
     live = workers_by_id()
     for wid in ALL_WORKERS:
         if live[wid].get("status") != "active":

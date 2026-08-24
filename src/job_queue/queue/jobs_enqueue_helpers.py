@@ -115,7 +115,7 @@ class JobsEnqueueHelpersMixin:
             WHERE tenant_id = %s
               AND queue_name = %s
               AND dedupe_key = %s
-              AND status IN (%s, %s, %s, %s, %s, %s, %s)
+              AND status IN (%s, %s, %s, %s, %s, %s, %s, %s)
             LIMIT 1
             """,
             (
@@ -127,6 +127,7 @@ class JobsEnqueueHelpersMixin:
                 JobStatus.AWAITING_APPROVAL.value,
                 JobStatus.AWAITING_CHILDREN.value,
                 JobStatus.AWAITING_SKILLS.value,
+                JobStatus.AWAITING_CAPACITY.value,
                 JobStatus.QUARANTINED.value,
                 JobStatus.FROZEN.value,
             ),
@@ -199,7 +200,9 @@ class JobsEnqueueHelpersMixin:
         sealed, payload_key_id = self._seal_job_payload(
             conn, tenant_id=tenant_id, job_id=jid, payload=payload
         )
-        status = self._enqueue_status_for_skills(conn, skill_list)
+        status = self._enqueue_status_for_skills(
+            conn, skill_list, resource_cost or {}
+        )
         cloned = (
             str(cloned_from_job_id) if cloned_from_job_id is not None else None
         )
@@ -234,7 +237,8 @@ class JobsEnqueueHelpersMixin:
                       AND status IN (
                           'pending', 'leased',
                           'awaiting_approval', 'awaiting_children',
-                          'awaiting_skills', 'quarantined'
+                          'awaiting_skills', 'awaiting_capacity',
+                          'quarantined'
                       )
                 DO NOTHING
                 RETURNING {_JOB_COLUMNS}

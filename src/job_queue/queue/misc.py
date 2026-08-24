@@ -70,7 +70,11 @@ class MiscMixin:
             """,
             (
                 tenant_id,
-                [JobStatus.PENDING.value, JobStatus.AWAITING_SKILLS.value],
+                [
+                    JobStatus.PENDING.value,
+                    JobStatus.AWAITING_SKILLS.value,
+                    JobStatus.AWAITING_CAPACITY.value,
+                ],
             ),
         ).fetchone()
         return int(row["n"]) if row else 0

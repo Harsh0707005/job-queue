@@ -151,7 +151,10 @@ class SkillsWaitMixin:
         self._park_unfulfillable_skills_locked(conn, now=now, limit=limit)
 
     def _enqueue_status_for_skills(
-        self, conn: Any, skills: list[str]
+        self,
+        conn: Any,
+        skills: list[str],
+        resource_cost: dict[str, int] | None = None,
     ) -> str:
         if not skills:
             return JobStatus.PENDING.value

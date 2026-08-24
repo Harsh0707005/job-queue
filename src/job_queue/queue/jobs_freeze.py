@@ -19,6 +19,7 @@ _FREEZEABLE = (
     JobStatus.PENDING,
     JobStatus.LEASED,
     JobStatus.AWAITING_SKILLS,
+    JobStatus.AWAITING_CAPACITY,
 )
 _FREEZEABLE_VALUES = tuple(s.value for s in _FREEZEABLE)
 
@@ -33,10 +34,11 @@ class JobsFreezeMixin:
     ) -> Job:
         """Hold one job so no worker can lease it. Other tenant jobs continue.
 
-        Pending / awaiting-skills jobs stay parked. A leased job is fenced
-        (lease token cleared) so the holder cannot ack / nack / heartbeat.
-        Already-frozen jobs are returned as-is. Terminal jobs raise
-        :class:`FreezeError`. Cross-tenant ids are not found.
+        Pending / awaiting-skills / awaiting-capacity jobs stay parked. A
+        leased job is fenced (lease token cleared) so the holder cannot
+        ack / nack / heartbeat. Already-frozen jobs are returned as-is.
+        Terminal jobs raise :class:`FreezeError`. Cross-tenant ids are
+        not found.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -63,7 +65,7 @@ class JobsFreezeMixin:
                 raise FreezeError(
                     f"job {job_id} cannot be frozen "
                     f"(status={job.status.value}; only pending, leased, "
-                    f"or awaiting_skills jobs freeze)",
+                    f"awaiting_skills, or awaiting_capacity jobs freeze)",
                     job=job,
                 )
             updated = self._freeze_locked_row(
@@ -149,7 +151,7 @@ class JobsFreezeMixin:
                 updated_at = %s
             WHERE id = %s
               AND tenant_id = %s
-              AND status IN (%s, %s, %s)
+              AND status IN (%s, %s, %s, %s)
             RETURNING {_JOB_COLUMNS}
             """,
             (
@@ -161,6 +163,7 @@ class JobsFreezeMixin:
                 JobStatus.PENDING.value,
                 JobStatus.LEASED.value,
                 JobStatus.AWAITING_SKILLS.value,
+                JobStatus.AWAITING_CAPACITY.value,
             ),
         ).fetchone()
         if updated is None:

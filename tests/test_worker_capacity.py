@@ -135,7 +135,11 @@ def test_live_lower_capacity_keeps_inflight_and_blocks_new(queue: JobQueue):
     assert queue.lease(tenant_id="t1", worker_id="live") is None
     leftover = [j for j in jobs if j.id not in {h.id for h in held}]
     assert leftover
-    assert queue.get(leftover[0].id, tenant_id="t1").status == JobStatus.PENDING
+    parked = queue.get(leftover[0].id, tenant_id="t1")
+    assert parked is not None
+    assert parked.status == JobStatus.AWAITING_CAPACITY
+    assert parked.is_awaiting_capacity
+    assert "capacity" in (parked.last_error or "")
 
 
 def test_live_raise_capacity_allows_more(queue: JobQueue):
@@ -260,3 +264,179 @@ def test_inprocess_worker_stops_when_resources_full(queue: JobQueue):
     worker.stop()
     t.join(timeout=3)
     assert len(seen) >= 2
+
+
+def test_uncoverable_cost_parks_until_worker_covers(queue: JobQueue):
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "gpu"},
+        resource_cost={"gpu": 1, "cpu": 2},
+    )
+    assert j.status == JobStatus.AWAITING_CAPACITY
+    assert j.is_awaiting_capacity
+    assert j.last_error == "waiting for worker capacity"
+    assert queue.lease(tenant_id="t1", worker_id="anyone") is None
+    parked = queue.list_awaiting_capacity(tenant_id="t1")
+    assert [p.id for p in parked] == [j.id]
+    stats = queue.get_tenant_stats("t1")
+    assert stats.awaiting_capacity == 1
+    assert stats.pending == 0
+
+    queue.register_worker("almost", capacity={"cpu": 8})
+    still = queue.get(j.id, tenant_id="t1")
+    assert still is not None and still.status == JobStatus.AWAITING_CAPACITY
+
+    queue.register_worker("fat", capacity={"gpu": 1, "cpu": 2})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="fat")
+    assert leased is not None and leased.id == j.id
+    _ack(queue, leased, "fat")
+
+
+def test_busy_large_worker_still_covers_pending(queue: JobQueue):
+    """Advertised cover, not free remaining — do not park a job that can wait."""
+    queue.register_worker("one", capacity={"cpu": 4})
+    first = queue.enqueue(
+        tenant_id="t1", payload={"i": 0}, resource_cost={"cpu": 4}
+    )
+    second = queue.enqueue(
+        tenant_id="t1", payload={"i": 1}, resource_cost={"cpu": 4}
+    )
+    assert first.status == JobStatus.PENDING
+    assert second.status == JobStatus.PENDING
+    held = queue.lease(tenant_id="t1", worker_id="one")
+    assert held is not None
+    leftover = queue.get(second.id, tenant_id="t1")
+    assert leftover is not None
+    assert leftover.status == JobStatus.PENDING
+    assert queue.list_awaiting_capacity(tenant_id="t1") == []
+    assert queue.lease(tenant_id="t1", worker_id="one") is None
+    _ack(queue, held, "one")
+    nxt = queue.lease(tenant_id="t1", worker_id="one")
+    assert nxt is not None and nxt.id == second.id
+    _ack(queue, nxt, "one")
+
+
+def test_last_covering_worker_leaving_reparks(queue: JobQueue):
+    queue.register_worker("fat", capacity={"cpu": 8})
+    j = queue.enqueue(
+        tenant_id="t1", payload={"need": 8}, resource_cost={"cpu": 8}
+    )
+    assert j.status == JobStatus.PENDING
+    queue.deregister_worker("fat")
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.AWAITING_CAPACITY
+    assert queue.lease(tenant_id="t1", worker_id="tiny") is None
+
+
+def test_drain_last_cover_reparks_resume_revives(queue: JobQueue):
+    queue.register_worker("fat", capacity={"cpu": 8})
+    j = queue.enqueue(
+        tenant_id="t1", payload={"need": 8}, resource_cost={"cpu": 8}
+    )
+    assert j.status == JobStatus.PENDING
+    queue.set_worker_maintenance("fat", draining=True)
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.AWAITING_CAPACITY
+    queue.set_worker_maintenance("fat", draining=False)
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="fat")
+    assert leased is not None
+    _ack(queue, leased, "fat")
+
+
+def test_raise_capacity_revives_parked(queue: JobQueue):
+    queue.register_worker("tiny", capacity={"cpu": 1})
+    j = queue.enqueue(
+        tenant_id="t1", payload={"need": 4}, resource_cost={"cpu": 4}
+    )
+    assert j.status == JobStatus.AWAITING_CAPACITY
+    queue.set_worker_capacity("tiny", {"cpu": 4})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="tiny")
+    assert leased is not None and leased.id == j.id
+    _ack(queue, leased, "tiny")
+
+
+def test_skills_win_when_both_uncoverable(queue: JobQueue):
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "tpu"},
+        required_skills=["tpu"],
+        resource_cost={"cpu": 99},
+    )
+    assert j.status == JobStatus.AWAITING_SKILLS
+    assert queue.list_awaiting_capacity(tenant_id="t1") == []
+    queue.register_worker("tpu-w", skills=["tpu"], capacity={"cpu": 1})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.AWAITING_CAPACITY
+    queue.set_worker_capacity("tpu-w", {"cpu": 99})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="tpu-w")
+    assert leased is not None
+    _ack(queue, leased, "tpu-w")
+
+
+def test_awaiting_capacity_deadline_dead_letters(queue: JobQueue):
+    from datetime import timedelta
+
+    from job_queue.queue._common import _utcnow
+
+    past = _utcnow() - timedelta(seconds=5)
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "gpu"},
+        resource_cost={"gpu": 4},
+        deadline_at=past,
+    )
+    assert j.status == JobStatus.DEAD
+    assert "resource cost" in (j.last_error or "")
+    out = queue.process_awaiting_capacity()
+    assert out["dead"] == 0
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.DEAD
+
+
+def test_cancel_awaiting_capacity_job(queue: JobQueue):
+    j = queue.enqueue(
+        tenant_id="t-ac",
+        payload={"x": 1},
+        resource_cost={"tpu": 1},
+    )
+    assert j.status == JobStatus.AWAITING_CAPACITY
+    cancelled = queue.cancel(j.id, tenant_id="t-ac")
+    assert cancelled.status == JobStatus.CANCELLED
+    assert queue.list_awaiting_capacity(tenant_id="t-ac") == []
+
+
+def test_http_awaiting_capacity_roundtrip(queue: JobQueue):
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        client = CoordinatorClient(f"http://127.0.0.1:{port}")
+        job = client.enqueue(
+            tenant_id="http-ac",
+            payload={"n": 1},
+            resource_cost={"gpu": 8},
+        )
+        assert job.status == JobStatus.AWAITING_CAPACITY
+        listed = client.list_jobs(tenant_id="http-ac", status="awaiting_capacity")
+        assert [j.id for j in listed] == [job.id]
+        stats = queue.get_tenant_stats("http-ac")
+        assert stats.awaiting_capacity == 1
+        client.register_worker("http-gpu", capacity={"gpu": 8})
+        got = client.get_job(job.id, tenant_id="http-ac")
+        assert got is not None and got.status == JobStatus.PENDING
+        leased = client.lease(worker_id="http-gpu", tenant_id="http-ac")
+        assert leased is not None and leased.id == job.id
+        _ack(queue, leased, "http-gpu")
+    finally:
+        server.shutdown()
+        t.join(timeout=5)

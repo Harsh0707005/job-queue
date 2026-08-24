@@ -161,6 +161,9 @@ class TenantsStatsMixin:
             total=total,
             claimable=claimable,
             awaiting_skills=int(counts.get(JobStatus.AWAITING_SKILLS.value) or 0),
+            awaiting_capacity=int(
+                counts.get(JobStatus.AWAITING_CAPACITY.value) or 0
+            ),
             frozen=int(counts.get(JobStatus.FROZEN.value) or 0),
             breaker_open=breaker_open,
             lease_weight=lease_weight,

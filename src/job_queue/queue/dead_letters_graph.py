@@ -37,6 +37,7 @@ _STAY = {
     JobStatus.AWAITING_APPROVAL.value,
     JobStatus.AWAITING_CHILDREN.value,
     JobStatus.AWAITING_SKILLS.value,
+    JobStatus.AWAITING_CAPACITY.value,
     JobStatus.COMPLETED.value,
     JobStatus.FROZEN.value,
 }

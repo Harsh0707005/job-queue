@@ -239,6 +239,7 @@ class AuditRebuildOneMixin:
             JobStatus.PENDING.value,
             JobStatus.AWAITING_APPROVAL.value,
             JobStatus.AWAITING_SKILLS.value,
+            JobStatus.AWAITING_CAPACITY.value,
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.DEAD.value,

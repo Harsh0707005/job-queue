@@ -72,18 +72,20 @@ _CANCELABLE_STATUSES = (
     JobStatus.AWAITING_APPROVAL,
     JobStatus.AWAITING_CHILDREN,
     JobStatus.AWAITING_SKILLS,
+    JobStatus.AWAITING_CAPACITY,
     JobStatus.QUARANTINED,
     JobStatus.FROZEN,
 )
 
 # A prior schedule tick is still live. Must match idx_jobs_schedule_inflight
-# (awaiting_skills + frozen included — those are parked, not finished).
+# (awaiting_skills / awaiting_capacity / frozen included — parked, not finished).
 _SCHEDULE_INFLIGHT_STATUSES = (
     JobStatus.PENDING.value,
     JobStatus.LEASED.value,
     JobStatus.AWAITING_APPROVAL.value,
     JobStatus.AWAITING_CHILDREN.value,
     JobStatus.AWAITING_SKILLS.value,
+    JobStatus.AWAITING_CAPACITY.value,
     JobStatus.FROZEN.value,
 )
 

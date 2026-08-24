@@ -27,7 +27,7 @@ from job_queue.queue._common import (
     _normalize_skills,
     _utcnow,
 )
-from job_queue.queue.skills_wait import SkillsWaitMixin
+from job_queue.queue.capacity_wait import CapacityWaitMixin
 
 # Statuses that can still be claimed / reclaimed / resumed — must stay inside
 # the live partition range after shrink.
@@ -37,11 +37,12 @@ _REMAP_STATUSES = (
     JobStatus.AWAITING_APPROVAL.value,
     JobStatus.AWAITING_CHILDREN.value,
     JobStatus.AWAITING_SKILLS.value,
+    JobStatus.AWAITING_CAPACITY.value,
     JobStatus.FAILED.value,
 )
 
 
-class PartitionsMixin(SkillsWaitMixin):
+class PartitionsMixin(CapacityWaitMixin):
     def get_partition_count(self) -> int:
         with self._pool.connection() as conn:
             return self._partition_count(conn)
@@ -149,10 +150,6 @@ class PartitionsMixin(SkillsWaitMixin):
             n = self._partition_count(conn)
             self._ensure_partition_rows(conn, n, now=now)
             self._rebalance_partitions_locked(conn, now=now)
-            skills_out = list((row or {}).get("skills") or skill_list or [])
-            self._sync_skills_wait_locked(
-                conn, now=now, worker_skills=skills_out
-            )
             if max_leases is not None:
                 conn.execute(
                     """
@@ -173,6 +170,10 @@ class PartitionsMixin(SkillsWaitMixin):
                     """,
                     (Jsonb(cap_map), now, wid),
                 )
+            skills_out = list((row or {}).get("skills") or skill_list or [])
+            self._sync_skills_wait_locked(
+                conn, now=now, worker_skills=skills_out
+            )
             snap = self._worker_snapshot_locked(conn, wid)
             snap["partition_count"] = n
             snap["generation"] = self._max_generation_locked(conn)
@@ -522,8 +523,9 @@ class PartitionsMixin(SkillsWaitMixin):
         Empty / ``None`` clears the map (unconstrained). Lowering a
         resource below current live usage does **not** release or ack
         inflight jobs — the worker just stops taking work that no longer
-        fits until holds finish. Raising a resource lets the next claim
-        use the extra immediately.
+        fits until holds finish. Pending jobs that no active worker can
+        still cover are parked as ``awaiting_capacity``; raising a
+        resource (or registering a capable peer) revives them.
         """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
@@ -557,7 +559,10 @@ class PartitionsMixin(SkillsWaitMixin):
                 """,
                 (Jsonb(cap_map), now, wid),
             )
-            return self._worker_snapshot_locked(conn, wid)
+            self._sync_skills_wait_locked(conn, now=now)
+            snap = self._worker_snapshot_locked(conn, wid)
+        self._rescan_awaiting_skills_after_commit()
+        return snap
 
     def get_worker_capacity(self, worker_id: str) -> dict[str, int]:
         snap = self.get_worker(worker_id)

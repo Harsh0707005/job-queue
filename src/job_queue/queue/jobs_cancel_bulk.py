@@ -59,7 +59,7 @@ class JobsCancelBulkMixin:
 
         When *status* is omitted, all cancelable statuses are targeted
         (pending, leased, awaiting_approval, awaiting_children,
-        awaiting_skills). Terminal
+        awaiting_skills, awaiting_capacity). Terminal
         jobs are never cancelled. Cascades dependents / join children like
         :meth:`cancel`.
         """
@@ -232,14 +232,15 @@ class JobsCancelBulkMixin:
           * spawned subtasks with ``parent_job_id = parent_id``
 
         Active statuses cancelled: pending, leased, awaiting_approval,
-        awaiting_children, awaiting_skills. Running (leased) holders have
-        fencing tokens cleared.
+        awaiting_children, awaiting_skills, awaiting_capacity. Running
+        (leased) holders have fencing tokens cleared.
         """
         active_pending = JobStatus.PENDING.value
         active_leased = JobStatus.LEASED.value
         active_approval = JobStatus.AWAITING_APPROVAL.value
         active_children = JobStatus.AWAITING_CHILDREN.value
         active_skills = JobStatus.AWAITING_SKILLS.value
+        active_capacity = JobStatus.AWAITING_CAPACITY.value
         active_frozen = JobStatus.FROZEN.value
         frontier: list[UUID] = [parent_id]
         visited: set[UUID] = set()
@@ -253,7 +254,7 @@ class JobsCancelBulkMixin:
                 SELECT {_JOB_COLUMNS}
                 FROM jobs
                 WHERE tenant_id = %s
-                  AND status IN (%s, %s, %s, %s, %s, %s)
+                  AND status IN (%s, %s, %s, %s, %s, %s, %s)
                   AND (
                       depends_on @> ARRAY[%s]::uuid[]
                       OR parent_job_id = %s
@@ -267,6 +268,7 @@ class JobsCancelBulkMixin:
                     active_approval,
                     active_children,
                     active_skills,
+                    active_capacity,
                     active_frozen,
                     current,
                     current,
@@ -304,7 +306,7 @@ class JobsCancelBulkMixin:
                         updated_at = %s
                     WHERE id = %s
                       AND tenant_id = %s
-                      AND status IN (%s, %s, %s, %s, %s, %s)
+                      AND status IN (%s, %s, %s, %s, %s, %s, %s)
                     RETURNING {_JOB_COLUMNS}
                     """,
                     (
@@ -321,6 +323,7 @@ class JobsCancelBulkMixin:
                         active_approval,
                         active_children,
                         active_skills,
+                        active_capacity,
                         active_frozen,
                     ),
                 ).fetchone()

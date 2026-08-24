@@ -15,6 +15,7 @@ class JobStatus(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     AWAITING_CHILDREN = "awaiting_children"
     AWAITING_SKILLS = "awaiting_skills"
+    AWAITING_CAPACITY = "awaiting_capacity"
     QUARANTINED = "quarantined"
     FROZEN = "frozen"
     COMPLETED = "completed"
@@ -103,7 +104,9 @@ class Job:
     ``resource_cost`` is how much of each advertised worker resource this
     job occupies while leased (cpu, memory, ...). Empty means free. A
     worker leases the job only when every listed cost fits in remaining
-    capacity after live (unexpired) holds. Lowering worker capacity live
+    capacity after live (unexpired) holds. If no *active* worker advertises
+    enough of every key, the job is parked as ``awaiting_capacity`` until
+    one does (or a deadline / TTL ends it). Lowering worker capacity live
     never drops inflight work.
 
     ``expires_at`` is an optional hard TTL. If the job is still unfinished
@@ -191,6 +194,10 @@ class Job:
     @property
     def is_awaiting_skills(self) -> bool:
         return self.status == JobStatus.AWAITING_SKILLS
+
+    @property
+    def is_awaiting_capacity(self) -> bool:
+        return self.status == JobStatus.AWAITING_CAPACITY
 
     @property
     def is_quarantined(self) -> bool:
@@ -416,6 +423,7 @@ class TenantStats:
     # or when the tenant failure breaker is open.
     claimable: int
     awaiting_skills: int = 0
+    awaiting_capacity: int = 0
     frozen: int = 0
     breaker_open: bool = False
     # Fair-lease weight (1..100). Missing / unset is 1 (equal share).

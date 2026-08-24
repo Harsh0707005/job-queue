@@ -19,6 +19,7 @@ from job_queue.queue.tenants_drain import _normalize_queue_name
 _FOLDABLE = {
     JobStatus.PENDING.value,
     JobStatus.AWAITING_SKILLS.value,
+    JobStatus.AWAITING_CAPACITY.value,
     JobStatus.FROZEN.value,
     JobStatus.QUARANTINED.value,
 }
@@ -31,6 +32,7 @@ _SURVIVOR_RANK = {
     JobStatus.LEASED.value: 0,
     JobStatus.PENDING.value: 1,
     JobStatus.AWAITING_SKILLS.value: 2,
+    JobStatus.AWAITING_CAPACITY.value: 2,
     JobStatus.FROZEN.value: 3,
     JobStatus.QUARANTINED.value: 4,
 }

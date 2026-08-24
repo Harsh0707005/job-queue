@@ -36,8 +36,9 @@ class JobsFreezeBulkMixin:
         """Freeze all matching jobs for *tenant_id*. Other tenants keep leasing.
 
         Same filter shape as :meth:`cancel_matching` (*labels* AND-match,
-        optional *status* / *queue_name*). Only pending, leased, and
-        awaiting_skills rows are held. Already-frozen rows are left as-is.
+        optional *status* / *queue_name*). Only pending, leased,
+        awaiting_skills, and awaiting_capacity rows are held.
+        Already-frozen rows are left as-is.
         """
         return self._sweep_freeze_matching(
             action="freeze",

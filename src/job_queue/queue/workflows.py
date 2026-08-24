@@ -1496,7 +1496,8 @@ class WorkflowsMixin:
               AND s.status IN ('pending', 'running')
               AND j.status IN (
                     'pending', 'leased', 'awaiting_skills',
-                    'awaiting_approval', 'awaiting_children'
+                    'awaiting_capacity', 'awaiting_approval',
+                    'awaiting_children'
                   )
             LIMIT 1
             """,
@@ -1928,7 +1929,8 @@ class WorkflowsMixin:
               AND s.status IN ('pending', 'running')
               AND j.status IN (
                     'pending', 'leased', 'awaiting_skills',
-                    'awaiting_approval', 'awaiting_children'
+                    'awaiting_capacity', 'awaiting_approval',
+                    'awaiting_children'
                   )
             LIMIT 1
             """,

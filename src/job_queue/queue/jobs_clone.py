@@ -154,8 +154,8 @@ class JobsCloneMixin:
             out = clone
 
         if (
-            out.required_skills
-            and out.status == JobStatus.AWAITING_SKILLS
+            out.status
+            in (JobStatus.AWAITING_SKILLS, JobStatus.AWAITING_CAPACITY)
             and hasattr(self, "_rescan_awaiting_skills_after_commit")
         ):
             self._rescan_awaiting_skills_after_commit()

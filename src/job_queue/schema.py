@@ -61,7 +61,7 @@ ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check;
 ALTER TABLE jobs ADD CONSTRAINT jobs_status_check CHECK (
     status IN (
         'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-        'awaiting_skills', 'quarantined', 'frozen',
+        'awaiting_skills', 'awaiting_capacity', 'quarantined', 'frozen',
         'completed', 'failed', 'dead', 'cancelled'
     )
 );
@@ -137,12 +137,14 @@ ALTER TABLE jobs ADD CONSTRAINT jobs_expiry_action_check CHECK (
     expiry_action IN ('cancel', 'dead')
 );
 
+DROP INDEX IF EXISTS idx_jobs_expires_at;
 CREATE INDEX IF NOT EXISTS idx_jobs_expires_at
     ON jobs (expires_at ASC)
     WHERE expires_at IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval',
-          'awaiting_children', 'awaiting_skills', 'quarantined'
+          'awaiting_children', 'awaiting_skills', 'awaiting_capacity',
+          'quarantined'
       );
 
 -- Poison-job quarantine: unique workers that killed this job.
@@ -241,11 +243,13 @@ CREATE INDEX IF NOT EXISTS idx_jobs_cloned_from
 
 -- Live fold key: same logical work may pile up (not unique, unlike dedupe).
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS coalesce_key TEXT;
+DROP INDEX IF EXISTS idx_jobs_coalesce_key;
 CREATE INDEX IF NOT EXISTS idx_jobs_coalesce_key
     ON jobs (tenant_id, queue_name, coalesce_key)
     WHERE coalesce_key IS NOT NULL
       AND status IN (
-          'pending', 'leased', 'awaiting_skills', 'quarantined', 'frozen'
+          'pending', 'leased', 'awaiting_skills', 'awaiting_capacity',
+          'quarantined', 'frozen'
       );
 
 UPDATE jobs
@@ -320,19 +324,20 @@ CREATE UNIQUE INDEX idx_jobs_dedupe_active
     WHERE dedupe_key IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-          'awaiting_skills', 'quarantined', 'frozen'
+          'awaiting_skills', 'awaiting_capacity', 'quarantined', 'frozen'
       );
 
 -- In-flight jobs per schedule (DAG ticks stamp schedule_id on every node,
 -- so this is no longer UNIQUE). Overlap is enforced by FOR UPDATE on the
 -- schedule row plus "any in-flight job for this schedule".
 DROP INDEX IF EXISTS idx_jobs_schedule_active;
+DROP INDEX IF EXISTS idx_jobs_schedule_inflight;
 CREATE INDEX IF NOT EXISTS idx_jobs_schedule_inflight
     ON jobs (schedule_id)
     WHERE schedule_id IS NOT NULL
       AND status IN (
           'pending', 'leased', 'awaiting_approval', 'awaiting_children',
-          'awaiting_skills', 'frozen'
+          'awaiting_skills', 'awaiting_capacity', 'frozen'
       );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_parent
@@ -366,6 +371,14 @@ CREATE INDEX IF NOT EXISTS idx_jobs_pending_skilled
 CREATE INDEX IF NOT EXISTS idx_jobs_awaiting_skills_deadline
     ON jobs (deadline_at ASC)
     WHERE status = 'awaiting_skills' AND deadline_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_awaiting_capacity
+    ON jobs (tenant_id, created_at ASC)
+    WHERE status = 'awaiting_capacity';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_awaiting_capacity_deadline
+    ON jobs (deadline_at ASC)
+    WHERE status = 'awaiting_capacity' AND deadline_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_schedule_id
     ON jobs (schedule_id)

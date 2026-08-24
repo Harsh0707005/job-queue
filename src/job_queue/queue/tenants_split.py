@@ -33,6 +33,7 @@ _MOVABLE = {
     JobStatus.AWAITING_APPROVAL.value,
     JobStatus.AWAITING_CHILDREN.value,
     JobStatus.AWAITING_SKILLS.value,
+    JobStatus.AWAITING_CAPACITY.value,
     JobStatus.QUARANTINED.value,
     JobStatus.FROZEN.value,
 }
@@ -202,6 +203,7 @@ class TenantsSplitMixin:
                 if row["status"] in (
                     JobStatus.PENDING.value,
                     JobStatus.AWAITING_SKILLS.value,
+                    JobStatus.AWAITING_CAPACITY.value,
                 ):
                     pending_extra += 1
             if hasattr(self, "_assert_queue_accepts_enqueue"):

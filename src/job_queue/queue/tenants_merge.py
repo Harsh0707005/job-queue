@@ -151,7 +151,8 @@ class TenantsMergeMixin:
                   AND j.dedupe_key IS NOT NULL
                   AND j.status IN (
                       'pending', 'leased', 'awaiting_approval',
-                      'awaiting_children', 'awaiting_skills'
+                      'awaiting_children', 'awaiting_skills',
+                      'awaiting_capacity'
                   )
                   AND EXISTS (
                         SELECT 1
@@ -162,7 +163,7 @@ class TenantsMergeMixin:
                           AND t.status IN (
                               'pending', 'leased',
                               'awaiting_approval', 'awaiting_children',
-                              'awaiting_skills'
+                              'awaiting_skills', 'awaiting_capacity'
                           )
                   )
                 RETURNING j.id
