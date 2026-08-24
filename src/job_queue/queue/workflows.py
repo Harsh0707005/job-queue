@@ -1,11 +1,13 @@
 """Multi-step saga workflows with reverse-order compensation.
 
 Each step is a normal queue job (single-worker lease). Workflows may be linear
-or include ``type: parallel`` branch blocks that fan-out and join. On terminal
-forward failure the orchestrator settles in-flight sibling branches (does not
-kill workers mid-step), then enqueues compensate jobs for completed steps in
-reverse step order. Durable step_run rows + unique (run, index, direction)
-prevent double compensation under reclaim or dual coordinators.
+or include ``type: parallel`` branch blocks that fan-out and join, or
+``type: map`` blocks that spawn one child step per item in a predecessor
+result (capped) and join before continuing. On terminal forward failure the
+orchestrator settles in-flight sibling branches (does not kill workers
+mid-step), then enqueues compensate jobs for completed steps in reverse step
+order. Durable step_run rows + unique (run, index, direction) prevent double
+compensation under reclaim or dual coordinators.
 """
 
 from __future__ import annotations
@@ -35,6 +37,11 @@ from job_queue.queue._common import (
     _normalize_skills,
     _utcnow,
 )
+from job_queue.queue.workflows_map import (
+    DEFAULT_MAP_MAX_ITEMS,
+    WorkflowsMapMixin,
+    _is_map_block,
+)
 
 WORKFLOW_STEP_KIND = "workflow.step"
 
@@ -55,7 +62,7 @@ _STEP_COLUMNS = """
 DEFAULT_MAX_COMPENSATE_RETRIES = 5
 
 
-class WorkflowsMixin:
+class WorkflowsMixin(WorkflowsMapMixin):
     def start_workflow(
         self,
         *,
@@ -578,10 +585,30 @@ class WorkflowsMixin:
         for srow in steps:
             job = None
             if srow.get("job_id") is not None:
-                job = conn.execute(
-                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s FOR UPDATE",
+                peek = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
                     (srow["job_id"],),
                 ).fetchone()
+                if (
+                    peek is not None
+                    and peek["status"] == JobStatus.LEASED.value
+                    and not release_in_flight
+                ):
+                    left += 1
+                    continue
+                job = conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM jobs
+                    WHERE id = %s
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (srow["job_id"],),
+                ).fetchone()
+                if job is None:
+                    # Locked by a concurrent ack/nack — leave in-flight.
+                    left += 1
+                    continue
 
             # Placeholder compensate step with no job yet.
             if job is None:
@@ -1379,11 +1406,80 @@ class WorkflowsMixin:
             ).fetchall()
         }
         n = 0
-        for i, sdef in enumerate(steps_def):
+        i = 0
+        while i < len(steps_def):
+            sdef = steps_def[i]
+            if str(sdef.get("kind") or "") == "map_join":
+                deps_ready = all(
+                    int(d) in completed
+                    for d in (sdef.get("map") or {}).get("from_indices")
+                    or sdef.get("depends_on_indices")
+                    or []
+                )
+                # After materialize, depends_on becomes the children; the
+                # producer set lives on map.from_indices.
+                producers = [
+                    int(d)
+                    for d in (sdef.get("map") or {}).get("from_indices") or []
+                ]
+                if producers:
+                    deps_ready = all(d in completed for d in producers)
+                if not deps_ready:
+                    i += 1
+                    continue
+                children = sdef.get("map_children")
+                if children is None:
+                    children = self._materialize_map_locked(
+                        conn,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        steps_def=steps_def,
+                        map_index=i,
+                        now=now,
+                    )
+                    if children is None:
+                        return n
+                child_idxs = [int(c) for c in children]
+                for ci in child_idxs:
+                    if ci in existing:
+                        continue
+                    self._create_and_enqueue_step(
+                        conn,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        steps_def=steps_def,
+                        step_index=ci,
+                        direction=WorkflowStepDirection.FORWARD.value,
+                        queue_name=queue_name,
+                        max_attempts=max_attempts,
+                        visibility_timeout_seconds=visibility_timeout_seconds,
+                        now=now,
+                    )
+                    existing.add(ci)
+                    n += 1
+                if child_idxs and any(c not in completed for c in child_idxs):
+                    i += 1
+                    continue
+                if i not in existing:
+                    self._complete_map_join_locked(
+                        conn,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        steps_def=steps_def,
+                        map_index=i,
+                        now=now,
+                    )
+                    existing.add(i)
+                    completed.add(i)
+                    n += 1
+                i += 1
+                continue
             if i in existing:
+                i += 1
                 continue
             deps = [int(d) for d in (sdef.get("depends_on_indices") or [])]
             if any(d not in completed for d in deps):
+                i += 1
                 continue
             self._create_and_enqueue_step(
                 conn,
@@ -1397,7 +1493,9 @@ class WorkflowsMixin:
                 visibility_timeout_seconds=visibility_timeout_seconds,
                 now=now,
             )
+            existing.add(i)
             n += 1
+            i += 1
         return n
 
     def _cancel_unstarted_forward_siblings(
@@ -1431,10 +1529,26 @@ class WorkflowsMixin:
         for srow in rows:
             job = None
             if srow.get("job_id") is not None:
-                job = conn.execute(
-                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s FOR UPDATE",
+                # Peek first — never wait on a sibling lease. Two nacks in
+                # the same fan-out would otherwise deadlock locking each
+                # other's in-flight jobs.
+                peek = conn.execute(
+                    f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",
                     (srow["job_id"],),
                 ).fetchone()
+                if peek is not None and peek["status"] == JobStatus.LEASED.value:
+                    continue
+                job = conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM jobs
+                    WHERE id = %s AND status <> %s
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (srow["job_id"], JobStatus.LEASED.value),
+                ).fetchone()
+                if job is None:
+                    continue
             # In-flight lease: worker keeps running; settle later on its terminal.
             if job is not None and job["status"] == JobStatus.LEASED.value:
                 continue
@@ -2069,6 +2183,13 @@ class WorkflowsMixin:
         now: Any,
     ) -> dict[str, Any]:
         sdef = steps_def[step_index]
+        if (
+            direction == WorkflowStepDirection.FORWARD.value
+            and str(sdef.get("kind") or "") == "map_join"
+        ):
+            # Map joins are materialized / completed by enqueue_ready, never
+            # as a worker job.
+            return {"id": None, "step_index": step_index, "job_id": None}
         step_id = uuid4()
         idem = f"{run_id}:{step_index}:{direction}"
         name = str(sdef.get("name") or f"step-{step_index}")
@@ -2395,6 +2516,14 @@ class WorkflowsMixin:
                 step["expires_at"] = exp_out
             if expiry_action and not step.get("expiry_action"):
                 step["expiry_action"] = expiry_action
+            nested = (step.get("map") or {}).get("step")
+            if isinstance(nested, dict):
+                if ttl_seconds is not None and nested.get("ttl_seconds") is None:
+                    nested["ttl_seconds"] = ttl_seconds
+                if exp_out is not None and nested.get("expires_at") is None:
+                    nested["expires_at"] = exp_out
+                if expiry_action and not nested.get("expiry_action"):
+                    nested["expiry_action"] = expiry_action
 
     def _workflow_step_expiry(
         self,
@@ -2464,7 +2593,7 @@ class WorkflowsMixin:
     def _expand_and_normalize_steps(
         cls, raw_steps: Sequence[Any]
     ) -> list[dict[str, Any]]:
-        """Flatten linear + parallel branch blocks into a DAG of leaf steps.
+        """Flatten linear + parallel + map blocks into a DAG of leaf steps.
 
         Parallel block form::
 
@@ -2477,8 +2606,19 @@ class WorkflowsMixin:
               ],
             }
 
+        Map / foreach form (N children from the previous step's result)::
+
+            {
+              "type": "map",
+              "name": "each",
+              "items": "ids",
+              "max_items": 256,
+              "step": {"name": "work", "payload": {"op": "do"}},
+            }
+
         Each branch runs concurrently after the previous wave; the next
-        sequential step depends on every branch tail (join).
+        sequential step depends on every branch tail (join). A map
+        placeholder joins after every spawned child completes.
         """
         if not raw_steps:
             raise ValueError("steps must be a non-empty list")
@@ -2488,6 +2628,8 @@ class WorkflowsMixin:
 
         def _is_parallel(item: Any) -> bool:
             if not isinstance(item, dict):
+                return False
+            if _is_map_block(item):
                 return False
             t = str(item.get("type") or item.get("kind") or "").strip().lower()
             return t == "parallel" or isinstance(item.get("branches"), list)
@@ -2500,8 +2642,10 @@ class WorkflowsMixin:
             branch_id: int | None = None,
             path: str,
         ) -> int:
-            if _is_parallel(raw):
-                raise ValueError(f"{path}: nested parallel blocks are not supported")
+            if _is_parallel(raw) or _is_map_block(raw):
+                raise ValueError(
+                    f"{path}: nested parallel/map blocks are not supported"
+                )
             idx = len(flat)
             leaf = cls._normalize_leaf_step(raw, idx, path=path)
             leaf["depends_on_indices"] = list(depends)
@@ -2543,6 +2687,58 @@ class WorkflowsMixin:
                 if not tails:
                     raise ValueError(f"{path}: parallel block produced no steps")
                 prev_wave = tails
+            elif _is_map_block(item):
+                template = item.get("step") or item.get("do")
+                if not isinstance(template, dict):
+                    raise ValueError(f"{path}.step must be an object")
+                pg = str(item.get("name") or f"map-{bi}").strip()
+                if not pg:
+                    raise ValueError(f"{path}.name is required")
+                items_path = str(
+                    item.get("items") or item.get("items_path") or "items"
+                ).strip() or "items"
+                raw_max = item.get("max_items")
+                if raw_max is None:
+                    max_items = int(DEFAULT_MAP_MAX_ITEMS)
+                else:
+                    try:
+                        max_items = int(raw_max)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"{path}.max_items must be an integer"
+                        ) from exc
+                    if max_items < 0:
+                        raise ValueError(f"{path}.max_items must be >= 0")
+                leaf_idx = len(flat)
+                tmpl = cls._normalize_leaf_step(
+                    template, leaf_idx, path=f"{path}.step"
+                )
+                tmpl["depends_on_indices"] = []
+                tmpl.pop("depends_on", None)
+                if _is_map_block(template) or _is_parallel(template):
+                    raise ValueError(f"{path}.step cannot be a map or parallel block")
+                join = {
+                    "name": pg,
+                    "kind": "map_join",
+                    "payload": {},
+                    "depends_on_indices": list(prev_wave),
+                    "map_group": pg,
+                    "map": {
+                        "items": items_path,
+                        "max_items": max_items,
+                        "from_indices": list(prev_wave),
+                        "step": tmpl,
+                    },
+                }
+                if item.get("required_skills") is not None:
+                    join["required_skills"] = list(
+                        _normalize_skills(item.get("required_skills"))
+                    )
+                    tmpl.setdefault(
+                        "required_skills", join["required_skills"]
+                    )
+                flat.append(join)
+                prev_wave = [leaf_idx]
             else:
                 idx = _append_leaf(
                     item,
@@ -2598,6 +2794,10 @@ class WorkflowsMixin:
         kind = str(raw.get("kind") or "effect").strip()
         if kind == "parallel":
             raise ValueError(f"{label}: kind=parallel requires branches")
+        if kind in ("map", "foreach", "fanout", "map_join"):
+            raise ValueError(
+                f"{label}: map/foreach must be a block with a step template"
+            )
         payload = raw.get("payload")
         if payload is None:
             payload = {}

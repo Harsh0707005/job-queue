@@ -30,9 +30,20 @@ class RemoteWorkerWorkflowWorkMixin:
         Uses side-effect begin/complete + stable idempotency_key so reclaim
         does not double-apply external ops. force_fail in payload nacks the step.
         """
-        if payload.get("force_fail") or payload.get("fail"):
+        direction = str(payload.get("direction") or "forward")
+        step = payload.get("step") if isinstance(payload.get("step"), dict) else {}
+        step_payload = (
+            step.get("payload") if isinstance(step.get("payload"), dict) else {}
+        )
+        item = step_payload.get("item")
+        fail_item = step_payload.get("fail_item")
+        if (
+            payload.get("force_fail")
+            or payload.get("fail")
+            or (fail_item is not None and item == fail_item)
+        ):
             try:
-                ms = int(payload.get("ms") or 30)
+                ms = int(payload.get("ms") or step_payload.get("ms") or 30)
             except (TypeError, ValueError):
                 ms = 30
             if ms > 0:
@@ -40,12 +51,6 @@ class RemoteWorkerWorkflowWorkMixin:
             raise RuntimeError(
                 str(payload.get("error") or "workflow step forced failure")
             )
-
-        direction = str(payload.get("direction") or "forward")
-        step = payload.get("step") if isinstance(payload.get("step"), dict) else {}
-        step_payload = (
-            step.get("payload") if isinstance(step.get("payload"), dict) else {}
-        )
         effect_key = f"wf:{payload.get('step_run_id')}:{direction}"
         idem = str(payload.get("idempotency_key") or f"{job.id}:{effect_key}")
 
@@ -137,17 +142,25 @@ class RemoteWorkerWorkflowWorkMixin:
         if lease_lost.is_set():
             raise LeaseError(f"job {job.id} lease lost after workflow effect")
 
+        result: dict[str, Any] = {
+            "direction": direction,
+            "step_name": payload.get("step_name"),
+            "op": step_payload.get("op") or direction,
+        }
+        # Test / soak producers can declare the ack result (items list for
+        # dynamic map fan-out) on the step payload.
+        declared = step_payload.get("result")
+        if isinstance(declared, dict):
+            result.update(declared)
+        if isinstance(step_payload.get("items"), list) and "items" not in result:
+            result["items"] = list(step_payload["items"])
         completed = self.client.complete_side_effect(
             job.id,
             tenant_id=job.tenant_id,
             worker_id=self.worker_id,
             lease_token=job.lease_token,  # type: ignore[arg-type]
             effect_key=effect_key,
-            result={
-                "direction": direction,
-                "step_name": payload.get("step_name"),
-                "op": step_payload.get("op") or direction,
-            },
+            result=result,
         )
         return {
             "workflow": True,
@@ -156,4 +169,5 @@ class RemoteWorkerWorkflowWorkMixin:
             "step_index": payload.get("step_index"),
             "effect_key": effect_key,
             "effect": completed,
+            **{k: result[k] for k in ("items",) if k in result},
         }
