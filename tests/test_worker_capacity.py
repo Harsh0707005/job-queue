@@ -361,6 +361,77 @@ def test_raise_capacity_revives_parked(queue: JobQueue):
     _ack(queue, leased, "tiny")
 
 
+def test_split_skills_and_capacity_parks_until_one_worker_covers(queue: JobQueue):
+    """Skills on one node and capacity on another is not runnable."""
+    queue.register_worker("skilled-small", skills=["gpu"], capacity={"cpu": 1})
+    queue.register_worker("fat-unskilled", capacity={"cpu": 8, "memory": 8192})
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "gpu"},
+        required_skills=["gpu"],
+        resource_cost={"cpu": 8},
+    )
+    assert j.status == JobStatus.AWAITING_CAPACITY
+    assert j.last_error == "waiting for worker capacity"
+    assert queue.lease(tenant_id="t1", worker_id="skilled-small") is None
+    assert queue.lease(tenant_id="t1", worker_id="fat-unskilled") is None
+    assert queue.lease(worker_id="skilled-small") is None
+    assert queue.list_awaiting_capacity(tenant_id="t1")[0].id == j.id
+    assert queue.get_tenant_stats("t1").awaiting_capacity == 1
+    assert queue.get_tenant_stats("t1").pending == 0
+
+    queue.set_worker_capacity("fat-unskilled", {"cpu": 16})
+    still = queue.get(j.id, tenant_id="t1")
+    assert still is not None and still.status == JobStatus.AWAITING_CAPACITY
+
+    queue.set_worker_capacity("skilled-small", {"cpu": 8})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="skilled-small")
+    assert leased is not None and leased.id == j.id
+    _ack(queue, leased, "skilled-small")
+
+
+def test_giving_fat_worker_the_skill_revives_split_cover(queue: JobQueue):
+    queue.register_worker("gpu-tiny", skills=["gpu"], capacity={"cpu": 1})
+    queue.register_worker("fat", capacity={"cpu": 8})
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "gpu"},
+        required_skills=["gpu"],
+        resource_cost={"cpu": 8},
+    )
+    assert j.status == JobStatus.AWAITING_CAPACITY
+    queue.register_worker("fat", skills=["gpu"], capacity={"cpu": 8})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="fat")
+    assert leased is not None and leased.id == j.id
+    _ack(queue, leased, "fat")
+
+
+def test_split_cover_after_skilled_worker_joins_reparks(queue: JobQueue):
+    queue.register_worker("fat", capacity={"cpu": 8})
+    j = queue.enqueue(
+        tenant_id="t1",
+        payload={"need": "tpu"},
+        required_skills=["tpu"],
+        resource_cost={"cpu": 8},
+    )
+    assert j.status == JobStatus.AWAITING_SKILLS
+    queue.register_worker("tpu-tiny", skills=["tpu"], capacity={"cpu": 1})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.AWAITING_CAPACITY
+    assert queue.lease(tenant_id="t1", worker_id="tpu-tiny") is None
+    assert queue.lease(tenant_id="t1", worker_id="fat") is None
+    queue.register_worker("tpu-tiny", skills=["tpu"], capacity={"cpu": 8})
+    got = queue.get(j.id, tenant_id="t1")
+    assert got is not None and got.status == JobStatus.PENDING
+    leased = queue.lease(tenant_id="t1", worker_id="tpu-tiny")
+    assert leased is not None
+    _ack(queue, leased, "tpu-tiny")
+
+
 def test_skills_win_when_both_uncoverable(queue: JobQueue):
     j = queue.enqueue(
         tenant_id="t1",

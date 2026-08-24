@@ -17,12 +17,16 @@ from job_queue.queue.skills_wait import SkillsWaitMixin
 
 _CAPACITY_WAIT_MSG = "waiting for worker capacity"
 
-# One active worker must advertise enough of *every* key on the job.
+# One *single* active worker must have the job's skills *and* advertise
+# enough of every cost key. Skills on one node and capacity on another
+# is not cover — nobody can actually lease the job.
 _CAPACITY_COVERED_SQL = """
     EXISTS (
         SELECT 1
         FROM worker_nodes wn
         WHERE wn.status = 'active'
+          AND COALESCE(j.required_skills, '{}'::text[])
+              <@ COALESCE(wn.skills, '{}'::text[])
           AND NOT EXISTS (
                 SELECT 1
                 FROM jsonb_each_text(COALESCE(j.resource_cost, '{}'::jsonb)) e
@@ -128,7 +132,9 @@ class CapacityWaitMixin(SkillsWaitMixin):
             for k, v in (resource_cost or {}).items()
             if int(v) > 0
         }
-        if cost and not self._capacity_is_covered(conn, cost):
+        if cost and not self._capacity_is_covered(
+            conn, cost, skills=skills
+        ):
             return JobStatus.AWAITING_CAPACITY.value
         return JobStatus.PENDING.value
 
@@ -174,8 +180,11 @@ class CapacityWaitMixin(SkillsWaitMixin):
             return row
         status = str(row.get("status") or "")
         cost = _resource_map_from_row(row.get("resource_cost"))
+        skills = [str(s) for s in (row.get("required_skills") or [])]
         if status == JobStatus.PENDING.value:
-            if cost and not self._capacity_is_covered(conn, cost):
+            if cost and not self._capacity_is_covered(
+                conn, cost, skills=skills
+            ):
                 updated = conn.execute(
                     f"""
                     UPDATE jobs
@@ -202,14 +211,16 @@ class CapacityWaitMixin(SkillsWaitMixin):
                         event_type="awaiting_capacity",
                         from_status=JobStatus.PENDING.value,
                         actor=None,
-                        detail={"reason": "no_active_worker_covers_cost"},
+                        detail={"reason": "no_active_worker_covers_job"},
                         now=now,
                     )
                 return updated
             return row
         if status != JobStatus.AWAITING_CAPACITY.value:
             return row
-        if cost and not self._capacity_is_covered(conn, cost):
+        if cost and not self._capacity_is_covered(
+            conn, cost, skills=skills
+        ):
             if row.get("last_error") == _CAPACITY_WAIT_MSG:
                 return row
             stamped = conn.execute(
@@ -259,22 +270,33 @@ class CapacityWaitMixin(SkillsWaitMixin):
         return updated
 
     @staticmethod
-    def _capacity_is_covered(conn: Any, cost: dict[str, int]) -> bool:
+    def _capacity_is_covered(
+        conn: Any,
+        cost: dict[str, int],
+        skills: list[str] | None = None,
+    ) -> bool:
         needed = {k: int(v) for k, v in (cost or {}).items() if int(v) > 0}
         if not needed:
             return True
+        needed_skills = {str(s) for s in (skills or [])}
         rows = conn.execute(
             """
-            SELECT capacity
+            SELECT capacity, skills
             FROM worker_nodes
             WHERE status = 'active'
             """
         ).fetchall()
         for row in rows:
+            have = {str(s) for s in (row.get("skills") or [])}
+            if needed_skills and not needed_skills <= have:
+                continue
             cap = _resource_map_from_row(row.get("capacity"))
             if not cap:
                 continue
-            if all(int(cap.get(name, 0)) >= amount for name, amount in needed.items()):
+            if all(
+                int(cap.get(name, 0)) >= amount
+                for name, amount in needed.items()
+            ):
                 return True
         return False
 
@@ -321,7 +343,7 @@ class CapacityWaitMixin(SkillsWaitMixin):
                     event_type="awaiting_capacity",
                     from_status=JobStatus.PENDING.value,
                     actor=None,
-                    detail={"reason": "no_active_worker_covers_cost"},
+                    detail={"reason": "no_active_worker_covers_job"},
                     now=now,
                 )
         return len(rows)

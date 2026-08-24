@@ -104,10 +104,11 @@ class Job:
     ``resource_cost`` is how much of each advertised worker resource this
     job occupies while leased (cpu, memory, ...). Empty means free. A
     worker leases the job only when every listed cost fits in remaining
-    capacity after live (unexpired) holds. If no *active* worker advertises
-    enough of every key, the job is parked as ``awaiting_capacity`` until
-    one does (or a deadline / TTL ends it). Lowering worker capacity live
-    never drops inflight work.
+    capacity after live (unexpired) holds. If no *single active* worker has
+    both the required skills and enough advertised capacity for every key,
+    the job is parked as ``awaiting_capacity`` (or ``awaiting_skills`` if
+    nobody has the skills) until one does (or a deadline / TTL ends it).
+    Lowering worker capacity live never drops inflight work.
 
     ``expires_at`` is an optional hard TTL. If the job is still unfinished
     (pending, leased, or parked) after this instant it is terminated

@@ -6,6 +6,7 @@
   * Mixed tenants and skilled work still drain.
   * Jobs no active worker can cover park as awaiting_capacity, then
     revive when advertised capacity arrives.
+  * Skills on one worker and capacity on another is not cover.
 """
 
 from __future__ import annotations
@@ -374,6 +375,57 @@ def main() -> int:
     if done < expected:
         raise RuntimeError(
             f"lost parked work: completed={done} expected={expected}"
+        )
+    apply_caps(CAPS)
+
+    logger.info("stage5: split skills/capacity is not cover")
+    split = "split-cover"
+    split_cost = {"cpu": 8, "memory": 2048}
+    split_ids: list[str] = []
+    for n in range(4):
+        job = enqueue(
+            split,
+            {"kind": "cuda", "n": n, "ms": 200, "cost": split_cost},
+            resource_cost=split_cost,
+            # cuda is only on worker-1 (cpu:2); worker-4 has the cpu
+            # but not the skill. No single worker can run these.
+            required_skills=["cuda"],
+        )
+        split_ids.append(str(job["id"]))
+        if job.get("status") != "awaiting_capacity":
+            raise RuntimeError(f"split-cover enqueue not parked: {job}")
+    if any(j.get("status") in ("pending", "leased") for j in list_jobs(split)):
+        raise RuntimeError("split-cover job stayed pending/leased")
+    logger.info("stage5 parked=%d", len(split_ids))
+    apply_caps({**CAPS, "worker-1": {"cpu": 8, "memory": 2048}})
+
+    def _split_done() -> bool:
+        rows = list_jobs(split)
+        leftover = [
+            f"{j.get('id')}:{j.get('status')}:{j.get('leased_by')}"
+            for j in rows
+            if j.get("status") != "completed"
+        ]
+        if leftover:
+            logger.info("stage5 leftover %s", leftover[:6])
+            return False
+        return len(rows) == len(split_ids)
+
+    wait_until(
+        _split_done,
+        timeout=max(30.0, MAX_WALL - (time.time() - started)),
+        msg="split-cover jobs did not revive and finish",
+    )
+    expected += len(split_ids)
+    done = sum(
+        1
+        for tid in tenants + [impossible, split]
+        for j in list_jobs(tid)
+        if j.get("status") == "completed"
+    )
+    if done < expected:
+        raise RuntimeError(
+            f"lost split-cover work: completed={done} expected={expected}"
         )
     apply_caps(CAPS)
 
