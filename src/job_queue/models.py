@@ -100,6 +100,12 @@ class Job:
     cannot stall on a shard whose owner lacks the hardware. Fairness and
     concurrency still apply.
 
+    ``resource_cost`` is how much of each advertised worker resource this
+    job occupies while leased (cpu, memory, ...). Empty means free. A
+    worker leases the job only when every listed cost fits in remaining
+    capacity after live (unexpired) holds. Lowering worker capacity live
+    never drops inflight work.
+
     ``expires_at`` is an optional hard TTL. If the job is still unfinished
     (pending, leased, or parked) after this instant it is terminated
     according to ``expiry_action``: ``dead`` (dead-letter) or ``cancel``.
@@ -153,6 +159,7 @@ class Job:
     last_error: str | None
     partition_id: int = 0
     required_skills: tuple[str, ...] = ()
+    resource_cost: tuple[tuple[str, int], ...] = ()
     expires_at: datetime | None = None
     expiry_action: str = "dead"
     failed_workers: tuple[str, ...] = ()

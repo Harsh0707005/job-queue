@@ -52,7 +52,8 @@ class LeaseClaimPublicMixin:
             AND attempts < max_attempts
 
         Delayed pending jobs, unmet dependencies, per-tenant concurrency
-        caps, and per-worker ``max_leases`` are always enforced. Paused
+        caps, per-worker ``max_leases``, and worker resource capacity
+        versus job ``resource_cost`` are always enforced. Paused
         tenants yield no new leases (in-flight work may still complete).
         Expired leases that already used all attempts are dead-lettered
         first (dependents cascade-cancelled).

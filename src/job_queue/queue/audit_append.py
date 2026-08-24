@@ -92,6 +92,7 @@ class AuditAppendMixin:
             "depends_on": dep_out,
             "labels": list(row.get("labels") or []),
             "required_skills": list(row.get("required_skills") or []),
+            "resource_cost": dict(row.get("resource_cost") or {}),
             "leased_by": row.get("leased_by"),
             "lease_token": _uuid(row.get("lease_token")),
             "lease_tenant_id": row.get("lease_tenant_id"),

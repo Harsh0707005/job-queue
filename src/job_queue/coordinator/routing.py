@@ -853,6 +853,12 @@ class RoutingMixin:
                     and parts[1] == "max-leases"
                 ):
                     return self._set_worker_max_leases(wid, body)
+                if (
+                    method == "POST"
+                    and len(parts) == 2
+                    and parts[1] == "capacity"
+                ):
+                    return self._set_worker_capacity(wid, body)
 
         # Multi-step saga workflows.
         if method == "POST" and path == "/v1/workflows":

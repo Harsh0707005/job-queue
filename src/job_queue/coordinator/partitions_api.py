@@ -28,6 +28,7 @@ class PartitionsApiMixin:
                     else None
                 ),
                 max_leases=max_leases,
+                capacity=body.get("capacity"),
             )
         except ValueError as exc:
             return 400, {"error": str(exc)}
@@ -136,6 +137,9 @@ class PartitionsApiMixin:
             if row.get("release_held") is not None
             else None,
             "max_leases": row.get("max_leases"),
+            "capacity": dict(row.get("capacity") or {}),
+            "used": dict(row.get("used") or {}),
+            "free": dict(row.get("free") or {}),
         }
 
     def _list_workers(self) -> tuple[int, dict[str, Any]]:
@@ -247,6 +251,20 @@ class PartitionsApiMixin:
                 return 400, {"error": "max_leases must be an integer or null"}
         try:
             row = self.queue.set_worker_max_leases(worker_id, cap)
+        except WorkerError as exc:
+            status = 404 if exc.code == "worker_not_found" else 409
+            return status, {"error": str(exc), "code": exc.code}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, self._serialize_worker(row)
+
+    def _set_worker_capacity(
+        self, worker_id: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        if "capacity" not in body:
+            return 400, {"error": "capacity is required"}
+        try:
+            row = self.queue.set_worker_capacity(worker_id, body.get("capacity"))
         except WorkerError as exc:
             status = 404 if exc.code == "worker_not_found" else 409
             return status, {"error": str(exc), "code": exc.code}

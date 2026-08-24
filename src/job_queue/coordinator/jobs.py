@@ -105,6 +105,7 @@ class JobsApiMixin:
                 preemptible=bool(body.get("preemptible", True)),
                 labels=labels,
                 required_skills=body.get("required_skills"),
+                resource_cost=body.get("resource_cost"),
                 ttl_seconds=ttl_seconds,
                 expires_at=expires_at,
                 expiry_action=body.get("expiry_action"),

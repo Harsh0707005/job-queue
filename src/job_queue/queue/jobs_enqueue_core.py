@@ -16,6 +16,7 @@ from job_queue.queue._common import (
     DependencyError,
     _as_utc,
     _normalize_labels,
+    _normalize_resource_map,
     _normalize_skills,
     _utcnow,
 )
@@ -44,6 +45,7 @@ class JobsEnqueueCoreMixin:
         preemptible: bool = True,
         labels: Sequence[str] | str | None = None,
         required_skills: Sequence[str] | str | None = None,
+        resource_cost: dict[str, int] | None = None,
         ttl_seconds: float | int | None = None,
         expires_at: datetime | None = None,
         expiry_action: str | None = None,
@@ -97,6 +99,11 @@ class JobsEnqueueCoreMixin:
             any worker may claim it. A worker leases the job only when it
             advertised every listed skill; partitions, fairness, and
             concurrency still apply.
+        resource_cost:
+            How much of each worker resource this job occupies while
+            leased (``{"cpu": 2, "memory": 1024}``). Empty means free.
+            A worker claims it only when remaining capacity covers every
+            listed amount.
         ttl_seconds / expires_at:
             Hard finish-by. If the job is still unfinished after this,
             ``process_expired_jobs`` (also run on lease/cleaner) terminates
@@ -133,6 +140,9 @@ class JobsEnqueueCoreMixin:
         dep_ids = self._normalize_depends_on(depends_on)
         label_list = _normalize_labels(labels)
         skill_list = _normalize_skills(required_skills)
+        cost_map = _normalize_resource_map(
+            resource_cost, allow_zero=False, noun="resource_cost"
+        )
 
         now = _utcnow()
         payload_kind = self._payload_kind(payload)
@@ -193,6 +203,7 @@ class JobsEnqueueCoreMixin:
                 dep_ids=dep_ids,
                 label_list=label_list,
                 skill_list=skill_list,
+                resource_cost=cost_map,
                 deadline=deadline,
                 estimated_duration_seconds=estimated_duration_seconds,
                 preemptible=bool(preemptible),

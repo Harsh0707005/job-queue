@@ -19,7 +19,10 @@ from job_queue.queue._common import (
     _SkipLeaseCandidate,
     _failed_worker_avoid_sql,
     _failed_worker_prefer_sql,
+    _job_fits_resources,
     _last_success_worker_prefer_sql,
+    _resource_claim_sql,
+    _resource_map_from_row,
     _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
@@ -151,6 +154,12 @@ class LeaseClaimFairMixin:
             )
             if remaining is not None and remaining <= 0:
                 return None
+        capacity: dict[str, int] = {}
+        free: dict[str, int] = {}
+        if hasattr(self, "_worker_capacity_state_locked"):
+            capacity, free = self._worker_capacity_state_locked(
+                conn, worker_id, now=now
+            )
         # Priority lanes first (higher priority always before lower), then
         # weighted virtual time within that lane (never-served = 0). A noisy
         # tenant's high-priority flood still rotates with other tenants at
@@ -180,6 +189,10 @@ class LeaseClaimFairMixin:
         params.append(worker_id)
         avoid_sql = _failed_worker_avoid_sql("jobs")
         params.extend([worker_id, worker_id, worker_id])
+        res_sql, res_params = _resource_claim_sql(
+            "jobs", capacity=capacity, free=free
+        )
+        params.extend(res_params)
         prefer_sql = _failed_worker_prefer_sql("jobs")
         affinity_sql = _last_success_worker_prefer_sql("jobs")
         params.extend(
@@ -204,6 +217,7 @@ class LeaseClaimFairMixin:
               {part_sql}
               {skill_sql}
               {avoid_sql}
+              {res_sql}
               AND NOT EXISTS (
                     SELECT 1
                     FROM tenant_settings ts
@@ -277,6 +291,9 @@ class LeaseClaimFairMixin:
         # Rebalance fence: unskilled jobs stay on owned shards. Skilled jobs
         # are allowed to cross partitions so they cannot stick on a worker
         # that cannot run them.
+        cost = _resource_map_from_row(candidate.get("resource_cost"))
+        if not _job_fits_resources(cost, capacity=capacity, free=free):
+            raise _SkipLeaseCandidate("worker at capacity")
         hop_open = bool(candidate.get("failed_workers")) or (
             candidate["status"] == JobStatus.LEASED.value
         )

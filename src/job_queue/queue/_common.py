@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from psycopg.types.json import Jsonb
+
 from job_queue.models import (
     Job,
     JobAuditEvent,
@@ -50,7 +52,7 @@ _JOB_COLUMNS = """
     required_skills, expires_at, expiry_action,
     failed_workers, max_worker_hops, quarantine_action,
     prefer_last_worker, payload_kind, cloned_from_job_id, coalesce_key,
-    tick_iteration
+    tick_iteration, resource_cost
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -59,6 +61,10 @@ WORKER_HEARTBEAT_TTL_SECONDS = 30
 _MAX_LABELS = 32
 
 _MAX_LABEL_LEN = 128
+
+_MAX_RESOURCE_KEYS = 16
+
+_MAX_RESOURCE_KEY_LEN = 64
 
 _CANCELABLE_STATUSES = (
     JobStatus.PENDING,
@@ -257,6 +263,144 @@ def _normalize_skills(skills: Sequence[str] | str | None) -> list[str]:
     return _normalize_tag_list(skills, noun="skill")
 
 
+def _normalize_resource_map(
+    raw: Any,
+    *,
+    allow_zero: bool = True,
+    noun: str = "resource",
+) -> dict[str, int]:
+    """Normalize a cpu/memory/... map to ``{name: int}``.
+
+    Names are stripped, lowercased, and restricted to ``[a-z0-9_-]``.
+    Empty / None → ``{}``. Values must be integers; ``allow_zero`` controls
+    whether 0 is kept (capacity) or dropped (job cost).
+    """
+    if raw is None or raw == "" or raw == {}:
+        return {}
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{noun} must be an object of name → amount")
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip().lower()
+        if not name:
+            raise ValueError(f"{noun} name is required")
+        if len(name) > _MAX_RESOURCE_KEY_LEN:
+            raise ValueError(
+                f"{noun} name must be <= {_MAX_RESOURCE_KEY_LEN} chars"
+            )
+        if any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in name):
+            raise ValueError(
+                f"{noun} name {name!r} must be alphanumeric, '_' or '-'"
+            )
+        try:
+            amount = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{noun} {name!r} amount must be an integer"
+            ) from exc
+        if amount < 0:
+            raise ValueError(f"{noun} {name!r} amount must be >= 0")
+        if amount == 0 and not allow_zero:
+            continue
+        out[name] = amount
+    if len(out) > _MAX_RESOURCE_KEYS:
+        raise ValueError(f"{noun} may list at most {_MAX_RESOURCE_KEYS} keys")
+    return dict(sorted(out.items()))
+
+
+def _resource_map_from_row(raw: Any) -> dict[str, int]:
+    if raw is None or raw == "" or raw == {}:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip().lower()
+        if not name:
+            continue
+        try:
+            amount = int(value)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            out[name] = amount
+    return dict(sorted(out.items()))
+
+
+def _resource_cost_tuples(raw: Any) -> tuple[tuple[str, int], ...]:
+    return tuple(_resource_map_from_row(raw).items())
+
+
+def _job_fits_resources(
+    cost: dict[str, int],
+    *,
+    capacity: dict[str, int],
+    free: dict[str, int],
+) -> bool:
+    """True when *cost* fits in *free* given advertised *capacity*."""
+    needed = {k: int(v) for k, v in (cost or {}).items() if int(v) > 0}
+    if not needed:
+        return True
+    if not capacity:
+        return False
+    for name, amount in needed.items():
+        if name not in capacity:
+            return False
+        if int(free.get(name, 0)) < amount:
+            return False
+    return True
+
+
+def _deduct_resources(free: dict[str, int], cost: dict[str, int]) -> None:
+    for name, amount in (cost or {}).items():
+        if amount <= 0 or name not in free:
+            continue
+        free[name] = int(free[name]) - int(amount)
+
+
+def _resource_claim_sql(
+    jobs_alias: str = "jobs",
+    *,
+    capacity: dict[str, int],
+    free: dict[str, int],
+) -> tuple[str, list[Any]]:
+    """SQL AND-clause: job cost is empty or fits *free* under *capacity*."""
+    cost = f"COALESCE({jobs_alias}.resource_cost, '{{}}'::jsonb)"
+    if not capacity:
+        return (
+            f"""
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_each_text({cost}) e
+                    WHERE (e.value)::numeric > 0
+              )
+            """,
+            [],
+        )
+    return (
+        f"""
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_each_text({cost}) e
+                    WHERE (e.value)::numeric > 0
+                      AND (
+                            NOT (%s::jsonb ? e.key)
+                            OR (e.value)::numeric
+                                > COALESCE((%s::jsonb->>e.key)::numeric, 0)
+                      )
+              )
+        """,
+        [Jsonb(capacity), Jsonb(free)],
+    )
+
+
 def _row_has_required_skills(row: Any) -> bool:
     """True when a job row declares a non-empty required_skills set."""
     raw = None
@@ -288,9 +432,9 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
     """
     skills = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
     failed = f"COALESCE({jobs_alias}.failed_workers, '{{}}'::text[])"
-    # A peer only "can take" the job if they are under their live-lease cap.
-    # Counting a full worker here left expired holds stuck: the previous
-    # holder was skipped and the peer could not grow.
+    # A peer only "can take" the job if they are under their live-lease cap
+    # and have remaining resource capacity for this job's cost. A full or
+    # too-small worker must not block the previous holder from reclaiming.
     peer_under_cap = f"""
         (
             wn.max_leases IS NULL
@@ -304,6 +448,48 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
                         OR held.lease_expires_at >= NOW()
                   )
             ) < wn.max_leases
+        )
+    """
+    job_cost = f"COALESCE({jobs_alias}.resource_cost, '{{}}'::jsonb)"
+    peer_fits_resources = f"""
+        (
+            NOT EXISTS (
+                SELECT 1
+                FROM jsonb_each_text({job_cost}) e
+                WHERE (e.value)::numeric > 0
+            )
+            OR (
+                wn.capacity IS NOT NULL
+                AND wn.capacity <> '{{}}'::jsonb
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_each_text({job_cost}) e
+                    WHERE (e.value)::numeric > 0
+                      AND (
+                            NOT (wn.capacity ? e.key)
+                            OR (e.value)::numeric > (
+                                COALESCE((wn.capacity->>e.key)::numeric, 0)
+                                - COALESCE(
+                                    (
+                                        SELECT SUM((e2.value)::numeric)
+                                        FROM jobs held
+                                        CROSS JOIN LATERAL jsonb_each_text(
+                                            COALESCE(held.resource_cost, '{{}}'::jsonb)
+                                        ) e2
+                                        WHERE held.leased_by = wn.worker_id
+                                          AND held.status = 'leased'
+                                          AND (
+                                                held.lease_expires_at IS NULL
+                                                OR held.lease_expires_at >= NOW()
+                                          )
+                                          AND e2.key = e.key
+                                    ),
+                                    0
+                                )
+                            )
+                      )
+                )
+            )
         )
     """
     return f"""
@@ -326,6 +512,7 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
                                 OR {skills} <@ COALESCE(wn.skills, '{{}}'::text[])
                           )
                           AND {peer_under_cap}
+                          AND {peer_fits_resources}
                     )
               )
     """
@@ -543,6 +730,7 @@ def _row_to_job(row: dict[str, Any]) -> Job:
         last_error=row["last_error"],
         partition_id=int(row["partition_id"]) if row.get("partition_id") is not None else 0,
         required_skills=tuple(skills),
+        resource_cost=_resource_cost_tuples(row.get("resource_cost")),
         expires_at=row.get("expires_at"),
         expiry_action=str(row.get("expiry_action") or "dead"),
         failed_workers=tuple(str(x) for x in (row.get("failed_workers") or [])),

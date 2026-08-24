@@ -1103,6 +1103,7 @@ class ClientAdminMixin:
         skills: list[str] | None = None,
         heartbeat_ttl_seconds: int | None = None,
         max_leases: int | None = None,
+        capacity: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"worker_id": worker_id}
         if skills is not None:
@@ -1111,7 +1112,22 @@ class ClientAdminMixin:
             body["heartbeat_ttl_seconds"] = heartbeat_ttl_seconds
         if max_leases is not None:
             body["max_leases"] = max_leases
+        if capacity is not None:
+            body["capacity"] = capacity
         payload = self._request("POST", "/v1/workers/register", body)
+        assert payload is not None
+        return payload
+
+    def set_worker_capacity(
+        self, worker_id: str, capacity: dict[str, int] | None
+    ) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        payload = self._request(
+            "POST",
+            f"/v1/workers/{quote(str(worker_id), safe='')}/capacity",
+            {"capacity": capacity or {}},
+        )
         assert payload is not None
         return payload
 

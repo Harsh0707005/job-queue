@@ -91,6 +91,7 @@ def job_to_dict(
         "waiting_on": [str(x) for x in job.waiting_on],
         "labels": list(job.labels),
         "required_skills": list(job.required_skills),
+        "resource_cost": {k: int(v) for k, v in (job.resource_cost or ())},
         "leased_by": job.leased_by,
         "lease_token": (_uuid(job.lease_token) if include_lease_token else None),
         "lease_tenant_id": job.lease_tenant_id,
@@ -203,6 +204,14 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         last_error=data.get("last_error"),
         partition_id=int(data.get("partition_id") or 0),
         required_skills=tuple(str(x) for x in required_skills),
+        resource_cost=tuple(
+            (str(k), int(v))
+            for k, v in sorted(
+                (dict(data.get("resource_cost") or {})).items(),
+                key=lambda kv: str(kv[0]),
+            )
+            if int(v) > 0
+        ),
         expires_at=parse_dt("expires_at"),
         expiry_action=str(data.get("expiry_action") or "dead"),
         failed_workers=tuple(str(x) for x in (data.get("failed_workers") or [])),

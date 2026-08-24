@@ -16,9 +16,13 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _NOT_TTL_EXPIRED_SQL,
     LeaseError,
+    _deduct_resources,
     _failed_worker_avoid_sql,
     _failed_worker_prefer_sql,
+    _job_fits_resources,
     _last_success_worker_prefer_sql,
+    _resource_claim_sql,
+    _resource_map_from_row,
     _row_has_required_skills,
     _skill_claim_sql,
     _utcnow,
@@ -131,6 +135,15 @@ class LeaseClaimTenantMixin:
             skill_params: list[Any] = [worker_id]
             avoid_sql = _failed_worker_avoid_sql("jobs")
             avoid_params: list[Any] = [worker_id, worker_id, worker_id]
+            capacity: dict[str, int] = {}
+            free: dict[str, int] = {}
+            if hasattr(self, "_worker_capacity_state_locked"):
+                capacity, free = self._worker_capacity_state_locked(
+                    conn, worker_id, now=now
+                )
+            res_sql, res_params = _resource_claim_sql(
+                "jobs", capacity=capacity, free=dict(free)
+            )
             prefer_sql = _failed_worker_prefer_sql("jobs")
             affinity_sql = _last_success_worker_prefer_sql("jobs")
 
@@ -152,6 +165,7 @@ class LeaseClaimTenantMixin:
                       {part_sql}
                       {skill_sql}
                       {avoid_sql}
+                      {res_sql}
                       AND status = %s
                       AND lease_expires_at < %s
                       AND attempts < max_attempts
@@ -170,6 +184,7 @@ class LeaseClaimTenantMixin:
                         + part_params
                         + skill_params
                         + avoid_params
+                        + res_params
                         + [
                             JobStatus.LEASED.value,
                             now,
@@ -201,6 +216,7 @@ class LeaseClaimTenantMixin:
                       {part_sql}
                       {skill_sql}
                       {avoid_sql}
+                      {res_sql}
                       AND (
                             (
                                 status = %s
@@ -229,6 +245,7 @@ class LeaseClaimTenantMixin:
                         + part_params
                         + skill_params
                         + avoid_params
+                        + res_params
                         + [
                             JobStatus.PENDING.value,
                             now,
@@ -277,6 +294,11 @@ class LeaseClaimTenantMixin:
                 if candidate["status"] == JobStatus.PENDING.value:
                     if not self._try_consume_lease_rate(conn, tenant_id, now=now):
                         break
+                cost = _resource_map_from_row(candidate.get("resource_cost"))
+                if not _job_fits_resources(
+                    cost, capacity=capacity, free=free
+                ):
+                    continue
                 try:
                     claimed.append(
                         self._claim_locked_job(
@@ -288,6 +310,7 @@ class LeaseClaimTenantMixin:
                             now=now,
                         )
                     )
+                    _deduct_resources(free, cost)
                 except LeaseError:
                     # Row no longer claimable (e.g. concurrent max-runtime release).
                     continue

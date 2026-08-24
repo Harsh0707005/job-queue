@@ -468,6 +468,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_worker_leased
     ON jobs (leased_by)
     WHERE status = 'leased' AND leased_by IS NOT NULL;
 
+-- Worker advertised resources (cpu/memory/...) and per-job run cost.
+-- Empty object = no constraint (job is free / worker is unconstrained).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resource_cost JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS capacity JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 -- Capabilities advertised by the worker. Lease requires
 -- jobs.required_skills <@ worker_nodes.skills (empty job skills = any worker).
 ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS skills TEXT[];

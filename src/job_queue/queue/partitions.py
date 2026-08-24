@@ -23,6 +23,7 @@ from job_queue.queue._common import (
     WORKER_HEARTBEAT_TTL_SECONDS,
     WorkerError,
     _JOB_COLUMNS,
+    _normalize_resource_map,
     _normalize_skills,
     _utcnow,
 )
@@ -74,6 +75,7 @@ class PartitionsMixin(SkillsWaitMixin):
         skills: Sequence[str] | str | None = None,
         heartbeat_ttl_seconds: int | None = None,
         max_leases: int | None = None,
+        capacity: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Register or revive a worker and return its owned partitions.
 
@@ -81,6 +83,8 @@ class PartitionsMixin(SkillsWaitMixin):
         ``required_skills`` are only claimable when that set is a subset.
         Re-registering replaces the advertised skills. *max_leases* is the
         inflight cap; omit to keep the current value (NULL = unlimited).
+        *capacity* is the resource map (cpu/memory/...); omit to keep the
+        current map (empty = unconstrained).
         """
         if not worker_id or not str(worker_id).strip():
             raise ValueError("worker_id is required")
@@ -89,6 +93,11 @@ class PartitionsMixin(SkillsWaitMixin):
             max_leases = int(max_leases)
             if max_leases < 1:
                 raise ValueError("max_leases must be >= 1")
+        cap_map = (
+            _normalize_resource_map(capacity, allow_zero=True, noun="capacity")
+            if capacity is not None
+            else None
+        )
         skill_list = _normalize_skills(skills) if skills is not None else None
         now = _utcnow()
         ttl = (
@@ -152,6 +161,17 @@ class PartitionsMixin(SkillsWaitMixin):
                     WHERE worker_id = %s
                     """,
                     (max_leases, now, wid),
+                )
+            if cap_map is not None:
+                from psycopg.types.json import Jsonb
+
+                conn.execute(
+                    """
+                    UPDATE worker_nodes
+                    SET capacity = %s, updated_at = %s
+                    WHERE worker_id = %s
+                    """,
+                    (Jsonb(cap_map), now, wid),
                 )
             snap = self._worker_snapshot_locked(conn, wid)
             snap["partition_count"] = n
@@ -425,7 +445,7 @@ class PartitionsMixin(SkillsWaitMixin):
             row = conn.execute(
                 """
                 SELECT worker_id, skills, status, maintenance, last_seen_at,
-                       max_leases
+                       max_leases, capacity
                 FROM worker_nodes
                 WHERE worker_id = %s
                 """,
@@ -440,7 +460,7 @@ class PartitionsMixin(SkillsWaitMixin):
             rows = conn.execute(
                 """
                 SELECT worker_id, skills, status, maintenance, last_seen_at,
-                       max_leases
+                       max_leases, capacity
                 FROM worker_nodes
                 ORDER BY worker_id ASC
                 """
@@ -493,6 +513,60 @@ class PartitionsMixin(SkillsWaitMixin):
                 (max_leases, now, wid),
             )
             return self._worker_snapshot_locked(conn, wid)
+
+    def set_worker_capacity(
+        self, worker_id: str, capacity: dict[str, int] | None
+    ) -> dict[str, Any]:
+        """Advertise how much cpu/memory/... this worker can hold.
+
+        Empty / ``None`` clears the map (unconstrained). Lowering a
+        resource below current live usage does **not** release or ack
+        inflight jobs — the worker just stops taking work that no longer
+        fits until holds finish. Raising a resource lets the next claim
+        use the extra immediately.
+        """
+        if not worker_id or not str(worker_id).strip():
+            raise ValueError("worker_id is required")
+        cap_map = _normalize_resource_map(
+            capacity or {}, allow_zero=True, noun="capacity"
+        )
+        wid = str(worker_id).strip()
+        now = _utcnow()
+        from psycopg.types.json import Jsonb
+
+        with transaction(self._pool) as conn:
+            row = conn.execute(
+                """
+                SELECT worker_id
+                FROM worker_nodes
+                WHERE worker_id = %s
+                FOR UPDATE
+                """,
+                (wid,),
+            ).fetchone()
+            if row is None:
+                raise WorkerError(
+                    f"worker {wid!r} is not registered",
+                    code="worker_not_found",
+                )
+            conn.execute(
+                """
+                UPDATE worker_nodes
+                SET capacity = %s, updated_at = %s
+                WHERE worker_id = %s
+                """,
+                (Jsonb(cap_map), now, wid),
+            )
+            return self._worker_snapshot_locked(conn, wid)
+
+    def get_worker_capacity(self, worker_id: str) -> dict[str, int]:
+        snap = self.get_worker(worker_id)
+        if snap is None:
+            raise WorkerError(
+                f"worker {worker_id!r} is not registered",
+                code="worker_not_found",
+            )
+        return dict(snap.get("capacity") or {})
 
     def get_worker_max_leases(self, worker_id: str) -> int | None:
         snap = self.get_worker(worker_id)
@@ -1061,7 +1135,7 @@ class PartitionsMixin(SkillsWaitMixin):
             row = conn.execute(
                 """
                 SELECT worker_id, skills, status, maintenance, last_seen_at,
-                       max_leases
+                       max_leases, capacity
                 FROM worker_nodes
                 WHERE worker_id = %s
                 """,
@@ -1086,6 +1160,16 @@ class PartitionsMixin(SkillsWaitMixin):
             """,
             (worker_id, JobStatus.LEASED.value),
         ).fetchone()
+        capacity = _normalize_resource_map(
+            row.get("capacity") or {}, allow_zero=True, noun="capacity"
+        )
+        used = self._worker_used_resources_locked(
+            conn, worker_id, now=_utcnow()
+        )
+        free = {
+            name: max(0, int(capacity[name]) - int(used.get(name, 0)))
+            for name in capacity
+        }
         return {
             "worker_id": str(row["worker_id"]),
             "status": status,
@@ -1095,6 +1179,9 @@ class PartitionsMixin(SkillsWaitMixin):
             "partitions": self._owned_partitions_locked(conn, worker_id),
             "leased": int(leased["n"] if leased else 0),
             "max_leases": max_leases,
+            "capacity": capacity,
+            "used": {k: int(used[k]) for k in sorted(used) if int(used[k]) > 0},
+            "free": free,
             "last_seen_at": last_seen,
         }
 
@@ -1137,3 +1224,51 @@ class PartitionsMixin(SkillsWaitMixin):
         ).fetchone()
         n = int(held["n"] if held else 0)
         return max(0, cap - n)
+
+    def _worker_used_resources_locked(
+        self, conn: Any, worker_id: str, *, now: datetime
+    ) -> dict[str, int]:
+        rows = conn.execute(
+            """
+            SELECT e.key AS name, SUM((e.value)::numeric)::bigint AS amount
+            FROM jobs j
+            CROSS JOIN LATERAL jsonb_each_text(
+                COALESCE(j.resource_cost, '{}'::jsonb)
+            ) e
+            WHERE j.leased_by = %s
+              AND j.status = %s
+              AND (j.lease_expires_at IS NULL OR j.lease_expires_at >= %s)
+              AND (e.value)::numeric > 0
+            GROUP BY e.key
+            """,
+            (worker_id, JobStatus.LEASED.value, now),
+        ).fetchall()
+        used: dict[str, int] = {}
+        for r in rows:
+            used[str(r["name"])] = int(r["amount"] or 0)
+        return used
+
+    def _worker_capacity_state_locked(
+        self, conn: Any, worker_id: str, *, now: datetime
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Return ``(capacity, free)`` under the worker-row lock."""
+        row = conn.execute(
+            """
+            SELECT capacity
+            FROM worker_nodes
+            WHERE worker_id = %s
+            FOR UPDATE
+            """,
+            (worker_id,),
+        ).fetchone()
+        if row is None:
+            return {}, {}
+        capacity = _normalize_resource_map(
+            row.get("capacity") or {}, allow_zero=True, noun="capacity"
+        )
+        used = self._worker_used_resources_locked(conn, worker_id, now=now)
+        free = {
+            name: max(0, int(capacity[name]) - int(used.get(name, 0)))
+            for name in capacity
+        }
+        return capacity, free

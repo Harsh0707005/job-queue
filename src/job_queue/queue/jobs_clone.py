@@ -122,6 +122,7 @@ class JobsCloneMixin:
                 dep_ids=[],
                 label_list=list(source.labels),
                 skill_list=list(source.required_skills),
+                resource_cost={k: int(v) for k, v in (source.resource_cost or ())},
                 deadline=deadline_at,
                 estimated_duration_seconds=source.estimated_duration_seconds,
                 preemptible=source.preemptible,
