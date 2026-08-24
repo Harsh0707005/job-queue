@@ -146,7 +146,9 @@ class LeaseClaimFairMixin:
         # Worker inflight cap: lock the registry row before the tenant lock
         # (same order as the scoped path). At cap, stop the batch.
         if hasattr(self, "_worker_lease_remaining_locked"):
-            remaining = self._worker_lease_remaining_locked(conn, worker_id)
+            remaining = self._worker_lease_remaining_locked(
+                conn, worker_id, now=now
+            )
             if remaining is not None and remaining <= 0:
                 return None
         # Priority lanes first (higher priority always before lower), then

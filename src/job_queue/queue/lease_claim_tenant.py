@@ -85,7 +85,7 @@ class LeaseClaimTenantMixin:
             worker_remaining: int | None = None
             if hasattr(self, "_worker_lease_remaining_locked"):
                 worker_remaining = self._worker_lease_remaining_locked(
-                    conn, worker_id
+                    conn, worker_id, now=now
                 )
                 if worker_remaining is not None and worker_remaining <= 0:
                     return []

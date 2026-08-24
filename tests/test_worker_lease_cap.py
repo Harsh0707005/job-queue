@@ -4,14 +4,30 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import timedelta
 from http.server import ThreadingHTTPServer
 
 import pytest
 
-from job_queue import JobQueue, JobStatus, WorkerError
+from job_queue import Job, JobQueue, JobStatus, WorkerError
 from job_queue.coordinator import Coordinator, _make_handler
+from job_queue.queue._common import _utcnow
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack, _hb
+
+
+def _expire_lease(queue: JobQueue, job: Job) -> None:
+    """Force a live lease past its visibility timeout without sleeping."""
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_expires_at = %s
+            WHERE id = %s
+            """,
+            (_utcnow() - timedelta(seconds=5), job.id),
+        )
+        conn.commit()
 
 
 def test_worker_cap_stops_hot_worker_peer_takes_rest(queue: JobQueue):
@@ -269,3 +285,145 @@ def test_inprocess_worker_stops_at_cap(queue: JobQueue):
     worker.stop()
     t.join(timeout=3)
     assert len(seen) >= 2
+
+
+def test_expired_own_lease_does_not_fill_cap_and_can_be_reclaimed(queue: JobQueue):
+    queue.register_worker("full")
+    queue.set_worker_max_leases("full", 1)
+    job = queue.enqueue(
+        tenant_id="t1",
+        payload={"n": 1},
+        visibility_timeout_seconds=60,
+    )
+    held = queue.lease(
+        tenant_id="t1",
+        worker_id="full",
+        visibility_timeout_seconds=60,
+    )
+    assert held is not None and held.id == job.id
+    assert queue.lease(tenant_id="t1", worker_id="full") is None
+
+    _expire_lease(queue, held)
+    still = queue.get(job.id, tenant_id="t1")
+    assert still is not None
+    assert still.status == JobStatus.LEASED
+    assert still.leased_by == "full"
+
+    reclaimed = queue.lease(
+        tenant_id="t1",
+        worker_id="full",
+        visibility_timeout_seconds=60,
+    )
+    assert reclaimed is not None
+    assert reclaimed.id == job.id
+    assert reclaimed.leased_by == "full"
+    assert reclaimed.lease_token != held.lease_token
+    assert reclaimed.attempts == held.attempts + 1
+    assert queue.lease(tenant_id="t1", worker_id="full") is None
+    _ack(queue, reclaimed, "full", result={"reclaimed": True})
+
+
+def test_expired_own_lease_can_be_reclaimed_on_fair_path(queue: JobQueue):
+    queue.register_worker("fair-full")
+    queue.set_worker_max_leases("fair-full", 1)
+    job = queue.enqueue(tenant_id="ta", payload={"n": 1})
+    held = queue.lease(worker_id="fair-full")
+    assert held is not None and held.id == job.id
+    _expire_lease(queue, held)
+    reclaimed = queue.lease(worker_id="fair-full")
+    assert reclaimed is not None and reclaimed.id == job.id
+    _ack(queue, reclaimed, "fair-full")
+
+
+def test_capped_fleet_with_only_expired_holds_does_not_stall(queue: JobQueue):
+    """If every capped worker is full of timed-out leases, work must move."""
+    queue.register_worker("a")
+    queue.register_worker("b")
+    queue.set_worker_max_leases("a", 1)
+    queue.set_worker_max_leases("b", 1)
+    j1 = queue.enqueue(tenant_id="t1", payload={"n": 1})
+    j2 = queue.enqueue(tenant_id="t1", payload={"n": 2})
+    extra = queue.enqueue(tenant_id="t1", payload={"n": 3})
+
+    h1 = queue.lease(tenant_id="t1", worker_id="a")
+    h2 = queue.lease(tenant_id="t1", worker_id="b")
+    assert h1 is not None and h2 is not None
+    assert {h1.id, h2.id} == {j1.id, j2.id}
+    assert queue.lease(tenant_id="t1", worker_id="a") is None
+    assert queue.lease(tenant_id="t1", worker_id="b") is None
+
+    _expire_lease(queue, h1)
+    _expire_lease(queue, h2)
+
+    got_ids: set = set()
+    for wid in ("a", "b"):
+        for _ in range(2):
+            nxt = queue.lease(tenant_id="t1", worker_id=wid)
+            if nxt is None:
+                break
+            got_ids.add(nxt.id)
+            _ack(queue, nxt, wid)
+    leftover = queue.lease(tenant_id="t1", worker_id="a")
+    if leftover is not None:
+        got_ids.add(leftover.id)
+        _ack(queue, leftover, "a")
+    leftover = queue.lease(tenant_id="t1", worker_id="b")
+    if leftover is not None:
+        got_ids.add(leftover.id)
+        _ack(queue, leftover, "b")
+
+    assert {j1.id, j2.id, extra.id} <= got_ids
+    for job in (j1, j2, extra):
+        final = queue.get(job.id, tenant_id="t1")
+        assert final is not None
+        assert final.status == JobStatus.COMPLETED
+
+
+def test_live_hold_still_blocks_reclaim_of_someone_elses_expired(queue: JobQueue):
+    queue.register_worker("busy")
+    queue.register_worker("dead")
+    queue.set_worker_max_leases("busy", 1)
+    queue.set_worker_max_leases("dead", 1)
+    live = queue.enqueue(tenant_id="t1", payload={"kind": "live"})
+    orphan = queue.enqueue(tenant_id="t1", payload={"kind": "orphan"})
+    held = queue.lease(tenant_id="t1", worker_id="busy", visibility_timeout_seconds=60)
+    other = queue.lease(tenant_id="t1", worker_id="dead", visibility_timeout_seconds=60)
+    assert held is not None and held.id == live.id
+    assert other is not None and other.id == orphan.id
+    _expire_lease(queue, other)
+
+    # busy still has a live hold — taking the orphan would be a second job.
+    assert queue.lease(tenant_id="t1", worker_id="busy") is None
+    still_live = queue.get(live.id, tenant_id="t1")
+    assert still_live is not None and still_live.status == JobStatus.LEASED
+    assert still_live.leased_by == "busy"
+    assert still_live.lease_token == held.lease_token
+
+    # The worker whose lease expired can reclaim without growing concurrency.
+    back = queue.lease(tenant_id="t1", worker_id="dead")
+    assert back is not None and back.id == orphan.id
+    assert back.leased_by == "dead"
+    _ack(queue, held, "busy")
+    _ack(queue, back, "dead")
+
+
+def test_batch_reclaim_of_own_expired_respects_cap(queue: JobQueue):
+    queue.register_worker("batch-exp")
+    queue.set_worker_max_leases("batch-exp", 2)
+    first = [queue.enqueue(tenant_id="t1", payload={"i": i}) for i in range(2)]
+    held = queue.lease_batch(tenant_id="t1", worker_id="batch-exp", limit=5)
+    assert {j.id for j in held} == {j.id for j in first}
+    for j in held:
+        _expire_lease(queue, j)
+    later = [queue.enqueue(tenant_id="t1", payload={"i": i}) for i in range(2, 4)]
+    back = queue.lease_batch(tenant_id="t1", worker_id="batch-exp", limit=5)
+    assert len(back) == 2
+    # Room opened by expiry; reclaim or new work is fine, but not 3+.
+    assert queue.lease_batch(tenant_id="t1", worker_id="batch-exp", limit=5) == []
+    live_ids = {j.id for j in back}
+    for j in back:
+        _ack(queue, j, "batch-exp")
+    rest = queue.lease_batch(tenant_id="t1", worker_id="batch-exp", limit=5)
+    assert len(rest) == 2
+    leftover_ids = {j.id for j in first + later} - live_ids
+    assert {j.id for j in rest} == leftover_ids

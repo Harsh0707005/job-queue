@@ -279,13 +279,33 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
 
     Binds *worker_id* three times: ``failed_workers`` membership, expired
     self-reclaim, and the unused-peer EXISTS. A peer counts only if they
-    are active, capable, and **not already in** ``failed_workers``. Once
-    every capable worker has failed the job, the clause is a no-op so
-    retries continue until hop quarantine trips (hop cap may exceed the
-    worker count). Solo / unregistered fleets are also a no-op.
+    are active, capable, **not already in** ``failed_workers``, and under
+    their live ``max_leases`` (uncapped peers always count). A full peer
+    must not block the previous holder from reclaiming its own expired
+    lease. Once every capable worker has failed the job, the clause is a
+    no-op so retries continue until hop quarantine trips (hop cap may
+    exceed the worker count). Solo / unregistered fleets are also a no-op.
     """
     skills = f"COALESCE({jobs_alias}.required_skills, '{{}}'::text[])"
     failed = f"COALESCE({jobs_alias}.failed_workers, '{{}}'::text[])"
+    # A peer only "can take" the job if they are under their live-lease cap.
+    # Counting a full worker here left expired holds stuck: the previous
+    # holder was skipped and the peer could not grow.
+    peer_under_cap = f"""
+        (
+            wn.max_leases IS NULL
+            OR (
+                SELECT COUNT(*)::int
+                FROM jobs held
+                WHERE held.leased_by = wn.worker_id
+                  AND held.status = 'leased'
+                  AND (
+                        held.lease_expires_at IS NULL
+                        OR held.lease_expires_at >= NOW()
+                  )
+            ) < wn.max_leases
+        )
+    """
     return f"""
               AND NOT (
                     (
@@ -305,6 +325,7 @@ def _failed_worker_avoid_sql(jobs_alias: str = "jobs") -> str:
                                 {skills} = '{{}}'::text[]
                                 OR {skills} <@ COALESCE(wn.skills, '{{}}'::text[])
                           )
+                          AND {peer_under_cap}
                     )
               )
     """

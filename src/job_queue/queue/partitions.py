@@ -1099,9 +1099,15 @@ class PartitionsMixin(SkillsWaitMixin):
         }
 
     def _worker_lease_remaining_locked(
-        self, conn: Any, worker_id: str
+        self, conn: Any, worker_id: str, *, now: datetime | None = None
     ) -> int | None:
         """Return remaining inflight slots, or None if this worker is uncapped.
+
+        Only **live** leases count (``lease_expires_at`` still in the future).
+        Timed-out rows stay ``status=leased`` until reclaimed, but they are
+        not concurrent work anymore — counting them left a full worker
+        unable to reclaim its own expired jobs, and a fleet of capped
+        workers with only expired holds could reclaim nothing.
 
         Takes ``FOR UPDATE`` on the registry row so concurrent claims and
         live cap changes serialize. Unregistered workers are unlimited.
@@ -1118,14 +1124,16 @@ class PartitionsMixin(SkillsWaitMixin):
         if row is None or row.get("max_leases") is None:
             return None
         cap = int(row["max_leases"])
+        at = now or _utcnow()
         held = conn.execute(
             """
             SELECT COUNT(*)::int AS n
             FROM jobs
             WHERE leased_by = %s
               AND status = %s
+              AND (lease_expires_at IS NULL OR lease_expires_at >= %s)
             """,
-            (worker_id, JobStatus.LEASED.value),
+            (worker_id, JobStatus.LEASED.value, at),
         ).fetchone()
         n = int(held["n"] if held else 0)
         return max(0, cap - n)
