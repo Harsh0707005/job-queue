@@ -7,6 +7,87 @@ from job_queue.models import WorkflowRunStatus, WorkflowStepStatus
 from tests.helpers_queue import _ack, _nack
 
 
+def _drive_map_last(queue: JobQueue, tenant_id: str, items: list[object]):
+    run = queue.start_workflow(
+        tenant_id=tenant_id,
+        max_attempts=1,
+        steps=[
+            {"name": "list", "payload": {"op": "list"}},
+            {
+                "type": "map",
+                "name": "each",
+                "items": "ids",
+                "step": {"name": "work", "payload": {"op": "work"}},
+            },
+        ],
+    )
+    j0 = queue.lease(tenant_id=tenant_id, worker_id="w")
+    assert j0 is not None
+    _ack(queue, j0, "w", result={"ids": items})
+    for i, _item in enumerate(items):
+        j = queue.lease(tenant_id=tenant_id, worker_id=f"w{i}")
+        assert j is not None
+        _ack(queue, j, f"w{i}", result={"item": _item})
+    return run
+
+
+def test_map_join_marks_run_completed_when_it_is_the_last_step(queue: JobQueue):
+    """Map join is not a job — finishing the last child must close the run."""
+    run = _drive_map_last(queue, "map-last", ["a", "b"])
+    assert queue.lease(tenant_id="map-last", worker_id="w") is None
+    done = queue.get_workflow(run.id, tenant_id="map-last")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+    assert done.completed_at is not None
+    steps = [
+        s
+        for s in queue.list_workflow_steps(run.id, tenant_id="map-last")
+        if s.direction == "forward"
+    ]
+    assert {s.name for s in steps} >= {"list", "each", "work-0", "work-1"}
+    assert all(s.status == WorkflowStepStatus.COMPLETED.value for s in steps)
+
+
+def test_stuck_running_after_map_join_is_reaped(queue: JobQueue):
+    """If the run is left running after every step completed, redrive closes it."""
+    run = _drive_map_last(queue, "map-stuck", ["x", "y"])
+    done = queue.get_workflow(run.id, tenant_id="map-stuck")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE workflow_runs
+            SET status = %s,
+                completed_at = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (WorkflowRunStatus.RUNNING.value, run.id),
+        )
+        conn.commit()
+
+    stuck = queue.get_workflow(run.id, tenant_id="map-stuck")
+    assert stuck is not None
+    assert stuck.status == WorkflowRunStatus.RUNNING.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="map-stuck")
+    assert steps
+    assert all(
+        s.status == WorkflowStepStatus.COMPLETED.value
+        for s in steps
+        if s.direction == "forward"
+    )
+
+    fixed = queue.process_workflow_compensation(tenant_id="map-stuck")
+    assert fixed >= 1
+    reaped = queue.get_workflow(run.id, tenant_id="map-stuck")
+    assert reaped is not None
+    assert reaped.status == WorkflowRunStatus.COMPLETED.value
+    assert reaped.completed_at is not None
+    assert queue.lease(tenant_id="map-stuck", worker_id="w") is None
+
+
 def test_map_spawns_children_then_joins(queue: JobQueue):
     run = queue.start_workflow(
         tenant_id="map-ok",

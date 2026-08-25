@@ -1018,7 +1018,11 @@ class WorkflowsMixin(WorkflowsMapMixin):
             if hasattr(self, "_is_queue_draining") and self._is_queue_draining(
                 conn, str(run["tenant_id"]), qn
             ):
-                return False
+                # Intake is closed, but a finished map join still needs to
+                # close the run so it cannot sit running forever.
+                return self._maybe_complete_running_workflow_locked(
+                    conn, run_id=run_id, now=now
+                )
             job = conn.execute(
                 f"""
                 SELECT max_attempts, visibility_timeout_seconds
@@ -1044,7 +1048,17 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 ),
                 now=now,
             )
-            return n > 0
+            finished = self._maybe_complete_running_workflow_locked(
+                conn, run_id=run_id, now=now
+            )
+            after = conn.execute(
+                "SELECT status FROM workflow_runs WHERE id = %s",
+                (run_id,),
+            ).fetchone()
+            return n > 0 or finished or (
+                after is not None
+                and after["status"] == WorkflowRunStatus.COMPLETED.value
+            )
 
     @staticmethod
     def _workflow_queue_name(conn: Any, run_id: UUID) -> str | None:
@@ -1132,6 +1146,93 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 return False
             return self._ensure_compensate_progress(conn, run=run, now=now)
 
+    def _maybe_complete_running_workflow_locked(
+        self,
+        conn: Any,
+        *,
+        run_id: UUID,
+        now: Any,
+    ) -> bool:
+        """Mark a running workflow completed when every real step is done.
+
+        Map join is not a worker job, so finishing the last child can leave
+        every step_run ``completed`` while the run stays ``running`` with
+        nothing left to lease. Re-read ``steps_def`` so a just-materialized
+        fan-out is included; ignore ghost child slots that have no step_run.
+        """
+        run = conn.execute(
+            f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
+            (run_id,),
+        ).fetchone()
+        if run is None or run["status"] != WorkflowRunStatus.RUNNING.value:
+            return False
+        steps_def = self._parse_steps_def(run, conn)
+        if not steps_def:
+            return False
+        rows = conn.execute(
+            """
+            SELECT step_index, status
+            FROM workflow_step_runs
+            WHERE run_id = %s AND direction = %s
+            """,
+            (run_id, WorkflowStepDirection.FORWARD.value),
+        ).fetchall()
+        by_idx = {int(r["step_index"]): str(r["status"]) for r in rows}
+        terminal = {
+            WorkflowStepStatus.COMPLETED.value,
+            WorkflowStepStatus.SKIPPED.value,
+            WorkflowStepStatus.FAILED.value,
+        }
+        completed_n = 0
+        for i, sdef in enumerate(steps_def):
+            st = by_idx.get(i)
+            if st is None:
+                if sdef.get("map_join_index") is not None:
+                    # Extra child slot from a lost rematerialize — not work.
+                    continue
+                if str(sdef.get("kind") or "") == "map_join":
+                    kids = [
+                        int(c)
+                        for c in (sdef.get("map_children") or [])
+                    ] or [
+                        j
+                        for j, d in enumerate(steps_def)
+                        if d.get("map_join_index") == i
+                    ]
+                    if kids and all(
+                        by_idx.get(c) == WorkflowStepStatus.COMPLETED.value
+                        for c in kids
+                    ):
+                        continue
+                return False
+            if st not in terminal:
+                return False
+            if st == WorkflowStepStatus.COMPLETED.value:
+                completed_n += 1
+        if completed_n < 1:
+            return False
+        updated = conn.execute(
+            """
+            UPDATE workflow_runs
+            SET status = %s,
+                current_index = %s,
+                completed_at = COALESCE(completed_at, %s),
+                updated_at = %s
+            WHERE id = %s
+              AND status = %s
+            RETURNING id
+            """,
+            (
+                WorkflowRunStatus.COMPLETED.value,
+                len(steps_def),
+                now,
+                now,
+                run_id,
+                WorkflowRunStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        return updated is not None
+
     def _complete_forward_step(
         self,
         conn: Any,
@@ -1211,37 +1312,9 @@ class WorkflowsMixin(WorkflowsMapMixin):
             visibility_timeout_seconds=vt,
             now=now,
         )
-
-        completed_n = conn.execute(
-            """
-            SELECT COUNT(*)::int AS n
-            FROM workflow_step_runs
-            WHERE run_id = %s
-              AND direction = 'forward'
-              AND status = %s
-            """,
-            (run["id"], WorkflowStepStatus.COMPLETED.value),
-        ).fetchone()
-        if completed_n and int(completed_n["n"]) >= len(steps_def):
-            conn.execute(
-                """
-                UPDATE workflow_runs
-                SET status = %s,
-                    current_index = %s,
-                    completed_at = %s,
-                    updated_at = %s
-                WHERE id = %s
-                  AND status = %s
-                """,
-                (
-                    WorkflowRunStatus.COMPLETED.value,
-                    len(steps_def),
-                    now,
-                    now,
-                    run["id"],
-                    WorkflowRunStatus.RUNNING.value,
-                ),
-            )
+        self._maybe_complete_running_workflow_locked(
+            conn, run_id=run["id"], now=now
+        )
 
     def _fail_forward_step(
         self,
@@ -1429,16 +1502,25 @@ class WorkflowsMixin(WorkflowsMapMixin):
                     continue
                 children = sdef.get("map_children")
                 if children is None:
-                    children = self._materialize_map_locked(
-                        conn,
-                        run_id=run_id,
-                        tenant_id=tenant_id,
-                        steps_def=steps_def,
-                        map_index=i,
-                        now=now,
-                    )
-                    if children is None:
-                        return n
+                    recovered = [
+                        j
+                        for j, d in enumerate(steps_def)
+                        if d.get("map_join_index") == i
+                    ]
+                    if recovered:
+                        children = recovered
+                        sdef["map_children"] = list(recovered)
+                    else:
+                        children = self._materialize_map_locked(
+                            conn,
+                            run_id=run_id,
+                            tenant_id=tenant_id,
+                            steps_def=steps_def,
+                            map_index=i,
+                            now=now,
+                        )
+                        if children is None:
+                            return n
                 child_idxs = [int(c) for c in children]
                 for ci in child_idxs:
                     if ci in existing:
@@ -1496,6 +1578,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
             existing.add(i)
             n += 1
             i += 1
+        self._maybe_complete_running_workflow_locked(conn, run_id=run_id, now=now)
         return n
 
     def _cancel_unstarted_forward_siblings(
