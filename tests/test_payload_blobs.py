@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from job_queue import JobQueue, WebhookEvent
+from job_queue import JobQueue, JobStatus, WebhookEvent
 from job_queue.blob_store import FilesystemBlobStore
 from job_queue.crypto import is_blob_pointer, is_envelope
 from job_queue.db import transaction
@@ -306,3 +306,67 @@ def test_orphan_catalog_gc_deletes_file(blob_queue: JobQueue):
     gc = blob_queue.process_payload_blobs(limit=10)
     assert gc["deleted"] >= 1
     assert not blob_queue._blob_store.exists(bid)
+
+
+def test_missing_blob_dead_letters_and_does_not_block_sibling_lease(
+    blob_queue: JobQueue,
+):
+    """A vanished spill must fail that job closed, not poison the tenant."""
+    broken = blob_queue.enqueue(
+        tenant_id="blob-miss", payload={"secret": "gone", "blob": BIG, "who": "broken"}
+    )
+    healthy = blob_queue.enqueue(
+        tenant_id="blob-miss", payload={"secret": "ok", "who": "healthy"}
+    )
+    stored = _stored(blob_queue, broken.id)
+    assert is_blob_pointer(stored)
+    blob_queue._blob_store.delete(stored["blob_id"])
+
+    # Repeating lease must not raise; the unreadable job is skipped.
+    leased = None
+    for _ in range(4):
+        got = blob_queue.lease(tenant_id="blob-miss", worker_id="w1")
+        if got is None:
+            continue
+        assert got.id != broken.id
+        leased = got
+        break
+    assert leased is not None
+    assert leased.id == healthy.id
+    assert leased.payload == {"secret": "ok", "who": "healthy"}
+
+    dead = blob_queue.get(broken.id, tenant_id="blob-miss")
+    assert dead is not None
+    assert dead.status == JobStatus.DEAD
+    assert dead.last_error is not None
+    assert "missing" in dead.last_error.lower()
+
+    listed = blob_queue.list_jobs(tenant_id="blob-miss")
+    assert {j.id for j in listed} == {broken.id, healthy.id}
+
+    again = blob_queue.lease(tenant_id="blob-miss", worker_id="w2")
+    assert again is None
+    still = blob_queue.get(broken.id, tenant_id="blob-miss")
+    assert still is not None and still.status == JobStatus.DEAD
+
+
+def test_missing_blob_is_skipped_on_fair_lease(blob_queue: JobQueue):
+    broken = blob_queue.enqueue(
+        tenant_id="blob-fair-a", payload={"secret": "gone", "blob": BIG}
+    )
+    healthy = blob_queue.enqueue(
+        tenant_id="blob-fair-b", payload={"secret": "ok", "n": 1}
+    )
+    stored = _stored(blob_queue, broken.id)
+    blob_queue._blob_store.delete(stored["blob_id"])
+
+    leased = blob_queue.lease(worker_id="fair-w")
+    assert leased is not None
+    assert leased.id == healthy.id
+    assert leased.payload["secret"] == "ok"
+
+    dead = blob_queue.get(broken.id, tenant_id="blob-fair-a")
+    assert dead is not None
+    assert dead.status == JobStatus.DEAD
+
+    assert blob_queue.lease(worker_id="fair-w") is None

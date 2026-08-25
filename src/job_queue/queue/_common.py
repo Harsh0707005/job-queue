@@ -880,6 +880,10 @@ class LeaseError(Exception):
     """Raised when a lease operation is invalid (wrong owner/tenant/token, expired, etc.)."""
 
 
+class UnreadablePayloadError(LeaseError):
+    """Spilled payload cannot be opened; the job should be fail-closed."""
+
+
 class RateLimitError(Exception):
     """Raised when a tenant exceeds its enqueue (or similar) rate limit."""
 

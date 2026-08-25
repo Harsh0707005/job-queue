@@ -7,10 +7,13 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from dataclasses import replace
+
 from job_queue.blob_store import BlobStoreError, FilesystemBlobStore
-from job_queue.crypto import is_blob_pointer
+from job_queue.crypto import REDACTED_PAYLOAD, is_blob_pointer
 from job_queue.db import transaction
-from job_queue.queue._common import _utcnow
+from job_queue.models import JobStatus, WebhookEvent
+from job_queue.queue._common import _JOB_COLUMNS, UnreadablePayloadError, _utcnow
 
 
 BLOB_KIND_PAYLOAD = "payload"
@@ -222,6 +225,137 @@ class PayloadBlobsMixin:
             """,
             (blob_id,),
         )
+
+    def _dead_letter_unreadable_payload(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        error: str,
+        worker_id: str | None,
+        now: Any,
+    ) -> dict[str, Any] | None:
+        """Mark a job dead because its spilled ciphertext cannot be opened.
+
+        Does not hydrate or decrypt. Dependents are cancelled so a missing
+        blob cannot stall a tenant's lease loop forever.
+        """
+        tenant_id = str(row["tenant_id"])
+        job_id = row["id"]
+        err = (error or "payload blob is unreadable")[:2000]
+        updated = conn.execute(
+            f"""
+            UPDATE jobs
+            SET status = %s,
+                leased_by = NULL,
+                lease_token = NULL,
+                lease_tenant_id = NULL,
+                lease_expires_at = NULL,
+                lease_started_at = NULL,
+                last_error = %s,
+                completed_at = COALESCE(completed_at, %s),
+                updated_at = %s
+            WHERE id = %s
+              AND tenant_id = %s
+              AND status IN (%s, %s)
+            RETURNING {_JOB_COLUMNS}
+            """,
+            (
+                JobStatus.DEAD.value,
+                err,
+                now,
+                now,
+                job_id,
+                tenant_id,
+                JobStatus.PENDING.value,
+                JobStatus.LEASED.value,
+            ),
+        ).fetchone()
+        if updated is None:
+            return None
+        if hasattr(self, "_orphan_blob"):
+            self._orphan_blob(conn, self._blob_id_of(row.get("payload")))
+            self._orphan_blob(conn, self._blob_id_of(row.get("result")))
+        if hasattr(self, "_append_job_audit"):
+            self._append_job_audit(
+                conn,
+                job_row=updated,
+                event_type="dead_lettered",
+                from_status=row.get("status"),
+                actor=worker_id,
+                detail={"reason": "unreadable payload blob", "error": err},
+                now=now,
+            )
+        if hasattr(self, "_record_metric"):
+            self._record_metric(
+                conn, tenant_id=tenant_id, metric="dead", count=1, now=now
+            )
+        if hasattr(self, "_cascade_cancel_dependents"):
+            self._cascade_cancel_dependents(
+                conn,
+                parent_id=job_id,
+                tenant_id=tenant_id,
+                reason=f"parent job {job_id} payload blob is unreadable",
+                now=now,
+            )
+        if updated.get("parent_job_id") is not None and hasattr(
+            self, "_maybe_wake_parent_on_join_locked"
+        ):
+            self._maybe_wake_parent_on_join_locked(
+                conn,
+                parent_id=updated["parent_job_id"],
+                tenant_id=tenant_id,
+                now=now,
+            )
+        if hasattr(self, "_fail_schedule_generation_for_job"):
+            try:
+                self._fail_schedule_generation_for_job(conn, updated)
+            except BlobStoreError:
+                pass
+        if hasattr(self, "_on_workflow_step_terminal"):
+            try:
+                self._on_workflow_step_terminal(
+                    conn, updated, success=False, error=err, now=now
+                )
+            except BlobStoreError:
+                pass
+        if hasattr(self, "_enqueue_job_webhooks"):
+            sealed = self._job(updated, decrypt=False, conn=conn)
+            hook_job = replace(
+                sealed, payload=dict(REDACTED_PAYLOAD), result=None
+            )
+            self._enqueue_job_webhooks(
+                conn, job=hook_job, event=WebhookEvent.JOB_DEAD, now=now
+            )
+        return updated
+
+    def _fail_closed_unreadable_payload(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        worker_id: str | None,
+        now: Any,
+    ) -> None:
+        """Open the spilled payload; dead-letter and raise if it cannot be read."""
+        try:
+            self._open_job_payload(
+                row.get("payload"),
+                tenant_id=str(row["tenant_id"]),
+                job_id=row["id"],
+                conn=conn,
+            )
+        except BlobStoreError as exc:
+            self._dead_letter_unreadable_payload(
+                conn,
+                row,
+                error=str(exc),
+                worker_id=worker_id,
+                now=now,
+            )
+            raise UnreadablePayloadError(
+                f"job {row['id']} payload blob is unreadable"
+            ) from exc
 
     def _orphan_blobs_for_jobs(self, conn: Any, job_ids: list[UUID]) -> None:
         if not job_ids:

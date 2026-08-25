@@ -767,14 +767,26 @@ class WorkflowsMixin(WorkflowsMapMixin):
 
         Must run inside the caller's transaction (ack/nack).
         """
-        payload = self._open_job_payload(
-            job_row.get("payload"),
-            tenant_id=str(job_row["tenant_id"]),
-            job_id=job_row["id"],
-            conn=conn,
-        )
+        from job_queue.blob_store import BlobStoreError
+
+        try:
+            payload = self._open_job_payload(
+                job_row.get("payload"),
+                tenant_id=str(job_row["tenant_id"]),
+                job_id=job_row["id"],
+                conn=conn,
+            )
+        except BlobStoreError:
+            payload = {}
         if payload.get("kind") != WORKFLOW_STEP_KIND:
-            return
+            # Regular jobs exit here. A workflow step whose blob is gone
+            # still has a step_run row — fail that step closed.
+            probe = conn.execute(
+                "SELECT 1 FROM workflow_step_runs WHERE job_id = %s LIMIT 1",
+                (job_row["id"],),
+            ).fetchone()
+            if probe is None:
+                return
         ts = now or _utcnow()
         job_id = job_row["id"]
         step = conn.execute(

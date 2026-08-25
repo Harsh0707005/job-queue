@@ -341,6 +341,20 @@ class PayloadCryptoMixin:
             data["payload"] = payload if isinstance(payload, dict) else {}
         return _row_to_job(data)
 
+    def _job_readable(
+        self,
+        row: dict[str, Any],
+        *,
+        conn: Any | None = None,
+    ) -> Job:
+        """Like ``_job`` but a missing/corrupt blob does not raise."""
+        from job_queue.blob_store import BlobStoreError
+
+        try:
+            return self._job(row, conn=conn)
+        except BlobStoreError:
+            return self._job(row, decrypt=False, conn=conn)
+
     def _schedule(
         self,
         row: dict[str, Any],

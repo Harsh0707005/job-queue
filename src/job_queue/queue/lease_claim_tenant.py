@@ -16,6 +16,7 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _NOT_TTL_EXPIRED_SQL,
     LeaseError,
+    UnreadablePayloadError,
     _deduct_resources,
     _failed_worker_avoid_sql,
     _failed_worker_prefer_sql,
@@ -147,16 +148,20 @@ class LeaseClaimTenantMixin:
             prefer_sql = _failed_worker_prefer_sql("jobs")
             affinity_sql = _last_success_worker_prefer_sql("jobs")
 
-            if conc_limit is not None and leased_count >= conc_limit:
-                # Only reclaim expired leases (does not increase concurrent
-                # holders beyond the cap in steady state). Still honor the
-                # worker inflight cap so a full worker cannot grow.
-                reclaim_take = limit
-                if worker_remaining is not None:
-                    reclaim_take = min(reclaim_take, worker_remaining)
-                if reclaim_take < 1:
-                    return []
-                candidates = conn.execute(
+            claim_passes = 0
+            while claim_passes < 4:
+                claim_passes += 1
+                fail_closed = 0
+                if conc_limit is not None and leased_count >= conc_limit:
+                    # Only reclaim expired leases (does not increase concurrent
+                    # holders beyond the cap in steady state). Still honor the
+                    # worker inflight cap so a full worker cannot grow.
+                    reclaim_take = limit
+                    if worker_remaining is not None:
+                        reclaim_take = min(reclaim_take, worker_remaining)
+                    if reclaim_take < 1:
+                        return claimed
+                    candidates = conn.execute(
                     f"""
                     SELECT {_JOB_COLUMNS}
                     FROM jobs
@@ -197,123 +202,133 @@ class LeaseClaimTenantMixin:
                         ]
                     ),
                 ).fetchall()
-            else:
-                take = limit
-                if conc_limit is not None:
-                    take = min(take, conc_limit - leased_count)
-                    take = max(take, 0)
-                if worker_remaining is not None:
-                    take = min(take, worker_remaining)
-                    take = max(take, 0)
-                if take < 1:
-                    return []
-                candidates = conn.execute(
-                    f"""
-                    SELECT {_JOB_COLUMNS}
-                    FROM jobs
-                    WHERE tenant_id = %s
-                      AND queue_name = %s
-                      {part_sql}
-                      {skill_sql}
-                      {avoid_sql}
-                      {res_sql}
-                      AND (
-                            (
-                                status = %s
-                                AND available_at <= %s
-                                AND {_DEPS_SATISFIED_SQL}
-                            )
-                         OR (
-                                status = %s
-                            AND lease_expires_at < %s
-                            AND attempts < max_attempts
-                         )
-                      )
-                      {_NOT_TTL_EXPIRED_SQL}
-                    ORDER BY {prefer_sql},
-                      priority DESC,
-                      {affinity_sql},
-                      CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
-                      (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
-                        - COALESCE(estimated_duration_seconds, 60)) ASC,
-                      created_at ASC
-                    FOR UPDATE OF jobs SKIP LOCKED
-                    LIMIT %s
-                    """,
-                    tuple(
-                        [tenant_id, queue_name]
-                        + part_params
-                        + skill_params
-                        + avoid_params
-                        + res_params
-                        + [
-                            JobStatus.PENDING.value,
-                            now,
-                            JobStatus.LEASED.value,
-                            now,
-                            now,
-                            worker_id,
-                            worker_id,
-                            now,
-                            now,
-                            take,
-                        ]
-                    ),
-                ).fetchall()
+                else:
+                    take = limit
+                    if conc_limit is not None:
+                        take = min(take, conc_limit - leased_count)
+                        take = max(take, 0)
+                    if worker_remaining is not None:
+                        take = min(take, worker_remaining)
+                        take = max(take, 0)
+                    if take < 1:
+                        return claimed
+                    candidates = conn.execute(
+                        f"""
+                        SELECT {_JOB_COLUMNS}
+                        FROM jobs
+                        WHERE tenant_id = %s
+                          AND queue_name = %s
+                          {part_sql}
+                          {skill_sql}
+                          {avoid_sql}
+                          {res_sql}
+                          AND (
+                                (
+                                    status = %s
+                                    AND available_at <= %s
+                                    AND {_DEPS_SATISFIED_SQL}
+                                )
+                             OR (
+                                    status = %s
+                                AND lease_expires_at < %s
+                                AND attempts < max_attempts
+                             )
+                          )
+                          {_NOT_TTL_EXPIRED_SQL}
+                        ORDER BY {prefer_sql},
+                          priority DESC,
+                          {affinity_sql},
+                          CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END ASC,
+                          (EXTRACT(EPOCH FROM (COALESCE(deadline_at, %s + INTERVAL '100 years') - %s))
+                            - COALESCE(estimated_duration_seconds, 60)) ASC,
+                          created_at ASC
+                        FOR UPDATE OF jobs SKIP LOCKED
+                        LIMIT %s
+                        """,
+                        tuple(
+                            [tenant_id, queue_name]
+                            + part_params
+                            + skill_params
+                            + avoid_params
+                            + res_params
+                            + [
+                                JobStatus.PENDING.value,
+                                now,
+                                JobStatus.LEASED.value,
+                                now,
+                                now,
+                                worker_id,
+                                worker_id,
+                                now,
+                                now,
+                                take,
+                            ]
+                        ),
+                    ).fetchall()
 
-            for candidate in candidates:
-                # Rebalance fence for unskilled work only. Skilled jobs may
-                # cross shards so they do not stall on an incapable owner.
-                hop_open = bool(candidate.get("failed_workers")) or (
-                    candidate["status"] == JobStatus.LEASED.value
-                )
-                affinity_hop = hasattr(self, "_job_allows_affinity_hop") and (
-                    self._job_allows_affinity_hop(conn, candidate, worker_id)
-                )
-                if (
-                    owned_parts is not None
-                    and not _row_has_required_skills(candidate)
-                    and not hop_open
-                    and not affinity_hop
-                    and hasattr(self, "_guard_partition_claim")
-                ):
-                    exp = None
-                    if part_gens is not None:
-                        exp = part_gens.get(int(candidate["partition_id"]))
-                    try:
-                        self._guard_partition_claim(
-                            conn,
-                            worker_id=worker_id,
-                            partition_id=int(candidate["partition_id"]),
-                            expected_generation=exp,
-                        )
-                    except LeaseError:
-                        continue
-                # Rate-limit new pending claims only; reclaim is free so
-                # recovery is not blocked by a noisy tenant's throttle.
-                if candidate["status"] == JobStatus.PENDING.value:
-                    if not self._try_consume_lease_rate(conn, tenant_id, now=now):
-                        break
-                cost = _resource_map_from_row(candidate.get("resource_cost"))
-                if not _job_fits_resources(
-                    cost, capacity=capacity, free=free
-                ):
-                    continue
-                try:
-                    claimed.append(
-                        self._claim_locked_job(
-                            conn,
-                            candidate,
-                            worker_id=worker_id,
-                            token=uuid4(),
-                            visibility_timeout_seconds=visibility_timeout_seconds,
-                            now=now,
-                        )
+                for candidate in candidates:
+                    # Rebalance fence for unskilled work only. Skilled jobs may
+                    # cross shards so they do not stall on an incapable owner.
+                    hop_open = bool(candidate.get("failed_workers")) or (
+                        candidate["status"] == JobStatus.LEASED.value
                     )
-                    _deduct_resources(free, cost)
-                except LeaseError:
-                    # Row no longer claimable (e.g. concurrent max-runtime release).
-                    continue
+                    affinity_hop = hasattr(self, "_job_allows_affinity_hop") and (
+                        self._job_allows_affinity_hop(conn, candidate, worker_id)
+                    )
+                    if (
+                        owned_parts is not None
+                        and not _row_has_required_skills(candidate)
+                        and not hop_open
+                        and not affinity_hop
+                        and hasattr(self, "_guard_partition_claim")
+                    ):
+                        exp = None
+                        if part_gens is not None:
+                            exp = part_gens.get(int(candidate["partition_id"]))
+                        try:
+                            self._guard_partition_claim(
+                                conn,
+                                worker_id=worker_id,
+                                partition_id=int(candidate["partition_id"]),
+                                expected_generation=exp,
+                            )
+                        except LeaseError:
+                            continue
+                    # Rate-limit new pending claims only; reclaim is free so
+                    # recovery is not blocked by a noisy tenant's throttle.
+                    if candidate["status"] == JobStatus.PENDING.value:
+                        if not self._try_consume_lease_rate(conn, tenant_id, now=now):
+                            break
+                    cost = _resource_map_from_row(candidate.get("resource_cost"))
+                    if not _job_fits_resources(
+                        cost, capacity=capacity, free=free
+                    ):
+                        continue
+                    try:
+                        claimed.append(
+                            self._claim_locked_job(
+                                conn,
+                                candidate,
+                                worker_id=worker_id,
+                                token=uuid4(),
+                                visibility_timeout_seconds=visibility_timeout_seconds,
+                                now=now,
+                            )
+                        )
+                        _deduct_resources(free, cost)
+                        leased_count += 1
+                    except UnreadablePayloadError:
+                        # Missing/corrupt blob: job is now dead. Refetch so a
+                        # sibling can fill this pull instead of returning empty.
+                        fail_closed += 1
+                        continue
+                    except LeaseError:
+                        # Row no longer claimable (e.g. concurrent max-runtime release).
+                        continue
+                    if len(claimed) >= limit:
+                        break
+                if len(claimed) >= limit or fail_closed == 0:
+                    break
         return claimed
 
     def _claim_locked_job(
@@ -422,7 +437,11 @@ class LeaseClaimTenantMixin:
                 f"job {candidate['id']} claim race "
                 f"(status changed under lock for tenant {candidate['tenant_id']!r})"
             )
-        job = self._job(row)
+        if hasattr(self, "_fail_closed_unreadable_payload"):
+            self._fail_closed_unreadable_payload(
+                conn, row, worker_id=worker_id, now=now
+            )
+        job = self._job(row, conn=conn)
         self._append_job_audit(
             conn,
             job_row=row,

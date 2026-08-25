@@ -16,6 +16,7 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _NOT_TTL_EXPIRED_SQL,
     LeaseError,
+    UnreadablePayloadError,
     _SkipLeaseCandidate,
     _failed_worker_avoid_sql,
     _failed_worker_prefer_sql,
@@ -28,6 +29,9 @@ from job_queue.queue._common import (
     _utcnow,
 )
 from job_queue.queue.tenants_breaker import _TENANT_CLAIMS_BLOCKED_SQL
+
+# Returned (not raised) so the claim transaction commits the dead-letter.
+_UNREADABLE_PAYLOAD = object()
 
 
 class LeaseClaimFairMixin:
@@ -115,6 +119,9 @@ class LeaseClaimFairMixin:
                         partitions=owned_parts,
                         partition_generations=part_gens,
                     )
+                    if job is _UNREADABLE_PAYLOAD:
+                        skips += 1
+                        continue
                     if job is None:
                         break
                     claimed.append(job)
@@ -356,14 +363,18 @@ class LeaseClaimFairMixin:
                     tenant_id=candidate["tenant_id"],
                 )
 
-        claimed = self._claim_locked_job(
-            conn,
-            candidate,
-            worker_id=worker_id,
-            token=token,
-            visibility_timeout_seconds=visibility_timeout_seconds,
-            now=now,
-        )
+        try:
+            claimed = self._claim_locked_job(
+                conn,
+                candidate,
+                worker_id=worker_id,
+                token=token,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
+        except UnreadablePayloadError:
+            # Commit the dead-letter; caller skips to the next candidate.
+            return _UNREADABLE_PAYLOAD
         # Weighted virtual time + LRS tie-break (drives the next fair pick).
         self._touch_tenant_fairness(conn, claimed.tenant_id)
         return claimed
