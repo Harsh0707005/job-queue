@@ -193,6 +193,25 @@ class PayloadBlobsMixin:
             "bytes": len(data),
         }
 
+    def _materialize_envelope(
+        self, env: Any, *, conn: Any | None = None
+    ) -> Any:
+        """Return an openable envelope: inline ``c`` or hydrate a pointer."""
+        if isinstance(env, str):
+            import json
+
+            try:
+                env = json.loads(env)
+            except json.JSONDecodeError:
+                return env
+        if not isinstance(env, dict):
+            return env
+        if isinstance(env.get("c"), str):
+            return env
+        if is_blob_pointer(env):
+            return self._hydrate_envelope(env, conn=conn)
+        return env
+
     def _hydrate_envelope(
         self, env: dict[str, Any], *, conn: Any | None = None
     ) -> dict[str, Any]:
@@ -328,6 +347,42 @@ class PayloadBlobsMixin:
                 conn, job=hook_job, event=WebhookEvent.JOB_DEAD, now=now
             )
         return updated
+
+    def _fail_closed_unreadable_delivery(
+        self,
+        conn: Any,
+        row: dict[str, Any],
+        *,
+        now: Any,
+    ) -> None:
+        """Open a webhook delivery payload; dead-letter if the blob is gone."""
+        from job_queue.crypto import delivery_aad
+
+        try:
+            self._open_dict(
+                row.get("payload"),
+                tenant_id=str(row["tenant_id"]),
+                aad=delivery_aad(row["id"]),
+                conn=conn,
+            )
+        except BlobStoreError as exc:
+            conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status = 'dead',
+                    delivering_until = NULL,
+                    last_error = %s,
+                    completed_at = COALESCE(completed_at, %s),
+                    updated_at = %s
+                WHERE id = %s
+                  AND status IN ('pending', 'delivering')
+                """,
+                (str(exc)[:2000], now, now, row["id"]),
+            )
+            self._orphan_blob(conn, self._blob_id_of(row.get("payload")))
+            raise UnreadablePayloadError(
+                f"delivery {row['id']} payload blob is unreadable"
+            ) from exc
 
     def _fail_closed_unreadable_payload(
         self,

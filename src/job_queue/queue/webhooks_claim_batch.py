@@ -240,7 +240,19 @@ class WebhooksClaimBatchMixin:
                         now=now,
                     )
                     continue
-                delivery = self._row_to_webhook_delivery(row)
+                try:
+                    if hasattr(self, "_fail_closed_unreadable_delivery"):
+                        self._fail_closed_unreadable_delivery(
+                            conn, row, now=now
+                        )
+                    delivery = self._row_to_webhook_delivery(row, conn=conn)
+                except Exception as exc:
+                    from job_queue.blob_store import BlobStoreError
+                    from job_queue.queue._common import UnreadablePayloadError
+
+                    if not isinstance(exc, (BlobStoreError, UnreadablePayloadError)):
+                        raise
+                    continue
                 url = row.get("_ep_url")
                 secret = row.get("_sign_secret")
                 enabled = row.get("_ep_enabled")

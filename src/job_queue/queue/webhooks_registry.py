@@ -219,14 +219,18 @@ class WebhooksRegistryMixin:
         if isinstance(payload, str):
             payload = json.loads(payload)
         if decrypt and isinstance(payload, dict):
+            from job_queue.blob_store import BlobStoreError
             from job_queue.crypto import delivery_aad
 
-            payload = self._open_dict(
-                payload,
-                tenant_id=str(row["tenant_id"]),
-                aad=delivery_aad(row["id"]),
-                conn=conn,
-            )
+            try:
+                payload = self._open_dict(
+                    payload,
+                    tenant_id=str(row["tenant_id"]),
+                    aad=delivery_aad(row["id"]),
+                    conn=conn,
+                )
+            except BlobStoreError:
+                payload = payload if isinstance(payload, dict) else {}
         return WebhookDelivery(
             id=row["id"],
             endpoint_id=row["endpoint_id"],

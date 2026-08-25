@@ -163,6 +163,88 @@ def test_rotate_rewrites_spilled_ciphertext(blob_queue: JobQueue):
     assert not blob_queue._blob_store.exists(old_blob)
 
 
+def test_export_restore_onto_empty_blob_store(blob_queue: JobQueue, tmp_path):
+    """Fresh dest fleet: snapshot carries ciphertext; dest rebuilds files."""
+    from job_queue.blob_store import FilesystemBlobStore
+    from tests.helpers_queue import _WebhookCapture
+
+    capture = _WebhookCapture()
+    try:
+        blob_queue.register_webhook(
+            tenant_id="blob-fresh-src",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="hook",
+        )
+        secret = "fresh-fleet-secret"
+        src = blob_queue.enqueue(
+            tenant_id="blob-fresh-src",
+            payload={"secret": secret, "blob": BIG, "n": 1},
+            queue_name="email",
+        )
+        pending = blob_queue.enqueue(
+            tenant_id="blob-fresh-src",
+            payload={"secret": secret, "blob": BIG, "n": 2},
+            queue_name="email",
+        )
+        leased = blob_queue.lease(
+            tenant_id="blob-fresh-src", worker_id="w", queue_name="email"
+        )
+        assert leased is not None
+        _ack(blob_queue, leased, "w", result={"out": secret, "blob": BIG})
+        snap = blob_queue.export_tenant("blob-fresh-src")
+        assert snap.status == "ready"
+        assert snap.counts.get("payload_blobs", 0) >= 1
+
+        # Simulate a new fleet with an empty blob volume.
+        blob_queue._blob_store = FilesystemBlobStore(tmp_path / "fresh-dest")
+        rst = blob_queue.restore_tenant(
+            "blob-fresh-dst",
+            snapshot_id=snap.id,
+            batch_size=20,
+            run_until_complete=True,
+        )
+        assert rst.status == "complete"
+        dst = blob_queue.list_jobs(tenant_id="blob-fresh-dst")
+        assert len(dst) == 2
+        completed = [j for j in dst if j.status == JobStatus.COMPLETED]
+        assert completed
+        got = blob_queue.get(completed[0].id, tenant_id="blob-fresh-dst")
+        assert got is not None
+        assert got.payload == {"secret": secret, "blob": BIG, "n": 1}
+        assert got.result == {"out": secret, "blob": BIG}
+        stored = _stored(blob_queue, got.id)
+        assert is_blob_pointer(stored)
+        assert blob_queue._blob_store.exists(stored["blob_id"])
+        assert secret not in json.dumps(stored)
+
+        dest_leased = blob_queue.lease(
+            tenant_id="blob-fresh-dst", worker_id="dw", queue_name="email"
+        )
+        assert dest_leased is not None
+        assert dest_leased.id != src.id
+        assert dest_leased.id != pending.id
+        assert dest_leased.payload["secret"] == secret
+        _ack(blob_queue, dest_leased, "dw")
+
+        rot = blob_queue.rotate_tenant_payload_key("blob-fresh-dst")
+        for _ in range(10):
+            rot = blob_queue.advance_payload_key_rotation(
+                "blob-fresh-dst", batch_size=8
+            )
+            if rot.status == "complete":
+                break
+        assert rot.status == "complete"
+        after = blob_queue.get(got.id, tenant_id="blob-fresh-dst")
+        assert after is not None and after.payload["secret"] == secret
+
+        deliveries = blob_queue.list_webhook_deliveries(tenant_id="blob-fresh-dst")
+        assert deliveries
+        assert deliveries[0].payload["payload"]["secret"] == secret
+    finally:
+        capture.stop()
+
+
 def test_export_restore_keeps_spilled_plaintext(blob_queue: JobQueue):
     secret = "export-blob-secret"
     src = blob_queue.enqueue(
@@ -348,6 +430,46 @@ def test_missing_blob_dead_letters_and_does_not_block_sibling_lease(
     assert again is None
     still = blob_queue.get(broken.id, tenant_id="blob-miss")
     assert still is not None and still.status == JobStatus.DEAD
+
+
+def test_missing_delivery_blob_does_not_break_webhook_claim(blob_queue: JobQueue):
+    capture = _WebhookCapture()
+    try:
+        blob_queue.register_webhook(
+            tenant_id="blob-wh-miss",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="hook",
+        )
+        blob_queue.enqueue(
+            tenant_id="blob-wh-miss",
+            payload={"secret": "gone", "blob": BIG},
+        )
+        job = blob_queue.lease(tenant_id="blob-wh-miss", worker_id="w")
+        assert job is not None
+        _ack(blob_queue, job, "w", result={"out": "gone", "blob": BIG})
+        pending = blob_queue.list_webhook_deliveries(
+            tenant_id="blob-wh-miss", status="pending"
+        )
+        assert pending
+        with blob_queue._pool.connection() as conn:
+            raw = conn.execute(
+                "SELECT payload FROM webhook_deliveries WHERE tenant_id = %s",
+                ("blob-wh-miss",),
+            ).fetchone()["payload"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        assert is_blob_pointer(raw)
+        blob_queue._blob_store.delete(raw["blob_id"])
+        # Must not raise; unreadable delivery is fail-closed.
+        blob_queue.process_webhook_deliveries(limit=10)
+        dead = blob_queue.list_webhook_deliveries(
+            tenant_id="blob-wh-miss", status="dead"
+        )
+        assert dead
+        assert blob_queue.process_webhook_deliveries(limit=10) == []
+    finally:
+        capture.stop()
 
 
 def test_missing_blob_is_skipped_on_fair_lease(blob_queue: JobQueue):

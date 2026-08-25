@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import datetime, time
 from typing import Any
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from job_queue.crypto import is_blob_pointer
 from job_queue.db import transaction
 from job_queue.models import TenantSnapshot
 from job_queue.queue._common import (
@@ -343,6 +345,15 @@ class TenantsExportMixin:
             return self._capture_payload_blobs(
                 conn, snapshot_id=snapshot_id, tenant_id=tenant_id
             )
+        if kind in ("jobs", "webhook_deliveries"):
+            return self._capture_kind_with_blob_bytes(
+                conn,
+                snapshot_id=snapshot_id,
+                kind=kind,
+                table=table,
+                cols=cols,
+                tenant_id=tenant_id,
+            )
         if kind == "alert_rules":
             where = "tenant_id = %s OR (scope = 'tenant' AND tenant_id = %s)"
             params: tuple[Any, ...] = (tenant_id, tenant_id)
@@ -395,10 +406,81 @@ class TenantsExportMixin:
                 break
         return total
 
-    def _capture_payload_blobs(
-        self, conn: Any, *, snapshot_id: UUID, tenant_id: str
+    def _snapshot_sealed_value(self, value: Any) -> Any:
+        """Copy ciphertext into the snapshot so restore does not need files.
+
+        Blob pointers become a full envelope (``c`` present). Missing files
+        stay as pointers; restore then fail-closes that row instead of
+        poisoning dest lease.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        if not isinstance(value, dict):
+            return value
+        if is_blob_pointer(value) and hasattr(self, "_hydrate_envelope"):
+            try:
+                return self._hydrate_envelope(value)
+            except Exception:
+                return value
+        return value
+
+    def _capture_kind_with_blob_bytes(
+        self,
+        conn: Any,
+        *,
+        snapshot_id: UUID,
+        kind: str,
+        table: str,
+        cols: str,
+        tenant_id: str,
     ) -> int:
-        store = getattr(self, "_blob_store", None)
+        total = 0
+        seq = 0
+        offset = 0
+        order = "id ASC"
+        while True:
+            rows = conn.execute(
+                f"""
+                SELECT {cols}
+                FROM {table}
+                WHERE tenant_id = %s
+                ORDER BY {order}
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, CHUNK, offset),
+            ).fetchall()
+            if not rows:
+                break
+            blob: list[dict[str, Any]] = []
+            for r in rows:
+                item = _jsonable(dict(r))
+                if "payload" in item:
+                    item["payload"] = self._snapshot_sealed_value(item.get("payload"))
+                if "result" in item and item.get("result") is not None:
+                    item["result"] = self._snapshot_sealed_value(item.get("result"))
+                blob.append(item)
+            conn.execute(
+                """
+                INSERT INTO tenant_snapshot_blobs (
+                    snapshot_id, kind, seq, row_count, rows
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (snapshot_id, kind, seq, len(blob), Jsonb(blob)),
+            )
+            total += len(rows)
+            seq += 1
+            offset += len(rows)
+            if len(rows) < CHUNK:
+                break
+        return total
+
+    def _iter_tenant_blob_refs(
+        self, conn: Any, tenant_id: str
+    ) -> dict[UUID, dict[str, Any]]:
+        refs: dict[UUID, dict[str, Any]] = {}
         rows = conn.execute(
             """
             SELECT id, tenant_id, job_id, kind, sha256, nbytes, key_id,
@@ -409,26 +491,79 @@ class TenantsExportMixin:
             """,
             (tenant_id,),
         ).fetchall()
-        if not rows:
-            return 0
-        out: list[dict[str, Any]] = []
         for r in rows:
-            item = _jsonable(dict(r))
-            bid = r["id"]
-            data_b64 = ""
-            if store is not None:
-                try:
-                    data_b64 = base64.b64encode(store.read(bid)).decode("ascii")
-                except Exception:
-                    data_b64 = ""
-            item["data_b64"] = data_b64
-            out.append(item)
-        conn.execute(
+            refs[r["id"]] = dict(r)
+        pointer_rows = conn.execute(
             """
-            INSERT INTO tenant_snapshot_blobs (
-                snapshot_id, kind, seq, row_count, rows
-            ) VALUES (%s, %s, %s, %s, %s)
+            SELECT id AS job_id, payload, result FROM jobs WHERE tenant_id = %s
+            UNION ALL
+            SELECT job_id, payload, NULL FROM webhook_deliveries
+            WHERE tenant_id = %s
             """,
-            (snapshot_id, "payload_blobs", 0, len(out), Jsonb(out)),
-        )
-        return len(out)
+            (tenant_id, tenant_id),
+        ).fetchall()
+        for r in pointer_rows:
+            for col in ("payload", "result"):
+                bid = (
+                    self._blob_id_of(r.get(col))
+                    if hasattr(self, "_blob_id_of")
+                    else None
+                )
+                if bid is None or bid in refs:
+                    continue
+                refs[bid] = {
+                    "id": bid,
+                    "tenant_id": tenant_id,
+                    "job_id": r.get("job_id"),
+                    "kind": "other",
+                    "sha256": "",
+                    "nbytes": 0,
+                    "key_id": None,
+                    "status": "committed",
+                    "created_at": None,
+                    "committed_at": None,
+                }
+        return refs
+
+    def _capture_payload_blobs(
+        self, conn: Any, *, snapshot_id: UUID, tenant_id: str
+    ) -> int:
+        store = getattr(self, "_blob_store", None)
+        refs = self._iter_tenant_blob_refs(conn, tenant_id)
+        if not refs:
+            return 0
+        items = sorted(refs.values(), key=lambda r: str(r.get("id")))
+        seq = 0
+        total = 0
+        for start in range(0, len(items), CHUNK):
+            chunk = items[start : start + CHUNK]
+            out: list[dict[str, Any]] = []
+            for r in chunk:
+                item = _jsonable(dict(r))
+                bid = r["id"]
+                data_b64 = ""
+                if store is not None:
+                    try:
+                        raw = store.read(bid)
+                        data_b64 = base64.b64encode(raw).decode("ascii")
+                        if not item.get("nbytes"):
+                            item["nbytes"] = len(raw)
+                        if not item.get("sha256"):
+                            import hashlib
+
+                            item["sha256"] = hashlib.sha256(raw).hexdigest()
+                    except Exception:
+                        data_b64 = ""
+                item["data_b64"] = data_b64
+                out.append(item)
+            conn.execute(
+                """
+                INSERT INTO tenant_snapshot_blobs (
+                    snapshot_id, kind, seq, row_count, rows
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (snapshot_id, "payload_blobs", seq, len(out), Jsonb(out)),
+            )
+            total += len(out)
+            seq += 1
+        return total

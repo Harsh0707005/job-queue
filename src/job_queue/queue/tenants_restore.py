@@ -482,8 +482,13 @@ class TenantsRestoreMixin:
         blob_id = UUID(str(bid))
         data_b64 = raw.get("data_b64") or ""
         store = getattr(self, "_blob_store", None)
+        file_ok = False
         if store is not None and data_b64:
             store.write(blob_id, base64.b64decode(data_b64))
+            file_ok = True
+        status = str(raw.get("status") or "committed")
+        if not file_ok and not data_b64:
+            status = "orphan"
         conn.execute(
             """
             INSERT INTO job_payload_blobs (
@@ -503,7 +508,7 @@ class TenantsRestoreMixin:
                 raw.get("sha256") or "",
                 int(raw.get("nbytes") or 0),
                 raw.get("key_id"),
-                raw.get("status") or "committed",
+                status,
                 raw.get("created_at"),
                 raw.get("committed_at"),
             ),
@@ -939,12 +944,26 @@ class TenantsRestoreMixin:
         old_payload_blob = (
             self._blob_id_of(payload) if hasattr(self, "_blob_id_of") else None
         )
-        plain = self._open_dict(
-            payload,
-            tenant_id=target,
-            aad=job_aad(old_id),
-            conn=conn,
-        )
+        restore_error: str | None = None
+        if hasattr(self, "_materialize_envelope"):
+            try:
+                payload = self._materialize_envelope(payload, conn=conn)
+            except Exception as exc:  # noqa: BLE001
+                restore_error = str(exc)
+        try:
+            if restore_error:
+                raise RuntimeError(restore_error)
+            plain = self._open_dict(
+                payload,
+                tenant_id=target,
+                aad=job_aad(old_id),
+                conn=conn,
+            )
+        except Exception as exc:  # noqa: BLE001
+            from job_queue.crypto import REDACTED_PAYLOAD
+
+            restore_error = str(exc)
+            plain = dict(REDACTED_PAYLOAD)
         sealed, kid = self._seal_dict(
             conn,
             tenant_id=target,
@@ -956,7 +975,7 @@ class TenantsRestoreMixin:
         result = raw.get("result")
         sealed_result = None
         old_result_blob = None
-        if result is not None:
+        if result is not None and not restore_error:
             if isinstance(result, str):
                 try:
                     result = json.loads(result)
@@ -967,17 +986,24 @@ class TenantsRestoreMixin:
                 if hasattr(self, "_blob_id_of")
                 else None
             )
-            opened = self._open_json_value(
-                result, tenant_id=target, aad=result_aad(old_id), conn=conn
-            )
-            sealed_result, _ = self._seal_json_value(
-                conn,
-                tenant_id=target,
-                value=opened,
-                aad=result_aad(new_id),
-                job_id=new_id,
-                blob_kind="result",
-            )
+            if hasattr(self, "_materialize_envelope") and result is not None:
+                try:
+                    result = self._materialize_envelope(result, conn=conn)
+                except Exception as exc:  # noqa: BLE001
+                    restore_error = str(exc)
+                    result = None
+            if result is not None:
+                opened = self._open_json_value(
+                    result, tenant_id=target, aad=result_aad(old_id), conn=conn
+                )
+                sealed_result, _ = self._seal_json_value(
+                    conn,
+                    tenant_id=target,
+                    value=opened,
+                    aad=result_aad(new_id),
+                    job_id=new_id,
+                    blob_kind="result",
+                )
         if hasattr(self, "_orphan_blob"):
             new_payload_blob = self._blob_id_of(sealed)
             if old_payload_blob and old_payload_blob != new_payload_blob:
@@ -992,7 +1018,14 @@ class TenantsRestoreMixin:
         lease_tenant_id = raw.get("lease_tenant_id")
         lease_expires_at = _parse_dt(raw.get("lease_expires_at"))
         lease_started_at = _parse_dt(raw.get("lease_started_at"))
-        if status == "leased":
+        if restore_error:
+            status = "dead"
+            leased_by = None
+            lease_token = None
+            lease_tenant_id = None
+            lease_expires_at = None
+            lease_started_at = None
+        elif status == "leased":
             status = "pending"
             attempts = max(0, attempts - 1)
             leased_by = None
@@ -1086,7 +1119,8 @@ class TenantsRestoreMixin:
                 lease_started_at,
                 _parse_dt(raw.get("created_at")) or _utcnow(),
                 _parse_dt(raw.get("updated_at")) or _utcnow(),
-                _parse_dt(raw.get("completed_at")),
+                _parse_dt(raw.get("completed_at"))
+                or (_utcnow() if restore_error else None),
                 Jsonb(sealed_result) if sealed_result is not None else None,
                 Jsonb(raw["checkpoint"])
                 if isinstance(raw.get("checkpoint"), (dict, list))
@@ -1106,7 +1140,11 @@ class TenantsRestoreMixin:
                 _parse_dt(raw.get("await_children_deadline_at")),
                 raw.get("await_children_outcome"),
                 _parse_dt(raw.get("await_children_resolved_at")),
-                raw.get("last_error"),
+                (
+                    f"restore: {restore_error}"[:2000]
+                    if restore_error
+                    else raw.get("last_error")
+                ),
                 part_id,
                 kid,
             ),
@@ -1303,12 +1341,22 @@ class TenantsRestoreMixin:
         old_blob = (
             self._blob_id_of(payload) if hasattr(self, "_blob_id_of") else None
         )
-        plain = self._open_dict(
-            payload,
-            tenant_id=target,
-            aad=delivery_aad(old_id),
-            conn=conn,
-        )
+        if hasattr(self, "_materialize_envelope"):
+            try:
+                payload = self._materialize_envelope(payload, conn=conn)
+            except Exception:
+                payload = payload
+        try:
+            plain = self._open_dict(
+                payload,
+                tenant_id=target,
+                aad=delivery_aad(old_id),
+                conn=conn,
+            )
+        except Exception:
+            from job_queue.crypto import REDACTED_PAYLOAD
+
+            plain = dict(REDACTED_PAYLOAD)
         if isinstance(plain.get("job_id"), str) and job_id is not None:
             plain["job_id"] = str(job_id)
         if isinstance(plain.get("delivery_id"), str):
