@@ -131,6 +131,8 @@ class PayloadCryptoMixin:
         tenant_id: str,
         plaintext: dict[str, Any],
         aad: bytes,
+        job_id: UUID | None = None,
+        blob_kind: str | None = None,
     ) -> tuple[dict[str, Any], UUID]:
         if not isinstance(plaintext, dict):
             raise ValueError("plaintext must be a dict")
@@ -143,6 +145,17 @@ class PayloadCryptoMixin:
             plaintext=plaintext,
             aad=aad,
         )
+        if hasattr(self, "_should_spill_envelope") and self._should_spill_envelope(
+            env
+        ):
+            kind = blob_kind or "other"
+            env = self._spill_envelope(
+                conn,
+                env,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                kind=kind,
+            )
         return env, rec.key_id
 
     def _open_dict(
@@ -162,8 +175,11 @@ class PayloadCryptoMixin:
             return {}
         if not is_envelope(payload):
             return payload
-        dek = self._load_dek(conn, tenant_id, UUID(str(payload["kid"])))
-        return decrypt_json(dek, payload, aad=aad)
+        env = payload
+        if hasattr(self, "_hydrate_envelope"):
+            env = self._hydrate_envelope(env, conn=conn)
+        dek = self._load_dek(conn, tenant_id, UUID(str(env["kid"])))
+        return decrypt_json(dek, env, aad=aad)
 
     def _seal_job_payload(
         self,
@@ -174,7 +190,12 @@ class PayloadCryptoMixin:
         payload: dict[str, Any],
     ) -> tuple[dict[str, Any], UUID]:
         return self._seal_dict(
-            conn, tenant_id=tenant_id, plaintext=payload, aad=job_aad(job_id)
+            conn,
+            tenant_id=tenant_id,
+            plaintext=payload,
+            aad=job_aad(job_id),
+            job_id=job_id,
+            blob_kind="payload",
         )
 
     def _seal_schedule_payload(
@@ -226,12 +247,16 @@ class PayloadCryptoMixin:
         tenant_id: str,
         value: Any,
         aad: bytes,
+        job_id: UUID | None = None,
+        blob_kind: str = "result",
     ) -> tuple[dict[str, Any], UUID]:
         return self._seal_dict(
             conn,
             tenant_id=tenant_id,
             plaintext={"_jq_val": value},
             aad=aad,
+            job_id=job_id,
+            blob_kind=blob_kind,
         )
 
     def _open_json_value(

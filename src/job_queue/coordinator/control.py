@@ -183,6 +183,8 @@ class CoordinatorControlLoop:
             return
         try:
             self.queue.purge_expired_jobs(limit=self.retention_limit, **fence)
+            if hasattr(self.queue, "process_payload_blobs"):
+                self.queue.process_payload_blobs(limit=self.retention_limit)
             self.queue.bump_control_tick(
                 lease_token=token,
                 kind="retention",

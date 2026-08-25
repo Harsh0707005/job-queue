@@ -470,6 +470,45 @@ class TenantsRestoreMixin:
             n += 1
         return n
 
+    def _restore_payload_blobs(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        import base64
+        from uuid import UUID
+
+        bid = raw.get("id")
+        if not bid:
+            return
+        blob_id = UUID(str(bid))
+        data_b64 = raw.get("data_b64") or ""
+        store = getattr(self, "_blob_store", None)
+        if store is not None and data_b64:
+            store.write(blob_id, base64.b64decode(data_b64))
+        conn.execute(
+            """
+            INSERT INTO job_payload_blobs (
+                id, tenant_id, job_id, kind, sha256, nbytes, key_id,
+                status, created_at, committed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, COALESCE(%s, NOW()), %s
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                blob_id,
+                target,
+                raw.get("job_id"),
+                raw.get("kind") or "other",
+                raw.get("sha256") or "",
+                int(raw.get("nbytes") or 0),
+                raw.get("key_id"),
+                raw.get("status") or "committed",
+                raw.get("created_at"),
+                raw.get("committed_at"),
+            ),
+        )
+
     def _restore_payload_keys(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:
@@ -895,24 +934,57 @@ class TenantsRestoreMixin:
         payload = raw.get("payload") or {}
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            payload = {}
+        old_payload_blob = (
+            self._blob_id_of(payload) if hasattr(self, "_blob_id_of") else None
+        )
         plain = self._open_dict(
-            payload if isinstance(payload, dict) else {},
+            payload,
             tenant_id=target,
             aad=job_aad(old_id),
             conn=conn,
         )
         sealed, kid = self._seal_dict(
-            conn, tenant_id=target, plaintext=plain, aad=job_aad(new_id)
+            conn,
+            tenant_id=target,
+            plaintext=plain,
+            aad=job_aad(new_id),
+            job_id=new_id,
+            blob_kind="payload",
         )
         result = raw.get("result")
         sealed_result = None
+        old_result_blob = None
         if result is not None:
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except json.JSONDecodeError:
+                    result = None
+            old_result_blob = (
+                self._blob_id_of(result)
+                if hasattr(self, "_blob_id_of")
+                else None
+            )
             opened = self._open_json_value(
                 result, tenant_id=target, aad=result_aad(old_id), conn=conn
             )
             sealed_result, _ = self._seal_json_value(
-                conn, tenant_id=target, value=opened, aad=result_aad(new_id)
+                conn,
+                tenant_id=target,
+                value=opened,
+                aad=result_aad(new_id),
+                job_id=new_id,
+                blob_kind="result",
             )
+        if hasattr(self, "_orphan_blob"):
+            new_payload_blob = self._blob_id_of(sealed)
+            if old_payload_blob and old_payload_blob != new_payload_blob:
+                self._orphan_blob(conn, old_payload_blob)
+            new_result_blob = self._blob_id_of(sealed_result)
+            if old_result_blob and old_result_blob != new_result_blob:
+                self._orphan_blob(conn, old_result_blob)
         status = str(raw.get("status") or "pending")
         attempts = int(raw.get("attempts") or 0)
         leased_by = raw.get("leased_by")
@@ -1226,8 +1298,13 @@ class TenantsRestoreMixin:
         payload = raw.get("payload") or {}
         if isinstance(payload, str):
             payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            payload = {}
+        old_blob = (
+            self._blob_id_of(payload) if hasattr(self, "_blob_id_of") else None
+        )
         plain = self._open_dict(
-            payload if isinstance(payload, dict) else {},
+            payload,
             tenant_id=target,
             aad=delivery_aad(old_id),
             conn=conn,
@@ -1239,8 +1316,17 @@ class TenantsRestoreMixin:
         if isinstance(plain.get("tenant_id"), str):
             plain["tenant_id"] = target
         sealed, kid = self._seal_dict(
-            conn, tenant_id=target, plaintext=plain, aad=delivery_aad(new_id)
+            conn,
+            tenant_id=target,
+            plaintext=plain,
+            aad=delivery_aad(new_id),
+            job_id=job_id,
+            blob_kind="delivery",
         )
+        if hasattr(self, "_orphan_blob"):
+            new_blob = self._blob_id_of(sealed)
+            if old_blob and old_blob != new_blob:
+                self._orphan_blob(conn, old_blob)
         status = str(raw.get("status") or "pending")
         delivering_until = _parse_dt(raw.get("delivering_until"))
         if status == "delivering":

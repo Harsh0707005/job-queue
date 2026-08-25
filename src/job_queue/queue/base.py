@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import os
+from pathlib import Path
+import tempfile
+
+from job_queue.blob_store import FilesystemBlobStore
 from job_queue.crypto import PayloadCrypto
 from job_queue.db import init_schema
 from job_queue.queue._common import (
@@ -33,6 +38,16 @@ class BaseMixin:
         # suites that never join membership still lease freely.
         self.require_worker_registration = True
         self._crypto = PayloadCrypto.from_env()
+        blob_dir = (
+            os.environ.get("JOB_QUEUE_BLOB_DIR")
+            or str(Path(tempfile.gettempdir()) / "job-queue-blobs")
+        )
+        self._blob_store = FilesystemBlobStore(blob_dir)
+        raw_thr = os.environ.get("JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD") or "32768"
+        try:
+            self.payload_blob_threshold_bytes = int(raw_thr)
+        except (TypeError, ValueError):
+            self.payload_blob_threshold_bytes = 32768
 
     @classmethod
     def connect(

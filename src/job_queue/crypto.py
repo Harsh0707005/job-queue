@@ -92,14 +92,29 @@ def load_keks_from_env(
     return keks, active_id
 
 
-def is_envelope(payload: Any) -> bool:
+def is_blob_pointer(payload: Any) -> bool:
+    """True when ciphertext lives in blob storage, not inline ``c``."""
     return (
         isinstance(payload, dict)
         and payload.get(ENVELOPE_MARKER) == ENVELOPE_VERSION
         and isinstance(payload.get("kid"), str)
         and isinstance(payload.get("n"), str)
-        and isinstance(payload.get("c"), str)
+        and isinstance(payload.get("blob_id"), str)
+        and not isinstance(payload.get("c"), str)
     )
+
+
+def is_envelope(payload: Any) -> bool:
+    if not (
+        isinstance(payload, dict)
+        and payload.get(ENVELOPE_MARKER) == ENVELOPE_VERSION
+        and isinstance(payload.get("kid"), str)
+        and isinstance(payload.get("n"), str)
+    ):
+        return False
+    if isinstance(payload.get("c"), str):
+        return True
+    return is_blob_pointer(payload)
 
 
 def job_aad(job_id: UUID | str) -> bytes:

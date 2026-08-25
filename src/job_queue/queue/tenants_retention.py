@@ -308,6 +308,8 @@ class TenantsRetentionMixin:
             all_ids = completed_ids + dead_ids
             side_n = 0
             if all_ids:
+                if hasattr(self, "_orphan_blobs_for_jobs"):
+                    self._orphan_blobs_for_jobs(conn, all_ids)
                 se = conn.execute(
                     """
                     DELETE FROM job_side_effects

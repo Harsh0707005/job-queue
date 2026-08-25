@@ -182,10 +182,16 @@ class RemoteWorkerDoWorkMixin:
                 time.sleep(min(0.1, max(0.01, deadline - time.time())))
         else:
             time.sleep(0.02)
-        return {
+        out = {
             "ok": True,
             "worker_id": self.worker_id,
             "tenant_id": job.tenant_id,
             "schedule_id": str(job.schedule_id) if job.schedule_id else None,
             "host": socket.gethostname(),
         }
+        # Soak / test hook: echo a declared result (can be large so the
+        # coordinator spills the ack body out of Postgres).
+        declared = payload.get("ack_result")
+        if isinstance(declared, dict):
+            out.update(declared)
+        return out

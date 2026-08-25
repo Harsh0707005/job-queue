@@ -228,6 +228,14 @@ class TenantsMergeMixin:
                 """,
                 (target, now, source),
             ).fetchall()
+            conn.execute(
+                """
+                UPDATE job_payload_blobs
+                SET tenant_id = %s
+                WHERE tenant_id = %s
+                """,
+                (target, source),
+            )
             for jm in jobs_moved:
                 moved_row = conn.execute(
                     f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",

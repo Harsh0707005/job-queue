@@ -1550,6 +1550,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_restores_one_active_target
     ON tenant_restores (target_tenant_id)
     WHERE status = 'restoring';
 
+-- Spilled ciphertext for large job payloads / results (JSONB stays tiny).
+CREATE TABLE IF NOT EXISTS job_payload_blobs (
+    id              UUID PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    job_id          UUID,
+    kind            TEXT NOT NULL,
+    sha256          TEXT NOT NULL,
+    nbytes          INTEGER NOT NULL,
+    key_id          UUID,
+    status          TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    committed_at    TIMESTAMPTZ,
+    CONSTRAINT job_payload_blobs_kind_check CHECK (
+        kind IN ('payload', 'result', 'delivery', 'other')
+    ),
+    CONSTRAINT job_payload_blobs_status_check CHECK (
+        status IN ('pending', 'committed', 'orphan')
+    ),
+    CONSTRAINT job_payload_blobs_nbytes_check CHECK (nbytes >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_payload_blobs_tenant
+    ON job_payload_blobs (tenant_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_job_payload_blobs_job
+    ON job_payload_blobs (job_id)
+    WHERE job_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_job_payload_blobs_gc
+    ON job_payload_blobs (status, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_tenant_restores_target
     ON tenant_restores (target_tenant_id, created_at DESC);
 

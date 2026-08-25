@@ -27,6 +27,7 @@ CHUNK = 200
 # before deliveries, runs before steps.
 SNAPSHOT_KINDS: tuple[str, ...] = (
     "payload_keys",
+    "payload_blobs",
     "payload_key_rotations",
     "tenant_settings",
     "tenant_fairness",
@@ -52,6 +53,11 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
 )
 
 _KIND_SQL: dict[str, tuple[str, str]] = {
+    "payload_blobs": (
+        "id, tenant_id, job_id, kind, sha256, nbytes, key_id, status, "
+        "created_at, committed_at",
+        "job_payload_blobs",
+    ),
     "payload_keys": (
         "tenant_id, key_id, wrapped_dek, wrap_nonce, kek_id, status, "
         "created_at, retired_at",
@@ -333,6 +339,10 @@ class TenantsExportMixin:
         cols: str,
         tenant_id: str,
     ) -> int:
+        if kind == "payload_blobs":
+            return self._capture_payload_blobs(
+                conn, snapshot_id=snapshot_id, tenant_id=tenant_id
+            )
         if kind == "alert_rules":
             where = "tenant_id = %s OR (scope = 'tenant' AND tenant_id = %s)"
             params: tuple[Any, ...] = (tenant_id, tenant_id)
@@ -384,3 +394,41 @@ class TenantsExportMixin:
             if len(rows) < CHUNK:
                 break
         return total
+
+    def _capture_payload_blobs(
+        self, conn: Any, *, snapshot_id: UUID, tenant_id: str
+    ) -> int:
+        store = getattr(self, "_blob_store", None)
+        rows = conn.execute(
+            """
+            SELECT id, tenant_id, job_id, kind, sha256, nbytes, key_id,
+                   status, created_at, committed_at
+            FROM job_payload_blobs
+            WHERE tenant_id = %s
+            ORDER BY created_at ASC, id ASC
+            """,
+            (tenant_id,),
+        ).fetchall()
+        if not rows:
+            return 0
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item = _jsonable(dict(r))
+            bid = r["id"]
+            data_b64 = ""
+            if store is not None:
+                try:
+                    data_b64 = base64.b64encode(store.read(bid)).decode("ascii")
+                except Exception:
+                    data_b64 = ""
+            item["data_b64"] = data_b64
+            out.append(item)
+        conn.execute(
+            """
+            INSERT INTO tenant_snapshot_blobs (
+                snapshot_id, kind, seq, row_count, rows
+            ) VALUES (%s, %s, %s, %s, %s)
+            """,
+            (snapshot_id, "payload_blobs", 0, len(out), Jsonb(out)),
+        )
+        return len(out)

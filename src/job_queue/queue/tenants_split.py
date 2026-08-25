@@ -240,6 +240,16 @@ class TenantsSplitMixin:
                             f"on job {conflict['id']}",
                             plan=plan,
                         )
+                old_payload_blob = (
+                    self._blob_id_of(row.get("payload"))
+                    if hasattr(self, "_blob_id_of")
+                    else None
+                )
+                old_result_blob = (
+                    self._blob_id_of(row.get("result"))
+                    if hasattr(self, "_blob_id_of")
+                    else None
+                )
                 sealed, payload_key_id = self._seal_job_payload(
                     conn,
                     tenant_id=dest,
@@ -256,7 +266,16 @@ class TenantsSplitMixin:
                         tenant_id=dest,
                         value=job.result,
                         aad=result_aad(job.id),
+                        job_id=job.id,
+                        blob_kind="result",
                     )
+                if hasattr(self, "_orphan_blob"):
+                    new_payload_blob = self._blob_id_of(sealed)
+                    if old_payload_blob and old_payload_blob != new_payload_blob:
+                        self._orphan_blob(conn, old_payload_blob)
+                    new_result_blob = self._blob_id_of(sealed_result)
+                    if old_result_blob and old_result_blob != new_result_blob:
+                        self._orphan_blob(conn, old_result_blob)
                 part_id = self._compute_partition_id(
                     conn, tenant_id=dest, job_id=job.id
                 )

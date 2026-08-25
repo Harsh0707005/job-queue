@@ -71,6 +71,8 @@ class WebhooksEnqueueMixin:
                 tenant_id=job.tenant_id,
                 plaintext=payload,
                 aad=delivery_aad(delivery_id),
+                job_id=job.id,
+                blob_kind="delivery",
             )
             # Freeze signing secret at enqueue so rotation mid-retry is safe.
             signing_secret = ep.get("secret")

@@ -159,12 +159,21 @@ class JobsTenantMoveMixin:
                         f"on job {conflict['id']}",
                         job=job,
                     )
+            old_payload_blob = (
+                self._blob_id_of(row.get("payload"))
+                if hasattr(self, "_blob_id_of")
+                else None
+            )
             sealed, payload_key_id = self._seal_job_payload(
                 conn,
                 tenant_id=dest,
                 job_id=job.id,
                 payload=job.payload,
             )
+            if hasattr(self, "_orphan_blob"):
+                new_payload_blob = self._blob_id_of(sealed)
+                if old_payload_blob and old_payload_blob != new_payload_blob:
+                    self._orphan_blob(conn, old_payload_blob)
             part_id = self._compute_partition_id(
                 conn, tenant_id=dest, job_id=job.id
             )

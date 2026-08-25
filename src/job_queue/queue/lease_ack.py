@@ -54,12 +54,21 @@ class LeaseAckMixin:
                 if result is not None:
                     from job_queue.crypto import result_aad
 
+                    old_result_blob = (
+                        self._blob_id_of(row.get("result"))
+                        if hasattr(self, "_blob_id_of")
+                        else None
+                    )
                     sealed_result, _kid = self._seal_json_value(
                         conn,
                         tenant_id=str(row["tenant_id"]),
                         value=result,
                         aad=result_aad(job_id),
+                        job_id=job_id,
+                        blob_kind="result",
                     )
+                    if hasattr(self, "_orphan_blob"):
+                        self._orphan_blob(conn, old_result_blob)
                     result_json = Jsonb(sealed_result)
 
                 updated = conn.execute(

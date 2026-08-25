@@ -176,6 +176,8 @@ class TenantsOffboardMixin:
                 """,
                 (tenant_id, JobStatus.LEASED.value),
             ).fetchall()
+            if purged and hasattr(self, "_orphan_blobs_for_jobs"):
+                self._orphan_blobs_for_jobs(conn, [r["id"] for r in purged])
 
             leased_n = self._count_leased(conn, tenant_id)
             delivering_n = self._count_webhook_delivering(conn, tenant_id)
@@ -308,6 +310,16 @@ class TenantsOffboardMixin:
             "DELETE FROM job_dag_batches WHERE tenant_id = %s",
             (tenant_id,),
         )
+        if hasattr(self, "_orphan_blobs_for_jobs"):
+            ids = conn.execute(
+                "SELECT id FROM jobs WHERE tenant_id = %s",
+                (tenant_id,),
+            ).fetchall()
+            self._orphan_blobs_for_jobs(conn, [r["id"] for r in ids])
+        if hasattr(self, "_purge_tenant_blobs"):
+            self._purge_tenant_blobs(conn, tenant_id)
+        elif hasattr(self, "_orphan_blobs_for_tenant"):
+            self._orphan_blobs_for_tenant(conn, tenant_id)
         conn.execute(
             "DELETE FROM jobs WHERE tenant_id = %s",
             (tenant_id,),

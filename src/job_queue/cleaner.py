@@ -45,6 +45,13 @@ class RetentionCleaner:
     def run_once(self) -> RetentionPurgeResult:
         """One purge pass (up to *batch_limit* jobs)."""
         try:
+            if hasattr(self.queue, "process_payload_blobs"):
+                self.queue.process_payload_blobs(
+                    limit=min(self.batch_limit, 200)
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("payload blob gc failed")
+        try:
             self.queue.process_payload_key_rotations(
                 limit=20,
                 batch_size=min(self.batch_limit, 500),

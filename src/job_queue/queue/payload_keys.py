@@ -439,17 +439,27 @@ class PayloadKeysMixin:
         ).fetchall()
         n = 0
         for row in rows:
+            old_payload_blob = (
+                self._blob_id_of(row.get("payload"))
+                if hasattr(self, "_blob_id_of")
+                else None
+            )
+            old_result_blob = (
+                self._blob_id_of(row.get("result"))
+                if hasattr(self, "_blob_id_of")
+                else None
+            )
             plain = self._open_job_payload(
                 row["payload"],
                 tenant_id=tenant_id,
                 job_id=row["id"],
                 conn=conn,
             )
-            env = encrypt_json(
-                rec.dek,
-                key_id=rec.key_id,
-                plaintext=plain,
-                aad=job_aad(row["id"]),
+            env, _ = self._seal_job_payload(
+                conn,
+                tenant_id=tenant_id,
+                job_id=row["id"],
+                payload=plain,
             )
             result_env = row.get("result")
             if result_env is not None:
@@ -464,6 +474,8 @@ class PayloadKeysMixin:
                     tenant_id=tenant_id,
                     value=opened_result,
                     aad=result_aad(row["id"]),
+                    job_id=row["id"],
+                    blob_kind="result",
                 )
             conn.execute(
                 """
@@ -482,6 +494,13 @@ class PayloadKeysMixin:
                     tenant_id,
                 ),
             )
+            if hasattr(self, "_orphan_blob"):
+                new_payload_blob = self._blob_id_of(env)
+                new_result_blob = self._blob_id_of(result_env)
+                if old_payload_blob and old_payload_blob != new_payload_blob:
+                    self._orphan_blob(conn, old_payload_blob)
+                if old_result_blob and old_result_blob != new_result_blob:
+                    self._orphan_blob(conn, old_result_blob)
             n += 1
         return n
 
@@ -560,17 +579,24 @@ class PayloadKeysMixin:
         ).fetchall()
         n = 0
         for row in rows:
+            old_blob = (
+                self._blob_id_of(row.get("payload"))
+                if hasattr(self, "_blob_id_of")
+                else None
+            )
             plain = self._open_dict(
                 row["payload"],
                 tenant_id=tenant_id,
                 aad=delivery_aad(row["id"]),
                 conn=conn,
             )
-            env = encrypt_json(
-                rec.dek,
-                key_id=rec.key_id,
+            env, _ = self._seal_dict(
+                conn,
+                tenant_id=tenant_id,
                 plaintext=plain,
                 aad=delivery_aad(row["id"]),
+                job_id=None,
+                blob_kind="delivery",
             )
             conn.execute(
                 """
@@ -582,6 +608,10 @@ class PayloadKeysMixin:
                 """,
                 (Jsonb(env), rec.key_id, row["id"], tenant_id),
             )
+            if hasattr(self, "_orphan_blob"):
+                new_blob = self._blob_id_of(env)
+                if old_blob and old_blob != new_blob:
+                    self._orphan_blob(conn, old_blob)
             n += 1
         return n
 
