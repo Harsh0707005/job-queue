@@ -157,6 +157,10 @@ class TenantsOffboardMixin:
                 """,
                 (tenant_id,),
             ).fetchall()
+            conn.execute(
+                "DELETE FROM inbound_triggers WHERE tenant_id = %s",
+                (tenant_id,),
+            )
             # Disable any remaining endpoints (still referenced by claims).
             conn.execute(
                 """
@@ -260,6 +264,12 @@ class TenantsOffboardMixin:
             (tenant_id,),
         ).fetchone()
         if deliveries is not None:
+            return False
+        triggers = conn.execute(
+            "SELECT 1 FROM inbound_triggers WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if triggers is not None:
             return False
         settings = conn.execute(
             "SELECT 1 FROM tenant_settings WHERE tenant_id = %s LIMIT 1",
@@ -389,6 +399,10 @@ class TenantsOffboardMixin:
         )
         conn.execute(
             "DELETE FROM webhook_endpoints WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM inbound_triggers WHERE tenant_id = %s",
             (tenant_id,),
         )
         conn.execute(

@@ -475,6 +475,31 @@ class RoutingMixin:
         if method == "GET" and path.startswith("/v1/schedules/"):
             return self._get_schedule(path, query)
 
+        if method == "POST" and path == "/v1/triggers":
+            return self._create_inbound_trigger(body)
+        if method == "GET" and path == "/v1/triggers":
+            return self._list_inbound_triggers(query)
+        if (
+            method == "POST"
+            and path.startswith("/v1/triggers/")
+            and path.endswith("/rotate-secret")
+        ):
+            return self._rotate_inbound_secret(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/triggers/")
+            and path.endswith("/set-enabled")
+        ):
+            return self._set_inbound_enabled(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/triggers/")
+            and path.endswith("/delete")
+        ):
+            return self._delete_inbound_trigger(path, body)
+        if method == "GET" and path.startswith("/v1/triggers/"):
+            return self._get_inbound_trigger(path, query)
+
         if method == "POST" and path == "/v1/webhooks":
             return self._register_webhook(body)
         if method == "GET" and path == "/v1/webhooks":

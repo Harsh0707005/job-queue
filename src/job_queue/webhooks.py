@@ -35,6 +35,9 @@ from job_queue.queue import JobQueue
 
 SIGNATURE_HEADER = "X-Job-Queue-Signature"
 SIGNATURE_VERSION_PREFIX = "v1="
+TIMESTAMP_HEADER = "X-Job-Queue-Timestamp"
+NONCE_HEADER = "X-Job-Queue-Nonce"
+INBOUND_MAX_SKEW_SECONDS = 300
 
 # Env escape hatch for local soak tests that POST to 127.0.0.1 sinks.
 _ALLOW_PRIVATE_WEBHOOKS_ENV = "JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS"
@@ -201,6 +204,59 @@ def verify_webhook_signature(
         return hmac.compare_digest(provided.lower(), expected_digest.lower())
     except (TypeError, ValueError):
         return False
+
+
+def inbound_signing_payload(timestamp: str, nonce: str, body: bytes) -> bytes:
+    """Canonical bytes signed for inbound trigger POSTs."""
+    ts = str(timestamp or "").strip()
+    n = str(nonce or "").strip()
+    return f"{ts}.{n}.".encode("ascii") + bytes(body or b"")
+
+
+def sign_inbound(
+    secret: str,
+    body: bytes,
+    *,
+    timestamp: str | int,
+    nonce: str,
+) -> str:
+    """HMAC-SHA256 over ``timestamp.nonce.body`` for inbound triggers."""
+    return sign_payload(secret, inbound_signing_payload(str(timestamp), nonce, body))
+
+
+def verify_inbound_signature(
+    secret: str,
+    body: bytes,
+    signature_header: str | None,
+    *,
+    timestamp: str | None,
+    nonce: str | None,
+    now: float | None = None,
+    max_skew_seconds: int = INBOUND_MAX_SKEW_SECONDS,
+) -> str | None:
+    """Return None if the inbound request is authentic, else an error code."""
+    import time as _time
+
+    if not secret:
+        return "missing_secret"
+    if not timestamp or not str(timestamp).strip():
+        return "missing_timestamp"
+    if not nonce or not str(nonce).strip():
+        return "missing_nonce"
+    try:
+        ts = int(str(timestamp).strip())
+    except (TypeError, ValueError):
+        return "bad_timestamp"
+    now_ts = float(now if now is not None else _time.time())
+    if abs(now_ts - ts) > int(max_skew_seconds):
+        return "stale_timestamp"
+    if not verify_webhook_signature(
+        secret,
+        inbound_signing_payload(str(ts), str(nonce).strip(), body),
+        signature_header,
+    ):
+        return "bad_signature"
+    return None
 
 
 class _SsrfSafeRedirectHandler(urllib.request.HTTPRedirectHandler):

@@ -299,6 +299,27 @@ class TenantsMergeMixin:
                 """,
                 (target, now, source),
             ).fetchall()
+            conn.execute(
+                """
+                UPDATE inbound_triggers s
+                SET name = s.name || %s,
+                    updated_at = %s
+                WHERE s.tenant_id = %s
+                  AND EXISTS (
+                        SELECT 1 FROM inbound_triggers t
+                        WHERE t.tenant_id = %s AND t.name = s.name
+                  )
+                """,
+                (f"__from_{source}", now, source, target),
+            )
+            conn.execute(
+                """
+                UPDATE inbound_triggers
+                SET tenant_id = %s, updated_at = %s
+                WHERE tenant_id = %s
+                """,
+                (target, now, source),
+            )
 
             # Side-effect markers follow job ownership (job_id unchanged).
             conn.execute(

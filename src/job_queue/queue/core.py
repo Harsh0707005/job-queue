@@ -10,6 +10,7 @@ from job_queue.queue.jobs import JobsMixin
 from job_queue.queue.lease import LeaseMixin
 from job_queue.queue.tenants import TenantsMixin
 from job_queue.queue.webhooks_ops import WebhooksOpsMixin
+from job_queue.queue.inbound_triggers import InboundTriggersMixin
 from job_queue.queue.schedules import SchedulesMixin
 from job_queue.queue.audit import AuditMixin
 from job_queue.queue.side_effects import SideEffectsMixin
@@ -34,6 +35,7 @@ class JobQueue(
     LeaseMixin,
     TenantsMixin,
     WebhooksOpsMixin,
+    InboundTriggersMixin,
     SchedulesMixin,
     AuditMixin,
     SideEffectsMixin,

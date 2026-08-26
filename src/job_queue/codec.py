@@ -455,6 +455,30 @@ def blackout_to_dict(win: ScheduleBlackout) -> dict[str, Any]:
     }
 
 
+def inbound_trigger_to_dict(
+    trig,
+    *,
+    include_secret: bool = False,
+) -> dict[str, Any]:
+    """Serialize an inbound trigger. Secret only on create/rotate."""
+    out: dict[str, Any] = {
+        "id": str(trig.id),
+        "tenant_id": trig.tenant_id,
+        "name": trig.name,
+        "kinds": list(trig.kinds),
+        "enabled": trig.enabled,
+        "created_at": _dt(trig.created_at),
+        "updated_at": _dt(trig.updated_at),
+        "has_secret": bool(trig.secret),
+        "path": f"/v1/inbound/{trig.id}",
+    }
+    if include_secret:
+        out["secret"] = trig.secret
+    else:
+        out["secret"] = None
+    return out
+
+
 def webhook_endpoint_to_dict(
     ep: WebhookEndpoint,
     *,

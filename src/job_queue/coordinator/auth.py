@@ -32,6 +32,17 @@ def _configured_api_token() -> str | None:
     return None
 
 
+def _is_public_inbound_path(path: str) -> bool:
+    """POST /v1/inbound/{uuid} is signed per-trigger; no API token."""
+    parts = (path or "").strip("/").split("/")
+    return (
+        len(parts) == 3
+        and parts[0] == "v1"
+        and parts[1] == "inbound"
+        and bool(_UUID_RE.match(parts[2]))
+    )
+
+
 def _extract_request_token(headers: Any) -> str | None:
     """Pull bearer / API key from request headers (case-insensitive mapping)."""
     if headers is None:

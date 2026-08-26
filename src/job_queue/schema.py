@@ -1665,4 +1665,42 @@ CREATE TABLE IF NOT EXISTS coordinator_nodes (
     last_seen_at    TIMESTAMPTZ NOT NULL
 );
 
+-- Signed inbound HTTP triggers. External systems POST to
+-- /v1/inbound/{id} with HMAC; tenant is bound to the trigger row.
+CREATE TABLE IF NOT EXISTS inbound_triggers (
+    id              UUID PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    secret          TEXT NOT NULL,
+    kinds           TEXT[] NOT NULL,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT inbound_triggers_name_check CHECK (char_length(name) BETWEEN 1 AND 128),
+    CONSTRAINT inbound_triggers_secret_check CHECK (char_length(secret) >= 16),
+    CONSTRAINT inbound_triggers_kinds_check CHECK (
+        kinds <> '{}'
+        AND kinds <@ ARRAY['job', 'dag', 'workflow', 'signal']::text[]
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_triggers_tenant_name
+    ON inbound_triggers (tenant_id, name);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_triggers_tenant
+    ON inbound_triggers (tenant_id);
+
+CREATE TABLE IF NOT EXISTS inbound_trigger_nonces (
+    trigger_id      UUID NOT NULL REFERENCES inbound_triggers(id) ON DELETE CASCADE,
+    nonce           TEXT NOT NULL,
+    seen_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (trigger_id, nonce),
+    CONSTRAINT inbound_trigger_nonces_nonce_check CHECK (
+        char_length(nonce) BETWEEN 1 AND 128
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_trigger_nonces_seen
+    ON inbound_trigger_nonces (seen_at);
+
 """

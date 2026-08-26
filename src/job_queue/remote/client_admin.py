@@ -1347,3 +1347,84 @@ class ClientAdminMixin:
         payload = self._request("GET", f"/v1/alerts/events?{urlencode(q)}")
         assert payload is not None
         return payload
+
+    def create_inbound_trigger(
+        self,
+        *,
+        tenant_id: str,
+        name: str,
+        secret: str | None = None,
+        kinds: list[str] | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "name": name,
+            "enabled": enabled,
+        }
+        if secret is not None:
+            body["secret"] = secret
+        if kinds is not None:
+            body["kinds"] = kinds
+        payload = self._request("POST", "/v1/triggers", body)
+        assert payload is not None
+        return payload
+
+    def list_inbound_triggers(self, *, tenant_id: str) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        payload = self._request(
+            "GET", f"/v1/triggers?{urlencode({'tenant_id': tenant_id})}"
+        )
+        assert payload is not None
+        return payload
+
+    def get_inbound_trigger(
+        self, trigger_id: str | UUID, *, tenant_id: str
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        payload = self._request(
+            "GET",
+            f"/v1/triggers/{trigger_id}?{urlencode({'tenant_id': tenant_id})}",
+        )
+        assert payload is not None
+        return payload
+
+    def rotate_inbound_trigger_secret(
+        self,
+        trigger_id: str | UUID,
+        *,
+        tenant_id: str,
+        secret: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if secret is not None:
+            body["secret"] = secret
+        payload = self._request(
+            "POST", f"/v1/triggers/{trigger_id}/rotate-secret", body
+        )
+        assert payload is not None
+        return payload
+
+    def set_inbound_trigger_enabled(
+        self, trigger_id: str | UUID, *, tenant_id: str, enabled: bool
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/triggers/{trigger_id}/set-enabled",
+            {"tenant_id": tenant_id, "enabled": enabled},
+        )
+        assert payload is not None
+        return payload
+
+    def delete_inbound_trigger(
+        self, trigger_id: str | UUID, *, tenant_id: str
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/triggers/{trigger_id}/delete",
+            {"tenant_id": tenant_id},
+        )
+        assert payload is not None
+        return payload

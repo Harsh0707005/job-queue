@@ -23,6 +23,7 @@ from job_queue.coordinator.auth import (
     _MAX_REQUEST_BODY_BYTES,
     _UUID_RE,
     _extract_request_token,
+    _is_public_inbound_path,
 )
 from job_queue.coordinator.routing import RoutingMixin
 from job_queue.coordinator.jobs import JobsApiMixin
@@ -37,6 +38,7 @@ from job_queue.coordinator.metrics_api import MetricsApiMixin
 from job_queue.coordinator.alerts_api import AlertsApiMixin
 from job_queue.coordinator.workflows_api import WorkflowsApiMixin
 from job_queue.coordinator.partitions_api import PartitionsApiMixin
+from job_queue.coordinator.inbound import InboundApiMixin
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ class Coordinator(
     AlertsApiMixin,
     WorkflowsApiMixin,
     PartitionsApiMixin,
+    InboundApiMixin,
 ):
     """Thin HTTP façade over JobQueue (handlers split by domain)."""
 
@@ -264,15 +267,33 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 except Exception:  # noqa: BLE001
                     return
 
-        def _authorized(self, path: str) -> bool:
+        def _read_raw(self) -> bytes:
+            raw_len = self.headers.get("Content-Length") or "0"
+            try:
+                length = int(raw_len)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if length < 0:
+                raise ValueError("invalid Content-Length")
+            if length <= 0:
+                return b""
+            if length > _MAX_REQUEST_BODY_BYTES:
+                raise _BodyTooLarge(
+                    f"body too large ({length} > {_MAX_REQUEST_BODY_BYTES})"
+                )
+            return self.rfile.read(length) or b""
+
+        def _authorized(self, path: str, method: str) -> bool:
             """When ``coordinator.api_token`` is set, require matching credential.
 
-            ``GET /health`` stays open for load balancers / probes.
+            ``GET /health`` and signed ``POST /v1/inbound/{id}`` stay open.
             """
             token = coordinator.api_token
             if not token:
                 return True
             if path == "/health":
+                return True
+            if method == "POST" and _is_public_inbound_path(path):
                 return True
             provided = _extract_request_token(self.headers)
             if provided is None:
@@ -294,7 +315,7 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                 path = self.path.split("?", 1)[0].rstrip("/")
             query = parse_qs(parsed.query)
             try:
-                if not self._authorized(path):
+                if not self._authorized(path, method):
                     self._send(401, {"error": "unauthorized", "code": "auth_required"})
                     return
                 # Live progress streams (SSE) — not JSON response bodies.
@@ -303,6 +324,13 @@ def _make_handler(coordinator: Coordinator) -> type[BaseHTTPRequestHandler]:
                     or (path.startswith("/v1/jobs/") and path.endswith("/events"))
                 ):
                     self._stream_job_events(path, query)
+                    return
+                if method == "POST" and _is_public_inbound_path(path):
+                    raw = self._read_raw()
+                    status, payload = coordinator._fire_inbound(
+                        path, raw, self.headers
+                    )
+                    self._send(status, payload)
                     return
                 body = self._read_json() if method in ("POST", "PUT", "PATCH") else None
                 status, payload = coordinator.handle(method, path, body, query)

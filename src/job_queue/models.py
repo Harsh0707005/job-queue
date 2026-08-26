@@ -940,6 +940,20 @@ class WorkflowSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class InboundTrigger:
+    """Tenant-scoped signed HTTP trigger for enqueue / DAG / workflow / signal."""
+
+    id: UUID
+    tenant_id: str
+    name: str
+    secret: str | None
+    kinds: tuple[str, ...]
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class WebhookEndpoint:
     """Registered HTTP webhook destination for a tenant."""
 

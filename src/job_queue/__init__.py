@@ -14,6 +14,7 @@ from job_queue.models import (
     JobRetentionSettings,
     JobSideEffect,
     JobStatus,
+    InboundTrigger,
     Schedule,
     ScheduleBlackout,
     ScheduleFire,
@@ -83,10 +84,14 @@ from job_queue.queue import (
 from job_queue.cleaner import RetentionCleaner
 from job_queue.scheduler import ScheduleRunner
 from job_queue.webhooks import (
+    NONCE_HEADER,
     SIGNATURE_HEADER,
+    TIMESTAMP_HEADER,
     WebhookDeliveryResult,
     WebhookDispatcher,
+    sign_inbound,
     sign_payload,
+    verify_inbound_signature,
     verify_webhook_signature,
 )
 from job_queue.worker import LeaseContext, Worker
@@ -144,6 +149,7 @@ __all__ = [
     "JobRetentionSettings",
     "JobSideEffect",
     "JobStatus",
+    "InboundTrigger",
     "JobQueue",
     "LeaseContext",
     "LeaseError",
@@ -164,6 +170,8 @@ __all__ = [
     "ScheduleGenerationOp",
     "ScheduleNode",
     "SIGNATURE_HEADER",
+    "TIMESTAMP_HEADER",
+    "NONCE_HEADER",
     "ScheduleRunner",
     "SpawnChildrenResult",
     "SpawnError",
@@ -190,7 +198,9 @@ __all__ = [
     "WebhookNode",
     "Worker",
     "compute_retry_backoff_seconds",
+    "sign_inbound",
     "sign_payload",
+    "verify_inbound_signature",
     "verify_webhook_signature",
 ]
 __version__ = "0.1.0"
