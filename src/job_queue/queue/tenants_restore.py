@@ -1341,21 +1341,25 @@ class TenantsRestoreMixin:
         old_blob = (
             self._blob_id_of(payload) if hasattr(self, "_blob_id_of") else None
         )
+        restore_error: str | None = None
         if hasattr(self, "_materialize_envelope"):
             try:
                 payload = self._materialize_envelope(payload, conn=conn)
-            except Exception:
-                payload = payload
+            except Exception as exc:  # noqa: BLE001
+                restore_error = str(exc)
         try:
+            if restore_error:
+                raise RuntimeError(restore_error)
             plain = self._open_dict(
                 payload,
                 tenant_id=target,
                 aad=delivery_aad(old_id),
                 conn=conn,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             from job_queue.crypto import REDACTED_PAYLOAD
 
+            restore_error = str(exc)
             plain = dict(REDACTED_PAYLOAD)
         if isinstance(plain.get("job_id"), str) and job_id is not None:
             plain["job_id"] = str(job_id)
@@ -1377,7 +1381,16 @@ class TenantsRestoreMixin:
                 self._orphan_blob(conn, old_blob)
         status = str(raw.get("status") or "pending")
         delivering_until = _parse_dt(raw.get("delivering_until"))
-        if status == "delivering":
+        last_error = raw.get("last_error")
+        completed_at = _parse_dt(raw.get("completed_at"))
+        if restore_error:
+            # Fail closed: never leave a redacted pending row that claim
+            # would POST to the endpoint as a successful delivery.
+            status = "dead"
+            delivering_until = None
+            last_error = f"restore: {restore_error}"[:2000]
+            completed_at = completed_at or _utcnow()
+        elif status == "delivering":
             status = "pending"
             delivering_until = None
         conn.execute(
@@ -1411,11 +1424,11 @@ class TenantsRestoreMixin:
                 int(raw.get("backoff_max_seconds") or 300),
                 _parse_dt(raw.get("next_attempt_at")) or _utcnow(),
                 delivering_until,
-                raw.get("last_error"),
+                last_error,
                 raw.get("last_status_code"),
                 _parse_dt(raw.get("created_at")) or _utcnow(),
                 _parse_dt(raw.get("updated_at")) or _utcnow(),
-                _parse_dt(raw.get("completed_at")),
+                completed_at,
                 raw.get("signing_secret"),
                 kid,
             ),

@@ -432,6 +432,70 @@ def test_missing_blob_dead_letters_and_does_not_block_sibling_lease(
     assert still is not None and still.status == JobStatus.DEAD
 
 
+def test_restore_unreadable_delivery_fails_closed_not_posted(
+    blob_queue: JobQueue, tmp_path
+):
+    """A dest delivery whose blob cannot be opened must not go out as success."""
+    from job_queue.blob_store import FilesystemBlobStore
+
+    capture = _WebhookCapture()
+    try:
+        blob_queue.register_webhook(
+            tenant_id="blob-wh-rst-src",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="hook",
+        )
+        blob_queue.enqueue(
+            tenant_id="blob-wh-rst-src",
+            payload={"secret": "wh-restore-secret", "blob": BIG},
+        )
+        job = blob_queue.lease(tenant_id="blob-wh-rst-src", worker_id="w")
+        assert job is not None
+        _ack(blob_queue, job, "w", result={"out": "wh-restore-secret", "blob": BIG})
+        with blob_queue._pool.connection() as conn:
+            raw = conn.execute(
+                "SELECT payload FROM webhook_deliveries WHERE tenant_id = %s",
+                ("blob-wh-rst-src",),
+            ).fetchone()["payload"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        assert is_blob_pointer(raw)
+        # File gone before export: snapshot cannot carry ciphertext.
+        blob_queue._blob_store.delete(raw["blob_id"])
+        snap = blob_queue.export_tenant("blob-wh-rst-src")
+        blob_queue._blob_store = FilesystemBlobStore(tmp_path / "fresh-wh")
+        rst = blob_queue.restore_tenant(
+            "blob-wh-rst-dst",
+            snapshot_id=snap.id,
+            batch_size=20,
+            run_until_complete=True,
+        )
+        assert rst.status == "complete"
+        dest = blob_queue.list_webhook_deliveries(tenant_id="blob-wh-rst-dst")
+        assert dest
+        assert dest[0].status == "dead"
+        assert dest[0].last_error
+        assert dest[0].last_error.startswith("restore:")
+        before = list(capture.received)
+        blob_queue.process_webhook_deliveries(limit=20)
+        assert capture.received == before
+        assert (
+            blob_queue.list_webhook_deliveries(
+                tenant_id="blob-wh-rst-dst", status="succeeded"
+            )
+            == []
+        )
+        assert (
+            blob_queue.list_webhook_deliveries(
+                tenant_id="blob-wh-rst-dst", status="pending"
+            )
+            == []
+        )
+    finally:
+        capture.stop()
+
+
 def test_missing_delivery_blob_does_not_break_webhook_claim(blob_queue: JobQueue):
     capture = _WebhookCapture()
     try:
