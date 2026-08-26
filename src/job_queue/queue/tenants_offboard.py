@@ -29,9 +29,11 @@ class TenantsOffboardMixin:
            deliveries — and the endpoints they reference — are kept so agents
            can still POST and ``finalize_webhook_delivery``.
         5. Purges all non-``leased`` job rows (history / cancelled / dead).
-        6. Leaves *leased* jobs running and *delivering* webhooks in flight;
-           when the last of both ends, remaining rows and settings are
-           auto-purged so the tenant is empty.
+        6. Deletes spilled blob files whose job/delivery pointers are gone
+           (payload, result, webhook body) from the shared store.
+        7. Leaves *leased* jobs running and *delivering* webhooks in flight;
+           when the last of both ends, remaining rows, settings, and leftover
+           blob files are auto-purged so the tenant is empty.
 
         Returns a :class:`~job_queue.models.TenantOffboardResult` with counts
         and how much in-flight work still needs to finish.
@@ -179,13 +181,26 @@ class TenantsOffboardMixin:
             if purged and hasattr(self, "_orphan_blobs_for_jobs"):
                 self._orphan_blobs_for_jobs(conn, [r["id"] for r in purged])
 
+            blobs_deleted = 0
+            if hasattr(self, "_purge_unreferenced_tenant_blobs"):
+                blobs_deleted += int(
+                    self._purge_unreferenced_tenant_blobs(conn, tenant_id) or 0
+                )
+
             leased_n = self._count_leased(conn, tenant_id)
             delivering_n = self._count_webhook_delivering(conn, tenant_id)
 
             empty = False
             if leased_n == 0 and delivering_n == 0:
-                self._finalize_offboard_locked(conn, tenant_id=tenant_id, now=now)
+                extra = self._finalize_offboard_locked(
+                    conn, tenant_id=tenant_id, now=now
+                )
+                blobs_deleted += int(extra or 0)
                 empty = True
+
+            blobs_remaining = 0
+            if hasattr(self, "_count_tenant_blobs"):
+                blobs_remaining = int(self._count_tenant_blobs(conn, tenant_id) or 0)
 
             return TenantOffboardResult(
                 tenant_id=tenant_id,
@@ -197,6 +212,8 @@ class TenantsOffboardMixin:
                 webhooks_delivering_remaining=delivering_n,
                 offboarding=not empty,
                 empty=empty,
+                blobs_deleted=blobs_deleted,
+                blobs_remaining=blobs_remaining,
             )
 
     def tenant_is_empty(self, tenant_id: str) -> bool:
@@ -262,6 +279,21 @@ class TenantsOffboardMixin:
         ).fetchone()
         if rots is not None:
             return False
+        blobs = conn.execute(
+            "SELECT 1 FROM job_payload_blobs WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if blobs is not None:
+            return False
+        snaps = conn.execute(
+            """
+            SELECT 1 FROM tenant_snapshots
+            WHERE source_tenant_id = %s LIMIT 1
+            """,
+            (tenant_id,),
+        ).fetchone()
+        if snaps is not None:
+            return False
         gens = conn.execute(
             "SELECT 1 FROM schedule_generations WHERE tenant_id = %s LIMIT 1",
             (tenant_id,),
@@ -294,17 +326,18 @@ class TenantsOffboardMixin:
         *,
         tenant_id: str,
         now: datetime,
-    ) -> None:
+    ) -> int:
         """Purge all remaining tenant state after in-flight work ends.
 
         Caller must hold the connection transaction. Refuses to wipe while
         leased jobs or claimed (``delivering``) webhooks remain.
+        Returns how many spilled blob files/catalog rows were removed.
         """
         # Safety: never wipe in-flight work.
         if self._count_leased(conn, tenant_id) > 0:
-            return
+            return 0
         if self._count_webhook_delivering(conn, tenant_id) > 0:
-            return
+            return 0
 
         conn.execute(
             "DELETE FROM job_dag_batches WHERE tenant_id = %s",
@@ -316,8 +349,9 @@ class TenantsOffboardMixin:
                 (tenant_id,),
             ).fetchall()
             self._orphan_blobs_for_jobs(conn, [r["id"] for r in ids])
+        blobs_deleted = 0
         if hasattr(self, "_purge_tenant_blobs"):
-            self._purge_tenant_blobs(conn, tenant_id)
+            blobs_deleted = int(self._purge_tenant_blobs(conn, tenant_id) or 0)
         elif hasattr(self, "_orphan_blobs_for_tenant"):
             self._orphan_blobs_for_tenant(conn, tenant_id)
         conn.execute(
@@ -373,11 +407,23 @@ class TenantsOffboardMixin:
             "DELETE FROM tenant_payload_keys WHERE tenant_id = %s",
             (tenant_id,),
         )
+        conn.execute(
+            """
+            DELETE FROM tenant_restores
+            WHERE source_tenant_id = %s OR target_tenant_id = %s
+            """,
+            (tenant_id, tenant_id),
+        )
+        conn.execute(
+            "DELETE FROM tenant_snapshots WHERE source_tenant_id = %s",
+            (tenant_id,),
+        )
         crypto = getattr(self, "_crypto", None)
         if crypto is not None:
             crypto.drop_tenant(tenant_id)
         # *now* reserved for future audit rows; keep signature stable.
         _ = now
+        return blobs_deleted
 
     def _maybe_finalize_offboard(
         self,
@@ -394,3 +440,35 @@ class TenantsOffboardMixin:
         if self._count_webhook_delivering(conn, tenant_id) > 0:
             return
         self._finalize_offboard_locked(conn, tenant_id=tenant_id, now=now)
+
+    def process_offboard_finalizes(self, *, limit: int = 50) -> int:
+        """Purge offboarding tenants whose in-flight work has already ended.
+
+        Control-plane tick so a missed finalize (leader death mid-drain)
+        cannot leave catalog rows or blob files behind.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        now = _utcnow()
+        finalized = 0
+        with transaction(self._pool) as conn:
+            rows = conn.execute(
+                """
+                SELECT tenant_id
+                FROM tenant_settings
+                WHERE offboarding = TRUE
+                ORDER BY tenant_id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (int(limit),),
+            ).fetchall()
+            for row in rows:
+                tid = str(row["tenant_id"])
+                if self._count_leased(conn, tid) > 0:
+                    continue
+                if self._count_webhook_delivering(conn, tid) > 0:
+                    continue
+                self._finalize_offboard_locked(conn, tenant_id=tid, now=now)
+                finalized += 1
+        return finalized

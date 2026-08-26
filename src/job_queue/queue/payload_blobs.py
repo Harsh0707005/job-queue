@@ -132,6 +132,33 @@ class PayloadBlobsMixin:
             n += 1
         return n
 
+    def _purge_unreferenced_tenant_blobs(self, conn: Any, tenant_id: str) -> int:
+        """Drop tenant blobs no live job or delivery pointer still names."""
+        if not tenant_id:
+            return 0
+        rows = conn.execute(
+            "SELECT id FROM job_payload_blobs WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchall()
+        store = getattr(self, "_blob_store", None)
+        n = 0
+        for row in rows:
+            bid = row["id"]
+            if self._blob_is_referenced(conn, bid):
+                continue
+            if store is not None:
+                store.delete(bid)
+            conn.execute("DELETE FROM job_payload_blobs WHERE id = %s", (bid,))
+            n += 1
+        return n
+
+    def _count_tenant_blobs(self, conn: Any, tenant_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*)::int AS n FROM job_payload_blobs WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
     def _blob_id_of(self, payload: Any) -> UUID | None:
         if not is_blob_pointer(payload):
             return None

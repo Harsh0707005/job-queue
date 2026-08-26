@@ -575,6 +575,8 @@ class TenantOffboardResult:
     webhooks_delivering_remaining: int
     offboarding: bool
     empty: bool
+    blobs_deleted: int = 0
+    blobs_remaining: int = 0
 
 
 @dataclass(frozen=True, slots=True)

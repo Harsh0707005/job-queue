@@ -391,3 +391,163 @@ def test_offboard_waits_for_both_lease_and_webhook(queue: JobQueue):
     # Finish lease last — now empty.
     _ack(queue, l2, "w2")
     assert queue.tenant_is_empty("gone") is True
+
+
+# ---------------------------------------------------------------------------
+# Spilled payloads on the shared blob store
+# ---------------------------------------------------------------------------
+
+BIG = "S" * 800
+_BLOB_THRESHOLD = 256
+
+
+@pytest.fixture
+def blob_queue(queue: JobQueue, tmp_path):
+    from job_queue.blob_store import FilesystemBlobStore
+
+    queue._blob_store = FilesystemBlobStore(tmp_path / "blobs")
+    queue.payload_blob_threshold_bytes = _BLOB_THRESHOLD
+    return queue
+
+
+def _blob_ids(queue: JobQueue, tenant_id: str) -> list:
+    with queue._pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM job_payload_blobs WHERE tenant_id = %s",
+            (tenant_id,),
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def test_offboard_purges_spilled_payload_result_and_webhook_files(
+    blob_queue: JobQueue,
+):
+    from job_queue import WebhookEvent
+    from job_queue.crypto import is_blob_pointer
+    from tests.helpers_queue import _WebhookCapture
+
+    keep_secret = "keep-blob-secret"
+    gone_secret = "gone-blob-secret"
+    capture = _WebhookCapture()
+    try:
+        blob_queue.register_webhook(
+            tenant_id="gone",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="hook",
+        )
+        keep = blob_queue.enqueue(
+            tenant_id="keep",
+            payload={"secret": keep_secret, "blob": BIG},
+        )
+        blob_queue.enqueue(
+            tenant_id="gone",
+            payload={"secret": gone_secret, "blob": BIG, "n": 1},
+        )
+        leased = blob_queue.lease(tenant_id="gone", worker_id="w")
+        assert leased is not None
+        _ack(blob_queue, leased, "w", result={"out": gone_secret, "blob": BIG})
+        pending = blob_queue.list_webhook_deliveries(
+            tenant_id="gone", status="pending"
+        )
+        assert pending
+        gone_ids = _blob_ids(blob_queue, "gone")
+        assert gone_ids
+        for bid in gone_ids:
+            assert blob_queue._blob_store.exists(bid)
+
+        result = blob_queue.offboard_tenant("gone")
+        assert result.empty is True
+        assert result.blobs_deleted >= 1
+        assert result.blobs_remaining == 0
+        assert blob_queue.tenant_is_empty("gone") is True
+        assert _blob_ids(blob_queue, "gone") == []
+        for bid in gone_ids:
+            assert not blob_queue._blob_store.exists(bid)
+
+        keep_stored = None
+        with blob_queue._pool.connection() as conn:
+            keep_stored = conn.execute(
+                "SELECT payload FROM jobs WHERE id = %s",
+                (keep.id,),
+            ).fetchone()["payload"]
+        assert is_blob_pointer(keep_stored)
+        assert blob_queue._blob_store.exists(keep_stored["blob_id"])
+        still = blob_queue.lease(tenant_id="keep", worker_id="kw")
+        assert still is not None
+        assert still.payload["secret"] == keep_secret
+    finally:
+        capture.stop()
+
+
+def test_offboard_waits_for_leased_spill_then_clears_shared_store(
+    blob_queue: JobQueue,
+):
+    secret = "lease-blob-secret"
+    blob_queue.enqueue(
+        tenant_id="gone", payload={"secret": secret, "blob": BIG, "who": "run"}
+    )
+    blob_queue.enqueue(
+        tenant_id="gone", payload={"secret": secret, "blob": BIG, "who": "pend"}
+    )
+    leased = blob_queue.lease(tenant_id="gone", worker_id="holder")
+    assert leased is not None
+    assert leased.payload["secret"] == secret
+    leased_ids = _blob_ids(blob_queue, "gone")
+    assert leased_ids
+
+    result = blob_queue.offboard_tenant("gone")
+    assert result.empty is False
+    assert result.offboarding is True
+    assert result.leased_remaining == 1
+    # Pending spill is gone; the inflight pointer must still open.
+    still = blob_queue.get(leased.id, tenant_id="gone")
+    assert still is not None
+    assert still.payload == {"secret": secret, "blob": BIG, "who": "run"}
+    live = [
+        bid
+        for bid in _blob_ids(blob_queue, "gone")
+        if blob_queue._blob_store.exists(bid)
+    ]
+    assert live
+
+    done = _ack(
+        blob_queue, leased, "holder", result={"out": secret, "blob": BIG}
+    )
+    assert done.status == JobStatus.COMPLETED
+    assert blob_queue.tenant_is_empty("gone") is True
+    assert _blob_ids(blob_queue, "gone") == []
+    for bid in leased_ids:
+        assert not blob_queue._blob_store.exists(bid)
+
+
+def test_offboard_on_peer_queue_clears_shared_volume(
+    queue: JobQueue, postgres_url: str, tmp_path
+):
+    from job_queue.blob_store import FilesystemBlobStore
+
+    root = tmp_path / "shared-offboard"
+    q1 = queue
+    q1._blob_store = FilesystemBlobStore(root)
+    q1.payload_blob_threshold_bytes = _BLOB_THRESHOLD
+    q2 = JobQueue.connect(
+        postgres_url, min_size=1, max_size=4, require_worker_registration=False
+    )
+    try:
+        q2._blob_store = FilesystemBlobStore(root)
+        q2.payload_blob_threshold_bytes = _BLOB_THRESHOLD
+        q1.enqueue(
+            tenant_id="gone",
+            payload={"secret": "cross-off", "blob": BIG},
+        )
+        ids = _blob_ids(q1, "gone")
+        assert ids
+        assert q2._blob_store.exists(ids[0])
+        result = q2.offboard_tenant("gone")
+        assert result.empty is True
+        assert q1.tenant_is_empty("gone") is True
+        assert _blob_ids(q1, "gone") == []
+        assert not q1._blob_store.exists(ids[0])
+        assert not q2._blob_store.exists(ids[0])
+    finally:
+        q2.close()

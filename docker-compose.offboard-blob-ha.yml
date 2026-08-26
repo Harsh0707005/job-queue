@@ -1,0 +1,96 @@
+# Offboard spilled payloads on a 3-coordinator HA fleet + shared blob volume.
+# Wait for inflight work, then wipe jobs/schedules/webhooks/blob files.
+# Kill the leader and a worker mid-offboard; other tenants keep working.
+#
+# Do not use --abort-on-container-exit: the soak kills the leader on purpose.
+#
+#   COMPOSE_PROJECT_NAME=jq-oblob-ha docker compose -p jq-oblob-ha \
+#     -f docker-compose.yml -f docker-compose.coordinator-leader.yml \
+#     -f docker-compose.offboard-blob-ha.yml up --build -d
+#   docker logs -f jq-oblob-ha-offboard-blob-ha-soak-1
+
+x-blob-env: &blob_env
+  JOB_QUEUE_BLOB_DIR: /var/lib/job-queue/blobs
+  JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD: "2048"
+  JOB_QUEUE_BLOB_READ_RETRIES: "20"
+  JOB_QUEUE_BLOB_READ_RETRY_SECONDS: "0.05"
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+  leader-soak:
+    profiles: ["disabled"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+    environment:
+      LOG_LEVEL: INFO
+      SLOW_MS: "2500"
+  coordinator-1:
+    ports: !reset []
+    environment:
+      <<: *blob_env
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+  coordinator-2:
+    ports: !reset []
+    environment:
+      <<: *blob_env
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+  coordinator-3:
+    ports: !reset []
+    environment:
+      <<: *blob_env
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+
+  offboard-blob-ha-soak:
+    build: .
+    command: ["python", "scripts/offboard_blob_ha_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+      <<: *blob_env
+      TENANTS: "4"
+      JOBS_PER_TENANT: "10"
+      PAYLOAD_BYTES: "49152"
+      JOB_SLEEP_MS: "2500"
+      OFFBOARD_COUNT: "2"
+      MAX_WALL_SECONDS: "240"
+      WEBHOOK_URL: http://webhook-sink:8090/hook
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-oblob-ha}
+      LOG_LEVEL: INFO
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/app/scripts
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      coordinator-3:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      webhook-sink:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  payload-blobs:
