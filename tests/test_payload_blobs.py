@@ -683,6 +683,112 @@ def test_missing_delivery_blob_does_not_break_webhook_claim(blob_queue: JobQueue
         capture.stop()
 
 
+def test_blob_store_retries_until_peer_write_is_visible(tmp_path):
+    import threading
+
+    from job_queue.blob_store import FilesystemBlobStore
+
+    root = tmp_path / "shared"
+    writer = FilesystemBlobStore(root)
+    reader = FilesystemBlobStore(root, read_retries=20, read_retry_seconds=0.01)
+    bid = uuid4()
+
+    def _write() -> None:
+        time.sleep(0.04)
+        writer.write(bid, b"cipher-from-other-node")
+
+    t = threading.Thread(target=_write)
+    t.start()
+    assert reader.read(bid) == b"cipher-from-other-node"
+    t.join()
+
+
+def test_shared_store_enqueue_on_one_queue_lease_rotate_export_on_peer(
+    queue: JobQueue, postgres_url: str, tmp_path
+):
+    """Two coordinators, one blob root: spill on A, hydrate on B."""
+    root = tmp_path / "fleet-blobs"
+    q1 = queue
+    q1._blob_store = FilesystemBlobStore(root)
+    q1.payload_blob_threshold_bytes = THRESHOLD
+    q2 = JobQueue.connect(
+        postgres_url, min_size=1, max_size=4, require_worker_registration=False
+    )
+    try:
+        q2._blob_store = FilesystemBlobStore(root)
+        q2.payload_blob_threshold_bytes = THRESHOLD
+        capture = _WebhookCapture()
+        try:
+            q1.register_webhook(
+                tenant_id="blob-ha",
+                url=capture.url,
+                events=[WebhookEvent.JOB_COMPLETED.value],
+                secret="hook",
+            )
+            secret = "cross-coord-secret"
+            job = q1.enqueue(
+                tenant_id="blob-ha",
+                payload={"secret": secret, "blob": BIG, "who": "a"},
+            )
+            stored = _stored(q1, job.id)
+            assert is_blob_pointer(stored)
+            assert q2._blob_store.exists(stored["blob_id"])
+            assert q2.get(job.id, tenant_id="blob-ha").payload["secret"] == secret
+
+            leased = q2.lease(tenant_id="blob-ha", worker_id="peer")
+            assert leased is not None
+            assert leased.id == job.id
+            assert leased.payload == {"secret": secret, "blob": BIG, "who": "a"}
+            _ack(q2, leased, "peer", result={"out": secret, "blob": BIG})
+
+            pending = q1.enqueue(
+                tenant_id="blob-ha",
+                payload={"secret": secret, "blob": BIG, "who": "pending"},
+            )
+            rot = q1.rotate_tenant_payload_key("blob-ha")
+            for _ in range(12):
+                rot = q2.advance_payload_key_rotation("blob-ha", batch_size=8)
+                if rot.status == "complete":
+                    break
+            assert rot.status == "complete"
+            after = _stored(q2, pending.id)
+            assert is_blob_pointer(after)
+            assert after["blob_id"] != stored["blob_id"]
+            assert q1._blob_store.exists(after["blob_id"])
+            still = q2.get(pending.id, tenant_id="blob-ha")
+            assert still is not None and still.payload["secret"] == secret
+
+            snap = q1.export_tenant("blob-ha")
+            assert snap.status == "ready"
+            assert snap.counts.get("payload_blobs", 0) >= 1
+            rst = q2.restore_tenant(
+                "blob-ha-dst",
+                snapshot_id=snap.id,
+                batch_size=20,
+                run_until_complete=True,
+            )
+            assert rst.status == "complete"
+            dest = q1.lease(tenant_id="blob-ha-dst", worker_id="dst")
+            assert dest is not None
+            assert dest.payload["secret"] == secret
+            assert dest.id != job.id
+            dest_stored = _stored(q2, dest.id)
+            assert is_blob_pointer(dest_stored)
+            assert q1._blob_store.exists(dest_stored["blob_id"])
+
+            q2.process_webhook_deliveries(limit=20)
+            delivered = q1.list_webhook_deliveries(
+                tenant_id="blob-ha", status="succeeded"
+            )
+            assert delivered
+            assert delivered[0].payload["payload"]["secret"] == secret
+            assert not _pg_has(q1, secret)
+        finally:
+            capture.stop()
+    finally:
+        q2.close()
+
+
 def test_missing_blob_is_skipped_on_fair_lease(blob_queue: JobQueue):
     broken = blob_queue.enqueue(
         tenant_id="blob-fair-a", payload={"secret": "gone", "blob": BIG}

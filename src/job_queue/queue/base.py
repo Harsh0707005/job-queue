@@ -42,7 +42,21 @@ class BaseMixin:
             os.environ.get("JOB_QUEUE_BLOB_DIR")
             or str(Path(tempfile.gettempdir()) / "job-queue-blobs")
         )
-        self._blob_store = FilesystemBlobStore(blob_dir)
+        try:
+            read_retries = int(os.environ.get("JOB_QUEUE_BLOB_READ_RETRIES") or "8")
+        except (TypeError, ValueError):
+            read_retries = 8
+        try:
+            read_retry_seconds = float(
+                os.environ.get("JOB_QUEUE_BLOB_READ_RETRY_SECONDS") or "0.025"
+            )
+        except (TypeError, ValueError):
+            read_retry_seconds = 0.025
+        self._blob_store = FilesystemBlobStore(
+            blob_dir,
+            read_retries=read_retries,
+            read_retry_seconds=read_retry_seconds,
+        )
         raw_thr = os.environ.get("JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD") or "32768"
         try:
             self.payload_blob_threshold_bytes = int(raw_thr)

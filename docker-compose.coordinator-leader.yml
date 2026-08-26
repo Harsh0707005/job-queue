@@ -39,9 +39,13 @@ services:
       JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
       JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
       JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      JOB_QUEUE_BLOB_DIR: /var/lib/job-queue/blobs
+      JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD: "32768"
       COORDINATOR_CONTROL: "1"
       COORDINATOR_LEADER_TTL: "2"
       COORDINATOR_CONTROL_INTERVAL: "0.35"
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
     depends_on:
       postgres:
         condition: service_healthy

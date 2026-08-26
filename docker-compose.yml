@@ -45,6 +45,10 @@ services:
       JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
       JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
       JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      JOB_QUEUE_BLOB_DIR: /var/lib/job-queue/blobs
+      JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD: "32768"
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,6 +77,10 @@ services:
       JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
       JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
       JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      JOB_QUEUE_BLOB_DIR: /var/lib/job-queue/blobs
+      JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD: "32768"
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
     depends_on:
       postgres:
         condition: service_healthy
@@ -263,3 +271,7 @@ services:
         condition: service_started
       chaos:
         condition: service_started
+
+# Shared across every coordinator so a spill written on one node hydrates on another.
+volumes:
+  payload-blobs:
