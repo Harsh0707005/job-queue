@@ -208,6 +208,14 @@ def test_follower_http_control_returns_503(queue: JobQueue):
         assert status == 503
         status, body = follow.handle("POST", "/v1/admin/purge-expired-jobs", {}, {})
         assert status == 503
+        status, body = follow.handle(
+            "POST", "/v1/admin/payload-keys/advance", {}, {}
+        )
+        assert status == 503
+        status, body = follow.handle(
+            "POST", "/v1/admin/restores/advance", {}, {}
+        )
+        assert status == 503
         # Worker APIs stay up on the follower.
         status, body = follow.handle(
             "POST",
@@ -219,7 +227,9 @@ def test_follower_http_control_returns_503(queue: JobQueue):
         h = CoordinatorClient(follow_url).health()
         assert h.get("ok") is True
         assert h.get("leader") is False
+        assert h.get("role") == "standby"
         assert h.get("leader_node") == lead.node_id
+        assert lead.node_id not in (h.get("standbys") or [])
         status, body = lead.handle("GET", "/v1/coordinator/leader", {}, {})
         assert status == 200
         assert body.get("leader") is True

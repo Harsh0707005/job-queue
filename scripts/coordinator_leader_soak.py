@@ -193,6 +193,34 @@ def main() -> int:
 
     lead = wait_unique_leader()
     logger.info("stage1 leader=%s epoch=%s", lead.get("node"), lead.get("leader_epoch"))
+    if lead.get("role") not in (None, "leader"):
+        # Older health payloads omit role; require leader=true.
+        if not lead.get("leader"):
+            raise RuntimeError(f"unique leader not marked leader: {lead}")
+    standbys = [r for r in poll_leaders() if r.get("ok") and not r.get("leader")]
+    if len(standbys) < 2:
+        raise RuntimeError(f"expected >=2 standbys, got {standbys}")
+    # Data plane works on every standby.
+    for i, sb in enumerate(standbys):
+        code, out = http_one(
+            sb["base"],
+            "POST",
+            "/v1/jobs",
+            {
+                "tenant_id": "cl-a",
+                "payload": {"op": "standby-enq", "i": i, "ms": 10},
+                "max_attempts": 1,
+            },
+        )
+        if code not in (200, 201):
+            raise RuntimeError(f"standby {sb.get('node')} enqueue -> {code}: {out}")
+        code, refused = http_one(
+            sb["base"], "POST", "/v1/schedules/process-due", {}
+        )
+        if code != 503 or (refused.get("code") != "not_leader"):
+            raise RuntimeError(
+                f"standby {sb.get('node')} must refuse process-due: {code} {refused}"
+            )
 
     # Stage 1: seed control work on both tenants.
     for tid in tenants:

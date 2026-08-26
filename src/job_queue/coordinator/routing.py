@@ -61,13 +61,23 @@ class RoutingMixin:
         draining: list[str] = []
         if hasattr(self.queue, "list_draining_workers"):
             draining = list(self.queue.list_draining_workers())
+        live_nodes: list[str] = []
+        if hasattr(self.queue, "list_live_control_nodes"):
+            try:
+                live_nodes = list(self.queue.list_live_control_nodes())
+            except Exception:
+                live_nodes = []
+        leader_node = lease.node_id if live else None
+        standbys = [n for n in live_nodes if n != leader_node]
         return {
             "ok": True,
-            "role": "coordinator",
+            "role": "leader" if is_leader else "standby",
             "node": self.node_id,
             "leader": is_leader,
-            "leader_node": lease.node_id if live else None,
+            "leader_node": leader_node,
             "leader_epoch": int(lease.epoch) if live else None,
+            "standbys": standbys,
+            "live_nodes": live_nodes,
             "handoff_to": handoff_to,
             "draining_workers": draining,
         }
@@ -712,6 +722,9 @@ class RoutingMixin:
             and path.startswith("/v1/tenants/")
             and path.endswith("/restore/advance")
         ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._advance_tenant_restore(path, body)
         if (
             method == "POST"
@@ -728,6 +741,9 @@ class RoutingMixin:
         if method == "GET" and path.startswith("/v1/snapshots/"):
             return self._get_snapshot(path)
         if method == "POST" and path == "/v1/admin/restores/advance":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._advance_all_restores(body)
         if (
             method == "GET"
@@ -746,8 +762,14 @@ class RoutingMixin:
             and path.startswith("/v1/tenants/")
             and path.endswith("/payload-keys/advance")
         ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._advance_tenant_payload_key(path, body)
         if method == "POST" and path == "/v1/admin/payload-keys/advance":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
             return self._advance_all_payload_keys(body)
 
         if method == "POST" and path == "/v1/admin/retention":

@@ -192,6 +192,24 @@ class CoordinatorControlLoop:
             )
         except Exception:  # noqa: BLE001
             logger.exception("control retention tick failed node=%s", self.node_id)
+        if self._stop.is_set() or not self.is_leader():
+            return
+        try:
+            if hasattr(self.queue, "process_payload_key_rotations"):
+                self.queue.process_payload_key_rotations(
+                    limit=20, batch_size=min(self.retention_limit, 200)
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("control key-rotation tick failed node=%s", self.node_id)
+        if self._stop.is_set() or not self.is_leader():
+            return
+        try:
+            if hasattr(self.queue, "process_tenant_restores"):
+                self.queue.process_tenant_restores(
+                    limit=20, batch_size=min(self.retention_limit, 200)
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("control restore tick failed node=%s", self.node_id)
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
