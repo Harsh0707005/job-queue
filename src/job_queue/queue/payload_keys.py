@@ -7,7 +7,9 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from job_queue.blob_store import BlobStoreError
 from job_queue.crypto import (
+    PayloadCryptoError,
     delivery_aad,
     encrypt_json,
     job_aad,
@@ -383,21 +385,47 @@ class PayloadKeysMixin:
         return out
 
     def _count_unsealed(self, conn: Any, tenant_id: str, active_key_id: UUID) -> int:
+        kid = str(active_key_id)
         total = 0
-        for table in (
-            "jobs",
-            "schedules",
-            "webhook_deliveries",
-            "workflow_runs",
+        jobs = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM jobs
+            WHERE tenant_id = %s
+              AND (
+                    payload_key_id IS DISTINCT FROM %s
+                 OR (
+                        payload ? '_jq_enc'
+                    AND payload->>'kid' IS DISTINCT FROM %s
+                 )
+                 OR (
+                        result ? '_jq_enc'
+                    AND result->>'kid' IS DISTINCT FROM %s
+                 )
+              )
+            """,
+            (tenant_id, active_key_id, kid, kid),
+        ).fetchone()
+        total += int(jobs["n"] if jobs else 0)
+        for table, col in (
+            ("schedules", "payload"),
+            ("webhook_deliveries", "payload"),
+            ("workflow_runs", "steps_def"),
         ):
             row = conn.execute(
                 f"""
                 SELECT COUNT(*)::int AS n
                 FROM {table}
                 WHERE tenant_id = %s
-                  AND (payload_key_id IS DISTINCT FROM %s)
+                  AND (
+                        payload_key_id IS DISTINCT FROM %s
+                     OR (
+                            {col} ? '_jq_enc'
+                        AND {col}->>'kid' IS DISTINCT FROM %s
+                     )
+                  )
                 """,
-                (tenant_id, active_key_id),
+                (tenant_id, active_key_id, kid),
             ).fetchone()
             total += int(row["n"] if row else 0)
         sig = conn.execute(
@@ -406,9 +434,15 @@ class PayloadKeysMixin:
             FROM workflow_signals
             WHERE tenant_id = %s
               AND payload IS NOT NULL
-              AND (payload_key_id IS DISTINCT FROM %s)
+              AND (
+                    payload_key_id IS DISTINCT FROM %s
+                 OR (
+                        payload ? '_jq_enc'
+                    AND payload->>'kid' IS DISTINCT FROM %s
+                 )
+              )
             """,
-            (tenant_id, active_key_id),
+            (tenant_id, active_key_id, kid),
         ).fetchone()
         total += int(sig["n"] if sig else 0)
         return total
@@ -449,34 +483,48 @@ class PayloadKeysMixin:
                 if hasattr(self, "_blob_id_of")
                 else None
             )
-            plain = self._open_job_payload(
-                row["payload"],
-                tenant_id=tenant_id,
-                job_id=row["id"],
-                conn=conn,
-            )
-            env, _ = self._seal_job_payload(
-                conn,
-                tenant_id=tenant_id,
-                job_id=row["id"],
-                payload=plain,
-            )
-            result_env = row.get("result")
-            if result_env is not None:
-                opened_result = self._open_json_value(
-                    result_env,
+            try:
+                plain = self._open_job_payload(
+                    row["payload"],
                     tenant_id=tenant_id,
-                    aad=result_aad(row["id"]),
+                    job_id=row["id"],
                     conn=conn,
                 )
-                result_env, _ = self._seal_json_value(
+                env, sealed_kid = self._seal_job_payload(
                     conn,
                     tenant_id=tenant_id,
-                    value=opened_result,
-                    aad=result_aad(row["id"]),
                     job_id=row["id"],
-                    blob_kind="result",
+                    payload=plain,
+                    force_new=True,
                 )
+                if sealed_kid != rec.key_id or str(env.get("kid")) != str(rec.key_id):
+                    continue
+                if hasattr(self, "_assert_envelope_readable"):
+                    self._assert_envelope_readable(env)
+                result_env = row.get("result")
+                if result_env is not None:
+                    opened_result = self._open_json_value(
+                        result_env,
+                        tenant_id=tenant_id,
+                        aad=result_aad(row["id"]),
+                        conn=conn,
+                    )
+                    result_env, result_kid = self._seal_json_value(
+                        conn,
+                        tenant_id=tenant_id,
+                        value=opened_result,
+                        aad=result_aad(row["id"]),
+                        job_id=row["id"],
+                        blob_kind="result",
+                        force_new=True,
+                    )
+                    if result_kid != rec.key_id:
+                        continue
+                    if hasattr(self, "_assert_envelope_readable"):
+                        self._assert_envelope_readable(result_env)
+            except (BlobStoreError, PayloadCryptoError):
+                # Leave the row on the old key; retiring waits until it rewraps.
+                continue
             conn.execute(
                 """
                 UPDATE jobs
@@ -584,20 +632,28 @@ class PayloadKeysMixin:
                 if hasattr(self, "_blob_id_of")
                 else None
             )
-            plain = self._open_dict(
-                row["payload"],
-                tenant_id=tenant_id,
-                aad=delivery_aad(row["id"]),
-                conn=conn,
-            )
-            env, _ = self._seal_dict(
-                conn,
-                tenant_id=tenant_id,
-                plaintext=plain,
-                aad=delivery_aad(row["id"]),
-                job_id=None,
-                blob_kind="delivery",
-            )
+            try:
+                plain = self._open_dict(
+                    row["payload"],
+                    tenant_id=tenant_id,
+                    aad=delivery_aad(row["id"]),
+                    conn=conn,
+                )
+                env, sealed_kid = self._seal_dict(
+                    conn,
+                    tenant_id=tenant_id,
+                    plaintext=plain,
+                    aad=delivery_aad(row["id"]),
+                    job_id=row.get("job_id"),
+                    blob_kind="delivery",
+                    force_new=True,
+                )
+                if sealed_kid != rec.key_id or str(env.get("kid")) != str(rec.key_id):
+                    continue
+                if hasattr(self, "_assert_envelope_readable"):
+                    self._assert_envelope_readable(env)
+            except (BlobStoreError, PayloadCryptoError):
+                continue
             conn.execute(
                 """
                 UPDATE webhook_deliveries
@@ -646,6 +702,7 @@ class PayloadKeysMixin:
                 tenant_id=tenant_id,
                 plaintext={"steps": steps},
                 aad=workflow_steps_aad(row["id"]),
+                force_new=True,
             )
             conn.execute(
                 """
@@ -699,6 +756,7 @@ class PayloadKeysMixin:
                 tenant_id=tenant_id,
                 plaintext=opened,
                 aad=workflow_signal_aad(row["run_id"], str(row["name"])),
+                force_new=True,
             )
             conn.execute(
                 """
@@ -757,12 +815,13 @@ class PayloadKeysMixin:
                 """
                 SELECT 1 FROM jobs
                 WHERE tenant_id = %s
-                  AND payload_key_id IS NULL
-                  AND payload ? '_jq_enc'
-                  AND payload->>'kid' = %s
+                  AND (
+                        payload->>'kid' = %s
+                     OR result->>'kid' = %s
+                  )
                 LIMIT 1
                 """,
-                (tenant_id, str(kid)),
+                (tenant_id, str(kid), str(kid)),
             ).fetchone()
             if env_job is not None:
                 continue
@@ -770,8 +829,6 @@ class PayloadKeysMixin:
                 """
                 SELECT 1 FROM schedules
                 WHERE tenant_id = %s
-                  AND payload_key_id IS NULL
-                  AND payload ? '_jq_enc'
                   AND payload->>'kid' = %s
                 LIMIT 1
                 """,
@@ -779,13 +836,29 @@ class PayloadKeysMixin:
             ).fetchone()
             if env_sched is not None:
                 continue
-            deliv_ref = conn.execute(
+            blob_ref = conn.execute(
                 """
-                SELECT 1 FROM webhook_deliveries
-                WHERE tenant_id = %s AND payload_key_id = %s
+                SELECT 1 FROM job_payload_blobs
+                WHERE tenant_id = %s
+                  AND key_id = %s
+                  AND status = 'committed'
                 LIMIT 1
                 """,
                 (tenant_id, kid),
+            ).fetchone()
+            if blob_ref is not None:
+                continue
+            deliv_ref = conn.execute(
+                """
+                SELECT 1 FROM webhook_deliveries
+                WHERE tenant_id = %s
+                  AND (
+                        payload_key_id = %s
+                     OR payload->>'kid' = %s
+                  )
+                LIMIT 1
+                """,
+                (tenant_id, kid, str(kid)),
             ).fetchone()
             if deliv_ref is not None:
                 continue

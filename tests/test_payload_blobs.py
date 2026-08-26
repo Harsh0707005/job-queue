@@ -163,6 +163,152 @@ def test_rotate_rewrites_spilled_ciphertext(blob_queue: JobQueue):
     assert not blob_queue._blob_store.exists(old_blob)
 
 
+def test_live_rotation_spilled_pending_leased_webhook_and_export(
+    blob_queue: JobQueue,
+):
+    """Old and new keys coexist; spilled pointers stay openable; list stays redacted."""
+    from job_queue.crypto import is_envelope
+    from tests.helpers_queue import _WebhookCapture
+
+    capture = _WebhookCapture()
+    try:
+        blob_queue.register_webhook(
+            tenant_id="blob-rot-live",
+            url=capture.url,
+            events=[WebhookEvent.JOB_COMPLETED.value],
+            secret="hook",
+        )
+        held = blob_queue.enqueue(
+            tenant_id="blob-rot-live",
+            payload={"secret": "lease-secret", "blob": BIG, "who": "leased"},
+        )
+        leased = blob_queue.lease(tenant_id="blob-rot-live", worker_id="holder")
+        assert leased is not None
+        assert leased.id == held.id
+        assert leased.payload["secret"] == "lease-secret"
+        done = blob_queue.enqueue(
+            tenant_id="blob-rot-live",
+            payload={"secret": "done-secret", "blob": BIG, "who": "done"},
+        )
+        dlease = blob_queue.lease(tenant_id="blob-rot-live", worker_id="finisher")
+        assert dlease is not None and dlease.id == done.id
+        _ack(blob_queue, dlease, "finisher", result={"out": "done-secret", "blob": BIG})
+        pending = blob_queue.enqueue(
+            tenant_id="blob-rot-live",
+            payload={"secret": "pend-secret", "blob": BIG, "who": "pending"},
+        )
+
+        listed = blob_queue.list_jobs(tenant_id="blob-rot-live")
+        # get/list decrypt locally; HTTP redaction is covered in encrypt tests.
+        # Postgres must not hold the secrets.
+        with blob_queue._pool.connection() as conn:
+            txt = "\n".join(
+                r["t"]
+                for r in conn.execute(
+                    """
+                    SELECT payload::text AS t FROM jobs WHERE tenant_id = %s
+                    UNION ALL
+                    SELECT result::text FROM jobs
+                    WHERE tenant_id = %s AND result IS NOT NULL
+                    """,
+                    ("blob-rot-live", "blob-rot-live"),
+                ).fetchall()
+            )
+        for secret in ("pend-secret", "lease-secret", "done-secret"):
+            assert secret not in txt
+
+        rot = blob_queue.rotate_tenant_payload_key("blob-rot-live")
+        assert rot.status == "reencrypting"
+        fresh = blob_queue.enqueue(
+            tenant_id="blob-rot-live",
+            payload={"secret": "new-secret", "blob": BIG, "who": "fresh"},
+        )
+        stored_fresh = _stored(blob_queue, fresh.id)
+        assert is_blob_pointer(stored_fresh)
+        with blob_queue._pool.connection() as conn:
+            kid = conn.execute(
+                "SELECT payload_key_id FROM jobs WHERE id = %s",
+                (fresh.id,),
+            ).fetchone()["payload_key_id"]
+        assert kid == rot.to_key_id
+
+        # Mid-rotation: old pending still leases, held lease still acks,
+        # export sees ciphertext only.
+        still = blob_queue.get(leased.id, tenant_id="blob-rot-live")
+        assert still is not None and still.payload["secret"] == "lease-secret"
+        snap = blob_queue.export_tenant("blob-rot-live")
+        assert snap.status == "ready"
+        assert snap.counts.get("payload_blobs", 0) >= 1
+
+        for _ in range(12):
+            rot = blob_queue.advance_payload_key_rotation(
+                "blob-rot-live", batch_size=4
+            )
+            if rot.status == "complete":
+                break
+        assert rot.status == "complete"
+
+        gc = blob_queue.process_payload_blobs(limit=50)
+        assert gc["deleted"] >= 0
+        for job_id in (pending.id, leased.id, done.id, fresh.id):
+            stored = _stored(blob_queue, job_id)
+            with blob_queue._pool.connection() as conn:
+                kid = conn.execute(
+                    "SELECT payload_key_id FROM jobs WHERE id = %s",
+                    (job_id,),
+                ).fetchone()["payload_key_id"]
+            assert kid == rot.to_key_id
+            assert is_envelope(stored)
+            if is_blob_pointer(stored):
+                assert blob_queue._blob_store.exists(stored["blob_id"])
+                blob_queue._hydrate_envelope(stored)
+            got = blob_queue.get(job_id, tenant_id="blob-rot-live")
+            assert got is not None
+            assert "secret" in got.payload
+
+        _ack(
+            blob_queue,
+            leased,
+            "holder",
+            result={"out": "lease-secret", "blob": BIG},
+        )
+        leftover = blob_queue.lease(tenant_id="blob-rot-live", worker_id="w2")
+        assert leftover is not None
+        assert leftover.payload["secret"] in {"pend-secret", "new-secret"}
+        _ack(blob_queue, leftover, "w2")
+        last = blob_queue.lease(tenant_id="blob-rot-live", worker_id="w3")
+        if last is not None:
+            _ack(blob_queue, last, "w3")
+
+        blob_queue.process_webhook_deliveries(limit=20)
+        delivered = blob_queue.list_webhook_deliveries(
+            tenant_id="blob-rot-live", status="succeeded"
+        )
+        assert delivered
+        assert delivered[0].payload["payload"]["secret"] in {
+            "done-secret",
+            "lease-secret",
+            "pend-secret",
+            "new-secret",
+        }
+
+        rst = blob_queue.restore_tenant(
+            "blob-rot-live-dst",
+            snapshot_id=snap.id,
+            batch_size=20,
+            run_until_complete=True,
+        )
+        assert rst.status == "complete"
+        dst = blob_queue.get(
+            blob_queue.list_jobs(tenant_id="blob-rot-live-dst")[0].id,
+            tenant_id="blob-rot-live-dst",
+        )
+        assert dst is not None
+        assert "secret" in dst.payload
+    finally:
+        capture.stop()
+
+
 def test_export_restore_onto_empty_blob_store(blob_queue: JobQueue, tmp_path):
     """Fresh dest fleet: snapshot carries ciphertext; dest rebuilds files."""
     from job_queue.blob_store import FilesystemBlobStore
@@ -380,6 +526,7 @@ def test_orphan_catalog_gc_deletes_file(blob_queue: JobQueue):
     stored = _stored(blob_queue, job.id)
     bid = stored["blob_id"]
     with blob_queue._pool.connection() as conn:
+        conn.execute("DELETE FROM jobs WHERE id = %s", (job.id,))
         conn.execute(
             "UPDATE job_payload_blobs SET status = 'orphan' WHERE id = %s",
             (bid,),

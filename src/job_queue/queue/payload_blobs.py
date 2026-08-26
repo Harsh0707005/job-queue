@@ -57,6 +57,8 @@ class PayloadBlobsMixin:
             store = getattr(self, "_blob_store", None)
             for row in rows:
                 bid = row["id"]
+                if self._blob_is_referenced(conn, bid):
+                    continue
                 if store is not None:
                     store.delete(bid)
                 conn.execute("DELETE FROM job_payload_blobs WHERE id = %s", (bid,))
@@ -192,6 +194,37 @@ class PayloadBlobsMixin:
             "sha256": digest,
             "bytes": len(data),
         }
+
+    def _assert_envelope_readable(self, env: Any) -> None:
+        """Raise if a spilled pointer has no readable file."""
+        if not is_blob_pointer(env):
+            return
+        self._hydrate_envelope(env)
+
+    def _blob_is_referenced(self, conn: Any, blob_id: UUID) -> bool:
+        bid = str(blob_id)
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM jobs
+            WHERE payload->>'blob_id' = %s
+               OR result->>'blob_id' = %s
+            LIMIT 1
+            """,
+            (bid, bid),
+        ).fetchone()
+        if row is not None:
+            return True
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM webhook_deliveries
+            WHERE payload->>'blob_id' = %s
+            LIMIT 1
+            """,
+            (bid,),
+        ).fetchone()
+        return row is not None
 
     def _materialize_envelope(
         self, env: Any, *, conn: Any | None = None

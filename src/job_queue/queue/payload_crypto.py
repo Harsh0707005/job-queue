@@ -133,10 +133,11 @@ class PayloadCryptoMixin:
         aad: bytes,
         job_id: UUID | None = None,
         blob_kind: str | None = None,
+        force_new: bool = False,
     ) -> tuple[dict[str, Any], UUID]:
         if not isinstance(plaintext, dict):
             raise ValueError("plaintext must be a dict")
-        if is_envelope(plaintext):
+        if is_envelope(plaintext) and not force_new:
             return plaintext, UUID(str(plaintext["kid"]))
         rec = self._ensure_active_key(conn, tenant_id)
         env = encrypt_json(
@@ -188,6 +189,7 @@ class PayloadCryptoMixin:
         tenant_id: str,
         job_id: UUID,
         payload: dict[str, Any],
+        force_new: bool = False,
     ) -> tuple[dict[str, Any], UUID]:
         return self._seal_dict(
             conn,
@@ -196,6 +198,7 @@ class PayloadCryptoMixin:
             aad=job_aad(job_id),
             job_id=job_id,
             blob_kind="payload",
+            force_new=force_new,
         )
 
     def _seal_schedule_payload(
@@ -249,6 +252,7 @@ class PayloadCryptoMixin:
         aad: bytes,
         job_id: UUID | None = None,
         blob_kind: str = "result",
+        force_new: bool = False,
     ) -> tuple[dict[str, Any], UUID]:
         return self._seal_dict(
             conn,
@@ -257,6 +261,7 @@ class PayloadCryptoMixin:
             aad=aad,
             job_id=job_id,
             blob_kind=blob_kind,
+            force_new=force_new,
         )
 
     def _open_json_value(
