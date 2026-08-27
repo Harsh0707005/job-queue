@@ -84,6 +84,16 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def process_workflow_timers(
+        self, *, tenant_id: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/workflows/process-timers", body)
+        assert payload is not None
+        return payload
+
     def cancel_workflow(
         self,
         run_id: str | UUID,

@@ -40,6 +40,8 @@ class WorkflowStepStatus(str, Enum):
     SKIPPED = "skipped"
     COMPENSATED = "compensated"
     AWAITING_SIGNAL = "awaiting_signal"
+    AWAITING_SLEEP = "awaiting_sleep"
+    AWAITING_TIMER = "awaiting_timer"
 
 
 class WorkflowStepDirection(str, Enum):

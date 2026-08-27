@@ -1,0 +1,71 @@
+# Durable sleep + timer workflow steps; kill coordinator-1 mid-wait.
+#
+#   COMPOSE_PROJECT_NAME=jq-wftm docker compose -p jq-wftm \
+#     -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.workflow-timer.yml up --build -d
+#   docker logs -f jq-wftm-workflow-soak-1
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+  coordinator-1:
+    ports: !reset []
+  coordinator-2:
+    ports: !reset []
+
+  worker-1:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-2:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-3:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-4:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-5:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-6:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-7:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+  worker-8:
+    environment:
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "4"
+
+  workflow-soak:
+    command: ["python", "scripts/workflow_timer_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      TENANTS: "4"
+      SLEEP_PER_TENANT: "3"
+      TIMER_PER_TENANT: "2"
+      SLEEP_SECONDS: "2"
+      TIMER_SECONDS: "1"
+      MAX_WALL_SECONDS: "240"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-wftm}
+      LOG_LEVEL: INFO
+    volumes:
+      - ./scripts:/app/scripts
+      - /var/run/docker.sock:/var/run/docker.sock

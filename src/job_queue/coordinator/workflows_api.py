@@ -316,3 +316,17 @@ class WorkflowsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"timed_out": n}
+
+    def _process_workflow_timers(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            n = self.queue.process_workflow_timers(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 50),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"fired": n}

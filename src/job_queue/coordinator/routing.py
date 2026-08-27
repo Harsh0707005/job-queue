@@ -914,6 +914,8 @@ class RoutingMixin:
             return self._process_workflow_compensation(body)
         if method == "POST" and path == "/v1/workflows/process-signal-timeouts":
             return self._process_workflow_signal_timeouts(body)
+        if method == "POST" and path == "/v1/workflows/process-timers":
+            return self._process_workflow_timers(body)
         if (
             method == "POST"
             and path.startswith("/v1/workflows/")

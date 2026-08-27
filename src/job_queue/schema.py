@@ -1360,7 +1360,8 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     CONSTRAINT workflow_step_runs_status_check CHECK (
         status IN (
             'pending', 'running', 'completed', 'failed',
-            'skipped', 'compensated', 'awaiting_signal'
+            'skipped', 'compensated', 'awaiting_signal',
+            'awaiting_sleep', 'awaiting_timer'
         )
     ),
     CONSTRAINT workflow_step_runs_index_check CHECK (step_index >= 0),
@@ -1375,7 +1376,8 @@ ALTER TABLE workflow_step_runs DROP CONSTRAINT IF EXISTS workflow_step_runs_stat
 ALTER TABLE workflow_step_runs ADD CONSTRAINT workflow_step_runs_status_check CHECK (
     status IN (
         'pending', 'running', 'completed', 'failed',
-        'skipped', 'compensated', 'awaiting_signal'
+        'skipped', 'compensated', 'awaiting_signal',
+        'awaiting_sleep', 'awaiting_timer'
     )
 );
 
@@ -1399,6 +1401,14 @@ CREATE INDEX IF NOT EXISTS idx_workflow_runs_compensating
 CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_awaiting_signal
     ON workflow_step_runs (deadline_at)
     WHERE status = 'awaiting_signal' AND deadline_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_awaiting_sleep
+    ON workflow_step_runs (deadline_at)
+    WHERE status = 'awaiting_sleep' AND deadline_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_awaiting_timer
+    ON workflow_step_runs (deadline_at)
+    WHERE status = 'awaiting_timer' AND deadline_at IS NOT NULL;
 
 -- Named signals latch per (run, name). Early send still counts; tenant_id
 -- is required on every read/write so one tenant cannot consume another.

@@ -208,6 +208,19 @@ class CoordinatorControlLoop:
         if self._stop.is_set() or not self.is_leader():
             return
         try:
+            if hasattr(self.queue, "process_workflow_timers"):
+                n = self.queue.process_workflow_timers(limit=50)
+                if n:
+                    logger.info("control fired %d workflow timer(s)", n)
+            if hasattr(self.queue, "process_workflow_signal_timeouts"):
+                n = self.queue.process_workflow_signal_timeouts(limit=50)
+                if n:
+                    logger.info("control timed out %d workflow wait(s)", n)
+        except Exception:  # noqa: BLE001
+            logger.exception("control workflow timer tick failed node=%s", self.node_id)
+        if self._stop.is_set() or not self.is_leader():
+            return
+        try:
             if hasattr(self.queue, "process_tenant_restores"):
                 self.queue.process_tenant_restores(
                     limit=20, batch_size=min(self.retention_limit, 200)

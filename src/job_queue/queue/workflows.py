@@ -61,6 +61,13 @@ _STEP_COLUMNS = """
 # Default redrives when a compensate job dies (crash / timeout / nack).
 DEFAULT_MAX_COMPENSATE_RETRIES = 5
 
+# Forward steps parked without a worker job (signal / sleep / timer).
+_PARKED_FORWARD_STATUSES = (
+    WorkflowStepStatus.AWAITING_SIGNAL.value,
+    WorkflowStepStatus.AWAITING_SLEEP.value,
+    WorkflowStepStatus.AWAITING_TIMER.value,
+)
+
 
 class WorkflowsMixin(WorkflowsMapMixin):
     def start_workflow(
@@ -562,17 +569,18 @@ class WorkflowsMixin(WorkflowsMapMixin):
             run["id"],
             WorkflowStepStatus.PENDING.value,
             WorkflowStepStatus.RUNNING.value,
-            WorkflowStepStatus.AWAITING_SIGNAL.value,
+            *_PARKED_FORWARD_STATUSES,
         ]
         if only_directions:
             dir_sql = "AND direction = ANY(%s)"
             params.append(list(only_directions))
+        parked_ph = ", ".join(["%s"] * len(_PARKED_FORWARD_STATUSES))
         steps = conn.execute(
             f"""
             SELECT {_STEP_COLUMNS}
             FROM workflow_step_runs
             WHERE run_id = %s
-              AND status IN (%s, %s, %s)
+              AND status IN (%s, %s, {parked_ph})
               {dir_sql}
             FOR UPDATE
             """,
@@ -1608,7 +1616,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
             FROM workflow_step_runs
             WHERE run_id = %s
               AND direction = 'forward'
-              AND status IN (%s, %s, %s)
+              AND status IN (%s, %s, {", ".join(["%s"] * len(_PARKED_FORWARD_STATUSES))})
               AND id <> %s
             FOR UPDATE
             """,
@@ -1616,7 +1624,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 run["id"],
                 WorkflowStepStatus.PENDING.value,
                 WorkflowStepStatus.RUNNING.value,
-                WorkflowStepStatus.AWAITING_SIGNAL.value,
+                *_PARKED_FORWARD_STATUSES,
                 failed_step_id,
             ),
         ).fetchall()
@@ -1720,10 +1728,10 @@ class WorkflowsMixin(WorkflowsMapMixin):
             FROM workflow_step_runs
             WHERE run_id = %s
               AND direction = 'forward'
-              AND status = %s
+              AND status = ANY(%s)
             LIMIT 1
             """,
-            (run_id, WorkflowStepStatus.AWAITING_SIGNAL.value),
+            (run_id, list(_PARKED_FORWARD_STATUSES)),
         ).fetchone()
         return waiting is not None
 
@@ -2327,11 +2335,29 @@ class WorkflowsMixin(WorkflowsMapMixin):
         assert step_row is not None
         if step_row["job_id"] is not None:
             return step_row
+        kind = str(sdef.get("kind") or "")
         if (
             direction == WorkflowStepDirection.FORWARD.value
-            and str(sdef.get("kind") or "") == "wait_signal"
+            and kind == "wait_signal"
         ):
             return self._park_or_complete_wait_signal(
+                conn,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                step_row=step_row,
+                steps_def=steps_def,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
+        if direction == WorkflowStepDirection.FORWARD.value and kind in (
+            "sleep",
+            "delay",
+            "timer",
+            "timeout",
+        ):
+            return self._park_or_complete_sleep_or_timer(
                 conn,
                 run_id=run_id,
                 tenant_id=tenant_id,
@@ -2923,6 +2949,22 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 out["timeout_seconds"] = timeout
             if raw.get("deadline_at") is not None:
                 out["deadline_at"] = raw["deadline_at"]
+        if kind in ("sleep", "delay", "timer", "timeout"):
+            from job_queue.queue.workflows_timers import wait_deadline
+
+            for key in (
+                "seconds",
+                "sleep_seconds",
+                "duration_seconds",
+                "timeout_seconds",
+            ):
+                if raw.get(key) is not None:
+                    out[key] = raw[key]
+            for key in ("deadline_at", "until", "wake_at"):
+                if raw.get(key) is not None:
+                    out[key] = raw[key]
+            # Validate now so a bad spec fails at start, not at park.
+            wait_deadline(out, now=_utcnow(), kind=kind)
         if raw.get("fail"):
             out["fail"] = True
             if raw.get("fail_error") is not None:
@@ -2934,6 +2976,8 @@ class WorkflowsMixin(WorkflowsMapMixin):
             ckind = str(comp.get("kind") or "effect").strip()
             if ckind == "wait_signal":
                 raise ValueError(f"{label}.compensate cannot wait for a signal")
+            if ckind in ("sleep", "delay", "timer", "timeout"):
+                raise ValueError(f"{label}.compensate cannot sleep or time out")
             out["compensate"] = {
                 "kind": ckind,
                 "payload": dict(comp.get("payload") or {}),

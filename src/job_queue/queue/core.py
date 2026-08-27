@@ -21,6 +21,7 @@ from job_queue.queue.usage import UsageMixin
 from job_queue.queue.alerts import AlertsMixin
 from job_queue.queue.workflows import WorkflowsMixin
 from job_queue.queue.workflows_signals import WorkflowSignalsMixin
+from job_queue.queue.workflows_timers import WorkflowsTimersMixin
 from job_queue.queue.partitions import PartitionsMixin
 from job_queue.queue.coordinator_leader import CoordinatorLeaderMixin
 from job_queue.queue.misc import MiscMixin
@@ -46,6 +47,7 @@ class JobQueue(
     AlertsMixin,
     WorkflowsMixin,
     WorkflowSignalsMixin,
+    WorkflowsTimersMixin,
     PartitionsMixin,
     CoordinatorLeaderMixin,
     MiscMixin,
