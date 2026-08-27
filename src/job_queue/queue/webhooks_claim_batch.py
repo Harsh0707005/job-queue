@@ -90,6 +90,9 @@ class WebhooksClaimBatchMixin:
                       AND d2.last_status_code < 300
                       AND (
                             d2.event IN ('alert.fired', 'alert.resolved')
+                            -- Inbound callbacks stay claimable while paused so
+                            -- offboard (which pauses the tenant) can finish.
+                            OR d2.callback_url IS NOT NULL
                             OR NOT EXISTS (
                                 SELECT 1 FROM tenant_settings ts
                                 WHERE ts.tenant_id = d2.tenant_id
@@ -151,6 +154,9 @@ class WebhooksClaimBatchMixin:
                     )
                     AND (
                         d.event IN ('alert.fired', 'alert.resolved')
+                        -- Offboard marks paused+offboarding and waits for
+                        -- inbound callbacks; they must still be claimable.
+                        OR d.callback_url IS NOT NULL
                         OR NOT EXISTS (
                             SELECT 1
                             FROM tenant_settings ts

@@ -442,6 +442,194 @@ def test_inbound_callback_survives_crash_and_does_not_double_deliver(
         cb.stop()
 
 
+def test_offboard_delivers_pending_inbound_callback_then_empties(queue: JobQueue):
+    """Offboard pauses the tenant but must still claim the kept callback."""
+    from job_queue import verify_webhook_signature
+    from tests.helpers_queue import _WebhookCapture
+
+    cb = _WebhookCapture()
+    hook = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="cb-ob",
+            url=hook.url,
+            events=["job.completed"],
+            secret="tenant-hook-ob",
+        )
+        trig = queue.create_inbound_trigger(
+            tenant_id="cb-ob",
+            name="ob-pending",
+            secret="ob-pending-secretx",
+            kinds=["job"],
+        )
+        out = queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 1}, "callback_url": cb.url},
+            nonce="ob-pending-1",
+        )
+        leased = queue.lease(tenant_id="cb-ob", worker_id="w")
+        assert leased is not None
+        _ack(queue, leased, "w", result={"ok": True})
+        pending = queue.list_webhook_deliveries(tenant_id="cb-ob", status="pending")
+        assert any(d.endpoint_id is None for d in pending)
+        assert any(d.endpoint_id is not None for d in pending)
+
+        result = queue.offboard_tenant("cb-ob")
+        assert result.empty is False
+        assert result.offboarding is True
+        assert result.webhooks_delivering_remaining >= 1
+        assert queue.is_tenant_paused("cb-ob") is True
+
+        # Tenant webhook pending rows are purged; inbound callback is kept.
+        left = queue.list_webhook_deliveries(tenant_id="cb-ob")
+        assert len(left) == 1
+        assert left[0].endpoint_id is None
+        assert left[0].status == "pending"
+
+        results = queue.process_webhook_deliveries(limit=10)
+        assert any(r.success and r.delivery.endpoint_id is None for r in results)
+        assert len(cb.received) == 1
+        body = cb.received[0]["body"]
+        assert body["job_id"] == str(out["job"].id)
+        assert body["event"] == "job.completed"
+        raw = json.dumps(body, default=str, separators=(",", ":")).encode()
+        assert verify_webhook_signature(
+            "ob-pending-secretx", raw, cb.received[0]["signature"]
+        )
+        assert hook.received == []
+        assert queue.tenant_is_empty("cb-ob") is True
+        assert queue.is_tenant_offboarding("cb-ob") is False
+    finally:
+        cb.stop()
+        hook.stop()
+
+
+def test_offboard_delivers_callback_after_in_flight_ack(queue: JobQueue):
+    """Leased inbound job acks after offboard; callback still POSTs."""
+    from tests.helpers_queue import _WebhookCapture
+
+    cb = _WebhookCapture()
+    try:
+        trig = queue.create_inbound_trigger(
+            tenant_id="cb-ob-lease",
+            name="ob-lease",
+            secret="ob-lease-secretxxx",
+            kinds=["job"],
+        )
+        out = queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 2}, "callback_url": cb.url},
+            nonce="ob-lease-1",
+        )
+        leased = queue.lease(tenant_id="cb-ob-lease", worker_id="w")
+        assert leased is not None and leased.id == out["job"].id
+
+        result = queue.offboard_tenant("cb-ob-lease")
+        assert result.offboarding is True
+        assert result.leased_remaining == 1
+        _ack(queue, leased, "w", result={"after": True})
+
+        results = queue.process_webhook_deliveries(limit=10)
+        assert any(r.success for r in results)
+        assert len(cb.received) == 1
+        assert cb.received[0]["body"]["job_id"] == str(out["job"].id)
+        assert queue.tenant_is_empty("cb-ob-lease") is True
+    finally:
+        cb.stop()
+
+
+def test_offboard_reclaims_inbound_callback_instead_of_dead_letter(queue: JobQueue):
+    """Expired delivering callbacks must be re-POSTed, not reaped as dead."""
+    from tests.helpers_queue import _WebhookCapture
+
+    cb = _WebhookCapture()
+    try:
+        trig = queue.create_inbound_trigger(
+            tenant_id="cb-ob-reap",
+            name="ob-reap",
+            secret="ob-reap-secretxxxxx",
+            kinds=["job"],
+        )
+        queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 3}, "callback_url": cb.url},
+            nonce="ob-reap-1",
+        )
+        leased = queue.lease(tenant_id="cb-ob-reap", worker_id="w")
+        assert leased is not None
+        _ack(queue, leased, "w", result={"ok": True})
+
+        claimed, auto = queue.claim_webhook_deliveries(
+            limit=5, claim_seconds=0.05
+        )
+        assert auto == []
+        assert len(claimed) == 1
+        assert claimed[0].delivery.endpoint_id is None
+
+        result = queue.offboard_tenant("cb-ob-reap")
+        assert result.offboarding is True
+        assert result.webhooks_delivering_remaining == 1
+
+        time.sleep(0.08)
+        results = queue.process_webhook_deliveries(limit=5, claim_seconds=5.0)
+        assert any(r.success for r in results)
+        assert len(cb.received) == 1
+        assert queue.tenant_is_empty("cb-ob-reap") is True
+    finally:
+        cb.stop()
+
+
+def test_paused_tenant_still_delivers_inbound_callback(queue: JobQueue):
+    """Regular pause blocks tenant webhooks but not inbound callbacks."""
+    from tests.helpers_queue import _WebhookCapture
+
+    cb = _WebhookCapture()
+    hook = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="cb-pause",
+            url=hook.url,
+            events=["job.completed"],
+            secret="tenant-hook-pause",
+        )
+        trig = queue.create_inbound_trigger(
+            tenant_id="cb-pause",
+            name="pause-cb",
+            secret="pause-callback-xxx",
+            kinds=["job"],
+        )
+        queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 4}, "callback_url": cb.url},
+            nonce="pause-cb-1",
+        )
+        leased = queue.lease(tenant_id="cb-pause", worker_id="w")
+        assert leased is not None
+        _ack(queue, leased, "w", result={"ok": True})
+        assert len(queue.list_webhook_deliveries(tenant_id="cb-pause")) == 2
+
+        queue.pause_tenant("cb-pause")
+        results = queue.process_webhook_deliveries(limit=10)
+        assert any(r.success and r.delivery.endpoint_id is None for r in results)
+        assert len(cb.received) == 1
+        assert hook.received == []
+        still = [
+            d
+            for d in queue.list_webhook_deliveries(tenant_id="cb-pause")
+            if d.endpoint_id is not None
+        ]
+        assert len(still) == 1
+        assert still[0].status == "pending"
+
+        queue.resume_tenant("cb-pause")
+        more = queue.process_webhook_deliveries(limit=10)
+        assert any(r.success and r.delivery.endpoint_id is not None for r in more)
+        assert len(hook.received) == 1
+    finally:
+        cb.stop()
+        hook.stop()
+
+
 def _nonce_rows(queue: JobQueue, trigger_id, nonce: str) -> int:
     with queue._pool.connection() as conn:
         row = conn.execute(

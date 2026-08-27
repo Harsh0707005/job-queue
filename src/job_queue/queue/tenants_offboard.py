@@ -20,14 +20,15 @@ class TenantsOffboardMixin:
     def offboard_tenant(self, tenant_id: str) -> TenantOffboardResult:
         """Fully offboard a tenant without interrupting in-flight work.
 
-        1. Marks tenant paused + offboarding (no new leases / schedule ticks /
-           webhook claims; enqueue is rejected).
+        1. Marks tenant paused + offboarding (no new leases / schedule ticks;
+           enqueue is rejected). Tenant webhook claims stay blocked; inbound
+           job callbacks remain claimable so they can finish.
         2. Cancels all *pending* jobs (cascade kills pending dependents).
         3. Deletes all schedules.
-        4. Deletes *non-claimed* webhook deliveries and any endpoints that no
-           longer have a ``delivering`` claim. Already-claimed (``delivering``)
-           deliveries — and the endpoints they reference — are kept so agents
-           can still POST and ``finalize_webhook_delivery``.
+        4. Deletes *non-claimed* tenant webhook deliveries and any endpoints
+           that no longer have a ``delivering`` claim. Already-claimed
+           (``delivering``) tenant deliveries — and pending inbound callbacks
+           — are kept so agents can still POST and ``finalize_webhook_delivery``.
         5. Purges all non-``leased`` job rows (history / cancelled / dead).
         6. Deletes spilled blob files whose job/delivery pointers are gone
            (payload, result, webhook body) from the shared store.

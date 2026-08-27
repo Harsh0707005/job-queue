@@ -200,8 +200,10 @@ class WebhooksEnqueueMixin:
     ) -> None:
         """Dead-letter expired ``delivering`` webhooks for offboarding tenants.
 
-        Offboarding tenants are paused, so stuck claims are never reclaimed for
-        a re-POST. Without this, abandoned agents leave the tenant non-empty.
+        Offboarding tenants are paused, so stuck *tenant* webhook claims are
+        never reclaimed for a re-POST. Without this, abandoned agents leave
+        the tenant non-empty. Inbound callbacks stay claimable while paused
+        and are skipped here so a mid-POST crash can reclaim and deliver.
         """
         if tenant_id is not None:
             if not self._is_tenant_offboarding(conn, tenant_id):
@@ -214,6 +216,7 @@ class WebhooksEnqueueMixin:
                   AND status = 'delivering'
                   AND delivering_until IS NOT NULL
                   AND delivering_until < %s
+                  AND callback_url IS NULL
                 FOR UPDATE
                 """,
                 (tenant_id, now),
@@ -226,6 +229,7 @@ class WebhooksEnqueueMixin:
                 WHERE d.status = 'delivering'
                   AND d.delivering_until IS NOT NULL
                   AND d.delivering_until < %s
+                  AND d.callback_url IS NULL
                   AND EXISTS (
                         SELECT 1
                         FROM tenant_settings ts

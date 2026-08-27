@@ -1,0 +1,67 @@
+# Inbound callbacks must deliver after offboard pauses the tenant.
+#
+#   COMPOSE_PROJECT_NAME=jq-cbob docker compose -p jq-cbob \
+#     -f docker-compose.yml -f docker-compose.inbound-callback-offboard.yml \
+#     up --build -d
+#   docker logs -f jq-cbob-inbound-callback-offboard-soak-1
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+    environment:
+      LOG_LEVEL: INFO
+      SLOW_MS: "120"
+      WEBHOOK_VERIFY_SECRETS: "secret-cob-00-xxxxxxxx,secret-cob-01-xxxxxxxx,secret-cob-02-xxxxxxxx,secret-cob-03-xxxxxxxx,tenant-hook-secret"
+  coordinator-1:
+    ports: !reset []
+  coordinator-2:
+    ports: !reset []
+
+  inbound-callback-offboard-soak:
+    build: .
+    command: ["python", "scripts/inbound_callback_offboard_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      SINK_URL: http://webhook-sink:8090
+      CALLBACK_URL: http://webhook-sink:8090/hook
+      WEBHOOK_URL: http://webhook-sink:8090/hook
+      TENANTS: "4"
+      JOBS_PER_TENANT: "12"
+      DEAD_PER_TENANT: "2"
+      OFFBOARD_COUNT: "2"
+      JOB_SLEEP_MS: "1800"
+      CONCURRENCY: "6"
+      MAX_WALL_SECONDS: "240"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-cbob}
+      LOG_LEVEL: INFO
+    volumes:
+      - ./scripts:/app/scripts
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      webhook-1:
+        condition: service_started
+      webhook-2:
+        condition: service_started
+      webhook-sink:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
