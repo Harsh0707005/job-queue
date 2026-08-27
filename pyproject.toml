@@ -22,6 +22,7 @@ job-queue-scheduler-node = "job_queue.remote:scheduler_main"
 job-queue-webhook-node = "job_queue.remote:webhook_main"
 job-queue-webhook-sink = "job_queue.webhook_sink:main"
 job-queue-effect-sink = "job_queue.effect_sink:main"
+job-queue-activity-runner = "job_queue.activity_runner:main"
 job-queue-cleaner-node = "job_queue.remote:cleaner_main"
 
 [project.optional-dependencies]

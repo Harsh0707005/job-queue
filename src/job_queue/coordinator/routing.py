@@ -201,6 +201,30 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/jobs/")
+            and path.endswith("/activity/start")
+        ):
+            return self._start_workflow_activity(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/activity/heartbeat")
+        ):
+            return self._heartbeat_workflow_activity(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/activity/complete")
+        ):
+            return self._complete_workflow_activity(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/activity")
+        ):
+            return self._get_workflow_activity(path, query)
+        if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
             and path.endswith("/heartbeat")
         ):
             return self._job_action(path, body, "heartbeat")
@@ -916,6 +940,8 @@ class RoutingMixin:
             return self._process_workflow_signal_timeouts(body)
         if method == "POST" and path == "/v1/workflows/process-timers":
             return self._process_workflow_timers(body)
+        if method == "POST" and path == "/v1/workflows/process-activities":
+            return self._process_workflow_activities(body)
         if (
             method == "POST"
             and path.startswith("/v1/workflows/")

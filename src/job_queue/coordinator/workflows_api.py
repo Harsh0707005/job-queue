@@ -5,9 +5,20 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+from job_queue.coordinator.auth import _UUID_RE
 from job_queue.crypto import redact_payload
-from job_queue.models import WorkflowRun, WorkflowSignal, WorkflowStepRun
-from job_queue.queue._common import CancelError, QueueDrainError, RateLimitError
+from job_queue.models import (
+    WorkflowActivity,
+    WorkflowRun,
+    WorkflowSignal,
+    WorkflowStepRun,
+)
+from job_queue.queue._common import (
+    CancelError,
+    LeaseError,
+    QueueDrainError,
+    RateLimitError,
+)
 
 
 def _redact_steps_def(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -62,6 +73,32 @@ def _step_to_dict(s: WorkflowStepRun) -> dict[str, Any]:
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
         "deadline_at": s.deadline_at.isoformat() if s.deadline_at else None,
+    }
+
+
+def _activity_to_dict(a: WorkflowActivity) -> dict[str, Any]:
+    return {
+        "id": str(a.id),
+        "step_run_id": str(a.step_run_id),
+        "job_id": str(a.job_id) if a.job_id else None,
+        "run_id": str(a.run_id),
+        "tenant_id": a.tenant_id,
+        "name": a.name,
+        "url": a.url,
+        "status": a.status,
+        "timeout_seconds": a.timeout_seconds,
+        "heartbeat_timeout_seconds": a.heartbeat_timeout_seconds,
+        "started_at": a.started_at.isoformat() if a.started_at else None,
+        "last_heartbeat_at": (
+            a.last_heartbeat_at.isoformat() if a.last_heartbeat_at else None
+        ),
+        "heartbeat_due_at": (
+            a.heartbeat_due_at.isoformat() if a.heartbeat_due_at else None
+        ),
+        "timeout_at": a.timeout_at.isoformat() if a.timeout_at else None,
+        "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+        "result": a.result,
+        "error": a.error,
     }
 
 
@@ -330,3 +367,104 @@ class WorkflowsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"fired": n}
+
+    def _process_workflow_activities(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            n = self.queue.process_workflow_activities(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 50),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"timed_out": n}
+
+    def _start_workflow_activity(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._activity_lease_action(path, body, "start")
+
+    def _heartbeat_workflow_activity(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._activity_lease_action(path, body, "heartbeat")
+
+    def _complete_workflow_activity(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._activity_lease_action(path, body, "complete")
+
+    def _activity_lease_action(
+        self, path: str, body: dict[str, Any], action: str
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / jobs / {id} / activity / start|heartbeat|complete
+        if len(parts) != 5:
+            return 400, {"error": "invalid activity path"}
+        if not _UUID_RE.match(parts[2]):
+            return 400, {"error": "invalid job id"}
+        tenant_id = body.get("tenant_id")
+        worker_id = body.get("worker_id")
+        lease_token = body.get("lease_token")
+        if not tenant_id or not worker_id or not lease_token:
+            return 400, {
+                "error": "tenant_id, worker_id, lease_token required"
+            }
+        try:
+            token = UUID(str(lease_token))
+            jid = UUID(parts[2])
+            if action == "start":
+                act = self.queue.start_workflow_activity(
+                    jid,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                )
+            elif action == "heartbeat":
+                act = self.queue.heartbeat_workflow_activity(
+                    jid,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                )
+            else:
+                result = body.get("result")
+                if result is not None and not isinstance(result, dict):
+                    return 400, {"error": "result must be an object"}
+                act = self.queue.complete_workflow_activity(
+                    jid,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    result=result,
+                )
+        except LeaseError as exc:
+            return 409, {"error": str(exc), "code": "lease_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"activity": _activity_to_dict(act)}
+
+    def _get_workflow_activity(
+        self, path: str, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        # v1 / jobs / {id} / activity
+        if len(parts) != 4:
+            return 400, {"error": "invalid activity path"}
+        if not _UUID_RE.match(parts[2]):
+            return 400, {"error": "invalid job id"}
+        tenant = (query.get("tenant_id") or [None])[0]
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            act = self.queue.get_workflow_activity(
+                UUID(parts[2]), tenant_id=str(tenant)
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        if act is None:
+            return 404, {"error": "activity not found"}
+        return 200, {"activity": _activity_to_dict(act)}

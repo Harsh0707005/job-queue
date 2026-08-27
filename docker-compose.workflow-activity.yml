@@ -1,0 +1,124 @@
+# Workflow external activities: start, heartbeat, timeout, worker kill.
+#
+#   COMPOSE_PROJECT_NAME=jq-wfact docker compose -p jq-wfact \
+#     -f docker-compose.yml -f docker-compose.workflow.yml \
+#     -f docker-compose.workflow-activity.yml up --build -d
+#   docker logs -f jq-wfact-workflow-soak-1
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+  coordinator-1:
+    ports: !reset []
+  coordinator-2:
+    ports: !reset []
+
+  activity-runner:
+    build: .
+    command: ["job-queue-activity-runner"]
+    environment:
+      PORT: "8092"
+      LOG_LEVEL: INFO
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  worker-1:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-2:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-3:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-4:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-5:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-6:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-7:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+  worker-8:
+    environment:
+      ACTIVITY_URL: http://activity-runner:8092
+      WORKFLOW_ALLOW_SINK_FAILURE: "1"
+      VISIBILITY_TIMEOUT: "8"
+    depends_on:
+      activity-runner:
+        condition: service_healthy
+
+  workflow-soak:
+    command: ["python", "scripts/workflow_activity_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080
+      EFFECT_SINK_URL: http://effect-sink:8091
+      ACTIVITY_URL: http://activity-runner:8092
+      TENANTS: "4"
+      HAPPY_PER_TENANT: "3"
+      TIMEOUT_PER_TENANT: "2"
+      LONG_PER_TENANT: "2"
+      MAX_WALL_SECONDS: "240"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-wfact}
+      LOG_LEVEL: INFO
+    volumes:
+      - ./scripts:/app/scripts
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      activity-runner:
+        condition: service_healthy

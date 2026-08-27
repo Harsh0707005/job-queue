@@ -336,6 +336,12 @@ class TenantsOffboardMixin:
         ).fetchone()
         if sigs is not None:
             return False
+        acts = conn.execute(
+            "SELECT 1 FROM workflow_activities WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if acts is not None:
+            return False
         return True
 
     def _finalize_offboard_locked(

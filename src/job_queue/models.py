@@ -930,6 +930,36 @@ class WorkflowStepRun:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowActivity:
+    """External activity started by a worker for one workflow step.
+
+    Status lifecycle: running → completed | failed | timed_out.
+    A missed heartbeat or start-to-close timeout fails the forward step
+    and starts reverse compensation.
+    """
+
+    id: UUID
+    step_run_id: UUID
+    job_id: UUID | None
+    run_id: UUID
+    tenant_id: str
+    name: str
+    url: str | None
+    status: str
+    timeout_seconds: float
+    heartbeat_timeout_seconds: float
+    started_at: datetime
+    last_heartbeat_at: datetime
+    heartbeat_due_at: datetime
+    timeout_at: datetime
+    completed_at: datetime | None
+    result: dict[str, Any] | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowSignal:
     """Named latch on a workflow run. First write wins; tenant-scoped."""
 

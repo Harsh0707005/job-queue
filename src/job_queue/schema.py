@@ -1735,4 +1735,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_inbound_callback
     ON webhook_deliveries (job_id, event)
     WHERE callback_url IS NOT NULL;
 
+-- External workflow activities. Worker starts the call, heartbeats while
+-- it runs; a missed heartbeat or start-to-close timeout fails the step
+-- and starts reverse compensate (does not reclaim/retry the same start).
+CREATE TABLE IF NOT EXISTS workflow_activities (
+    id                          UUID PRIMARY KEY,
+    step_run_id                 UUID NOT NULL UNIQUE
+        REFERENCES workflow_step_runs(id) ON DELETE CASCADE,
+    job_id                      UUID,
+    run_id                      UUID NOT NULL
+        REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    tenant_id                   TEXT NOT NULL,
+    name                        TEXT NOT NULL,
+    url                         TEXT,
+    status                      TEXT NOT NULL DEFAULT 'running',
+    timeout_seconds             DOUBLE PRECISION NOT NULL,
+    heartbeat_timeout_seconds   DOUBLE PRECISION NOT NULL,
+    started_at                  TIMESTAMPTZ NOT NULL,
+    last_heartbeat_at           TIMESTAMPTZ NOT NULL,
+    heartbeat_due_at            TIMESTAMPTZ NOT NULL,
+    timeout_at                  TIMESTAMPTZ NOT NULL,
+    completed_at                TIMESTAMPTZ,
+    result                      JSONB,
+    error                       TEXT,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT workflow_activities_status_check CHECK (
+        status IN ('running', 'completed', 'failed', 'timed_out')
+    ),
+    CONSTRAINT workflow_activities_timeout_check CHECK (timeout_seconds > 0),
+    CONSTRAINT workflow_activities_heartbeat_check CHECK (
+        heartbeat_timeout_seconds > 0
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_activities_due
+    ON workflow_activities (heartbeat_due_at, timeout_at)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_workflow_activities_tenant_run
+    ON workflow_activities (tenant_id, run_id);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_activities_job
+    ON workflow_activities (job_id)
+    WHERE job_id IS NOT NULL;
+
 """

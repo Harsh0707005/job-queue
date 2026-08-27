@@ -87,6 +87,11 @@ class LeaseClaimFairMixin:
                 self.process_workflow_timers(limit=max(8, limit))
             except Exception:  # noqa: BLE001
                 pass
+        if hasattr(self, "process_workflow_activities"):
+            try:
+                self.process_workflow_activities(limit=max(8, limit))
+            except Exception:  # noqa: BLE001
+                pass
         # Expire dead workers and rebalance partition ownership.
         if hasattr(self, "process_worker_timeouts"):
             try:

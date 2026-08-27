@@ -2416,6 +2416,15 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 "kind": sdef.get("kind") or "effect",
                 "payload": sdef.get("payload") or {},
             }
+            if action["kind"] == "activity":
+                for key in (
+                    "activity",
+                    "url",
+                    "timeout_seconds",
+                    "heartbeat_timeout_seconds",
+                ):
+                    if sdef.get(key) is not None:
+                        action[key] = sdef[key]
         run_meta = conn.execute(
             """
             SELECT schedule_id, tick_iteration, tenant_id
@@ -2479,6 +2488,20 @@ class WorkflowsMixin(WorkflowsMapMixin):
         expires_at, expiry_action = self._workflow_step_expiry(
             conn, tenant_id=tenant_id, step_def=sdef, now=now
         )
+        max_runtime_seconds = 3600
+        vis = int(visibility_timeout_seconds)
+        if str(action.get("kind") or "") == "activity":
+            try:
+                act_timeout = float(action.get("timeout_seconds") or 30)
+            except (TypeError, ValueError):
+                act_timeout = 30.0
+            max_runtime_seconds = max(1, int(act_timeout) + 2)
+            try:
+                hb = float(action.get("heartbeat_timeout_seconds") or 0)
+            except (TypeError, ValueError):
+                hb = 0.0
+            if hb > 0:
+                vis = max(vis, int(hb * 3) + 1)
         # Compensation is cleanup, not new product work.
         if (
             direction != WorkflowStepDirection.COMPENSATE.value
@@ -2500,7 +2523,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
             ) VALUES (
                 %s, %s, %s, %s, %s, 0,
                 0, %s, %s,
-                3600,
+                %s,
                 0, 30,
                 %s, %s, %s, %s,
                 %s, %s,
@@ -2516,7 +2539,8 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 Jsonb(sealed),
                 status,
                 max_attempts,
-                visibility_timeout_seconds,
+                vis,
+                max_runtime_seconds,
                 now,
                 dedupe,
                 sched_id,
@@ -2949,6 +2973,10 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 out["timeout_seconds"] = timeout
             if raw.get("deadline_at") is not None:
                 out["deadline_at"] = raw["deadline_at"]
+        if kind == "activity":
+            from job_queue.queue.workflows_activities import apply_activity_fields
+
+            apply_activity_fields(out, raw, label=label)
         if kind in ("sleep", "delay", "timer", "timeout"):
             from job_queue.queue.workflows_timers import wait_deadline
 
@@ -2982,6 +3010,12 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 "kind": ckind,
                 "payload": dict(comp.get("payload") or {}),
             }
+            if ckind == "activity":
+                from job_queue.queue.workflows_activities import apply_activity_fields
+
+                apply_activity_fields(
+                    out["compensate"], comp, label=f"{label}.compensate"
+                )
         # Preserve explicit name-based depends_on for post-pass resolution.
         if raw.get("depends_on") is not None:
             out["depends_on"] = raw["depends_on"]

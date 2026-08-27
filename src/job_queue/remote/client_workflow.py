@@ -94,6 +94,90 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def start_workflow_activity(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: str | UUID,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/activity/start",
+            {
+                "tenant_id": tenant_id,
+                "worker_id": worker_id,
+                "lease_token": str(lease_token),
+            },
+        )
+        assert payload is not None
+        return payload
+
+    def heartbeat_workflow_activity(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: str | UUID,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/activity/heartbeat",
+            {
+                "tenant_id": tenant_id,
+                "worker_id": worker_id,
+                "lease_token": str(lease_token),
+            },
+        )
+        assert payload is not None
+        return payload
+
+    def complete_workflow_activity(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: str | UUID,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "worker_id": worker_id,
+            "lease_token": str(lease_token),
+        }
+        if result is not None:
+            body["result"] = result
+        payload = self._request(
+            "POST", f"/v1/jobs/{job_id}/activity/complete", body
+        )
+        assert payload is not None
+        return payload
+
+    def get_workflow_activity(
+        self, job_id: str | UUID, *, tenant_id: str
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode({"tenant_id": tenant_id})
+        payload = self._request("GET", f"/v1/jobs/{job_id}/activity?{q}")
+        assert payload is not None
+        return payload
+
+    def process_workflow_activities(
+        self, *, tenant_id: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request(
+            "POST", "/v1/workflows/process-activities", body
+        )
+        assert payload is not None
+        return payload
+
     def cancel_workflow(
         self,
         run_id: str | UUID,

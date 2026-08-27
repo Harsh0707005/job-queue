@@ -57,6 +57,11 @@ class RemoteWorkerWorkflowWorkMixin:
         if lease_lost.is_set():
             raise LeaseError(f"job {job.id} lease lost before workflow step")
 
+        if str(step.get("kind") or "") == "activity":
+            return self._do_workflow_activity(
+                job, lease_lost, payload, step, step_payload
+            )
+
         try:
             begun = self.client.begin_side_effect(
                 job.id,
@@ -171,3 +176,151 @@ class RemoteWorkerWorkflowWorkMixin:
             "effect": completed,
             **{k: result[k] for k in ("items",) if k in result},
         }
+
+    def _do_workflow_activity(
+        self,
+        job: Job,
+        lease_lost: threading.Event,
+        payload: dict[str, Any],
+        step: dict[str, Any],
+        step_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Start an external activity and heartbeat until it finishes.
+
+        A missed heartbeat or start-to-close timeout is raised as a step
+        failure so the saga compensates. Reclaim of a still-running
+        activity resumes the wait without a second start POST.
+        """
+        started = self.client.start_workflow_activity(
+            job.id,
+            tenant_id=job.tenant_id,
+            worker_id=self.worker_id,
+            lease_token=job.lease_token,  # type: ignore[arg-type]
+        )
+        act = started.get("activity") or started
+        status = str(act.get("status") or "")
+        if status == "completed":
+            return {
+                "workflow": True,
+                "activity": True,
+                "direction": payload.get("direction"),
+                "result": act.get("result"),
+            }
+        if status in ("failed", "timed_out"):
+            raise RuntimeError(
+                str(act.get("error") or f"activity {status}")
+            )
+
+        url = str(step.get("url") or os.environ.get("ACTIVITY_URL") or "").rstrip("/")
+        if url:
+            self._post_activity_start(job, payload, step, step_payload, act, url)
+
+        hb_s = float(act.get("heartbeat_timeout_seconds") or 2.0)
+        interval = max(0.05, min(0.5, hb_s / 3.0))
+        while True:
+            if lease_lost.is_set():
+                raise LeaseError(f"job {job.id} lease lost during activity")
+            hb = self.client.heartbeat_workflow_activity(
+                job.id,
+                tenant_id=job.tenant_id,
+                worker_id=self.worker_id,
+                lease_token=job.lease_token,  # type: ignore[arg-type]
+            )
+            act = hb.get("activity") or hb
+            status = str(act.get("status") or "")
+            if status == "completed":
+                return {
+                    "workflow": True,
+                    "activity": True,
+                    "direction": payload.get("direction"),
+                    "result": act.get("result"),
+                }
+            if status in ("failed", "timed_out"):
+                raise RuntimeError(
+                    str(act.get("error") or f"activity {status}")
+                )
+            if url:
+                remote = self._poll_activity_runner(url, str(act.get("id") or ""))
+                if remote is not None:
+                    if remote.get("error") and not remote.get("done"):
+                        raise RuntimeError(str(remote.get("error")))
+                    if remote.get("done"):
+                        result = remote.get("result")
+                        if not isinstance(result, dict):
+                            result = {
+                                "activity": step.get("activity") or step.get("name"),
+                                "op": step_payload.get("op") or "activity",
+                            }
+                        done = self.client.complete_workflow_activity(
+                            job.id,
+                            tenant_id=job.tenant_id,
+                            worker_id=self.worker_id,
+                            lease_token=job.lease_token,  # type: ignore[arg-type]
+                            result=result,
+                        )
+                        fin = done.get("activity") or done
+                        return {
+                            "workflow": True,
+                            "activity": True,
+                            "direction": payload.get("direction"),
+                            "result": fin.get("result") or result,
+                        }
+            time.sleep(interval)
+
+    def _post_activity_start(
+        self,
+        job: Job,
+        payload: dict[str, Any],
+        step: dict[str, Any],
+        step_payload: dict[str, Any],
+        act: dict[str, Any],
+        url: str,
+    ) -> None:
+        start_url = url if url.endswith("/start") else url + "/start"
+        body = json.dumps(
+            {
+                "activity_id": act.get("id"),
+                "activity": step.get("activity") or act.get("name"),
+                "job_id": str(job.id),
+                "tenant_id": job.tenant_id,
+                "payload": step_payload,
+                "timeout_seconds": act.get("timeout_seconds"),
+                "heartbeat_timeout_seconds": act.get("heartbeat_timeout_seconds"),
+                "workflow_run_id": payload.get("workflow_run_id"),
+                "step_name": payload.get("step_name"),
+            }
+        ).encode()
+        req = urllib.request.Request(
+            start_url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": str(act.get("id") or job.id),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            if os.environ.get("WORKFLOW_ALLOW_SINK_FAILURE") == "1":
+                logger.warning(
+                    "activity start failed job=%s: %s (allowed)", job.id, exc
+                )
+                return
+            raise RuntimeError(f"activity start failed: {exc}") from exc
+
+    def _poll_activity_runner(
+        self, url: str, activity_id: str
+    ) -> dict[str, Any] | None:
+        if not activity_id:
+            return None
+        base = url[: -len("/start")] if url.endswith("/start") else url
+        status_url = f"{base}/status?id={activity_id}"
+        try:
+            req = urllib.request.Request(status_url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = resp.read()
+            return json.loads(raw.decode() or "{}")
+        except Exception:  # noqa: BLE001
+            return None
