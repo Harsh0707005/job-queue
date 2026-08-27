@@ -250,14 +250,19 @@ class InboundTriggersMixin:
         *,
         nonce: str,
     ) -> dict[str, Any]:
-        """Execute a verified inbound POST. Tenant comes from the trigger."""
+        """Execute a verified inbound POST. Tenant comes from the trigger.
+
+        The nonce row and the job / DAG / workflow / signal are written in
+        the same Postgres transaction. A crash after the nonce insert and
+        before the work is created rolls both back, so a retry is not
+        treated as a replay.
+        """
         action = str(body.get("action") or body.get("kind") or "").strip().lower()
         if action not in TRIGGER_KINDS:
             raise ValueError("action must be one of job, dag, workflow, signal")
         nonce = str(nonce or "").strip()
         if not nonce or len(nonce) > 128:
             raise ValueError("nonce must be 1..128 characters")
-        claimed_tenant: str | None = None
         with transaction(self._pool) as conn:
             row = conn.execute(
                 f"""
@@ -293,62 +298,79 @@ class InboundTriggersMixin:
             ).fetchone()
             if inserted is None:
                 raise FileExistsError("replayed nonce")
-            claimed_tenant = trig.tenant_id
-        assert claimed_tenant is not None
-        try:
-            return self._dispatch_inbound_action(
-                action, tenant_id=claimed_tenant, body=body
+            out = self._dispatch_inbound_action_on_conn(
+                conn, action, tenant_id=trig.tenant_id, body=body
             )
-        except Exception:
-            with transaction(self._pool) as conn:
-                conn.execute(
-                    """
-                    DELETE FROM inbound_trigger_nonces
-                    WHERE trigger_id = %s AND nonce = %s
-                    """,
-                    (trigger_id, nonce),
-                )
-            raise
+        if out.get("action") == "workflow" and out.get("run") is not None:
+            run = out["run"]
+            out["steps"] = self.list_workflow_steps(
+                run.id, tenant_id=run.tenant_id
+            )
+        return out
 
-    def _dispatch_inbound_action(
-        self, action: str, *, tenant_id: str, body: dict[str, Any]
+    def _dispatch_inbound_action_on_conn(
+        self,
+        conn: Any,
+        action: str,
+        *,
+        tenant_id: str,
+        body: dict[str, Any],
     ) -> dict[str, Any]:
         if action == "job":
-            job = self.enqueue(
-                tenant_id=tenant_id,
-                payload=dict(body.get("payload") or {}),
-                queue_name=str(body.get("queue_name") or "default"),
-                priority=int(body.get("priority") or 0),
-                max_attempts=int(body.get("max_attempts") or 3),
-                visibility_timeout_seconds=int(
-                    body.get("visibility_timeout_seconds") or 30
-                ),
-                labels=body.get("labels"),
-                required_skills=body.get("required_skills"),
-                coalesce_key=body.get("coalesce_key"),
+            job = self._inbound_enqueue_job_on_conn(
+                conn, tenant_id=tenant_id, body=body
             )
             return {"action": "job", "job": job}
         if action == "dag":
-            result = self.enqueue_dag(
+            jobs = list(body.get("jobs") or [])
+            batch_key = str(body.get("batch_key") or "")
+            queue_name = str(body.get("queue_name") or "default")
+            if not batch_key.strip():
+                raise ValueError("batch_key is required")
+            if not jobs:
+                raise ValueError("jobs must be a non-empty list")
+            specs = self._normalize_dag_specs(jobs)
+            result = self._enqueue_dag_on_conn(
+                conn,
                 tenant_id=tenant_id,
-                jobs=list(body.get("jobs") or []),
-                batch_key=str(body.get("batch_key") or ""),
-                queue_name=str(body.get("queue_name") or "default"),
+                queue_name=queue_name,
+                batch_key=batch_key.strip(),
+                specs=specs,
+                now=_utcnow(),
             )
             return {"action": "dag", "dag": result}
         if action == "workflow":
             steps = body.get("steps")
             if not isinstance(steps, list) or not steps:
                 raise ValueError("steps must be a non-empty list")
-            run = self.start_workflow(
+            from job_queue.queue.workflows import DEFAULT_MAX_COMPENSATE_RETRIES
+
+            normalized = self._expand_and_normalize_steps(steps)
+            self._apply_workflow_ttl_defaults(
+                normalized,
+                ttl_seconds=None,
+                expires_at=None,
+                expiry_action=None,
+            )
+            row = self._start_workflow_on_conn(
+                conn,
                 tenant_id=tenant_id,
-                steps=steps,
+                normalized=normalized,
                 name=body.get("name"),
                 queue_name=str(body.get("queue_name") or "default"),
                 max_attempts=int(body.get("max_attempts") or 3),
+                visibility_timeout_seconds=int(
+                    body.get("visibility_timeout_seconds") or 30
+                ),
+                max_compensate_retries=DEFAULT_MAX_COMPENSATE_RETRIES,
+                run_id=uuid4(),
+                now=_utcnow(),
+                lock_tenant=True,
             )
-            steps_out = self.list_workflow_steps(run.id, tenant_id=tenant_id)
-            return {"action": "workflow", "run": run, "steps": steps_out}
+            return {
+                "action": "workflow",
+                "run": self._row_to_workflow_run(row),
+            }
         if action == "signal":
             raw_run = body.get("run_id")
             if not raw_run:
@@ -356,14 +378,77 @@ class InboundTriggersMixin:
             name = body.get("signal") or body.get("name")
             if name is None or not str(name).strip():
                 raise ValueError("signal name is required")
+            from job_queue.queue.workflows_signals import normalize_signal_name
+
             payload = body.get("signal_payload")
             if payload is None:
                 payload = body.get("payload")
-            out = self.send_workflow_signal(
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+            out = self._send_workflow_signal_on_conn(
+                conn,
                 UUID(str(raw_run)),
                 tenant_id=tenant_id,
-                name=str(name),
-                payload=payload if isinstance(payload, dict) else None,
+                name=normalize_signal_name(name),
+                payload=payload,
+                now=_utcnow(),
             )
             return {"action": "signal", **out}
         raise ValueError(f"unsupported action {action!r}")
+
+    def _inbound_enqueue_job_on_conn(
+        self, conn: Any, *, tenant_id: str, body: dict[str, Any]
+    ) -> Any:
+        from job_queue.queue._common import (
+            _normalize_labels,
+            _normalize_skills,
+            _utcnow,
+        )
+        from uuid import uuid4 as _uuid4
+
+        payload = dict(body.get("payload") or {})
+        now = _utcnow()
+        return self._enqueue_on_conn(
+            conn,
+            tenant_id=tenant_id,
+            payload=payload,
+            queue_name=str(body.get("queue_name") or "default"),
+            priority=int(body.get("priority") or 0),
+            max_attempts=int(body.get("max_attempts") or 3),
+            visibility_timeout_seconds=int(
+                body.get("visibility_timeout_seconds") or 30
+            ),
+            max_runtime_seconds=int(body.get("max_runtime_seconds") or 3600),
+            retry_backoff_base_seconds=int(
+                body.get("retry_backoff_base_seconds") or 1
+            ),
+            retry_backoff_max_seconds=int(
+                body.get("retry_backoff_max_seconds") or 300
+            ),
+            run_at=now,
+            now=now,
+            jid=_uuid4(),
+            dedupe_key=None,
+            dep_ids=[],
+            label_list=_normalize_labels(body.get("labels")),
+            skill_list=_normalize_skills(body.get("required_skills")),
+            cost_map=None,
+            deadline=None,
+            estimated_duration_seconds=None,
+            preemptible=True,
+            ttl_seconds=None,
+            expires_at=None,
+            expiry_action=None,
+            prefer_lw=False,
+            payload_kind=self._payload_kind(payload),
+            cloned_from_job_id=None,
+            max_worker_hops=None,
+            quarantine_action=None,
+            coal_key=(
+                str(body["coalesce_key"]).strip()
+                if body.get("coalesce_key")
+                else None
+            ),
+        )

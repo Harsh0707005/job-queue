@@ -162,32 +162,7 @@ class JobsEnqueueCoreMixin:
             raise ValueError("a job cannot be cloned from itself")
 
         with transaction(self._pool) as conn:
-            # Serialize with merge_tenant / pending-cap for this tenant.
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (tenant_id,),
-            )
-            if self._is_tenant_offboarding(conn, tenant_id):
-                raise ValueError(
-                    f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
-                )
-            if self._is_tenant_restoring(conn, tenant_id):
-                raise ValueError(
-                    f"tenant {tenant_id!r} is restoring; enqueue is rejected"
-                )
-            if dep_ids:
-                self._validate_dependencies(
-                    conn, tenant_id=tenant_id, depends_on=dep_ids
-                )
-            expires, exp_action = self._resolve_job_expiry(
-                conn,
-                tenant_id=tenant_id,
-                now=now,
-                ttl_seconds=ttl_seconds,
-                expires_at=expires_at,
-                expiry_action=expiry_action,
-            )
-            out = self._enqueue_pending_on_conn(
+            out = self._enqueue_on_conn(
                 conn,
                 tenant_id=tenant_id,
                 payload=payload,
@@ -199,24 +174,25 @@ class JobsEnqueueCoreMixin:
                 retry_backoff_base_seconds=retry_backoff_base_seconds,
                 retry_backoff_max_seconds=retry_backoff_max_seconds,
                 run_at=run_at,
+                now=now,
+                jid=jid,
                 dedupe_key=dedupe_key,
                 dep_ids=dep_ids,
                 label_list=label_list,
                 skill_list=skill_list,
-                resource_cost=cost_map,
+                cost_map=cost_map,
                 deadline=deadline,
                 estimated_duration_seconds=estimated_duration_seconds,
                 preemptible=bool(preemptible),
-                now=now,
-                jid=jid,
-                expires=expires,
-                exp_action=exp_action,
+                ttl_seconds=ttl_seconds,
+                expires_at=expires_at,
+                expiry_action=expiry_action,
                 prefer_lw=prefer_lw,
                 payload_kind=payload_kind,
                 cloned_from_job_id=cloned_from_job_id,
                 max_worker_hops=max_worker_hops,
                 quarantine_action=quarantine_action,
-                coalesce_key=coal_key,
+                coal_key=coal_key,
             )
 
         if (
@@ -229,3 +205,94 @@ class JobsEnqueueCoreMixin:
             if refreshed is not None:
                 out = refreshed
         return out
+
+    def _enqueue_on_conn(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        payload: dict[str, Any],
+        queue_name: str,
+        priority: int,
+        max_attempts: int,
+        visibility_timeout_seconds: int,
+        max_runtime_seconds: int,
+        retry_backoff_base_seconds: int,
+        retry_backoff_max_seconds: int,
+        run_at: datetime,
+        now: datetime,
+        jid: UUID,
+        dedupe_key: str | None,
+        dep_ids: list,
+        label_list: list,
+        skill_list: list,
+        cost_map: dict[str, int] | None,
+        deadline: datetime | None,
+        estimated_duration_seconds: int | None,
+        preemptible: bool,
+        ttl_seconds: float | int | None,
+        expires_at: datetime | None,
+        expiry_action: str | None,
+        prefer_lw: bool,
+        payload_kind: str,
+        cloned_from_job_id: UUID | None,
+        max_worker_hops: int | None,
+        quarantine_action: str | None,
+        coal_key: str | None,
+    ) -> Job:
+        """Insert one job on an already-open transaction."""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (tenant_id,),
+        )
+        if self._is_tenant_offboarding(conn, tenant_id):
+            raise ValueError(
+                f"tenant {tenant_id!r} is offboarding; enqueue is rejected"
+            )
+        if self._is_tenant_restoring(conn, tenant_id):
+            raise ValueError(
+                f"tenant {tenant_id!r} is restoring; enqueue is rejected"
+            )
+        if dep_ids:
+            self._validate_dependencies(
+                conn, tenant_id=tenant_id, depends_on=dep_ids
+            )
+        expires, exp_action = self._resolve_job_expiry(
+            conn,
+            tenant_id=tenant_id,
+            now=now,
+            ttl_seconds=ttl_seconds,
+            expires_at=expires_at,
+            expiry_action=expiry_action,
+        )
+        return self._enqueue_pending_on_conn(
+            conn,
+            tenant_id=tenant_id,
+            payload=payload,
+            queue_name=queue_name,
+            priority=priority,
+            max_attempts=max_attempts,
+            visibility_timeout_seconds=visibility_timeout_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            retry_backoff_base_seconds=retry_backoff_base_seconds,
+            retry_backoff_max_seconds=retry_backoff_max_seconds,
+            run_at=run_at,
+            dedupe_key=dedupe_key,
+            dep_ids=dep_ids,
+            label_list=label_list,
+            skill_list=skill_list,
+            resource_cost=cost_map,
+            deadline=deadline,
+            estimated_duration_seconds=estimated_duration_seconds,
+            preemptible=bool(preemptible),
+            now=now,
+            jid=jid,
+            expires=expires,
+            exp_action=exp_action,
+            prefer_lw=prefer_lw,
+            payload_kind=payload_kind,
+            cloned_from_job_id=cloned_from_job_id,
+            max_worker_hops=max_worker_hops,
+            quarantine_action=quarantine_action,
+            coalesce_key=coal_key,
+        )

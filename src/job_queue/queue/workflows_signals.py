@@ -67,71 +67,90 @@ class WorkflowSignalsMixin:
             raise ValueError("payload must be an object")
         now = _utcnow()
         with transaction(self._pool) as conn:
-            run = conn.execute(
-                f"""
-                SELECT {_RUN_COLUMNS}
-                FROM workflow_runs
-                WHERE id = %s AND tenant_id = %s
-                FOR UPDATE
-                """,
-                (run_id, tenant_id),
-            ).fetchone()
-            if run is None:
-                raise ValueError(
-                    f"workflow run {run_id} not found for tenant {tenant_id!r}"
-                )
-            sealed, key_id = self._seal_signal_payload(
+            return self._send_workflow_signal_on_conn(
                 conn,
+                run_id,
                 tenant_id=tenant_id,
-                run_id=run_id,
                 name=name,
-                payload=dict(payload),
+                payload=payload,
+                now=now,
             )
-            inserted = conn.execute(
-                f"""
-                INSERT INTO workflow_signals (
-                    id, run_id, tenant_id, name, payload, payload_key_id,
-                    created_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s
-                )
-                ON CONFLICT (run_id, name) DO NOTHING
-                RETURNING {_SIGNAL_COLUMNS}
-                """,
-                (
-                    uuid4(),
-                    run_id,
-                    tenant_id,
-                    name,
-                    Jsonb(sealed) if sealed is not None else None,
-                    key_id,
-                    now,
-                ),
-            ).fetchone()
-            created = inserted is not None
-            row = inserted or conn.execute(
-                f"""
-                SELECT {_SIGNAL_COLUMNS}
-                FROM workflow_signals
-                WHERE run_id = %s AND tenant_id = %s AND name = %s
-                """,
-                (run_id, tenant_id, name),
-            ).fetchone()
-            assert row is not None
-            unblocked = 0
-            if run["status"] == WorkflowRunStatus.RUNNING.value:
-                unblocked = self._complete_waiters_for_signal(
-                    conn,
-                    run=run,
-                    name=name,
-                    signal_row=row,
-                    now=now,
-                )
-            return {
-                "signal": self._row_to_workflow_signal(row, conn=conn),
-                "created": created,
-                "unblocked": unblocked,
-            }
+
+    def _send_workflow_signal_on_conn(
+        self,
+        conn: Any,
+        run_id: UUID,
+        *,
+        tenant_id: str,
+        name: str,
+        payload: dict[str, Any],
+        now: Any,
+    ) -> dict[str, Any]:
+        run = conn.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM workflow_runs
+            WHERE id = %s AND tenant_id = %s
+            FOR UPDATE
+            """,
+            (run_id, tenant_id),
+        ).fetchone()
+        if run is None:
+            raise ValueError(
+                f"workflow run {run_id} not found for tenant {tenant_id!r}"
+            )
+        sealed, key_id = self._seal_signal_payload(
+            conn,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            name=name,
+            payload=dict(payload),
+        )
+        inserted = conn.execute(
+            f"""
+            INSERT INTO workflow_signals (
+                id, run_id, tenant_id, name, payload, payload_key_id,
+                created_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (run_id, name) DO NOTHING
+            RETURNING {_SIGNAL_COLUMNS}
+            """,
+            (
+                uuid4(),
+                run_id,
+                tenant_id,
+                name,
+                Jsonb(sealed) if sealed is not None else None,
+                key_id,
+                now,
+            ),
+        ).fetchone()
+        created = inserted is not None
+        row = inserted or conn.execute(
+            f"""
+            SELECT {_SIGNAL_COLUMNS}
+            FROM workflow_signals
+            WHERE run_id = %s AND tenant_id = %s AND name = %s
+            """,
+            (run_id, tenant_id, name),
+        ).fetchone()
+        assert row is not None
+        unblocked = 0
+        if run["status"] == WorkflowRunStatus.RUNNING.value:
+            unblocked = self._complete_waiters_for_signal(
+                conn,
+                run=run,
+                name=name,
+                signal_row=row,
+                now=now,
+            )
+        return {
+            "signal": self._row_to_workflow_signal(row, conn=conn),
+            "created": created,
+            "unblocked": unblocked,
+        }
 
     def list_workflow_signals(
         self, run_id: UUID, *, tenant_id: str

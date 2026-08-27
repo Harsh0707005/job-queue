@@ -300,3 +300,67 @@ def test_inbound_disabled_and_queue_isolation(queue: JobQueue, coordinator_url: 
     assert queue.count(tenant_id="in-d", status=JobStatus.PENDING) == 1
     listed = client.list_inbound_triggers(tenant_id="keep")
     assert listed["triggers"] == []
+
+
+def _nonce_rows(queue: JobQueue, trigger_id, nonce: str) -> int:
+    with queue._pool.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM inbound_trigger_nonces
+            WHERE trigger_id = %s AND nonce = %s
+            """,
+            (trigger_id, nonce),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def test_inbound_retry_after_crash_between_nonce_and_job(
+    queue: JobQueue, monkeypatch
+):
+    """Nonce must not stick if the coordinator dies before the job commits.
+
+    Simulates: nonce INSERT succeeds in the fire txn, then enqueue blows up
+    (process kill / exception) before COMMIT. Retry with the same nonce
+    must create the job, not return replay.
+    """
+    trig = queue.create_inbound_trigger(
+        tenant_id="in-crash",
+        name="crash",
+        secret="crash-secret-xxxx",
+        kinds=["job"],
+    )
+    nonce = "crash-mid-create"
+    real_enqueue = queue._enqueue_pending_on_conn
+
+    def die_after_nonce(*args, **kwargs):
+        raise RuntimeError("coordinator died after nonce, before job")
+
+    monkeypatch.setattr(queue, "_enqueue_pending_on_conn", die_after_nonce)
+    with pytest.raises(RuntimeError, match="died after nonce"):
+        queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 1}},
+            nonce=nonce,
+        )
+    assert _nonce_rows(queue, trig.id, nonce) == 0
+    assert queue.count(tenant_id="in-crash", status=JobStatus.PENDING) == 0
+
+    monkeypatch.setattr(queue, "_enqueue_pending_on_conn", real_enqueue)
+    out = queue.fire_inbound_trigger(
+        trig.id,
+        {"action": "job", "payload": {"n": 1}},
+        nonce=nonce,
+    )
+    assert out["action"] == "job"
+    assert out["job"].payload == {"n": 1}
+    assert _nonce_rows(queue, trig.id, nonce) == 1
+    assert queue.count(tenant_id="in-crash", status=JobStatus.PENDING) == 1
+
+    with pytest.raises(FileExistsError, match="replayed nonce"):
+        queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 2}},
+            nonce=nonce,
+        )
+    assert queue.count(tenant_id="in-crash", status=JobStatus.PENDING) == 1
