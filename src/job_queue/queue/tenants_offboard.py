@@ -140,6 +140,7 @@ class TenantsOffboardMixin:
                 DELETE FROM webhook_deliveries
                 WHERE tenant_id = %s
                   AND status <> 'delivering'
+                  AND callback_url IS NULL
                 """,
                 (tenant_id,),
             )
@@ -271,6 +272,12 @@ class TenantsOffboardMixin:
         ).fetchone()
         if triggers is not None:
             return False
+        cbs = conn.execute(
+            "SELECT 1 FROM inbound_job_callbacks WHERE tenant_id = %s LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        if cbs is not None:
+            return False
         settings = conn.execute(
             "SELECT 1 FROM tenant_settings WHERE tenant_id = %s LIMIT 1",
             (tenant_id,),
@@ -399,6 +406,10 @@ class TenantsOffboardMixin:
         )
         conn.execute(
             "DELETE FROM webhook_endpoints WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
+            "DELETE FROM inbound_job_callbacks WHERE tenant_id = %s",
             (tenant_id,),
         )
         conn.execute(

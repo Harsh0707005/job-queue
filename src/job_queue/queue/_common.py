@@ -1017,4 +1017,4 @@ _SIDE_EFFECT_SELECT = "\n        job_id, effect_key, tenant_id, status, idempote
 
 _WEBHOOK_ENDPOINT_COLUMNS = "\n        id, tenant_id, url, secret, events, enabled, max_attempts,\n        backoff_base_seconds, backoff_max_seconds, created_at, updated_at\n    "
 
-_WEBHOOK_DELIVERY_COLUMNS = "\n        id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,\n        max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,\n        delivering_until, last_error, last_status_code, created_at, updated_at,\n        completed_at, signing_secret\n    "
+_WEBHOOK_DELIVERY_COLUMNS = "\n        id, endpoint_id, tenant_id, job_id, event, payload, status, attempts,\n        max_attempts, backoff_base_seconds, backoff_max_seconds, next_attempt_at,\n        delivering_until, last_error, last_status_code, created_at, updated_at,\n        completed_at, signing_secret, callback_url\n    "

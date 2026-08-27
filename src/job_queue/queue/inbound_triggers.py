@@ -299,7 +299,7 @@ class InboundTriggersMixin:
             if inserted is None:
                 raise FileExistsError("replayed nonce")
             out = self._dispatch_inbound_action_on_conn(
-                conn, action, tenant_id=trig.tenant_id, body=body
+                conn, action, tenant_id=trig.tenant_id, body=body, trigger=trig
             )
         if out.get("action") == "workflow" and out.get("run") is not None:
             run = out["run"]
@@ -315,10 +315,14 @@ class InboundTriggersMixin:
         *,
         tenant_id: str,
         body: dict[str, Any],
+        trigger: InboundTrigger,
     ) -> dict[str, Any]:
         if action == "job":
             job = self._inbound_enqueue_job_on_conn(
                 conn, tenant_id=tenant_id, body=body
+            )
+            self._record_inbound_callback(
+                conn, job=job, trigger=trigger, body=body
             )
             return {"action": "job", "job": job}
         if action == "dag":
@@ -397,6 +401,33 @@ class InboundTriggersMixin:
             )
             return {"action": "signal", **out}
         raise ValueError(f"unsupported action {action!r}")
+
+    def _record_inbound_callback(
+        self,
+        conn: Any,
+        *,
+        job: Any,
+        trigger: InboundTrigger,
+        body: dict[str, Any],
+    ) -> None:
+        raw = body.get("callback_url")
+        if raw is None or raw == "":
+            return
+        from job_queue.webhooks import validate_webhook_url
+
+        url = validate_webhook_url(str(raw), resolve_dns=True)
+        secret = trigger.secret
+        if not secret:
+            raise ValueError("trigger has no secret to sign the callback")
+        conn.execute(
+            """
+            INSERT INTO inbound_job_callbacks (
+                job_id, trigger_id, tenant_id, callback_url, signing_secret,
+                created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (job.id, trigger.id, trigger.tenant_id, url, secret, _utcnow()),
+        )
 
     def _inbound_enqueue_job_on_conn(
         self, conn: Any, *, tenant_id: str, body: dict[str, Any]

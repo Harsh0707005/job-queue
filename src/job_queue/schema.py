@@ -1703,4 +1703,26 @@ CREATE TABLE IF NOT EXISTS inbound_trigger_nonces (
 CREATE INDEX IF NOT EXISTS idx_inbound_trigger_nonces_seen
     ON inbound_trigger_nonces (seen_at);
 
+-- Optional result callback for one inbound-fired job. Secret is snapshotted
+-- from the trigger at enqueue so rotation does not break in-flight work.
+CREATE TABLE IF NOT EXISTS inbound_job_callbacks (
+    job_id          UUID PRIMARY KEY,
+    trigger_id      UUID NOT NULL,
+    tenant_id       TEXT NOT NULL,
+    callback_url    TEXT NOT NULL,
+    signing_secret  TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_job_callbacks_tenant
+    ON inbound_job_callbacks (tenant_id);
+
+-- Inbound callbacks reuse the webhook outbox without a registered endpoint.
+ALTER TABLE webhook_deliveries ALTER COLUMN endpoint_id DROP NOT NULL;
+ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS callback_url TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_inbound_callback
+    ON webhook_deliveries (job_id, event)
+    WHERE callback_url IS NOT NULL;
+
 """

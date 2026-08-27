@@ -29,6 +29,10 @@ class WebhooksEnqueueMixin:
         An open failure breaker still enqueues: it only stops new leases,
         not notifications for work that already ran (complete / fail / dead).
         """
+        if event in (WebhookEvent.JOB_COMPLETED, WebhookEvent.JOB_DEAD):
+            self._enqueue_inbound_callback(
+                conn, job=job, event=event, now=now
+            )
         if self._is_tenant_paused(conn, job.tenant_id):
             return
 
@@ -107,6 +111,85 @@ class WebhooksEnqueueMixin:
                     payload_key_id,
                 ),
             )
+
+    def _enqueue_inbound_callback(
+        self,
+        conn: Any,
+        *,
+        job: Job,
+        event: WebhookEvent,
+        now: datetime,
+    ) -> None:
+        """Queue a durable signed POST to an inbound job's callback URL."""
+        cb = conn.execute(
+            """
+            SELECT trigger_id, callback_url, signing_secret
+            FROM inbound_job_callbacks
+            WHERE job_id = %s AND tenant_id = %s
+            """,
+            (job.id, job.tenant_id),
+        ).fetchone()
+        if cb is None:
+            return
+        delivery_id = uuid4()
+        payload = {
+            "event": event.value,
+            "delivery_id": str(delivery_id),
+            "trigger_id": str(cb["trigger_id"]),
+            "job_id": str(job.id),
+            "tenant_id": job.tenant_id,
+            "queue_name": job.queue_name,
+            "status": job.status.value,
+            "payload": job.payload,
+            "result": job.result,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "last_error": job.last_error,
+            "completed_at": (
+                job.completed_at.isoformat() if job.completed_at else None
+            ),
+            "timestamp": now.isoformat(),
+        }
+        from job_queue.crypto import delivery_aad
+
+        sealed, payload_key_id = self._seal_dict(
+            conn,
+            tenant_id=job.tenant_id,
+            plaintext=payload,
+            aad=delivery_aad(delivery_id),
+            job_id=job.id,
+            blob_kind="delivery",
+        )
+        conn.execute(
+            """
+            INSERT INTO webhook_deliveries (
+                id, endpoint_id, tenant_id, job_id, event, payload,
+                status, attempts, max_attempts, backoff_base_seconds,
+                backoff_max_seconds, next_attempt_at, signing_secret,
+                created_at, updated_at, payload_key_id, callback_url
+            ) VALUES (
+                %s, NULL, %s, %s, %s, %s,
+                'pending', 0, 5, 1,
+                300, %s, %s,
+                %s, %s, %s, %s
+            )
+            ON CONFLICT (job_id, event) WHERE callback_url IS NOT NULL
+            DO NOTHING
+            """,
+            (
+                delivery_id,
+                job.tenant_id,
+                job.id,
+                event.value,
+                Jsonb(sealed),
+                now,
+                cb["signing_secret"],
+                now,
+                now,
+                payload_key_id,
+                cb["callback_url"],
+            ),
+        )
 
     def _reap_offboarding_expired_webhooks(
         self,

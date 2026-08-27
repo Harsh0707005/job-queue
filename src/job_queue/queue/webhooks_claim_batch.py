@@ -208,14 +208,18 @@ class WebhooksClaimBatchMixin:
                         d.backoff_base_seconds, d.backoff_max_seconds,
                         d.next_attempt_at, d.delivering_until, d.last_error,
                         d.last_status_code, d.created_at, d.updated_at,
-                        d.completed_at, d.signing_secret
+                        d.completed_at, d.signing_secret, d.callback_url
                 )
                 SELECT
                     u.*,
-                    e.url AS _ep_url,
+                    COALESCE(e.url, u.callback_url) AS _ep_url,
                     -- Prefer frozen delivery secret; fall back for legacy rows.
                     COALESCE(u.signing_secret, e.secret) AS _sign_secret,
-                    e.enabled AS _ep_enabled
+                    CASE
+                        WHEN e.id IS NULL AND u.callback_url IS NOT NULL
+                        THEN TRUE
+                        ELSE e.enabled
+                    END AS _ep_enabled
                 FROM updated u
                 LEFT JOIN webhook_endpoints e ON e.id = u.endpoint_id
                 """,
@@ -382,7 +386,13 @@ class WebhooksClaimBatchMixin:
             SELECT COUNT(*)::int AS n
             FROM webhook_deliveries
             WHERE tenant_id = %s
-              AND status = 'delivering'
+              AND (
+                    status = 'delivering'
+                 OR (
+                        callback_url IS NOT NULL
+                    AND status IN ('pending', 'delivering')
+                    )
+              )
             """,
             (tenant_id,),
         ).fetchone()

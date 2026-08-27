@@ -984,7 +984,7 @@ class WebhookDelivery:
     """
 
     id: UUID
-    endpoint_id: UUID
+    endpoint_id: UUID | None
     tenant_id: str
     job_id: UUID | None
     event: str

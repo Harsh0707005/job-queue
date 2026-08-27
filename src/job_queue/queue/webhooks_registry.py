@@ -233,7 +233,7 @@ class WebhooksRegistryMixin:
                 payload = payload if isinstance(payload, dict) else {}
         return WebhookDelivery(
             id=row["id"],
-            endpoint_id=row["endpoint_id"],
+            endpoint_id=row.get("endpoint_id"),
             tenant_id=row["tenant_id"],
             job_id=row["job_id"],
             event=row["event"],

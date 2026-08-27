@@ -554,6 +554,14 @@ class TenantsApiLifecycleMixin:
                 """,
                 (tenant_id,),
             ).fetchone()
+            callbacks = conn.execute(
+                """
+                SELECT COUNT(*)::int AS n
+                FROM inbound_job_callbacks
+                WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()
             j_total = int(jobs["total"]) if jobs else 0
             s_n = int(schedules["n"]) if schedules else 0
             e_n = int(endpoints["n"]) if endpoints else 0
@@ -561,6 +569,7 @@ class TenantsApiLifecycleMixin:
             b_n = int(blobs["n"]) if blobs else 0
             snap_n = int(snaps["n"]) if snaps else 0
             tr_n = int(triggers["n"]) if triggers else 0
+            cb_n = int(callbacks["n"]) if callbacks else 0
             has_settings = settings is not None
             has_fairness = fairness is not None
             empty = (
@@ -571,6 +580,7 @@ class TenantsApiLifecycleMixin:
                 and b_n == 0
                 and snap_n == 0
                 and tr_n == 0
+                and cb_n == 0
                 and not has_settings
                 and not has_fairness
             )
@@ -589,6 +599,7 @@ class TenantsApiLifecycleMixin:
                 "payload_blobs": b_n,
                 "snapshots": snap_n,
                 "inbound_triggers": tr_n,
+                "inbound_callbacks": cb_n,
                 "has_settings": has_settings,
                 "has_fairness": has_fairness,
             }
@@ -615,6 +626,8 @@ class TenantsApiLifecycleMixin:
                 SELECT source_tenant_id FROM tenant_snapshots
                 UNION
                 SELECT tenant_id FROM inbound_triggers
+                UNION
+                SELECT tenant_id FROM inbound_job_callbacks
                 ORDER BY tenant_id
                 """
             ).fetchall()

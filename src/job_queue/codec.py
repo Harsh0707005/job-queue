@@ -812,7 +812,7 @@ def webhook_delivery_to_dict(
     """
     out: dict[str, Any] = {
         "id": str(d.id),
-        "endpoint_id": str(d.endpoint_id),
+        "endpoint_id": str(d.endpoint_id) if d.endpoint_id else None,
         "tenant_id": d.tenant_id,
         "job_id": str(d.job_id) if d.job_id is not None else None,
         "event": d.event,

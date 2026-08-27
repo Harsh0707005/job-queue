@@ -302,6 +302,146 @@ def test_inbound_disabled_and_queue_isolation(queue: JobQueue, coordinator_url: 
     assert listed["triggers"] == []
 
 
+def test_inbound_job_callback_signed_on_success_and_dead(queue: JobQueue):
+    from job_queue import WebhookEvent, verify_webhook_signature
+    from tests.helpers_queue import _WebhookCapture, _nack
+
+    cb = _WebhookCapture()
+    hook = _WebhookCapture()
+    try:
+        queue.register_webhook(
+            tenant_id="cb-a",
+            url=hook.url,
+            events=[WebhookEvent.JOB_COMPLETED.value, WebhookEvent.JOB_DEAD.value],
+            secret="tenant-hook-secret",
+        )
+        trig = queue.create_inbound_trigger(
+            tenant_id="cb-a",
+            name="with-cb",
+            secret="trigger-secret-xxx",
+            kinds=["job"],
+        )
+        out = queue.fire_inbound_trigger(
+            trig.id,
+            {
+                "action": "job",
+                "payload": {"n": 1},
+                "callback_url": cb.url,
+            },
+            nonce="cb-ok",
+        )
+        job = out["job"]
+        leased = queue.lease(tenant_id="cb-a", worker_id="w")
+        assert leased is not None and leased.id == job.id
+        _ack(queue, leased, "w", result={"ok": True})
+        results = queue.process_webhook_deliveries(limit=10)
+        assert any(r.success for r in results)
+        cb_hit = next(r for r in cb.received if r["body"].get("trigger_id") == str(trig.id))
+        got = cb_hit["body"]
+        assert got["event"] == "job.completed"
+        assert got["job_id"] == str(job.id)
+        assert got["status"] == "completed"
+        assert got["result"] == {"ok": True}
+        assert got["tenant_id"] == "cb-a"
+        raw = json.dumps(got, default=str, separators=(",", ":")).encode()
+        assert verify_webhook_signature("trigger-secret-xxx", raw, cb_hit["signature"])
+        assert any(r["body"].get("event") == "job.completed" for r in hook.received)
+
+        dead = queue.fire_inbound_trigger(
+            trig.id,
+            {
+                "action": "job",
+                "payload": {"n": 2},
+                "callback_url": cb.url,
+                "max_attempts": 1,
+            },
+            nonce="cb-dead",
+        )
+        inbound_dead = queue.lease(tenant_id="cb-a", worker_id="wd")
+        assert inbound_dead is not None
+        assert inbound_dead.id == dead["job"].id
+        _nack(queue, inbound_dead, "wd", error="boom", requeue=True)
+        queue.process_webhook_deliveries(limit=20)
+        assert any(
+            r["body"].get("event") == "job.dead"
+            and r["body"].get("job_id") == str(dead["job"].id)
+            for r in cb.received
+        )
+    finally:
+        cb.stop()
+        hook.stop()
+
+
+def test_inbound_callback_survives_crash_and_does_not_double_deliver(
+    queue: JobQueue,
+):
+    from tests.helpers_queue import _WebhookCapture
+
+    cb = _WebhookCapture()
+    try:
+        trig = queue.create_inbound_trigger(
+            tenant_id="cb-crash",
+            name="crash",
+            secret="crash-callback-xxx",
+            kinds=["job"],
+        )
+        out = queue.fire_inbound_trigger(
+            trig.id,
+            {"action": "job", "payload": {"n": 1}, "callback_url": cb.url},
+            nonce="cb-crash-1",
+        )
+        leased = queue.lease(tenant_id="cb-crash", worker_id="w")
+        assert leased is not None
+        _ack(queue, leased, "w", result={"done": True})
+        pending = queue.list_webhook_deliveries(
+            tenant_id="cb-crash", status="pending"
+        )
+        assert len(pending) == 1
+        assert pending[0].endpoint_id is None
+
+        def crash_after_post(_item):
+            raise RuntimeError("coordinator died after claim, before POST")
+
+        with pytest.raises(RuntimeError, match="died after claim"):
+            queue.process_webhook_deliveries(
+                limit=5, claim_seconds=0.01, on_before_post=crash_after_post
+            )
+        assert cb.received == []
+        delivering = queue.list_webhook_deliveries(
+            tenant_id="cb-crash", status="delivering"
+        )
+        assert len(delivering) == 1
+        import time
+
+        time.sleep(0.02)
+
+        # Reclaim + POST. Then crash after 2xx is persisted, before terminal flip.
+        real_note = queue.note_webhook_last_status
+
+        def crash_after_2xx(delivery_id, status_code):
+            real_note(delivery_id, status_code)
+            raise RuntimeError("crash after POST before finalize")
+
+        queue.note_webhook_last_status = crash_after_2xx  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="before finalize"):
+            queue.process_webhook_deliveries(limit=5, claim_seconds=0.01)
+        assert len(cb.received) == 1
+        queue.note_webhook_last_status = real_note  # type: ignore[method-assign]
+
+        # Reclaim must auto-succeed from the stored 2xx, not POST again.
+        time.sleep(0.02)
+        results = queue.process_webhook_deliveries(limit=5)
+        assert any(r.success for r in results)
+        assert len(cb.received) == 1
+        succeeded = queue.list_webhook_deliveries(
+            tenant_id="cb-crash", status="succeeded"
+        )
+        assert len(succeeded) == 1
+        assert succeeded[0].id == pending[0].id
+    finally:
+        cb.stop()
+
+
 def _nonce_rows(queue: JobQueue, trigger_id, nonce: str) -> int:
     with queue._pool.connection() as conn:
         row = conn.execute(
