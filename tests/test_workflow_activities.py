@@ -209,6 +209,140 @@ def test_activity_heartbeat_extends_due(queue: JobQueue):
     _ack(queue, job, "w", result={"ok": True})
 
 
+def test_activity_runner_done_failed_is_a_failure():
+    from job_queue.remote.worker_agent_workflow_work import activity_runner_failure
+
+    assert activity_runner_failure(
+        {"done": True, "status": "failed", "error": "charge declined"}
+    ) == "charge declined"
+    assert activity_runner_failure({"done": True, "status": "failed"}) == "activity failed"
+    assert activity_runner_failure({"done": True, "status": "completed"}) is None
+    assert activity_runner_failure({"done": True}) is None
+    assert activity_runner_failure({"done": False, "error": "boom"}) == "boom"
+
+
+def test_activity_runner_done_failed_fails_step_and_compensates(queue: JobQueue):
+    """done=true + status=failed must not complete the activity or ship."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse
+
+    from job_queue.coordinator import Coordinator, _make_handler
+    from job_queue.remote import CoordinatorClient, RemoteWorkerAgent
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            return
+
+        def do_POST(self):  # noqa: N802
+            n = int(self.headers.get("Content-Length") or "0")
+            self.rfile.read(n)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"accepted":true,"status":"running"}')
+
+        def do_GET(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/status":
+                body = json.dumps(
+                    {
+                        "done": True,
+                        "status": "failed",
+                        "error": "charge declined",
+                    }
+                ).encode()
+            else:
+                body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    runner = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=runner.serve_forever, daemon=True).start()
+    runner_url = f"http://127.0.0.1:{runner.server_address[1]}"
+
+    coord = Coordinator(queue)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(coord))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    coord_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        run = queue.start_workflow(
+            tenant_id="act-done-fail",
+            max_attempts=1,
+            steps=[
+                {
+                    "name": "reserve",
+                    "kind": "effect",
+                    "payload": {"op": "reserve"},
+                    "compensate": {"kind": "effect", "payload": {"op": "release"}},
+                },
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": runner_url,
+                    "timeout_seconds": 30,
+                    "heartbeat_timeout_seconds": 10,
+                    "payload": {"op": "charge", "fail": True, "work_ms": 0},
+                    "compensate": {
+                        "kind": "effect",
+                        "payload": {"op": "undo_charge"},
+                    },
+                },
+                {"name": "ship", "kind": "effect", "payload": {"op": "ship"}},
+            ],
+        )
+        _drive_effect(queue, "act-done-fail")
+        job = queue.lease(tenant_id="act-done-fail", worker_id="w")
+        assert job is not None
+        agent = RemoteWorkerAgent(
+            CoordinatorClient(coord_url),
+            worker_id="w",
+            poll_interval_seconds=0.1,
+        )
+        with pytest.raises(RuntimeError, match="charge declined"):
+            agent._do_workflow_activity(
+                job,
+                threading.Event(),
+                job.payload,
+                job.payload["step"],
+                job.payload["step"].get("payload") or {},
+            )
+        act = queue.get_workflow_activity(job.id, tenant_id="act-done-fail")
+        assert act is not None
+        assert act.status == "failed"
+        assert "declined" in (act.error or "")
+        dead = queue.get(job.id, tenant_id="act-done-fail")
+        assert dead is not None
+        assert dead.status == JobStatus.DEAD
+        mid = queue.get_workflow(run.id, tenant_id="act-done-fail")
+        assert mid is not None
+        assert mid.status == WorkflowRunStatus.COMPENSATING.value
+        c = queue.lease(tenant_id="act-done-fail", worker_id="undo")
+        assert c is not None
+        assert c.payload.get("direction") == "compensate"
+        assert c.payload.get("step_name") == "reserve"
+        _ack(queue, c, "undo", result={"undid": True})
+        extra = queue.lease(tenant_id="act-done-fail", worker_id="undo")
+        if extra is not None:
+            _ack(queue, extra, "undo")
+        failed = queue.get_workflow(run.id, tenant_id="act-done-fail")
+        assert failed is not None
+        assert failed.status == WorkflowRunStatus.FAILED.value
+        steps = queue.list_workflow_steps(run.id, tenant_id="act-done-fail")
+        ship = next((s for s in steps if s.name == "ship"), None)
+        assert ship is None or ship.status != WorkflowStepStatus.COMPLETED.value
+        charge = next(s for s in steps if s.name == "charge")
+        assert charge.status == WorkflowStepStatus.FAILED.value
+    finally:
+        server.shutdown()
+        runner.shutdown()
+
+
 def test_activity_requires_timeout(queue: JobQueue):
     with pytest.raises(ValueError, match="timeout"):
         queue.start_workflow(

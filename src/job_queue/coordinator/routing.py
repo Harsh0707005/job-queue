@@ -217,6 +217,12 @@ class RoutingMixin:
         ):
             return self._complete_workflow_activity(path, body)
         if (
+            method == "POST"
+            and path.startswith("/v1/jobs/")
+            and path.endswith("/activity/fail")
+        ):
+            return self._fail_workflow_activity(path, body)
+        if (
             method == "GET"
             and path.startswith("/v1/jobs/")
             and path.endswith("/activity")

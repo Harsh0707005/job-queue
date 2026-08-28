@@ -18,6 +18,22 @@ from job_queue.queue import LeaseError
 logger = logging.getLogger(__name__)
 
 
+def activity_runner_failure(remote: dict[str, Any] | None) -> str | None:
+    """Error text when the runner finished unsuccessfully.
+
+    ``done=true`` is not enough: a runner can return ``status=failed``
+    after finishing. That must fail the step, not complete it.
+    """
+    if not remote:
+        return None
+    status = str(remote.get("status") or "").strip().lower()
+    if status in ("failed", "timed_out", "error"):
+        return str(remote.get("error") or f"activity {status}")
+    if remote.get("error") and not remote.get("done"):
+        return str(remote["error"])
+    return None
+
+
 class RemoteWorkerWorkflowWorkMixin:
     def _do_workflow_step(
         self,
@@ -242,8 +258,10 @@ class RemoteWorkerWorkflowWorkMixin:
             if url:
                 remote = self._poll_activity_runner(url, str(act.get("id") or ""))
                 if remote is not None:
-                    if remote.get("error") and not remote.get("done"):
-                        raise RuntimeError(str(remote.get("error")))
+                    fail_msg = activity_runner_failure(remote)
+                    if fail_msg:
+                        self._fail_activity_from_runner(job, fail_msg)
+                        raise RuntimeError(fail_msg)
                     if remote.get("done"):
                         result = remote.get("result")
                         if not isinstance(result, dict):
@@ -266,6 +284,21 @@ class RemoteWorkerWorkflowWorkMixin:
                             "result": fin.get("result") or result,
                         }
             time.sleep(interval)
+
+    def _fail_activity_from_runner(self, job: Job, error: str) -> None:
+        fail = getattr(self.client, "fail_workflow_activity", None)
+        if fail is None:
+            return
+        try:
+            fail(
+                job.id,
+                tenant_id=job.tenant_id,
+                worker_id=self.worker_id,
+                lease_token=job.lease_token,  # type: ignore[arg-type]
+                error=error,
+            )
+        except LeaseError:
+            pass
 
     def _post_activity_start(
         self,

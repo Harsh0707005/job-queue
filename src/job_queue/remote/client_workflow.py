@@ -156,6 +156,28 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def fail_workflow_activity(
+        self,
+        job_id: str | UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: str | UUID,
+        error: str,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/jobs/{job_id}/activity/fail",
+            {
+                "tenant_id": tenant_id,
+                "worker_id": worker_id,
+                "lease_token": str(lease_token),
+                "error": error,
+            },
+        )
+        assert payload is not None
+        return payload
+
     def get_workflow_activity(
         self, job_id: str | UUID, *, tenant_id: str
     ) -> dict[str, Any]:

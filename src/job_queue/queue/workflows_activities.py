@@ -300,6 +300,42 @@ class WorkflowsActivitiesMixin:
             ).fetchone()
             return self._row_to_workflow_activity(updated or row)
 
+    def fail_workflow_activity(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: str,
+        worker_id: str,
+        lease_token: UUID,
+        error: str,
+    ) -> WorkflowActivity:
+        """Mark a running activity failed and start reverse compensate."""
+        if not tenant_id or not str(tenant_id).strip():
+            raise ValueError("tenant_id is required")
+        tenant_id = str(tenant_id).strip()
+        msg = str(error or "activity failed").strip() or "activity failed"
+        now = _utcnow()
+        with transaction(self._pool) as conn:
+            job = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_lease_tenant(job, tenant_id)
+            self._assert_active_lease(job, worker_id, lease_token, now)
+            row = self._lock_activity_for_job(conn, job_id, tenant_id)
+            if row["status"] != "running":
+                return self._row_to_workflow_activity(row)
+            self._terminate_activity_locked(
+                conn,
+                activity=row,
+                job_row=job,
+                error=msg,
+                status="failed",
+                now=now,
+            )
+            done = conn.execute(
+                f"SELECT {_ACTIVITY_COLUMNS} FROM workflow_activities WHERE id = %s",
+                (row["id"],),
+            ).fetchone()
+            return self._row_to_workflow_activity(done or row)
+
     def get_workflow_activity(
         self, job_id: UUID, *, tenant_id: str
     ) -> WorkflowActivity | None:

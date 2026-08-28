@@ -397,6 +397,11 @@ class WorkflowsApiMixin:
     ) -> tuple[int, dict[str, Any]]:
         return self._activity_lease_action(path, body, "complete")
 
+    def _fail_workflow_activity(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._activity_lease_action(path, body, "fail")
+
     def _activity_lease_action(
         self, path: str, body: dict[str, Any], action: str
     ) -> tuple[int, dict[str, Any]]:
@@ -429,6 +434,14 @@ class WorkflowsApiMixin:
                     tenant_id=str(tenant_id),
                     worker_id=str(worker_id),
                     lease_token=token,
+                )
+            elif action == "fail":
+                act = self.queue.fail_workflow_activity(
+                    jid,
+                    tenant_id=str(tenant_id),
+                    worker_id=str(worker_id),
+                    lease_token=token,
+                    error=str(body.get("error") or "activity failed"),
                 )
             else:
                 result = body.get("result")
