@@ -353,6 +353,268 @@ def test_approval_cannot_be_a_compensate_step(queue: JobQueue):
         )
 
 
+def _settle(queue: JobQueue, tenant_id: str, *, timeout: float = 5) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        j = queue.lease(tenant_id=tenant_id, worker_id="settle")
+        if j is not None:
+            _ack(queue, j, "settle", result={"ok": True})
+            continue
+        time.sleep(0.02)
+
+
+def test_approval_deadlock_retry_is_graceful():
+    from psycopg.errors import DeadlockDetected
+
+    from job_queue.queue.workflows_approvals import (
+        _DEADLOCK_RETRIES,
+        _run_avoiding_deadlock,
+    )
+
+    n = {"i": 0}
+
+    def always() -> str:
+        n["i"] += 1
+        raise DeadlockDetected()
+
+    with pytest.raises(ApprovalError, match="lock race"):
+        _run_avoiding_deadlock(always)
+    assert n["i"] == _DEADLOCK_RETRIES
+
+    n["i"] = 0
+
+    def once() -> str:
+        n["i"] += 1
+        if n["i"] == 1:
+            raise DeadlockDetected()
+        return "ok"
+
+    assert _run_avoiding_deadlock(once) == "ok"
+    assert n["i"] == 2
+
+
+def test_approve_versus_timeout_tick_no_deadlock_one_winner(queue: JobQueue):
+    """Human approve (run→step) vs due timeout tick must not 40P01.
+
+    Exactly one decision lands; the saga continues or compensates.
+    """
+    n = 12
+    runs = []
+    for i in range(n):
+        tid = f"ap-race-to-{i:02d}"
+        run = queue.start_workflow(
+            tenant_id=tid,
+            max_attempts=4,
+            steps=_approval_steps(timeout=0.12),
+        )
+        _drive(queue, tid)
+        runs.append((tid, run.id))
+    time.sleep(0.2)
+
+    errors: list[BaseException] = []
+    outcomes: list[str] = []
+
+    def approve(tid: str, rid: object) -> None:
+        try:
+            queue.approve_workflow(rid, tenant_id=tid, decided_by="ops")
+            outcomes.append("approved")
+        except ApprovalError:
+            outcomes.append("approve_lost")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def tick(tid: str) -> None:
+        try:
+            queue.process_workflow_approval_timeouts(tenant_id=tid, limit=8)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futs = []
+        for tid, rid in runs:
+            futs.append(pool.submit(approve, tid, rid))
+            futs.append(pool.submit(tick, tid))
+            futs.append(pool.submit(tick, tid))
+        for fut in as_completed(futs):
+            fut.result()
+    assert errors == [], errors
+
+    approved = lost = 0
+    for tid, rid in runs:
+        steps = queue.list_workflow_steps(rid, tenant_id=tid)
+        gate = next(s for s in steps if s.name == "gate")
+        decision = (gate.result or {}).get("decision")
+        assert decision in ("approved", "timeout"), (tid, gate.status, decision)
+        if decision == "approved":
+            assert gate.status == WorkflowStepStatus.COMPLETED.value
+            approved += 1
+        else:
+            assert gate.status == WorkflowStepStatus.FAILED.value
+            lost += 1
+        _settle(queue, tid)
+        done = queue.get_workflow(rid, tenant_id=tid)
+        assert done is not None
+        if decision == "approved":
+            assert done.status == WorkflowRunStatus.COMPLETED.value
+        else:
+            assert done.status == WorkflowRunStatus.FAILED.value
+    assert approved + lost == n
+    assert approved >= 1 or lost >= 1
+
+
+def test_concurrent_approve_and_reject_one_winner(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="ap-ar",
+        max_attempts=1,
+        steps=_approval_steps(),
+    )
+    _drive(queue, "ap-ar")
+    errors: list[BaseException] = []
+    seen: list[str] = []
+
+    def approve() -> None:
+        try:
+            queue.approve_workflow(run.id, tenant_id="ap-ar")
+            seen.append("approved")
+        except ApprovalError:
+            seen.append("approve_lost")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reject() -> None:
+        try:
+            queue.reject_workflow(run.id, tenant_id="ap-ar", reason="no")
+            seen.append("rejected")
+        except ApprovalError:
+            seen.append("reject_lost")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(approve), pool.submit(reject)]
+        for fut in as_completed(futs):
+            fut.result()
+    assert errors == [], errors
+    assert "approved" in seen or "rejected" in seen
+    assert not ("approved" in seen and "rejected" in seen)
+    steps = queue.list_workflow_steps(run.id, tenant_id="ap-ar")
+    gate = next(s for s in steps if s.name == "gate")
+    decision = (gate.result or {}).get("decision")
+    assert decision in ("approved", "rejected")
+    _settle(queue, "ap-ar")
+    done = queue.get_workflow(run.id, tenant_id="ap-ar")
+    assert done is not None
+    if decision == "approved":
+        assert done.status == WorkflowRunStatus.COMPLETED.value
+    else:
+        assert done.status == WorkflowRunStatus.FAILED.value
+
+
+def test_concurrent_double_approve_is_idempotent(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="ap-aa",
+        max_attempts=1,
+        steps=_approval_steps(),
+    )
+    _drive(queue, "ap-aa")
+    errors: list[BaseException] = []
+    oks = []
+
+    def approve() -> None:
+        try:
+            out = queue.approve_workflow(run.id, tenant_id="ap-aa")
+            oks.append(out["step"].result["decision"])
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [pool.submit(approve) for _ in range(8)]
+        for fut in as_completed(futs):
+            fut.result()
+    assert errors == [], errors
+    assert oks == ["approved"] * 8
+    steps = queue.list_workflow_steps(run.id, tenant_id="ap-aa")
+    gate = next(s for s in steps if s.name == "gate")
+    assert gate.status == WorkflowStepStatus.COMPLETED.value
+    _settle(queue, "ap-aa")
+    done = queue.get_workflow(run.id, tenant_id="ap-aa")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+
+
+def test_forced_step_then_run_lock_does_not_leak_deadlock(queue: JobQueue):
+    """Opposite lock order vs approve: operator must not see 40P01."""
+    import threading
+
+    from psycopg.errors import DeadlockDetected
+
+    run = queue.start_workflow(
+        tenant_id="ap-dl",
+        max_attempts=1,
+        steps=_approval_steps(),
+    )
+    _drive(queue, "ap-dl")
+    steps = queue.list_workflow_steps(run.id, tenant_id="ap-dl")
+    gate = next(s for s in steps if s.name == "gate")
+    barrier = threading.Barrier(2, timeout=5)
+    errors: list[BaseException] = []
+    human: list[str] = []
+
+    def invert() -> None:
+        try:
+            with queue._pool.connection() as conn:
+                try:
+                    conn.execute(
+                        "SELECT id FROM workflow_step_runs WHERE id = %s FOR UPDATE",
+                        (gate.id,),
+                    )
+                    barrier.wait()
+                    conn.execute(
+                        "SELECT id FROM workflow_runs WHERE id = %s FOR UPDATE",
+                        (run.id,),
+                    )
+                    conn.commit()
+                except DeadlockDetected:
+                    conn.rollback()
+        except BaseException as exc:  # noqa: BLE001
+            if not isinstance(exc, DeadlockDetected):
+                errors.append(exc)
+
+    def human_approve() -> None:
+        try:
+            barrier.wait()
+            queue.approve_workflow(run.id, tenant_id="ap-dl")
+            human.append("ok")
+        except ApprovalError:
+            human.append("lost")
+        except DeadlockDetected as exc:
+            errors.append(exc)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=invert)
+    t2 = threading.Thread(target=human_approve)
+    t1.start()
+    t2.start()
+    t1.join(timeout=8)
+    t2.join(timeout=8)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert errors == [], errors
+    assert human in (["ok"], ["lost"])
+    steps = queue.list_workflow_steps(run.id, tenant_id="ap-dl")
+    gate2 = next(s for s in steps if s.name == "gate")
+    if human == ["ok"]:
+        assert gate2.status == WorkflowStepStatus.COMPLETED.value
+        _settle(queue, "ap-dl")
+        done = queue.get_workflow(run.id, tenant_id="ap-dl")
+        assert done is not None
+        assert done.status == WorkflowRunStatus.COMPLETED.value
+    else:
+        assert gate2.status == WorkflowStepStatus.AWAITING_APPROVAL.value
+        queue.approve_workflow(run.id, tenant_id="ap-dl")
+        _settle(queue, "ap-dl")
+
+
 def test_approval_http_decide_and_isolation(queue: JobQueue):
     from http.server import ThreadingHTTPServer
     import threading

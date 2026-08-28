@@ -8,10 +8,12 @@ a missed deadline) fails the step and starts reverse compensate.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable, TypeVar
 from uuid import UUID
 
+from psycopg.errors import DeadlockDetected
 from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
@@ -25,6 +27,23 @@ from job_queue.queue.workflows import _RUN_COLUMNS, _STEP_COLUMNS
 
 
 APPROVAL_KINDS = frozenset({"approval", "wait_approval", "approve"})
+
+_T = TypeVar("_T")
+_DEADLOCK_RETRIES = 8
+
+
+def _run_avoiding_deadlock(op: Callable[[], _T]) -> _T:
+    """Retry a txn that hit 40P01 so the operator never sees a raw DB error."""
+    last: DeadlockDetected | None = None
+    for attempt in range(_DEADLOCK_RETRIES):
+        try:
+            return op()
+        except DeadlockDetected as exc:
+            last = exc
+            time.sleep(0.01 * (attempt + 1))
+    raise ApprovalError(
+        "approval lost a lock race; retry the decision"
+    ) from last
 
 
 def apply_approval_fields(
@@ -134,37 +153,44 @@ class WorkflowsApprovalsMixin:
         tenant_id = str(tenant_id).strip()
         if decision not in ("approved", "rejected", "timeout"):
             raise ValueError("decision must be approved, rejected, or timeout")
-        now = _utcnow()
-        with transaction(self._pool) as conn:
-            run = conn.execute(
-                f"""
-                SELECT {_RUN_COLUMNS}
-                FROM workflow_runs
-                WHERE id = %s AND tenant_id = %s
-                FOR UPDATE
-                """,
-                (run_id, tenant_id),
-            ).fetchone()
-            if run is None:
-                raise ValueError(
-                    f"workflow run {run_id} not found for tenant {tenant_id!r}"
+
+        def _once() -> dict[str, Any]:
+            now = _utcnow()
+            with transaction(self._pool) as conn:
+                # Always lock the run first, then the step. The timeout tick
+                # uses the same order so a simultaneous human decide cannot
+                # deadlock (40P01) against process_workflow_approval_timeouts.
+                run = conn.execute(
+                    f"""
+                    SELECT {_RUN_COLUMNS}
+                    FROM workflow_runs
+                    WHERE id = %s AND tenant_id = %s
+                    FOR UPDATE
+                    """,
+                    (run_id, tenant_id),
+                ).fetchone()
+                if run is None:
+                    raise ValueError(
+                        f"workflow run {run_id} not found for tenant {tenant_id!r}"
+                    )
+                step_row = self._lock_approval_step(
+                    conn,
+                    run=run,
+                    step=step,
+                    step_id=step_id,
                 )
-            step_row = self._lock_approval_step(
-                conn,
-                run=run,
-                step=step,
-                step_id=step_id,
-            )
-            return self._apply_approval_decision_locked(
-                conn,
-                run=run,
-                step=step_row,
-                decision=decision,
-                decided_by=decided_by,
-                comment=comment,
-                reason=reason,
-                now=now,
-            )
+                return self._apply_approval_decision_locked(
+                    conn,
+                    run=run,
+                    step=step_row,
+                    decision=decision,
+                    decided_by=decided_by,
+                    comment=comment,
+                    reason=reason,
+                    now=now,
+                )
+
+        return _run_avoiding_deadlock(_once)
 
     def list_awaiting_workflow_approvals(
         self,
@@ -251,45 +277,73 @@ class WorkflowsApprovalsMixin:
         return fixed
 
     def _timeout_one_approval_step(self, step_id: UUID) -> bool:
-        now = _utcnow()
-        with transaction(self._pool) as conn:
-            step = conn.execute(
-                f"""
-                SELECT {_STEP_COLUMNS}
-                FROM workflow_step_runs
-                WHERE id = %s
-                FOR UPDATE
-                """,
-                (step_id,),
-            ).fetchone()
-            if step is None:
-                return False
-            if step["status"] != WorkflowStepStatus.AWAITING_APPROVAL.value:
-                return False
-            if step.get("deadline_at") is None or _as_utc(step["deadline_at"]) > now:
-                return False
-            run = conn.execute(
-                f"""
-                SELECT {_RUN_COLUMNS}
-                FROM workflow_runs
-                WHERE id = %s
-                FOR UPDATE
-                """,
-                (step["run_id"],),
-            ).fetchone()
-            if run is None:
-                return False
-            if run["status"] != WorkflowRunStatus.RUNNING.value:
-                return False
-            self._apply_approval_decision_locked(
-                conn,
-                run=run,
-                step=step,
-                decision="timeout",
-                reason="approval deadline exceeded",
-                now=now,
-            )
-            return True
+        def _once() -> bool:
+            now = _utcnow()
+            with transaction(self._pool) as conn:
+                peek = conn.execute(
+                    """
+                    SELECT run_id, status, deadline_at
+                    FROM workflow_step_runs
+                    WHERE id = %s
+                    """,
+                    (step_id,),
+                ).fetchone()
+                if peek is None:
+                    return False
+                if peek["status"] != WorkflowStepStatus.AWAITING_APPROVAL.value:
+                    return False
+                if (
+                    peek.get("deadline_at") is None
+                    or _as_utc(peek["deadline_at"]) > now
+                ):
+                    return False
+                # Run first, then step — same order as approve_workflow.
+                run = conn.execute(
+                    f"""
+                    SELECT {_RUN_COLUMNS}
+                    FROM workflow_runs
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (peek["run_id"],),
+                ).fetchone()
+                if run is None:
+                    return False
+                if run["status"] != WorkflowRunStatus.RUNNING.value:
+                    return False
+                step = conn.execute(
+                    f"""
+                    SELECT {_STEP_COLUMNS}
+                    FROM workflow_step_runs
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (step_id,),
+                ).fetchone()
+                if step is None:
+                    return False
+                if step["status"] != WorkflowStepStatus.AWAITING_APPROVAL.value:
+                    return False
+                if (
+                    step.get("deadline_at") is None
+                    or _as_utc(step["deadline_at"]) > now
+                ):
+                    return False
+                self._apply_approval_decision_locked(
+                    conn,
+                    run=run,
+                    step=step,
+                    decision="timeout",
+                    reason="approval deadline exceeded",
+                    now=now,
+                )
+                return True
+
+        try:
+            return _run_avoiding_deadlock(_once)
+        except ApprovalError:
+            # Next control tick will retry; do not fail the whole sweep.
+            return False
 
     def _park_approval_step(
         self,
@@ -347,6 +401,11 @@ class WorkflowsApprovalsMixin:
             ),
         ).fetchone()
         step = updated or step_row
+        if deadline is None or _as_utc(deadline) > _as_utc(now):
+            _ = (queue_name, max_attempts, visibility_timeout_seconds)
+            return step
+        # Caller already holds the run (enqueue locks it first). Re-read
+        # under that lock; do not lock the step then the run.
         run = conn.execute(
             f"""
             SELECT {_RUN_COLUMNS}
@@ -359,9 +418,6 @@ class WorkflowsApprovalsMixin:
         if run is None:
             return step
         if run["status"] != WorkflowRunStatus.RUNNING.value:
-            return step
-        if deadline is None or _as_utc(deadline) > _as_utc(now):
-            _ = (queue_name, max_attempts, visibility_timeout_seconds)
             return step
         return self._apply_approval_decision_locked(
             conn,

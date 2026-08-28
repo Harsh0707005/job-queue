@@ -1470,8 +1470,10 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
             # Drain closes intake. Do not raise — callers include the step
             # ack transaction, which must still complete the finished job.
             return 0
+        # Lock the run before any new step row so park/timeout cannot
+        # invert the run-then-step order used by approve_workflow.
         st = conn.execute(
-            "SELECT status FROM workflow_runs WHERE id = %s",
+            "SELECT status FROM workflow_runs WHERE id = %s FOR UPDATE",
             (run_id,),
         ).fetchone()
         if st is not None and st["status"] in (
