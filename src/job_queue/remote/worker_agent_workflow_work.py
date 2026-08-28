@@ -227,7 +227,9 @@ class RemoteWorkerWorkflowWorkMixin:
                 str(act.get("error") or f"activity {status}")
             )
 
-        url = str(step.get("url") or os.environ.get("ACTIVITY_URL") or "").rstrip("/")
+        url = self._safe_activity_base_url(
+            str(step.get("url") or os.environ.get("ACTIVITY_URL") or "")
+        )
         if url:
             self._post_activity_start(job, payload, step, step_payload, act, url)
 
@@ -300,6 +302,32 @@ class RemoteWorkerWorkflowWorkMixin:
         except LeaseError:
             pass
 
+    @staticmethod
+    def _safe_activity_base_url(raw: str) -> str:
+        url = str(raw or "").strip().rstrip("/")
+        if not url:
+            return ""
+        from job_queue.queue.workflows_activities import validate_activity_url
+
+        try:
+            return validate_activity_url(url, resolve_dns=True).rstrip("/")
+        except ValueError as exc:
+            raise RuntimeError(f"activity url blocked: {exc}") from exc
+
+    @staticmethod
+    def _activity_http_open(req: urllib.request.Request, timeout: float):
+        """Open *req* only after SSRF checks; never follow redirects."""
+        from job_queue.queue.workflows_activities import validate_activity_url
+
+        validate_activity_url(req.full_url, resolve_dns=True)
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):  # noqa: ANN002
+                raise urllib.error.URLError("activity redirects are not allowed")
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        return opener.open(req, timeout=timeout)
+
     def _post_activity_start(
         self,
         job: Job,
@@ -310,6 +338,7 @@ class RemoteWorkerWorkflowWorkMixin:
         url: str,
     ) -> None:
         start_url = url if url.endswith("/start") else url + "/start"
+        start_url = self._safe_activity_base_url(start_url)
         body = json.dumps(
             {
                 "activity_id": act.get("id"),
@@ -333,8 +362,10 @@ class RemoteWorkerWorkflowWorkMixin:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with self._activity_http_open(req, 10) as resp:
                 resp.read()
+        except RuntimeError:
+            raise
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             if os.environ.get("WORKFLOW_ALLOW_SINK_FAILURE") == "1":
                 logger.warning(
@@ -351,9 +382,12 @@ class RemoteWorkerWorkflowWorkMixin:
         base = url[: -len("/start")] if url.endswith("/start") else url
         status_url = f"{base}/status?id={activity_id}"
         try:
+            status_url = self._safe_activity_base_url(status_url)
             req = urllib.request.Request(status_url, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with self._activity_http_open(req, 5) as resp:
                 raw = resp.read()
             return json.loads(raw.decode() or "{}")
+        except RuntimeError:
+            raise
         except Exception:  # noqa: BLE001
             return None

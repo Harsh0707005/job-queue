@@ -153,6 +153,139 @@ def test_register_webhook_rejects_private_url(queue: JobQueue, monkeypatch):
         )
 
 
+def test_start_workflow_rejects_ssrf_activity_url(queue: JobQueue, monkeypatch):
+    monkeypatch.delenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", raising=False)
+    with pytest.raises(ValueError, match="non-public|not allowed|activity"):
+        queue.start_workflow(
+            tenant_id="ssrf-act",
+            steps=[
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": "http://127.0.0.1:9/start",
+                    "timeout_seconds": 5,
+                }
+            ],
+        )
+    with pytest.raises(ValueError, match="link-local|not allowed"):
+        queue.start_workflow(
+            tenant_id="ssrf-act",
+            steps=[
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": "http://169.254.169.254/latest/meta-data",
+                    "timeout_seconds": 5,
+                }
+            ],
+        )
+    with pytest.raises(ValueError, match="http"):
+        queue.start_workflow(
+            tenant_id="ssrf-act",
+            steps=[
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": "file:///etc/passwd",
+                    "timeout_seconds": 5,
+                }
+            ],
+        )
+    with pytest.raises(ValueError, match="credentials"):
+        queue.start_workflow(
+            tenant_id="ssrf-act",
+            steps=[
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": "https://user:pass@example.com/act",
+                    "timeout_seconds": 5,
+                }
+            ],
+        )
+
+
+def test_start_workflow_never_allows_activity_metadata_url(
+    queue: JobQueue, monkeypatch
+):
+    monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
+    with pytest.raises(ValueError, match="link-local|not allowed"):
+        queue.start_workflow(
+            tenant_id="ssrf-act-meta",
+            steps=[
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": "http://169.254.169.254/latest/meta-data",
+                    "timeout_seconds": 5,
+                }
+            ],
+        )
+    with pytest.raises(ValueError, match="not allowed"):
+        queue.start_workflow(
+            tenant_id="ssrf-act-meta",
+            steps=[
+                {
+                    "name": "charge",
+                    "kind": "activity",
+                    "activity": "charge",
+                    "url": "http://metadata.google.internal/computeMetadata/v1/",
+                    "timeout_seconds": 5,
+                }
+            ],
+        )
+
+
+def test_worker_refuses_to_fetch_ssrf_activity_url(monkeypatch):
+    from job_queue.remote.worker_agent_workflow_work import (
+        RemoteWorkerWorkflowWorkMixin,
+    )
+
+    monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
+    with pytest.raises(RuntimeError, match="activity url blocked"):
+        RemoteWorkerWorkflowWorkMixin._safe_activity_base_url(
+            "http://169.254.169.254/latest/meta-data"
+        )
+    monkeypatch.delenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", raising=False)
+    with pytest.raises(RuntimeError, match="activity url blocked"):
+        RemoteWorkerWorkflowWorkMixin._safe_activity_base_url("http://127.0.0.1:9/x")
+    with pytest.raises(RuntimeError, match="activity url blocked"):
+        RemoteWorkerWorkflowWorkMixin._safe_activity_base_url("file:///etc/passwd")
+
+
+def test_worker_does_not_follow_activity_redirect_to_metadata(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from job_queue.remote.worker_agent_workflow_work import (
+        RemoteWorkerWorkflowWorkMixin,
+    )
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            return
+
+        def do_GET(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", "http://169.254.169.254/latest/meta-data")
+            self.end_headers()
+
+    monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/status"
+        req = urllib.request.Request(url, method="GET")
+        with pytest.raises((urllib.error.URLError, urllib.error.HTTPError)):
+            RemoteWorkerWorkflowWorkMixin._activity_http_open(req, 3)
+    finally:
+        srv.shutdown()
+
+
 def test_register_webhook_accepts_private_when_allowed(queue: JobQueue, monkeypatch):
     monkeypatch.setenv("JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS", "1")
     ep = queue.register_webhook(

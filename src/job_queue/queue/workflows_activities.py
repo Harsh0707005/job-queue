@@ -41,6 +41,19 @@ _ACTIVITY_COLUMNS = """
 """
 
 
+def validate_activity_url(url: str, *, resolve_dns: bool = True) -> str:
+    """Same SSRF rules as webhooks: http(s), no credentials, no metadata."""
+    from job_queue.webhooks import validate_webhook_url
+
+    try:
+        return validate_webhook_url(url, resolve_dns=resolve_dns)
+    except ValueError as exc:
+        msg = str(exc).replace("webhook URL", "activity URL")
+        if msg.startswith("url "):
+            msg = "activity " + msg
+        raise ValueError(msg) from exc
+
+
 def parse_activity_seconds(raw: Any, *, label: str, default: float | None = None) -> float:
     if raw is None:
         if default is None:
@@ -63,7 +76,7 @@ def apply_activity_fields(
         raise ValueError(f"{label}.activity is required")
     dest["activity"] = name
     if raw.get("url") is not None and str(raw.get("url") or "").strip():
-        dest["url"] = str(raw["url"]).strip()
+        dest["url"] = validate_activity_url(str(raw["url"]), resolve_dns=True)
     timeout = parse_activity_seconds(
         raw.get("timeout_seconds") or raw.get("start_to_close_seconds"),
         label=f"{label}.timeout_seconds",
