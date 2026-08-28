@@ -37,6 +37,11 @@ from job_queue.queue._common import (
     _normalize_skills,
     _utcnow,
 )
+from job_queue.queue.workflows_branch import (
+    WorkflowsBranchMixin,
+    _is_if_block,
+    normalize_if_cases,
+)
 from job_queue.queue.workflows_map import (
     DEFAULT_MAP_MAX_ITEMS,
     WorkflowsMapMixin,
@@ -69,7 +74,7 @@ _PARKED_FORWARD_STATUSES = (
 )
 
 
-class WorkflowsMixin(WorkflowsMapMixin):
+class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
     def start_workflow(
         self,
         *,
@@ -1229,7 +1234,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 return False
             if st == WorkflowStepStatus.COMPLETED.value:
                 completed_n += 1
-        if completed_n < 1:
+        if completed_n < 1 and not by_idx:
             return False
         updated = conn.execute(
             """
@@ -1474,6 +1479,23 @@ class WorkflowsMixin(WorkflowsMapMixin):
             WorkflowRunStatus.COMPENSATING.value,
         ):
             return 0
+        ready = {
+            int(r["step_index"])
+            for r in conn.execute(
+                """
+                SELECT step_index
+                FROM workflow_step_runs
+                WHERE run_id = %s
+                  AND direction = 'forward'
+                  AND status IN (%s, %s)
+                """,
+                (
+                    run_id,
+                    WorkflowStepStatus.COMPLETED.value,
+                    WorkflowStepStatus.SKIPPED.value,
+                ),
+            ).fetchall()
+        }
         completed = {
             int(r["step_index"])
             for r in conn.execute(
@@ -1504,7 +1526,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
             sdef = steps_def[i]
             if str(sdef.get("kind") or "") == "map_join":
                 deps_ready = all(
-                    int(d) in completed
+                    int(d) in ready
                     for d in (sdef.get("map") or {}).get("from_indices")
                     or sdef.get("depends_on_indices")
                     or []
@@ -1516,7 +1538,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
                     for d in (sdef.get("map") or {}).get("from_indices") or []
                 ]
                 if producers:
-                    deps_ready = all(d in completed for d in producers)
+                    deps_ready = all(d in ready for d in producers)
                 if not deps_ready:
                     i += 1
                     continue
@@ -1573,6 +1595,7 @@ class WorkflowsMixin(WorkflowsMapMixin):
                     )
                     existing.add(i)
                     completed.add(i)
+                    ready.add(i)
                     n += 1
                 i += 1
                 continue
@@ -1580,9 +1603,38 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 i += 1
                 continue
             deps = [int(d) for d in (sdef.get("depends_on_indices") or [])]
-            if any(d not in completed for d in deps):
+            if any(d not in ready for d in deps):
                 i += 1
                 continue
+            branch = (
+                sdef.get("branch") if isinstance(sdef.get("branch"), dict) else None
+            )
+            if branch:
+                sources = [int(x) for x in (branch.get("source_indices") or [])]
+                if any(s not in ready for s in sources):
+                    i += 1
+                    continue
+                group = str(branch.get("group") or "")
+                winner = self._winner_for_branch_group(
+                    conn,
+                    run_id=run_id,
+                    steps_def=steps_def,
+                    group=group,
+                )
+                n += self._skip_losing_branch_steps(
+                    conn,
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    steps_def=steps_def,
+                    group=group,
+                    winner=winner,
+                    existing=existing,
+                    ready=ready,
+                    now=now,
+                )
+                if i in existing:
+                    i += 1
+                    continue
             self._create_and_enqueue_step(
                 conn,
                 run_id=run_id,
@@ -2759,8 +2811,22 @@ class WorkflowsMixin(WorkflowsMapMixin):
               "step": {"name": "work", "payload": {"op": "do"}},
             }
 
-        Each branch runs concurrently after the previous wave; the next
-        sequential step depends on every branch tail (join). A map
+        If / switch form (exactly one path runs)::
+
+            {
+              "type": "if",
+              "name": "route",
+              "on": "choice",
+              "equals": "vip",
+              "then": [{"name": "vip-work", ...}],
+              "else": [{"name": "std-work", ...}],
+            }
+
+        Unused branch steps are marked ``skipped`` so the join is not
+        stuck. ``cases`` is a multi-way switch; first match wins.
+
+        Each parallel branch runs concurrently after the previous wave; the
+        next sequential step depends on every branch tail (join). A map
         placeholder joins after every spawned child completes.
         """
         if not raw_steps:
@@ -2785,9 +2851,9 @@ class WorkflowsMixin(WorkflowsMapMixin):
             branch_id: int | None = None,
             path: str,
         ) -> int:
-            if _is_parallel(raw) or _is_map_block(raw):
+            if _is_parallel(raw) or _is_map_block(raw) or _is_if_block(raw):
                 raise ValueError(
-                    f"{path}: nested parallel/map blocks are not supported"
+                    f"{path}: nested parallel/map/if blocks are not supported"
                 )
             idx = len(flat)
             leaf = cls._normalize_leaf_step(raw, idx, path=path)
@@ -2882,6 +2948,31 @@ class WorkflowsMixin(WorkflowsMapMixin):
                     )
                 flat.append(join)
                 prev_wave = [leaf_idx]
+            elif _is_if_block(item):
+                cases = normalize_if_cases(item, path=path)
+                pg = str(item.get("name") or f"if-{bi}").strip() or f"if-{bi}"
+                tails: list[int] = []
+                for c_i, case in enumerate(cases):
+                    dep = list(prev_wave)
+                    last: int | None = None
+                    for s_i, sraw in enumerate(case["steps"]):
+                        last = _append_leaf(
+                            sraw,
+                            depends=dep if s_i == 0 else [int(last)],  # type: ignore[arg-type]
+                            path=f"{path}.branch[{c_i}][{s_i}]",
+                        )
+                        flat[last]["branch"] = {
+                            "group": pg,
+                            "id": c_i,
+                            "pred": dict(case["pred"]),
+                            "source_indices": list(prev_wave),
+                        }
+                        dep = [last]
+                    assert last is not None
+                    tails.append(last)
+                if not tails:
+                    raise ValueError(f"{path}: if/switch produced no steps")
+                prev_wave = tails
             else:
                 idx = _append_leaf(
                     item,
@@ -2971,6 +3062,8 @@ class WorkflowsMixin(WorkflowsMapMixin):
                 out["timeout_seconds"] = timeout
             if raw.get("deadline_at") is not None:
                 out["deadline_at"] = raw["deadline_at"]
+        if kind in ("if", "switch", "branch", "choose"):
+            raise ValueError(f"{label}: if/switch requires then or cases")
         if kind == "activity":
             from job_queue.queue.workflows_activities import apply_activity_fields
 

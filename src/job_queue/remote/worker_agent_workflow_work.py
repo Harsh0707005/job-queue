@@ -91,15 +91,29 @@ class RemoteWorkerWorkflowWorkMixin:
             lease_lost.set()
             raise
 
+        declared: dict[str, Any] = {}
+        raw_declared = step_payload.get("result")
+        if isinstance(raw_declared, dict):
+            declared.update(raw_declared)
+        if isinstance(step_payload.get("items"), list) and "items" not in declared:
+            declared["items"] = list(step_payload["items"])
+
         status = str(begun.get("status") or "")
         if status == "completed":
-            return {
+            # Reclaim after complete_side_effect: flatten the stored result
+            # so later if/map steps still see `branch` / `items` at the top.
+            prev = begun.get("result")
+            out: dict[str, Any] = {
                 "workflow": True,
                 "direction": direction,
                 "skipped": True,
                 "effect_key": effect_key,
-                "result": begun.get("result"),
             }
+            if isinstance(prev, dict):
+                out.update(prev)
+            else:
+                out.update(declared)
+            return out
 
         try:
             effect_ms = int(
@@ -168,13 +182,11 @@ class RemoteWorkerWorkflowWorkMixin:
             "step_name": payload.get("step_name"),
             "op": step_payload.get("op") or direction,
         }
-        # Test / soak producers can declare the ack result (items list for
-        # dynamic map fan-out) on the step payload.
-        declared = step_payload.get("result")
-        if isinstance(declared, dict):
-            result.update(declared)
-        if isinstance(step_payload.get("items"), list) and "items" not in result:
-            result["items"] = list(step_payload["items"])
+        # Soak / test producers declare the ack result on the step payload
+        # (map `items`, if/switch `branch`). Those keys must land on the
+        # job/step result the coordinator evaluates, not only on the
+        # side-effect row.
+        result.update(declared)
         completed = self.client.complete_side_effect(
             job.id,
             tenant_id=job.tenant_id,
@@ -190,7 +202,7 @@ class RemoteWorkerWorkflowWorkMixin:
             "step_index": payload.get("step_index"),
             "effect_key": effect_key,
             "effect": completed,
-            **{k: result[k] for k in ("items",) if k in result},
+            **declared,
         }
 
     def _do_workflow_activity(
