@@ -382,6 +382,103 @@ class WorkflowsApiMixin:
             return 400, {"error": str(exc)}
         return 200, {"timed_out": n}
 
+    def _approve_workflow(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._decide_workflow(path, body, "approved")
+
+    def _reject_workflow(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        return self._decide_workflow(path, body, "rejected")
+
+    def _decide_workflow(
+        self, path: str, body: dict[str, Any], decision: str
+    ) -> tuple[int, dict[str, Any]]:
+        from job_queue.queue import ApprovalError
+
+        parts = path.strip("/").split("/")
+        if len(parts) < 4:
+            return 400, {"error": "invalid workflow approval path"}
+        try:
+            rid = UUID(parts[2])
+        except ValueError:
+            return 400, {"error": "invalid workflow id"}
+        tenant = body.get("tenant_id")
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        step = body.get("step")
+        step_id = body.get("step_id")
+        sid = None
+        if step_id is not None:
+            try:
+                sid = UUID(str(step_id))
+            except ValueError:
+                return 400, {"error": "invalid step_id"}
+        kwargs: dict[str, Any] = {
+            "tenant_id": str(tenant),
+            "step": step,
+            "step_id": sid,
+            "decided_by": body.get("decided_by"),
+        }
+        try:
+            if decision == "approved":
+                out = self.queue.approve_workflow(
+                    rid, comment=body.get("comment"), **kwargs
+                )
+            else:
+                out = self.queue.reject_workflow(
+                    rid, reason=body.get("reason"), **kwargs
+                )
+        except ApprovalError as exc:
+            return 409, {"error": str(exc), "code": "approval_error"}
+        except ValueError as exc:
+            msg = str(exc)
+            if "not found" in msg:
+                return 404, {"error": msg}
+            return 400, {"error": msg}
+        return 200, {
+            "run": _run_to_dict(out["run"]),
+            "step": _step_to_dict(out["step"]),
+        }
+
+    def _list_awaiting_workflow_approvals(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, dict[str, Any]]:
+        tenant = (query.get("tenant_id") or [None])[0]
+        if not tenant:
+            return 400, {"error": "tenant_id is required"}
+        try:
+            limit = int((query.get("limit") or ["100"])[0])
+            offset = int((query.get("offset") or ["0"])[0])
+        except ValueError:
+            return 400, {"error": "limit and offset must be integers"}
+        try:
+            steps = self.queue.list_awaiting_workflow_approvals(
+                tenant_id=str(tenant), limit=limit, offset=offset
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "steps": [_step_to_dict(s) for s in steps],
+            "count": len(steps),
+            "tenant_id": str(tenant),
+        }
+
+    def _process_workflow_approval_timeouts(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            n = self.queue.process_workflow_approval_timeouts(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 50),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"timed_out": n}
+
     def _start_workflow_activity(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:

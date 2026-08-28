@@ -94,6 +94,76 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def approve_workflow(
+        self,
+        run_id: str | UUID,
+        *,
+        tenant_id: str,
+        step: str | int | None = None,
+        step_id: str | UUID | None = None,
+        decided_by: str | None = None,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if step is not None:
+            body["step"] = step
+        if step_id is not None:
+            body["step_id"] = str(step_id)
+        if decided_by is not None:
+            body["decided_by"] = decided_by
+        if comment is not None:
+            body["comment"] = comment
+        payload = self._request("POST", f"/v1/workflows/{run_id}/approve", body)
+        assert payload is not None
+        return payload
+
+    def reject_workflow(
+        self,
+        run_id: str | UUID,
+        *,
+        tenant_id: str,
+        step: str | int | None = None,
+        step_id: str | UUID | None = None,
+        reason: str | None = None,
+        decided_by: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"tenant_id": tenant_id}
+        if step is not None:
+            body["step"] = step
+        if step_id is not None:
+            body["step_id"] = str(step_id)
+        if reason is not None:
+            body["reason"] = reason
+        if decided_by is not None:
+            body["decided_by"] = decided_by
+        payload = self._request("POST", f"/v1/workflows/{run_id}/reject", body)
+        assert payload is not None
+        return payload
+
+    def list_awaiting_workflow_approvals(
+        self, *, tenant_id: str, limit: int = 100, offset: int = 0
+    ) -> dict[str, Any]:
+        from urllib.parse import urlencode
+
+        q = urlencode(
+            {"tenant_id": tenant_id, "limit": limit, "offset": offset}
+        )
+        payload = self._request("GET", f"/v1/workflows/approvals?{q}")
+        assert payload is not None
+        return payload
+
+    def process_workflow_approval_timeouts(
+        self, *, tenant_id: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request(
+            "POST", "/v1/workflows/process-approval-timeouts", body
+        )
+        assert payload is not None
+        return payload
+
     def start_workflow_activity(
         self,
         job_id: str | UUID,

@@ -72,6 +72,7 @@ _PARKED_FORWARD_STATUSES = (
     WorkflowStepStatus.AWAITING_SIGNAL.value,
     WorkflowStepStatus.AWAITING_SLEEP.value,
     WorkflowStepStatus.AWAITING_TIMER.value,
+    WorkflowStepStatus.AWAITING_APPROVAL.value,
 )
 
 
@@ -2423,6 +2424,22 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 visibility_timeout_seconds=visibility_timeout_seconds,
                 now=now,
             )
+        if direction == WorkflowStepDirection.FORWARD.value and kind in (
+            "approval",
+            "wait_approval",
+            "approve",
+        ):
+            return self._park_approval_step(
+                conn,
+                run_id=run_id,
+                tenant_id=tenant_id,
+                step_row=step_row,
+                steps_def=steps_def,
+                queue_name=queue_name,
+                max_attempts=max_attempts,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                now=now,
+            )
         return self._enqueue_job_for_step(
             conn,
             run_id=run_id,
@@ -3088,6 +3105,10 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                     out[key] = raw[key]
             # Validate now so a bad spec fails at start, not at park.
             wait_deadline(out, now=_utcnow(), kind=kind)
+        if kind in ("approval", "wait_approval", "approve"):
+            from job_queue.queue.workflows_approvals import apply_approval_fields
+
+            apply_approval_fields(out, raw, label=label)
         if raw.get("fail"):
             out["fail"] = True
             if raw.get("fail_error") is not None:
@@ -3101,6 +3122,8 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 raise ValueError(f"{label}.compensate cannot wait for a signal")
             if ckind in ("sleep", "delay", "timer", "timeout"):
                 raise ValueError(f"{label}.compensate cannot sleep or time out")
+            if ckind in ("approval", "wait_approval", "approve"):
+                raise ValueError(f"{label}.compensate cannot wait for approval")
             out["compensate"] = {
                 "kind": ckind,
                 "payload": dict(comp.get("payload") or {}),

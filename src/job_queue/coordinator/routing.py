@@ -948,6 +948,10 @@ class RoutingMixin:
             return self._process_workflow_timers(body)
         if method == "POST" and path == "/v1/workflows/process-activities":
             return self._process_workflow_activities(body)
+        if method == "POST" and path == "/v1/workflows/process-approval-timeouts":
+            return self._process_workflow_approval_timeouts(body)
+        if method == "GET" and path.rstrip("/") == "/v1/workflows/approvals":
+            return self._list_awaiting_workflow_approvals(query)
         if (
             method == "POST"
             and path.startswith("/v1/workflows/")
@@ -960,6 +964,18 @@ class RoutingMixin:
             and path.rstrip("/").endswith("/signals")
         ):
             return self._send_workflow_signal(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/workflows/")
+            and path.rstrip("/").endswith("/approve")
+        ):
+            return self._approve_workflow(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/workflows/")
+            and path.rstrip("/").endswith("/reject")
+        ):
+            return self._reject_workflow(path, body)
         if method == "GET" and path.startswith("/v1/workflows/"):
             if path.rstrip("/").endswith("/steps"):
                 return self._list_workflow_steps(path, query)
