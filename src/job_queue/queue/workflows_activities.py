@@ -402,6 +402,30 @@ class WorkflowsActivitiesMixin:
     def _timeout_one_activity(self, activity_id: UUID) -> bool:
         now = _utcnow()
         with transaction(self._pool) as conn:
+            peek = conn.execute(
+                f"""
+                SELECT {_ACTIVITY_COLUMNS}
+                FROM workflow_activities
+                WHERE id = %s
+                """,
+                (activity_id,),
+            ).fetchone()
+            if peek is None or peek["status"] != "running":
+                return False
+            if not self._activity_is_due(peek, now):
+                return False
+            # Lock the step job first so ack (job then activity) cannot deadlock.
+            job = None
+            if peek.get("job_id") is not None:
+                job = conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM jobs
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (peek["job_id"],),
+                ).fetchone()
             row = conn.execute(
                 f"""
                 SELECT {_ACTIVITY_COLUMNS}
@@ -415,17 +439,6 @@ class WorkflowsActivitiesMixin:
                 return False
             if not self._activity_is_due(row, now):
                 return False
-            job = None
-            if row.get("job_id") is not None:
-                job = conn.execute(
-                    f"""
-                    SELECT {_JOB_COLUMNS}
-                    FROM jobs
-                    WHERE id = %s
-                    FOR UPDATE
-                    """,
-                    (row["job_id"],),
-                ).fetchone()
             self._terminate_activity_locked(
                 conn,
                 activity=row,
@@ -435,6 +448,33 @@ class WorkflowsActivitiesMixin:
                 now=now,
             )
             return True
+
+    def _assert_activity_step_ackable(self, conn: Any, job_row: dict[str, Any]) -> None:
+        """Refuse a successful ack until the activity row is completed.
+
+        A worker that acks the step job while the activity is missing,
+        running, failed, or timed out would advance the saga as if the
+        external call succeeded.
+        """
+        try:
+            self._activity_spec_from_job(job_row, conn=conn)
+        except ValueError:
+            return
+        row = conn.execute(
+            f"""
+            SELECT {_ACTIVITY_COLUMNS}
+            FROM workflow_activities
+            WHERE job_id = %s AND tenant_id = %s
+            FOR UPDATE
+            """,
+            (job_row["id"], job_row["tenant_id"]),
+        ).fetchone()
+        status = str(row["status"]) if row is not None else "not started"
+        if row is None or status != "completed":
+            raise LeaseError(
+                f"cannot ack activity step {job_row['id']} "
+                f"until the activity is completed (status={status})"
+            )
 
     def _terminate_activity_locked(
         self,

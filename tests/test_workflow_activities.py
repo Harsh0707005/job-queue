@@ -79,6 +79,96 @@ def test_activity_start_complete_continues(queue: JobQueue):
     assert fin.status == WorkflowRunStatus.COMPLETED.value
 
 
+def test_ack_without_completing_activity_is_refused(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="act-ack-early",
+        max_attempts=1,
+        steps=_activity_steps(timeout=30, heartbeat=5),
+    )
+    _drive_effect(queue, "act-ack-early")
+    job = queue.lease(tenant_id="act-ack-early", worker_id="w")
+    assert job is not None
+    queue.start_workflow_activity(
+        job.id,
+        tenant_id="act-ack-early",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    with pytest.raises(LeaseError, match="until the activity is completed"):
+        _ack(queue, job, "w", result={"skipped": True})
+    still = queue.get(job.id, tenant_id="act-ack-early")
+    assert still is not None
+    assert still.status == JobStatus.LEASED
+    running = queue.get_workflow(run.id, tenant_id="act-ack-early")
+    assert running is not None
+    assert running.status == WorkflowRunStatus.RUNNING.value
+    assert queue.lease(tenant_id="act-ack-early", worker_id="other") is None
+    steps = queue.list_workflow_steps(run.id, tenant_id="act-ack-early")
+    assert not any(s.name == "ship" for s in steps)
+
+
+def test_ack_without_starting_activity_is_refused(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="act-ack-none",
+        max_attempts=1,
+        steps=_activity_steps(timeout=30, heartbeat=5),
+    )
+    _drive_effect(queue, "act-ack-none")
+    job = queue.lease(tenant_id="act-ack-none", worker_id="w")
+    assert job is not None
+    with pytest.raises(LeaseError, match="not started"):
+        _ack(queue, job, "w", result={"never": "started"})
+    still = queue.get(job.id, tenant_id="act-ack-none")
+    assert still is not None
+    assert still.status == JobStatus.LEASED
+    running = queue.get_workflow(run.id, tenant_id="act-ack-none")
+    assert running is not None
+    assert running.status == WorkflowRunStatus.RUNNING.value
+
+
+def test_refused_ack_can_still_timeout_and_compensate(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="act-ack-to",
+        max_attempts=1,
+        steps=_activity_steps(timeout=30, heartbeat=0.2),
+    )
+    _drive_effect(queue, "act-ack-to")
+    job = queue.lease(tenant_id="act-ack-to", worker_id="w")
+    assert job is not None
+    queue.start_workflow_activity(
+        job.id,
+        tenant_id="act-ack-to",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    with pytest.raises(LeaseError, match="until the activity is completed"):
+        _ack(queue, job, "w")
+    time.sleep(0.35)
+    n = queue.process_workflow_activities(tenant_id="act-ack-to", limit=10)
+    assert n >= 1
+    act = queue.get_workflow_activity(job.id, tenant_id="act-ack-to")
+    assert act is not None
+    assert act.status == "timed_out"
+    mid = queue.get_workflow(run.id, tenant_id="act-ack-to")
+    assert mid is not None
+    assert mid.status == WorkflowRunStatus.COMPENSATING.value
+    c = queue.lease(tenant_id="act-ack-to", worker_id="undo")
+    assert c is not None
+    assert c.payload.get("direction") == "compensate"
+    _ack(queue, c, "undo")
+    extra = queue.lease(tenant_id="act-ack-to", worker_id="undo")
+    if extra is not None:
+        _ack(queue, extra, "undo")
+    failed = queue.get_workflow(run.id, tenant_id="act-ack-to")
+    assert failed is not None
+    assert failed.status == WorkflowRunStatus.FAILED.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="act-ack-to")
+    assert not any(
+        s.name == "ship" and s.status == WorkflowStepStatus.COMPLETED.value
+        for s in steps
+    )
+
+
 def test_activity_heartbeat_timeout_fails_and_compensates(queue: JobQueue):
     run = queue.start_workflow(
         tenant_id="act-hb",

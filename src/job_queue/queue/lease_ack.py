@@ -49,6 +49,8 @@ class LeaseAckMixin:
             else:
                 runtime_exceeded = False
                 self._assert_lease_not_expired(row, now)
+                if hasattr(self, "_assert_activity_step_ackable"):
+                    self._assert_activity_step_ackable(conn, row)
 
                 result_json = None
                 if result is not None:
