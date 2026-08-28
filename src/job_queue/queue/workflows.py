@@ -2491,11 +2491,9 @@ class WorkflowsMixin(WorkflowsMapMixin):
         max_runtime_seconds = 3600
         vis = int(visibility_timeout_seconds)
         if str(action.get("kind") or "") == "activity":
-            try:
-                act_timeout = float(action.get("timeout_seconds") or 30)
-            except (TypeError, ValueError):
-                act_timeout = 30.0
-            max_runtime_seconds = max(1, int(act_timeout) + 2)
+            # Do not pin max_runtime to activity timeout here: that clock
+            # starts at lease, but the activity clock starts later. Start
+            # aligns the job deadline in start_workflow_activity.
             try:
                 hb = float(action.get("heartbeat_timeout_seconds") or 0)
             except (TypeError, ValueError):

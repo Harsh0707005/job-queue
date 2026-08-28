@@ -79,6 +79,120 @@ def test_activity_start_complete_continues(queue: JobQueue):
     assert fin.status == WorkflowRunStatus.COMPLETED.value
 
 
+def test_slow_lease_to_start_does_not_deadletter_before_activity_timeout(
+    queue: JobQueue,
+):
+    """max_runtime must not fire on lease time before the activity starts."""
+    from job_queue.queue._common import _utcnow
+
+    run = queue.start_workflow(
+        tenant_id="act-slow-start",
+        max_attempts=1,
+        steps=_activity_steps(timeout=2, heartbeat=10),
+    )
+    _drive_effect(queue, "act-slow-start")
+    job = queue.lease(tenant_id="act-slow-start", worker_id="w")
+    assert job is not None
+    # Enqueue used to set max_runtime = timeout+2 from lease_started_at.
+    assert job.max_runtime_seconds >= 60
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_started_at = NOW() - INTERVAL '20 seconds'
+            WHERE id = %s
+            """,
+            (job.id,),
+        )
+        conn.commit()
+    # Heartbeat would have dead-lettered under the old timeout+2 pin.
+    alive = queue.heartbeat(
+        job.id,
+        tenant_id="act-slow-start",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    assert alive.status == JobStatus.LEASED
+    started = queue.start_workflow_activity(
+        job.id,
+        tenant_id="act-slow-start",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    assert started.status == "running"
+    refreshed = queue.get(job.id, tenant_id="act-slow-start")
+    assert refreshed is not None
+    hard = refreshed.lease_started_at
+    assert hard is not None
+    remaining = (
+        hard.timestamp()
+        + refreshed.max_runtime_seconds
+        - _utcnow().timestamp()
+    )
+    assert remaining >= started.timeout_seconds
+    queue.heartbeat(
+        job.id,
+        tenant_id="act-slow-start",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    done = queue.complete_workflow_activity(
+        job.id,
+        tenant_id="act-slow-start",
+        worker_id="w",
+        lease_token=job.lease_token,
+        result={"ok": True},
+    )
+    _ack(queue, job, "w", result=done.result)
+    _drive_effect(queue, "act-slow-start")
+    fin = queue.get_workflow(run.id, tenant_id="act-slow-start")
+    assert fin is not None
+    assert fin.status == WorkflowRunStatus.COMPLETED.value
+
+
+def test_activity_timeout_still_compensates_after_slow_start(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="act-slow-to",
+        max_attempts=1,
+        steps=_activity_steps(timeout=0.2, heartbeat=5),
+    )
+    _drive_effect(queue, "act-slow-to")
+    job = queue.lease(tenant_id="act-slow-to", worker_id="w")
+    assert job is not None
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_started_at = NOW() - INTERVAL '15 seconds'
+            WHERE id = %s
+            """,
+            (job.id,),
+        )
+        conn.commit()
+    queue.start_workflow_activity(
+        job.id,
+        tenant_id="act-slow-to",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    time.sleep(0.35)
+    n = queue.process_workflow_activities(tenant_id="act-slow-to", limit=10)
+    assert n >= 1
+    mid = queue.get_workflow(run.id, tenant_id="act-slow-to")
+    assert mid is not None
+    assert mid.status == WorkflowRunStatus.COMPENSATING.value
+    c = queue.lease(tenant_id="act-slow-to", worker_id="undo")
+    assert c is not None
+    assert c.payload.get("direction") == "compensate"
+    _ack(queue, c, "undo")
+    extra = queue.lease(tenant_id="act-slow-to", worker_id="undo")
+    if extra is not None:
+        _ack(queue, extra, "undo")
+    failed = queue.get_workflow(run.id, tenant_id="act-slow-to")
+    assert failed is not None
+    assert failed.status == WorkflowRunStatus.FAILED.value
+
+
 def test_ack_without_completing_activity_is_refused(queue: JobQueue):
     run = queue.start_workflow(
         tenant_id="act-ack-early",

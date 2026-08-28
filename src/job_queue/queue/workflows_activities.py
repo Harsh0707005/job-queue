@@ -199,6 +199,12 @@ class WorkflowsActivitiesMixin:
                         WorkflowStepStatus.PENDING.value,
                     ),
                 )
+            self._align_job_deadline_to_activity(
+                conn,
+                job_id=job_id,
+                timeout_seconds=timeout,
+                now=now,
+            )
             row = conn.execute(
                 f"SELECT {_ACTIVITY_COLUMNS} FROM workflow_activities WHERE id = %s",
                 (aid,),
@@ -600,6 +606,50 @@ class WorkflowsActivitiesMixin:
                 error=error,
                 now=now,
             )
+
+    def _align_job_deadline_to_activity(
+        self,
+        conn: Any,
+        *,
+        job_id: UUID,
+        timeout_seconds: float,
+        now: Any,
+    ) -> None:
+        """Make the job hard deadline start at activity start, not lease.
+
+        ``max_runtime`` is measured from ``lease_started_at``. A worker that
+        is slow between lease and start would otherwise dead-letter before
+        the activity timeout clock begins. After start, keep a small slack
+        past ``timeout_at`` as a backstop.
+        """
+        import math
+
+        row = conn.execute(
+            """
+            SELECT lease_started_at
+            FROM jobs
+            WHERE id = %s
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return
+        slack = 2.0
+        started = row.get("lease_started_at")
+        elapsed = 0.0
+        if started is not None:
+            elapsed = max(0.0, (_as_utc(now) - _as_utc(started)).total_seconds())
+        max_rt = max(1, int(math.ceil(elapsed + float(timeout_seconds) + slack)))
+        conn.execute(
+            """
+            UPDATE jobs
+            SET max_runtime_seconds = %s,
+                updated_at = %s
+            WHERE id = %s
+              AND status = %s
+            """,
+            (max_rt, now, job_id, JobStatus.LEASED.value),
+        )
 
     def _lock_activity_for_job(
         self, conn: Any, job_id: UUID, tenant_id: str
