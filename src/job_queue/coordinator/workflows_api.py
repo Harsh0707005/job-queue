@@ -51,6 +51,7 @@ def _run_to_dict(r: WorkflowRun) -> dict[str, Any]:
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+        "deadline_at": r.deadline_at.isoformat() if r.deadline_at else None,
     }
 
 
@@ -151,6 +152,8 @@ class WorkflowsApiMixin:
                 ttl_seconds=None if ttl_raw is None else float(ttl_raw),
                 expires_at=expires_at,
                 expiry_action=body.get("expiry_action"),
+                deadline_seconds=body.get("deadline_seconds"),
+                deadline_at=body.get("deadline_at"),
             )
         except RateLimitError as exc:
             from job_queue.coordinator.jobs import _limit_error_response
@@ -381,6 +384,20 @@ class WorkflowsApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, {"timed_out": n}
+
+    def _process_workflow_run_deadlines(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            n = self.queue.process_workflow_run_deadlines(
+                tenant_id=(
+                    str(body["tenant_id"]) if body.get("tenant_id") else None
+                ),
+                limit=int(body.get("limit") or 50),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"fired": n}
 
     def _approve_workflow(
         self, path: str, body: dict[str, Any]

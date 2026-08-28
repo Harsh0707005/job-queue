@@ -55,7 +55,7 @@ _RUN_COLUMNS = """
     id, tenant_id, name, status, steps_def, current_index,
     fail_step_index, fail_reason, max_compensate_retries,
     created_at, updated_at, completed_at, payload_key_id,
-    schedule_id, tick_iteration
+    schedule_id, tick_iteration, deadline_at
 """
 
 _STEP_COLUMNS = """
@@ -93,12 +93,18 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
         expiry_action: str | None = None,
         schedule_id: UUID | None = None,
         tick_iteration: int | None = None,
+        deadline_seconds: float | int | None = None,
+        deadline_at: Any = None,
     ) -> WorkflowRun:
         """Start a multi-step workflow and enqueue the first forward step job.
 
         *ttl_seconds* / *expires_at* / *expiry_action* apply to every step
         job unless the step itself sets those fields. When omitted, the
         tenant default job TTL is used so saga steps cannot sit forever.
+
+        *deadline_seconds* / *deadline_at* bound the whole run. When the
+        instant hits, leftover forwards (including parked waits and
+        approvals) are skipped and only completed work is compensated.
         """
         if not tenant_id or not str(tenant_id).strip():
             raise ValueError("tenant_id is required")
@@ -107,6 +113,14 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
             raise ValueError("steps must be a non-empty list")
         if int(max_compensate_retries) < 0:
             raise ValueError("max_compensate_retries must be >= 0")
+        from job_queue.queue.workflows_deadlines import parse_run_deadline
+
+        now = _utcnow()
+        run_deadline = parse_run_deadline(
+            deadline_seconds=deadline_seconds,
+            deadline_at=deadline_at,
+            now=now,
+        )
         normalized = self._expand_and_normalize_steps(steps)
         self._apply_workflow_ttl_defaults(
             normalized,
@@ -114,7 +128,6 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
             expires_at=expires_at,
             expiry_action=expiry_action,
         )
-        now = _utcnow()
         rid = run_id or uuid4()
         with transaction(self._pool) as conn:
             row = self._start_workflow_on_conn(
@@ -130,6 +143,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 now=now,
                 schedule_id=schedule_id,
                 tick_iteration=tick_iteration,
+                deadline_at=run_deadline,
                 lock_tenant=True,
             )
         assert row is not None
@@ -150,6 +164,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
         now: Any,
         schedule_id: UUID | None = None,
         tick_iteration: int | None = None,
+        deadline_at: Any = None,
         lock_tenant: bool = True,
     ) -> Any:
         if lock_tenant:
@@ -171,12 +186,12 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 id, tenant_id, name, status, steps_def, current_index,
                 fail_step_index, fail_reason, max_compensate_retries,
                 created_at, updated_at, completed_at, payload_key_id,
-                schedule_id, tick_iteration
+                schedule_id, tick_iteration, deadline_at
             ) VALUES (
                 %s, %s, %s, %s, %s, 0,
                 NULL, NULL, %s,
                 %s, %s, NULL, %s,
-                %s, %s
+                %s, %s, %s
             )
             """,
             (
@@ -191,6 +206,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 steps_key_id,
                 schedule_id,
                 int(tick_iteration) if tick_iteration else None,
+                deadline_at,
             ),
         )
         self._enqueue_ready_forward_steps(
@@ -203,6 +219,30 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
             visibility_timeout_seconds=visibility_timeout_seconds,
             now=now,
         )
+        if deadline_at is not None and _as_utc(deadline_at) <= _as_utc(now):
+            due = conn.execute(
+                f"""
+                SELECT {_RUN_COLUMNS}
+                FROM workflow_runs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (run_id,),
+            ).fetchone()
+            if (
+                due is not None
+                and due["status"] == WorkflowRunStatus.RUNNING.value
+            ):
+                from job_queue.queue.workflows_deadlines import DEADLINE_REASON
+
+                self._cancel_workflow_locked(
+                    conn,
+                    due,
+                    reason=DEADLINE_REASON,
+                    release_in_flight=True,
+                    compensate=True,
+                    now=now,
+                )
         return conn.execute(
             f"SELECT {_RUN_COLUMNS} FROM workflow_runs WHERE id = %s",
             (run_id,),
@@ -3183,6 +3223,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 if row.get("tick_iteration") is None
                 else int(row["tick_iteration"])
             ),
+            deadline_at=row.get("deadline_at"),
         )
 
     @staticmethod

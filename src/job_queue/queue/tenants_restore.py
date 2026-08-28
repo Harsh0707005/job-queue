@@ -851,12 +851,12 @@ class TenantsRestoreMixin:
                 id, tenant_id, name, status, steps_def, current_index,
                 fail_step_index, fail_reason, max_compensate_retries,
                 created_at, updated_at, completed_at, payload_key_id,
-                schedule_id, tick_iteration
+                schedule_id, tick_iteration, deadline_at
             ) VALUES (
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s, %s,
-                %s, %s
+                %s, %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -882,6 +882,7 @@ class TenantsRestoreMixin:
                     if raw.get("tick_iteration") is None
                     else int(raw["tick_iteration"])
                 ),
+                _parse_dt(raw.get("deadline_at")),
             ),
         )
 

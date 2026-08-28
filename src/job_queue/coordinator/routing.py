@@ -950,6 +950,8 @@ class RoutingMixin:
             return self._process_workflow_activities(body)
         if method == "POST" and path == "/v1/workflows/process-approval-timeouts":
             return self._process_workflow_approval_timeouts(body)
+        if method == "POST" and path == "/v1/workflows/process-deadlines":
+            return self._process_workflow_run_deadlines(body)
         if method == "GET" and path.rstrip("/") == "/v1/workflows/approvals":
             return self._list_awaiting_workflow_approvals(query)
         if (

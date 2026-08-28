@@ -164,6 +164,18 @@ class ClientWorkflowMixin:
         assert payload is not None
         return payload
 
+    def process_workflow_run_deadlines(
+        self, *, tenant_id: str | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request(
+            "POST", "/v1/workflows/process-deadlines", body
+        )
+        assert payload is not None
+        return payload
+
     def start_workflow_activity(
         self,
         job_id: str | UUID,

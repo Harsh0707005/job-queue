@@ -905,6 +905,7 @@ class WorkflowRun:
     completed_at: datetime | None
     schedule_id: UUID | None = None
     tick_iteration: int | None = None
+    deadline_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -108,7 +108,8 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     "workflow_runs": (
         "id, tenant_id, name, status, steps_def, current_index, "
         "fail_step_index, fail_reason, max_compensate_retries, created_at, "
-        "updated_at, completed_at, payload_key_id, schedule_id, tick_iteration",
+        "updated_at, completed_at, payload_key_id, schedule_id, tick_iteration, "
+        "deadline_at",
         "workflow_runs",
     ),
     "workflow_signals": (

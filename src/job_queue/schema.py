@@ -1383,6 +1383,11 @@ ALTER TABLE workflow_step_runs ADD CONSTRAINT workflow_step_runs_status_check CH
 
 -- Per-run cap for redriving failed/killed compensate jobs (not job max_attempts).
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS max_compensate_retries INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_deadline
+    ON workflow_runs (deadline_at ASC)
+    WHERE status = 'running' AND deadline_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_workflow_step_runs_run
     ON workflow_step_runs (run_id, step_index, direction);

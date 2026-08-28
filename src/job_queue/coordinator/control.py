@@ -224,6 +224,10 @@ class CoordinatorControlLoop:
                 n = self.queue.process_workflow_approval_timeouts(limit=50)
                 if n:
                     logger.info("control timed out %d workflow approval(s)", n)
+            if hasattr(self.queue, "process_workflow_run_deadlines"):
+                n = self.queue.process_workflow_run_deadlines(limit=50)
+                if n:
+                    logger.info("control fired %d workflow run deadline(s)", n)
         except Exception:  # noqa: BLE001
             logger.exception("control workflow timer tick failed node=%s", self.node_id)
         if self._stop.is_set() or not self.is_leader():

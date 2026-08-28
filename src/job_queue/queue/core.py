@@ -24,6 +24,7 @@ from job_queue.queue.workflows_signals import WorkflowSignalsMixin
 from job_queue.queue.workflows_timers import WorkflowsTimersMixin
 from job_queue.queue.workflows_activities import WorkflowsActivitiesMixin
 from job_queue.queue.workflows_approvals import WorkflowsApprovalsMixin
+from job_queue.queue.workflows_deadlines import WorkflowsDeadlinesMixin
 from job_queue.queue.partitions import PartitionsMixin
 from job_queue.queue.coordinator_leader import CoordinatorLeaderMixin
 from job_queue.queue.misc import MiscMixin
@@ -52,6 +53,7 @@ class JobQueue(
     WorkflowsTimersMixin,
     WorkflowsActivitiesMixin,
     WorkflowsApprovalsMixin,
+    WorkflowsDeadlinesMixin,
     PartitionsMixin,
     CoordinatorLeaderMixin,
     MiscMixin,

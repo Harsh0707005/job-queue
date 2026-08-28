@@ -89,6 +89,13 @@ class LeaseClaimTenantMixin:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        if hasattr(self, "process_workflow_run_deadlines"):
+            try:
+                self.process_workflow_run_deadlines(
+                    tenant_id=tenant_id, limit=max(8, limit)
+                )
+            except Exception:  # noqa: BLE001
+                pass
         if hasattr(self, "process_worker_timeouts"):
             try:
                 self.process_worker_timeouts()
