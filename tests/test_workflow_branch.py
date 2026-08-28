@@ -221,6 +221,74 @@ def test_if_reads_nested_worker_envelope_result(queue: JobQueue):
     assert by_name["std-work"].status == WorkflowStepStatus.SKIPPED.value
 
 
+def test_same_named_if_blocks_pick_independent_paths(queue: JobQueue):
+    """Two ifs both named ``route`` must not share a branch group.
+
+    First if sees vip → then. Second if sees std → else. Before the fix
+    both used group=route, so the second if reused the first winner.
+    """
+    run = queue.start_workflow(
+        tenant_id="br-dup",
+        max_attempts=1,
+        steps=[
+            {
+                "name": "decide-a",
+                "payload": {"result": {"branch": "vip"}},
+            },
+            {
+                "type": "if",
+                "name": "route",
+                "on": "branch",
+                "equals": "vip",
+                "then": [{"name": "a-vip", "payload": {"op": "a-vip"}}],
+                "else": [{"name": "a-std", "payload": {"op": "a-std"}}],
+            },
+            {
+                "name": "decide-b",
+                "payload": {"result": {"branch": "std"}},
+            },
+            {
+                "type": "if",
+                "name": "route",
+                "on": "branch",
+                "equals": "vip",
+                "then": [{"name": "b-vip", "payload": {"op": "b-vip"}}],
+                "else": [{"name": "b-std", "payload": {"op": "b-std"}}],
+            },
+            {"name": "ship", "payload": {"op": "ship"}},
+        ],
+    )
+    groups = {
+        s["branch"]["group"]
+        for s in run.steps_def
+        if isinstance(s.get("branch"), dict)
+    }
+    assert groups == {"if:1", "if:3"}
+
+    j = _drive(queue, "br-dup")
+    assert j.payload.get("step_name") == "decide-a"
+    j = _drive(queue, "br-dup")
+    assert j.payload.get("step_name") == "a-vip"
+    j = _drive(queue, "br-dup")
+    assert j.payload.get("step_name") == "decide-b"
+    j = _drive(queue, "br-dup")
+    assert j.payload.get("step_name") == "b-std"
+    j = _drive(queue, "br-dup")
+    assert j.payload.get("step_name") == "ship"
+
+    done = queue.get_workflow(run.id, tenant_id="br-dup")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="br-dup")
+    by_name = {s.name: s for s in steps if s.direction == "forward"}
+    assert by_name["a-vip"].status == WorkflowStepStatus.COMPLETED.value
+    assert by_name["a-std"].status == WorkflowStepStatus.SKIPPED.value
+    assert by_name["b-std"].status == WorkflowStepStatus.COMPLETED.value
+    assert by_name["b-vip"].status == WorkflowStepStatus.SKIPPED.value
+    assert by_name["b-vip"].job_id is None
+    assert queue.lease(tenant_id="br-dup", worker_id="w") is None
+
+
 def test_if_requires_then_or_cases(queue: JobQueue):
     with pytest.raises(ValueError, match="then or cases"):
         queue.start_workflow(

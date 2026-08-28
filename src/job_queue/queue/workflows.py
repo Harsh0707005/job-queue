@@ -40,6 +40,7 @@ from job_queue.queue._common import (
 from job_queue.queue.workflows_branch import (
     WorkflowsBranchMixin,
     _is_if_block,
+    if_block_group,
     normalize_if_cases,
 )
 from job_queue.queue.workflows_map import (
@@ -1620,6 +1621,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                     run_id=run_id,
                     steps_def=steps_def,
                     group=group,
+                    source_indices=sources,
                 )
                 n += self._skip_losing_branch_steps(
                     conn,
@@ -1631,6 +1633,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                     existing=existing,
                     ready=ready,
                     now=now,
+                    source_indices=sources,
                 )
                 if i in existing:
                     i += 1
@@ -2950,7 +2953,8 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 prev_wave = [leaf_idx]
             elif _is_if_block(item):
                 cases = normalize_if_cases(item, path=path)
-                pg = str(item.get("name") or f"if-{bi}").strip() or f"if-{bi}"
+                # Display name is not unique; group by expansion index.
+                pg = if_block_group(index=bi)
                 tails: list[int] = []
                 for c_i, case in enumerate(cases):
                     dep = list(prev_wave)

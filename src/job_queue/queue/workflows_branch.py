@@ -20,6 +20,15 @@ from job_queue.models import (
 _IF_KINDS = frozenset({"if", "switch", "branch", "choose"})
 
 
+def if_block_group(*, index: int) -> str:
+    """Internal exclusive-branch group id.
+
+    Unique per if/switch block. The user-facing display name is only a
+    label and may repeat, so it is never used as the group key.
+    """
+    return f"if:{int(index)}"
+
+
 def _is_if_block(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
@@ -243,16 +252,21 @@ class WorkflowsBranchMixin:
         run_id: Any,
         steps_def: list[dict[str, Any]],
         group: str,
+        source_indices: list[int] | None = None,
     ) -> int | None:
+        want_src = [int(x) for x in (source_indices or [])]
         cases: dict[int, dict[str, Any]] = {}
-        sources: list[int] = []
+        sources: list[int] = list(want_src)
         for sdef in steps_def:
             b = sdef.get("branch")
             if not isinstance(b, dict) or str(b.get("group") or "") != group:
                 continue
+            src = [int(x) for x in (b.get("source_indices") or [])]
+            # Same display name used to share a group; keep waves apart.
+            if want_src and src != want_src:
+                continue
             cid = int(b["id"])
             cases[cid] = dict(b.get("pred") or {})
-            src = [int(x) for x in (b.get("source_indices") or [])]
             if src and not sources:
                 sources = src
         ordered = [(i, cases[i]) for i in sorted(cases)]
@@ -273,11 +287,16 @@ class WorkflowsBranchMixin:
         existing: set[int],
         ready: set[int],
         now: Any,
+        source_indices: list[int] | None = None,
     ) -> int:
+        want_src = [int(x) for x in (source_indices or [])]
         n = 0
         for i, sdef in enumerate(steps_def):
             b = sdef.get("branch")
             if not isinstance(b, dict) or str(b.get("group") or "") != group:
+                continue
+            src = [int(x) for x in (b.get("source_indices") or [])]
+            if want_src and src != want_src:
                 continue
             if winner is not None and int(b.get("id")) == int(winner):
                 continue
