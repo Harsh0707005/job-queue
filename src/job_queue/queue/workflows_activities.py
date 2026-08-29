@@ -495,6 +495,38 @@ class WorkflowsActivitiesMixin:
                 f"until the activity is completed (status={status})"
             )
 
+    def _close_running_activity_for_step_locked(
+        self,
+        conn: Any,
+        *,
+        step_id: Any,
+        error: str,
+        now: Any,
+        status: str = "failed",
+    ) -> bool:
+        """Fail a still-running activity when its step is skipped/cancelled.
+
+        Does not touch the step job — the caller already cancelled or
+        skipped that row. A leftover ``running`` activity would keep
+        showing up on the due index after a run deadline.
+        """
+        if status not in ("failed", "timed_out"):
+            status = "failed"
+        updated = conn.execute(
+            """
+            UPDATE workflow_activities
+            SET status = %s,
+                error = %s,
+                completed_at = COALESCE(completed_at, %s),
+                updated_at = %s
+            WHERE step_run_id = %s
+              AND status = 'running'
+            RETURNING id
+            """,
+            (status, error, now, now, step_id),
+        ).fetchone()
+        return updated is not None
+
     def _terminate_activity_locked(
         self,
         conn: Any,

@@ -306,6 +306,88 @@ def test_run_deadline_future_does_not_fire(queue: JobQueue):
     assert pause.status == WorkflowStepStatus.AWAITING_SLEEP.value
 
 
+def test_run_deadline_fails_started_activity_not_left_running(queue: JobQueue):
+    """A started activity must not stay running after the run deadline."""
+    run = queue.start_workflow(
+        tenant_id="rd-act",
+        max_attempts=1,
+        deadline_seconds=0.25,
+        steps=_reserve_then(
+            {
+                "name": "charge",
+                "kind": "activity",
+                "activity": "charge",
+                "timeout_seconds": 30,
+                "heartbeat_timeout_seconds": 10,
+                "payload": {"op": "charge"},
+                "compensate": {"kind": "effect", "payload": {"op": "undo_charge"}},
+            },
+            {"name": "ship", "payload": {"op": "ship"}},
+        ),
+    )
+    _drive(queue, "rd-act")
+    job = queue.lease(tenant_id="rd-act", worker_id="w")
+    assert job is not None
+    assert job.payload["step"]["kind"] == "activity"
+    started = queue.start_workflow_activity(
+        job.id,
+        tenant_id="rd-act",
+        worker_id="w",
+        lease_token=job.lease_token,
+    )
+    assert started.status == "running"
+
+    time.sleep(0.35)
+    assert queue.process_workflow_run_deadlines(tenant_id="rd-act", limit=5) >= 1
+    assert queue.process_workflow_run_deadlines(tenant_id="rd-act", limit=5) == 0
+    # Due-activity sweep must not see a leftover running row.
+    assert queue.process_workflow_activities(tenant_id="rd-act", limit=10) == 0
+
+    act = queue.get_workflow_activity(job.id, tenant_id="rd-act")
+    assert act is not None
+    assert act.status == "failed"
+    assert act.error is not None
+    assert "deadline" in act.error or "cancelled" in act.error
+    assert act.completed_at is not None
+
+    with pytest.raises(LeaseError):
+        queue.heartbeat_workflow_activity(
+            job.id,
+            tenant_id="rd-act",
+            worker_id="w",
+            lease_token=job.lease_token,
+        )
+    with pytest.raises(LeaseError):
+        queue.complete_workflow_activity(
+            job.id,
+            tenant_id="rd-act",
+            worker_id="w",
+            lease_token=job.lease_token,
+            result={"late": True},
+        )
+    with pytest.raises(LeaseError):
+        _ack(queue, job, "w", result={"stale": True})
+
+    steps = queue.list_workflow_steps(run.id, tenant_id="rd-act")
+    charge = next(s for s in steps if s.name == "charge")
+    assert charge.status == WorkflowStepStatus.SKIPPED.value
+
+    _settle(queue, "rd-act")
+    done = queue.get_workflow(run.id, tenant_id="rd-act")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.CANCELLED.value
+    steps = queue.list_workflow_steps(run.id, tenant_id="rd-act")
+    _assert_no_pending(steps)
+    _assert_single_compensate(steps)
+    assert not any(
+        s.direction == "compensate" and s.name == "charge"
+        for s in steps
+    )
+    still = queue.get_workflow_activity(job.id, tenant_id="rd-act")
+    assert still is not None
+    assert still.status == "failed"
+
+
 def test_run_deadline_requires_non_negative(queue: JobQueue):
     with pytest.raises(ValueError, match="deadline_seconds"):
         queue.start_workflow(

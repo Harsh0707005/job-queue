@@ -637,6 +637,16 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
         released = 0
         left = 0
         err = f"cancelled: {reason}"
+
+        def _close_activity(srow: dict[str, Any]) -> None:
+            if hasattr(self, "_close_running_activity_for_step_locked"):
+                self._close_running_activity_for_step_locked(
+                    conn,
+                    step_id=srow["id"],
+                    error=err,
+                    now=now,
+                )
+
         for srow in steps:
             job = None
             if srow.get("job_id") is not None:
@@ -667,6 +677,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
 
             # Placeholder compensate step with no job yet.
             if job is None:
+                _close_activity(srow)
                 conn.execute(
                     """
                     UPDATE workflow_step_runs
@@ -689,6 +700,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
 
             jstatus = str(job["status"])
             if jstatus == JobStatus.PENDING.value:
+                _close_activity(srow)
                 conn.execute(
                     """
                     UPDATE jobs
@@ -735,6 +747,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
 
             if jstatus == JobStatus.LEASED.value:
                 if release_in_flight:
+                    _close_activity(srow)
                     conn.execute(
                         """
                         UPDATE jobs
@@ -788,6 +801,7 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 JobStatus.DEAD.value,
                 JobStatus.FAILED.value,
             ):
+                _close_activity(srow)
                 conn.execute(
                     """
                     UPDATE workflow_step_runs
