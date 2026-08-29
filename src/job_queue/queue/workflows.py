@@ -1662,6 +1662,12 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 for ci in child_idxs:
                     if ci in existing:
                         continue
+                    child_deps = [
+                        int(d)
+                        for d in (steps_def[ci].get("depends_on_indices") or [])
+                    ]
+                    if any(d not in ready for d in child_deps):
+                        continue
                     self._create_and_enqueue_step(
                         conn,
                         run_id=run_id,

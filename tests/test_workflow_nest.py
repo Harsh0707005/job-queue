@@ -303,6 +303,117 @@ def test_nested_if_then_fail_compensates_taken_path_only(queue: JobQueue):
     )
 
 
+def test_map_chain_later_leaf_waits_for_parent(queue: JobQueue):
+    """A sequential map template must not lease step 2 before step 1 finishes."""
+    run = queue.start_workflow(
+        tenant_id="nest-chain",
+        max_attempts=1,
+        steps=[
+            {"name": "list", "payload": {"result": {"ids": ["a", "b"]}}},
+            {
+                "type": "map",
+                "name": "each",
+                "items": "ids",
+                "step": [
+                    {"name": "first", "payload": {"op": "1"}},
+                    {"name": "second", "payload": {"op": "2"}},
+                ],
+            },
+            {"name": "ship", "payload": {"op": "ship"}},
+        ],
+    )
+    _drive(queue, "nest-chain")
+    firsts = []
+    for _ in range(2):
+        j = queue.lease(tenant_id="nest-chain", worker_id="w")
+        assert j is not None
+        name = j.payload.get("step_name")
+        assert name in ("first-0", "first-1")
+        firsts.append(j)
+    assert queue.lease(tenant_id="nest-chain", worker_id="w") is None
+    _ack(queue, firsts[0], "w", result={"ok": True})
+    nxt = queue.lease(tenant_id="nest-chain", worker_id="w")
+    assert nxt is not None
+    assert nxt.payload.get("step_name") == "second-0"
+    assert queue.lease(tenant_id="nest-chain", worker_id="w") is None
+    _ack(queue, nxt, "w", result={"ok": True})
+    _ack(queue, firsts[1], "w", result={"ok": True})
+    nxt = _drive(queue, "nest-chain")
+    assert nxt.payload.get("step_name") == "second-1"
+    assert _drive(queue, "nest-chain").payload.get("step_name") == "ship"
+    done = queue.get_workflow(run.id, tenant_id="nest-chain")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+
+
+def test_map_multileaf_max_items_counts_spawned_jobs(queue: JobQueue):
+    """3 items × 2-leaf parallel = 6 jobs, so max_items=4 must fail closed."""
+    run = queue.start_workflow(
+        tenant_id="nest-cap",
+        max_attempts=1,
+        steps=[
+            {"name": "list", "payload": {"result": {"ids": [1, 2, 3]}}},
+            {
+                "type": "map",
+                "name": "each",
+                "items": "ids",
+                "max_items": 4,
+                "step": {
+                    "type": "parallel",
+                    "branches": [
+                        [{"name": "left", "payload": {"op": "L"}}],
+                        [{"name": "right", "payload": {"op": "R"}}],
+                    ],
+                },
+            },
+            {"name": "ship", "payload": {"op": "ship"}},
+        ],
+    )
+    _drive(queue, "nest-cap")
+    assert queue.lease(tenant_id="nest-cap", worker_id="w") is None
+    done = queue.get_workflow(run.id, tenant_id="nest-cap")
+    assert done is not None
+    assert done.status in (
+        WorkflowRunStatus.FAILED.value,
+        WorkflowRunStatus.COMPENSATING.value,
+    )
+    names = [s.name for s in _fwd(queue, run.id, "nest-cap")]
+    assert not any(n.startswith("left-") or n.startswith("right-") for n in names)
+    join = next(s for s in _fwd(queue, run.id, "nest-cap") if s.name == "each")
+    assert join.status == WorkflowStepStatus.FAILED.value
+    assert "max_items" in (join.error or "")
+    assert "3 items" in (join.error or "")
+
+
+def test_map_multileaf_under_job_cap_still_runs(queue: JobQueue):
+    run = queue.start_workflow(
+        tenant_id="nest-undercap",
+        max_attempts=1,
+        steps=[
+            {"name": "list", "payload": {"result": {"ids": ["p", "q"]}}},
+            {
+                "type": "map",
+                "name": "each",
+                "items": "ids",
+                "max_items": 4,
+                "step": {
+                    "type": "parallel",
+                    "branches": [
+                        [{"name": "left", "payload": {"op": "L"}}],
+                        [{"name": "right", "payload": {"op": "R"}}],
+                    ],
+                },
+            },
+        ],
+    )
+    _drive(queue, "nest-undercap")
+    names = {_drive(queue, "nest-undercap").payload.get("step_name") for _ in range(4)}
+    assert names == {"left-0", "right-0", "left-1", "right-1"}
+    done = queue.get_workflow(run.id, tenant_id="nest-undercap")
+    assert done is not None
+    assert done.status == WorkflowRunStatus.COMPLETED.value
+
+
 def test_map_step_rejects_nested_map(queue: JobQueue):
     with pytest.raises(ValueError, match="nested map"):
         queue.start_workflow(

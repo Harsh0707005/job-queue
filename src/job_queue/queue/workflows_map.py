@@ -5,8 +5,9 @@ A ``type: map`` (or ``foreach`` / ``fanout``) block sits in the DAG as a
 reads those results, materializes one child leaf per item (capped), and
 only then becomes complete so later steps can run.
 
-Overflow (more items than the cap) fails the map closed — it does not
-enqueue a storm. Cancel / sibling-fail reuse the existing settle path:
+Overflow (more items×template-leaves than the cap) fails the map closed
+— it does not enqueue a storm. Cancel / sibling-fail reuse the existing
+settle path:
 unstarted children are skipped, in-flight leases finish, completed
 children compensate in reverse.
 """
@@ -226,7 +227,9 @@ class WorkflowsMapMixin:
                 now=now,
             )
             return None
-        if len(items) > cap:
+        n_leaves = max(1, len(templates))
+        spawned = len(items) * n_leaves
+        if len(items) > cap or spawned > cap:
             self._fail_map_join_locked(
                 conn,
                 run_id=run_id,
@@ -234,7 +237,8 @@ class WorkflowsMapMixin:
                 steps_def=steps_def,
                 map_index=map_index,
                 error=(
-                    f"map fan-out exceeds max_items ({len(items)} > {cap})"
+                    f"map fan-out exceeds max_items "
+                    f"({len(items)} items × {n_leaves} steps = {spawned} > {cap})"
                 ),
                 now=now,
             )
