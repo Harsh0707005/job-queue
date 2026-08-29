@@ -20,6 +20,17 @@ from job_queue.models import (
 _IF_KINDS = frozenset({"if", "switch", "branch", "choose"})
 
 
+def branch_records(sdef: dict[str, Any]) -> list[dict[str, Any]]:
+    """Outer-to-inner exclusive-branch tags on a flattened leaf."""
+    path = sdef.get("branch_path")
+    if isinstance(path, list) and path:
+        return [dict(p) for p in path if isinstance(p, dict)]
+    b = sdef.get("branch")
+    if isinstance(b, dict):
+        return [dict(b)]
+    return []
+
+
 def if_block_group(*, index: int) -> str:
     """Internal exclusive-branch group id.
 
@@ -258,15 +269,20 @@ class WorkflowsBranchMixin:
         cases: dict[int, dict[str, Any]] = {}
         sources: list[int] = list(want_src)
         for sdef in steps_def:
-            b = sdef.get("branch")
-            if not isinstance(b, dict) or str(b.get("group") or "") != group:
+            rec = None
+            for b in branch_records(sdef):
+                if str(b.get("group") or "") != group:
+                    continue
+                src = [int(x) for x in (b.get("source_indices") or [])]
+                if want_src and src != want_src:
+                    continue
+                rec = b
+                break
+            if rec is None:
                 continue
-            src = [int(x) for x in (b.get("source_indices") or [])]
-            # Same display name used to share a group; keep waves apart.
-            if want_src and src != want_src:
-                continue
-            cid = int(b["id"])
-            cases[cid] = dict(b.get("pred") or {})
+            src = [int(x) for x in (rec.get("source_indices") or [])]
+            cid = int(rec["id"])
+            cases[cid] = dict(rec.get("pred") or {})
             if src and not sources:
                 sources = src
         ordered = [(i, cases[i]) for i in sorted(cases)]
@@ -292,13 +308,18 @@ class WorkflowsBranchMixin:
         want_src = [int(x) for x in (source_indices or [])]
         n = 0
         for i, sdef in enumerate(steps_def):
-            b = sdef.get("branch")
-            if not isinstance(b, dict) or str(b.get("group") or "") != group:
+            rec = None
+            for b in branch_records(sdef):
+                if str(b.get("group") or "") != group:
+                    continue
+                src = [int(x) for x in (b.get("source_indices") or [])]
+                if want_src and src != want_src:
+                    continue
+                rec = b
+                break
+            if rec is None:
                 continue
-            src = [int(x) for x in (b.get("source_indices") or [])]
-            if want_src and src != want_src:
-                continue
-            if winner is not None and int(b.get("id")) == int(winner):
+            if winner is not None and int(rec.get("id")) == int(winner):
                 continue
             if i in existing:
                 continue

@@ -13,6 +13,7 @@ children compensate in reverse.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -181,8 +182,11 @@ class WorkflowsMapMixin:
         spec = dict(sdef.get("map") or {})
         if sdef.get("map_children") is not None:
             return [int(i) for i in (sdef.get("map_children") or [])]
+        templates = list(spec.get("template_steps") or [])
         template = spec.get("step")
-        if not isinstance(template, dict):
+        if not templates and isinstance(template, dict):
+            templates = [template]
+        if not templates:
             raise ValueError(f"map {sdef.get('name')!r} is missing a step template")
         from_idx = [
             int(i)
@@ -237,30 +241,44 @@ class WorkflowsMapMixin:
             return None
 
         group = str(sdef.get("map_group") or sdef.get("name") or f"map-{map_index}")
-        tmpl_name = str(template.get("name") or "item").strip() or "item"
         child_indices: list[int] = []
         for i, item in enumerate(items):
-            child = dict(template)
-            payload = dict(child.get("payload") or {})
-            payload["item"] = item
-            payload["index"] = i
-            payload["map_group"] = group
-            child["payload"] = payload
-            child["name"] = f"{tmpl_name}-{i}"
-            child["depends_on_indices"] = list(from_idx)
-            child["map_group"] = group
-            child["map_index"] = i
-            child["map_join_index"] = map_index
-            if child.get("compensate"):
-                comp = dict(child["compensate"])
-                cp = dict(comp.get("payload") or {})
-                cp["item"] = item
-                cp["index"] = i
-                cp["map_group"] = group
-                comp["payload"] = cp
-                child["compensate"] = comp
-            steps_def.append(child)
-            child_indices.append(len(steps_def) - 1)
+            index_map: dict[int, int] = {}
+            for t_i, raw_tmpl in enumerate(templates):
+                child = deepcopy(raw_tmpl)
+                payload = dict(child.get("payload") or {})
+                payload["item"] = item
+                payload["index"] = i
+                payload["map_group"] = group
+                child["payload"] = payload
+                base_name = str(child.get("name") or "item").strip() or "item"
+                if len(templates) == 1:
+                    child["name"] = f"{base_name}-{i}"
+                else:
+                    child["name"] = f"{base_name}-{i}"
+                rel_deps = [int(d) for d in (child.get("depends_on_indices") or [])]
+                new_deps = [
+                    index_map[d] for d in rel_deps if d in index_map
+                ]
+                if not new_deps:
+                    new_deps = list(from_idx)
+                child["depends_on_indices"] = new_deps
+                child["map_group"] = group
+                child["map_index"] = i
+                child["map_sub"] = t_i
+                child["map_join_index"] = map_index
+                if child.get("compensate"):
+                    comp = dict(child["compensate"])
+                    cp = dict(comp.get("payload") or {})
+                    cp["item"] = item
+                    cp["index"] = i
+                    cp["map_group"] = group
+                    comp["payload"] = cp
+                    child["compensate"] = comp
+                steps_def.append(child)
+                new_idx = len(steps_def) - 1
+                index_map[t_i] = new_idx
+                child_indices.append(new_idx)
 
         sdef["map_children"] = list(child_indices)
         sdef["map_count"] = len(child_indices)

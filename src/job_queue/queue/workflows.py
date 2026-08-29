@@ -12,6 +12,7 @@ compensation under reclaim or dual coordinators.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Sequence
 from uuid import UUID, uuid4
 
@@ -40,6 +41,7 @@ from job_queue.queue._common import (
 from job_queue.queue.workflows_branch import (
     WorkflowsBranchMixin,
     _is_if_block,
+    branch_records,
     if_block_group,
     normalize_if_cases,
 )
@@ -1583,6 +1585,41 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
         while i < len(steps_def):
             sdef = steps_def[i]
             if str(sdef.get("kind") or "") == "map_join":
+                if i in existing:
+                    i += 1
+                    continue
+                skipped_branch = False
+                for br in branch_records(sdef):
+                    sources = [int(x) for x in (br.get("source_indices") or [])]
+                    if any(s not in ready for s in sources):
+                        skipped_branch = True
+                        break
+                    group = str(br.get("group") or "")
+                    winner = self._winner_for_branch_group(
+                        conn,
+                        run_id=run_id,
+                        steps_def=steps_def,
+                        group=group,
+                        source_indices=sources,
+                    )
+                    n += self._skip_losing_branch_steps(
+                        conn,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        steps_def=steps_def,
+                        group=group,
+                        winner=winner,
+                        existing=existing,
+                        ready=ready,
+                        now=now,
+                        source_indices=sources,
+                    )
+                    if i in existing:
+                        skipped_branch = True
+                        break
+                if skipped_branch:
+                    i += 1
+                    continue
                 deps_ready = all(
                     int(d) in ready
                     for d in (sdef.get("map") or {}).get("from_indices")
@@ -1664,14 +1701,13 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
             if any(d not in ready for d in deps):
                 i += 1
                 continue
-            branch = (
-                sdef.get("branch") if isinstance(sdef.get("branch"), dict) else None
-            )
-            if branch:
+            records = branch_records(sdef)
+            blocked = False
+            for branch in records:
                 sources = [int(x) for x in (branch.get("source_indices") or [])]
                 if any(s not in ready for s in sources):
-                    i += 1
-                    continue
+                    blocked = True
+                    break
                 group = str(branch.get("group") or "")
                 winner = self._winner_for_branch_group(
                     conn,
@@ -1693,8 +1729,11 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                     source_indices=sources,
                 )
                 if i in existing:
-                    i += 1
-                    continue
+                    blocked = True
+                    break
+            if blocked:
+                i += 1
+                continue
             self._create_and_enqueue_step(
                 conn,
                 run_id=run_id,
@@ -2787,8 +2826,14 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
                 step["expires_at"] = exp_out
             if expiry_action and not step.get("expiry_action"):
                 step["expiry_action"] = expiry_action
-            nested = (step.get("map") or {}).get("step")
-            if isinstance(nested, dict):
+            spec = step.get("map") or {}
+            nested_steps = list(spec.get("template_steps") or [])
+            one = spec.get("step")
+            if isinstance(one, dict):
+                nested_steps.append(one)
+            for nested in nested_steps:
+                if not isinstance(nested, dict):
+                    continue
                 if ttl_seconds is not None and nested.get("ttl_seconds") is None:
                     nested["ttl_seconds"] = ttl_seconds
                 if exp_out is not None and nested.get("expires_at") is None:
@@ -2864,73 +2909,41 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
     def _expand_and_normalize_steps(
         cls, raw_steps: Sequence[Any]
     ) -> list[dict[str, Any]]:
-        """Flatten linear + parallel + map blocks into a DAG of leaf steps.
+        """Flatten linear + nested parallel / map / if blocks into a DAG.
 
-        Parallel block form::
-
-            {
-              "type": "parallel",  # or kind: "parallel"
-              "name": "fan",
-              "branches": [
-                [{"name": "a1", ...}, {"name": "a2", ...}],
-                [{"name": "b1", ...}],
-              ],
-            }
-
-        Map / foreach form (N children from the previous step's result)::
-
-            {
-              "type": "map",
-              "name": "each",
-              "items": "ids",
-              "max_items": 256,
-              "step": {"name": "work", "payload": {"op": "do"}},
-            }
-
-        If / switch form (exactly one path runs)::
-
-            {
-              "type": "if",
-              "name": "route",
-              "on": "choice",
-              "equals": "vip",
-              "then": [{"name": "vip-work", ...}],
-              "else": [{"name": "std-work", ...}],
-            }
-
-        Unused branch steps are marked ``skipped`` so the join is not
-        stuck. ``cases`` is a multi-way switch; first match wins.
-
-        Each parallel branch runs concurrently after the previous wave; the
-        next sequential step depends on every branch tail (join). A map
-        placeholder joins after every spawned child completes.
+        A parallel branch, an if then/else, or a map child may contain
+        another block. Unused exclusive-branch leaves (including nested
+        ones) are tagged so they can be skipped and later joins are not
+        stuck. Map children may be a short parallel; map-in-map is
+        rejected so fan-out stays bounded.
         """
         if not raw_steps:
             raise ValueError("steps must be a non-empty list")
+        max_depth = 8
         flat: list[dict[str, Any]] = []
-        # Indices of the previous wave that subsequent steps depend on.
-        prev_wave: list[int] = []
+        counters = {"if": 0, "par": 0, "map": 0}
 
         def _is_parallel(item: Any) -> bool:
             if not isinstance(item, dict):
                 return False
-            if _is_map_block(item):
+            if _is_map_block(item) or _is_if_block(item):
                 return False
             t = str(item.get("type") or item.get("kind") or "").strip().lower()
             return t == "parallel" or isinstance(item.get("branches"), list)
+
+        def _take(kind: str) -> int:
+            n = counters[kind]
+            counters[kind] = n + 1
+            return n
 
         def _append_leaf(
             raw: Any,
             *,
             depends: list[int],
+            path: str,
             parallel_group: str | None = None,
             branch_id: int | None = None,
-            path: str,
         ) -> int:
-            if _is_parallel(raw) or _is_map_block(raw) or _is_if_block(raw):
-                raise ValueError(
-                    f"{path}: nested parallel/map/if blocks are not supported"
-                )
             idx = len(flat)
             leaf = cls._normalize_leaf_step(raw, idx, path=path)
             leaf["depends_on_indices"] = list(depends)
@@ -2941,122 +2954,213 @@ class WorkflowsMixin(WorkflowsBranchMixin, WorkflowsMapMixin):
             flat.append(leaf)
             return idx
 
-        for bi, item in enumerate(raw_steps):
-            path = f"steps[{bi}]"
-            if not isinstance(item, dict):
-                raise ValueError(f"{path} must be an object")
-            if _is_parallel(item):
-                branches = item.get("branches")
-                if not isinstance(branches, list) or not branches:
-                    raise ValueError(f"{path}.branches must be a non-empty list")
-                pg = str(item.get("name") or f"parallel-{bi}").strip()
-                tails: list[int] = []
-                for b_i, branch in enumerate(branches):
-                    if not isinstance(branch, list) or not branch:
-                        raise ValueError(
-                            f"{path}.branches[{b_i}] must be a non-empty step list"
-                        )
-                    dep = list(prev_wave)
-                    last: int | None = None
-                    for s_i, sraw in enumerate(branch):
-                        last = _append_leaf(
-                            sraw,
-                            depends=dep if s_i == 0 else [int(last)],  # type: ignore[arg-type]
-                            parallel_group=pg,
-                            branch_id=b_i,
-                            path=f"{path}.branches[{b_i}][{s_i}]",
-                        )
-                        dep = [last]
-                    assert last is not None
-                    tails.append(last)
-                if not tails:
-                    raise ValueError(f"{path}: parallel block produced no steps")
-                prev_wave = tails
-            elif _is_map_block(item):
-                template = item.get("step") or item.get("do")
-                if not isinstance(template, dict):
-                    raise ValueError(f"{path}.step must be an object")
-                pg = str(item.get("name") or f"map-{bi}").strip()
-                if not pg:
-                    raise ValueError(f"{path}.name is required")
-                items_path = str(
-                    item.get("items") or item.get("items_path") or "items"
-                ).strip() or "items"
-                raw_max = item.get("max_items")
-                if raw_max is None:
-                    max_items = int(DEFAULT_MAP_MAX_ITEMS)
+        def _tag_new(start: int, meta: dict[str, Any]) -> None:
+            for i in range(start, len(flat)):
+                path_tags = list(flat[i].get("branch_path") or [])
+                if not path_tags and isinstance(flat[i].get("branch"), dict):
+                    path_tags = [dict(flat[i]["branch"])]
+                path_tags.append(dict(meta))
+                flat[i]["branch_path"] = path_tags
+                flat[i]["branch"] = path_tags[-1]
+
+        def _expand_seq(
+            items: Sequence[Any],
+            *,
+            path: str,
+            prev_wave: list[int],
+            depth: int,
+        ) -> list[int]:
+            if depth > max_depth:
+                raise ValueError(
+                    f"{path}: nesting deeper than {max_depth} is not supported"
+                )
+            if not items:
+                raise ValueError(f"{path} must be a non-empty list")
+            wave = list(prev_wave)
+            for bi, item in enumerate(items):
+                ipath = f"{path}[{bi}]"
+                if not isinstance(item, dict):
+                    raise ValueError(f"{ipath} must be an object")
+                if _is_parallel(item):
+                    wave = _expand_parallel(
+                        item, path=ipath, prev_wave=wave, depth=depth
+                    )
+                elif _is_map_block(item):
+                    wave = _expand_map(
+                        item, path=ipath, prev_wave=wave, depth=depth
+                    )
+                elif _is_if_block(item):
+                    wave = _expand_if(
+                        item, path=ipath, prev_wave=wave, depth=depth
+                    )
                 else:
-                    try:
-                        max_items = int(raw_max)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f"{path}.max_items must be an integer"
-                        ) from exc
-                    if max_items < 0:
-                        raise ValueError(f"{path}.max_items must be >= 0")
-                leaf_idx = len(flat)
-                tmpl = cls._normalize_leaf_step(
-                    template, leaf_idx, path=f"{path}.step"
+                    idx = _append_leaf(item, depends=list(wave), path=ipath)
+                    wave = [idx]
+            return wave
+
+        def _expand_parallel(
+            item: dict[str, Any],
+            *,
+            path: str,
+            prev_wave: list[int],
+            depth: int,
+        ) -> list[int]:
+            branches = item.get("branches")
+            if not isinstance(branches, list) or not branches:
+                raise ValueError(f"{path}.branches must be a non-empty list")
+            pg = str(item.get("name") or f"parallel-{_take('par')}").strip()
+            tails: list[int] = []
+            for b_i, branch in enumerate(branches):
+                if not isinstance(branch, list) or not branch:
+                    raise ValueError(
+                        f"{path}.branches[{b_i}] must be a non-empty step list"
+                    )
+                start = len(flat)
+                br_tails = _expand_seq(
+                    branch,
+                    path=f"{path}.branches[{b_i}]",
+                    prev_wave=list(prev_wave),
+                    depth=depth + 1,
                 )
-                tmpl["depends_on_indices"] = []
-                tmpl.pop("depends_on", None)
-                if _is_map_block(template) or _is_parallel(template):
-                    raise ValueError(f"{path}.step cannot be a map or parallel block")
-                join = {
-                    "name": pg,
-                    "kind": "map_join",
-                    "payload": {},
-                    "depends_on_indices": list(prev_wave),
-                    "map_group": pg,
-                    "map": {
-                        "items": items_path,
-                        "max_items": max_items,
-                        "from_indices": list(prev_wave),
-                        "step": tmpl,
+                for idx in range(start, len(flat)):
+                    flat[idx].setdefault("parallel_group", pg)
+                    if flat[idx].get("branch_id") is None:
+                        flat[idx]["branch_id"] = b_i
+                tails.extend(br_tails)
+            if not tails:
+                raise ValueError(f"{path}: parallel block produced no steps")
+            return tails
+
+        def _expand_if(
+            item: dict[str, Any],
+            *,
+            path: str,
+            prev_wave: list[int],
+            depth: int,
+        ) -> list[int]:
+            cases = normalize_if_cases(item, path=path)
+            pg = if_block_group(index=_take("if"))
+            tails: list[int] = []
+            for c_i, case in enumerate(cases):
+                start = len(flat)
+                case_tails = _expand_seq(
+                    case["steps"],
+                    path=f"{path}.branch[{c_i}]",
+                    prev_wave=list(prev_wave),
+                    depth=depth + 1,
+                )
+                _tag_new(
+                    start,
+                    {
+                        "group": pg,
+                        "id": c_i,
+                        "pred": dict(case["pred"]),
+                        "source_indices": list(prev_wave),
                     },
-                }
-                if item.get("required_skills") is not None:
-                    join["required_skills"] = list(
-                        _normalize_skills(item.get("required_skills"))
-                    )
-                    tmpl.setdefault(
-                        "required_skills", join["required_skills"]
-                    )
-                flat.append(join)
-                prev_wave = [leaf_idx]
-            elif _is_if_block(item):
-                cases = normalize_if_cases(item, path=path)
-                # Display name is not unique; group by expansion index.
-                pg = if_block_group(index=bi)
-                tails: list[int] = []
-                for c_i, case in enumerate(cases):
-                    dep = list(prev_wave)
-                    last: int | None = None
-                    for s_i, sraw in enumerate(case["steps"]):
-                        last = _append_leaf(
-                            sraw,
-                            depends=dep if s_i == 0 else [int(last)],  # type: ignore[arg-type]
-                            path=f"{path}.branch[{c_i}][{s_i}]",
-                        )
-                        flat[last]["branch"] = {
-                            "group": pg,
-                            "id": c_i,
-                            "pred": dict(case["pred"]),
-                            "source_indices": list(prev_wave),
-                        }
-                        dep = [last]
-                    assert last is not None
-                    tails.append(last)
-                if not tails:
-                    raise ValueError(f"{path}: if/switch produced no steps")
-                prev_wave = tails
-            else:
-                idx = _append_leaf(
-                    item,
-                    depends=list(prev_wave),
-                    path=path,
                 )
-                prev_wave = [idx]
+                tails.extend(case_tails)
+            if not tails:
+                raise ValueError(f"{path}: if/switch produced no steps")
+            return tails
+
+        def _capture_template(
+            raw: Any, *, path: str, depth: int
+        ) -> list[dict[str, Any]]:
+            if isinstance(raw, list):
+                seq = raw
+            elif isinstance(raw, dict) and (
+                _is_parallel(raw) or _is_if_block(raw) or _is_map_block(raw)
+            ):
+                seq = [raw]
+            elif isinstance(raw, dict):
+                leaf = cls._normalize_leaf_step(raw, 0, path=path)
+                leaf["depends_on_indices"] = []
+                leaf.pop("depends_on", None)
+                return [leaf]
+            else:
+                raise ValueError(f"{path}.step must be an object or step list")
+            start = len(flat)
+            _expand_seq(seq, path=path, prev_wave=[], depth=depth + 1)
+            captured = [dict(s) for s in flat[start:]]
+            del flat[start:]
+            if any(str(s.get("kind") or "") == "map_join" for s in captured):
+                raise ValueError(f"{path}.step cannot contain a nested map")
+            if any(branch_records(s) for s in captured):
+                raise ValueError(
+                    f"{path}.step cannot contain if/switch (use a parallel of leaves)"
+                )
+            for i, s in enumerate(captured):
+                deps = [int(d) for d in (s.get("depends_on_indices") or [])]
+                s["depends_on_indices"] = [d - start for d in deps if d >= start]
+                recs = []
+                for rec in branch_records(s):
+                    src = [int(x) for x in (rec.get("source_indices") or [])]
+                    rec = dict(rec)
+                    rec["source_indices"] = [
+                        x - start for x in src if x >= start
+                    ]
+                    recs.append(rec)
+                if recs:
+                    s["branch_path"] = recs
+                    s["branch"] = recs[-1]
+            return captured
+
+        def _expand_map(
+            item: dict[str, Any],
+            *,
+            path: str,
+            prev_wave: list[int],
+            depth: int,
+        ) -> list[int]:
+            template = item.get("step") if "step" in item else item.get("do")
+            if template is None:
+                raise ValueError(f"{path}.step must be an object")
+            pg = str(item.get("name") or f"map-{_take('map')}").strip()
+            if not pg:
+                raise ValueError(f"{path}.name is required")
+            items_path = str(
+                item.get("items") or item.get("items_path") or "items"
+            ).strip() or "items"
+            raw_max = item.get("max_items")
+            if raw_max is None:
+                max_items = int(DEFAULT_MAP_MAX_ITEMS)
+            else:
+                try:
+                    max_items = int(raw_max)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{path}.max_items must be an integer") from exc
+                if max_items < 0:
+                    raise ValueError(f"{path}.max_items must be >= 0")
+            tmpl_steps = _capture_template(
+                template, path=f"{path}.step", depth=depth
+            )
+            if not tmpl_steps:
+                raise ValueError(f"{path}.step expanded to no steps")
+            leaf_idx = len(flat)
+            join: dict[str, Any] = {
+                "name": pg,
+                "kind": "map_join",
+                "payload": {},
+                "depends_on_indices": list(prev_wave),
+                "map_group": pg,
+                "map": {
+                    "items": items_path,
+                    "max_items": max_items,
+                    "from_indices": list(prev_wave),
+                    "step": dict(tmpl_steps[0]),
+                    "template_steps": tmpl_steps,
+                },
+            }
+            if item.get("required_skills") is not None:
+                skills = list(_normalize_skills(item.get("required_skills")))
+                join["required_skills"] = skills
+                for ts in tmpl_steps:
+                    ts.setdefault("required_skills", skills)
+                join["map"]["step"].setdefault("required_skills", skills)
+            flat.append(join)
+            return [leaf_idx]
+
+        _expand_seq(raw_steps, path="steps", prev_wave=[], depth=0)
 
         if not flat:
             raise ValueError("steps expanded to an empty workflow")

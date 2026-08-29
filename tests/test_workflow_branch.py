@@ -263,7 +263,7 @@ def test_same_named_if_blocks_pick_independent_paths(queue: JobQueue):
         for s in run.steps_def
         if isinstance(s.get("branch"), dict)
     }
-    assert groups == {"if:1", "if:3"}
+    assert groups == {"if:0", "if:1"}
 
     j = _drive(queue, "br-dup")
     assert j.payload.get("step_name") == "decide-a"
