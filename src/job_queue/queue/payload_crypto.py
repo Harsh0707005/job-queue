@@ -323,6 +323,9 @@ class PayloadCryptoMixin:
         payload = data.get("payload")
         tenant_id = str(data["tenant_id"])
         job_id = data["id"]
+        if decrypt and hasattr(self, "_overlay_archive_row"):
+            data = self._overlay_archive_row(data, conn=conn)
+            payload = data.get("payload")
         if decrypt:
             data["payload"] = self._open_job_payload(
                 payload,

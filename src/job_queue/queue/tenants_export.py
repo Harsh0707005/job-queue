@@ -75,6 +75,7 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "offboarding, enqueue_rate_per_sec, enqueue_burst, enqueue_tokens, "
         "enqueue_tokens_at, lease_rate_per_sec, lease_burst, lease_tokens, "
         "lease_tokens_at, completed_retention_seconds, dead_retention_seconds, "
+        "archive_after_seconds, archive_max_live_bytes, "
         "default_job_ttl_seconds, default_expiry_action, "
         "default_max_worker_hops, default_quarantine_action, "
         "spend_enqueue_limit, spend_runtime_ms_limit, spend_window_seconds, "
@@ -524,6 +525,30 @@ class TenantsExportMixin:
                     "created_at": None,
                     "committed_at": None,
                 }
+        archive_rows = conn.execute(
+            """
+            SELECT id, archive_blob_id
+            FROM jobs
+            WHERE tenant_id = %s AND archive_blob_id IS NOT NULL
+            """,
+            (tenant_id,),
+        ).fetchall()
+        for r in archive_rows:
+            bid = r["archive_blob_id"]
+            if bid is None or bid in refs:
+                continue
+            refs[bid] = {
+                "id": bid,
+                "tenant_id": tenant_id,
+                "job_id": r["id"],
+                "kind": "archive",
+                "sha256": "",
+                "nbytes": 0,
+                "key_id": None,
+                "status": "committed",
+                "created_at": None,
+                "committed_at": None,
+            }
         return refs
 
     def _capture_payload_blobs(

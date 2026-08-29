@@ -484,6 +484,18 @@ CREATE INDEX IF NOT EXISTS idx_jobs_worker_leased
 -- Worker advertised resources (cpu/memory/...) and per-job run cost.
 -- Empty object = no constraint (job is free / worker is unconstrained).
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resource_cost JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Finished jobs can drop payload/result/checkpoint into a durable archive
+-- blob and keep a stub row. list/get rehydrate on demand.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS archive_blob_id UUID;
+CREATE INDEX IF NOT EXISTS idx_jobs_archive_candidates
+    ON jobs (tenant_id, COALESCE(completed_at, updated_at) ASC)
+    WHERE archived_at IS NULL
+      AND status IN ('completed', 'failed', 'dead', 'cancelled');
+CREATE INDEX IF NOT EXISTS idx_jobs_archive_blob
+    ON jobs (archive_blob_id)
+    WHERE archive_blob_id IS NOT NULL;
 ALTER TABLE worker_nodes ADD COLUMN IF NOT EXISTS capacity JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- Capabilities advertised by the worker. Lease requires
@@ -616,6 +628,21 @@ ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_completed_ret_check C
 ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_dead_ret_check;
 ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_dead_ret_check CHECK (
     dead_retention_seconds IS NULL OR dead_retention_seconds >= -1
+);
+
+-- Per-tenant archival of finished jobs (NULL = off, -1 = never, >=0 policy).
+-- Age: archive when COALESCE(completed_at, updated_at) is older than N seconds.
+-- Size: archive oldest live finished rows until payload+result+checkpoint
+-- bytes drop under the cap.
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS archive_after_seconds INTEGER;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS archive_max_live_bytes BIGINT;
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_archive_after_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_archive_after_check CHECK (
+    archive_after_seconds IS NULL OR archive_after_seconds >= -1
+);
+ALTER TABLE tenant_settings DROP CONSTRAINT IF EXISTS tenant_settings_archive_bytes_check;
+ALTER TABLE tenant_settings ADD CONSTRAINT tenant_settings_archive_bytes_check CHECK (
+    archive_max_live_bytes IS NULL OR archive_max_live_bytes >= -1
 );
 
 ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS default_job_ttl_seconds INTEGER;
@@ -1582,12 +1609,17 @@ CREATE TABLE IF NOT EXISTS job_payload_blobs (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     committed_at    TIMESTAMPTZ,
     CONSTRAINT job_payload_blobs_kind_check CHECK (
-        kind IN ('payload', 'result', 'delivery', 'other')
+        kind IN ('payload', 'result', 'delivery', 'other', 'archive')
     ),
     CONSTRAINT job_payload_blobs_status_check CHECK (
         status IN ('pending', 'committed', 'orphan')
     ),
     CONSTRAINT job_payload_blobs_nbytes_check CHECK (nbytes >= 0)
+);
+
+ALTER TABLE job_payload_blobs DROP CONSTRAINT IF EXISTS job_payload_blobs_kind_check;
+ALTER TABLE job_payload_blobs ADD CONSTRAINT job_payload_blobs_kind_check CHECK (
+    kind IN ('payload', 'result', 'delivery', 'other', 'archive')
 );
 
 CREATE INDEX IF NOT EXISTS idx_job_payload_blobs_tenant

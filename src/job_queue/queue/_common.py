@@ -52,7 +52,7 @@ _JOB_COLUMNS = """
     required_skills, expires_at, expiry_action,
     failed_workers, max_worker_hops, quarantine_action,
     prefer_last_worker, payload_kind, cloned_from_job_id, coalesce_key,
-    tick_iteration, resource_cost
+    tick_iteration, resource_cost, archived_at, archive_blob_id
 """
 
 DEFAULT_PARTITION_COUNT = 32
@@ -751,6 +751,8 @@ def _row_to_job(row: dict[str, Any]) -> Job:
             if row.get("tick_iteration") is None
             else int(row["tick_iteration"])
         ),
+        archived_at=row.get("archived_at"),
+        archive_blob_id=row.get("archive_blob_id"),
     )
 
 

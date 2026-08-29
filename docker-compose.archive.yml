@@ -1,0 +1,88 @@
+# Per-tenant archival on a multi-coordinator HA fleet.
+# Finished jobs move to the shared blob store; list/get rehydrate.
+# The soak kills the leader mid-archive on purpose.
+#
+# Do not use --abort-on-container-exit: the soak kills the leader.
+#
+#   COMPOSE_PROJECT_NAME=jq-arch docker compose -p jq-arch \
+#     -f docker-compose.yml -f docker-compose.coordinator-leader.yml \
+#     -f docker-compose.archive.yml up --build -d
+#   docker logs -f jq-arch-archive-soak-1
+
+x-blob-env: &blob_env
+  JOB_QUEUE_BLOB_DIR: /var/lib/job-queue/blobs
+  JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD: "2048"
+  JOB_QUEUE_BLOB_READ_RETRIES: "20"
+  JOB_QUEUE_BLOB_READ_RETRY_SECONDS: "0.05"
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+  leader-soak:
+    profiles: ["disabled"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+  coordinator-1:
+    ports: !reset []
+    environment:
+      <<: *blob_env
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+  coordinator-2:
+    ports: !reset []
+    environment:
+      <<: *blob_env
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+  coordinator-3:
+    ports: !reset []
+    environment:
+      <<: *blob_env
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+
+  archive-soak:
+    build: .
+    command: ["python", "scripts/archive_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+      JOB_QUEUE_DSN: postgresql://queue:queue@postgres:5432/queue
+      JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+      JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+      <<: *blob_env
+      TENANTS: "4"
+      JOBS_PER_TENANT: "16"
+      PAYLOAD_BYTES: "4096"
+      MAX_WALL_SECONDS: "240"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-arch}
+      LOG_LEVEL: INFO
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/app/scripts
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      coordinator-3:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  payload-blobs:

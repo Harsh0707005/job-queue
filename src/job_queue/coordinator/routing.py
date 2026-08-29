@@ -739,6 +739,18 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/archive")
+        ):
+            return self._set_tenant_archive(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/archive")
+        ):
+            return self._get_tenant_archive(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/offboard")
         ):
             return self._offboard_tenant(path)
@@ -836,6 +848,11 @@ class RoutingMixin:
             if gated is not None:
                 return gated
             return self._purge_expired_jobs(body)
+        if method == "POST" and path == "/v1/admin/process-job-archives":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._process_job_archives(body)
         if method == "GET" and path == "/v1/admin/backlog":
             return self._backlog()
         if method == "GET" and path == "/v1/admin/completed-by-schedule":

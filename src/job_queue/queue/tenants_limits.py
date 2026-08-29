@@ -6,6 +6,7 @@ from job_queue.queue.tenants_breaker import TenantsBreakerMixin
 from job_queue.queue.tenants_concurrency import TenantsConcurrencyMixin
 from job_queue.queue.tenants_rate import TenantsRateMixin
 from job_queue.queue.tenants_retention import TenantsRetentionMixin
+from job_queue.queue.tenants_archive import TenantsArchiveMixin
 from job_queue.queue.tenants_spend import TenantsSpendMixin
 from job_queue.queue.tenants_ttl import TenantsTtlMixin
 from job_queue.queue.tenants_quarantine import TenantsQuarantineMixin
@@ -17,6 +18,7 @@ class TenantsLimitsMixin(
     TenantsConcurrencyMixin,
     TenantsRateMixin,
     TenantsRetentionMixin,
+    TenantsArchiveMixin,
     TenantsTtlMixin,
     TenantsSpendMixin,
     TenantsQuarantineMixin,

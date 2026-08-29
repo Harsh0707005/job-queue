@@ -183,6 +183,10 @@ class CoordinatorControlLoop:
             return
         try:
             self.queue.purge_expired_jobs(limit=self.retention_limit, **fence)
+            if hasattr(self.queue, "process_job_archives"):
+                self.queue.process_job_archives(
+                    limit=self.retention_limit, **fence
+                )
             if hasattr(self.queue, "process_offboard_finalizes"):
                 self.queue.process_offboard_finalizes(limit=50)
             if hasattr(self.queue, "process_inbound_nonces"):

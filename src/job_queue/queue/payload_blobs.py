@@ -20,6 +20,7 @@ BLOB_KIND_PAYLOAD = "payload"
 BLOB_KIND_RESULT = "result"
 BLOB_KIND_DELIVERY = "delivery"
 BLOB_KIND_OTHER = "other"
+BLOB_KIND_ARCHIVE = "archive"
 
 _PENDING_GC_SECONDS = 60
 
@@ -236,9 +237,10 @@ class PayloadBlobsMixin:
             FROM jobs
             WHERE payload->>'blob_id' = %s
                OR result->>'blob_id' = %s
+               OR archive_blob_id::text = %s
             LIMIT 1
             """,
-            (bid, bid),
+            (bid, bid, bid),
         ).fetchone()
         if row is not None:
             return True

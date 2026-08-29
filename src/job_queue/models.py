@@ -178,6 +178,12 @@ class Job:
     cloned_from_job_id: UUID | None = None
     coalesce_key: str | None = None
     tick_iteration: int | None = None
+    archived_at: datetime | None = None
+    archive_blob_id: UUID | None = None
+
+    @property
+    def is_archived(self) -> bool:
+        return self.archived_at is not None or self.archive_blob_id is not None
 
     @property
     def is_leased(self) -> bool:
@@ -532,6 +538,38 @@ class JobRetentionSettings:
     completed_inherits: bool = False
     dead_inherits: bool = False
     metrics_retention_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class JobArchiveSettings:
+    """Per-tenant policy that moves finished jobs off the live heap.
+
+    ``None`` means that policy is off (no automatic archive). ``0`` means
+    eligible on the next archive pass. There is no global default: tenants
+    that never set a policy keep finished rows in Postgres.
+
+    *after_inherits* / *size_inherits* are True when that field is unset
+    (off). When inherits is False and the value is ``None``, the tenant
+    explicitly never archives by that policy.
+    """
+
+    archive_after_seconds: int | None
+    archive_max_live_bytes: int | None
+    after_inherits: bool = True
+    size_inherits: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class JobArchiveResult:
+    """Result of one :meth:`~job_queue.queue.JobQueue.process_job_archives` pass."""
+
+    archived: int
+    bytes_archived: int = 0
+    skipped: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.archived
 
 
 @dataclass(frozen=True, slots=True)

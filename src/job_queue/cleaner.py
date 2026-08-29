@@ -78,6 +78,14 @@ class RetentionCleaner:
             )
         except Exception:  # noqa: BLE001
             logger.exception("job ttl expiry failed")
+        try:
+            if hasattr(self.queue, "process_job_archives"):
+                self.queue.process_job_archives(
+                    limit=self.batch_limit,
+                    tenant_id=self.tenant_id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("job archive pass failed")
         result = self.queue.purge_expired_jobs(
             limit=self.batch_limit,
             tenant_id=self.tenant_id,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from job_queue.codec import (
+    job_archive_result_to_dict,
     retention_purge_to_dict,
     tenant_stats_to_dict,
 )
@@ -27,6 +28,23 @@ class AdminApiMixin:
         except ValueError as exc:
             return 400, {"error": str(exc)}
         return 200, retention_purge_to_dict(result)
+
+    def _process_job_archives(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        fence = self._control_fence_args()
+        if fence is None:
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            fence = {}
+        try:
+            result = self.queue.process_job_archives(
+                limit=int(body.get("limit") or 200),
+                tenant_id=(str(body["tenant_id"]) if body.get("tenant_id") else None),
+                **fence,
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, job_archive_result_to_dict(result)
 
     def _backlog(self) -> tuple[int, dict[str, Any]]:
         with self.queue._pool.connection() as conn:

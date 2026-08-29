@@ -942,11 +942,34 @@ class TenantsRestoreMixin:
             payload = json.loads(payload)
         if not isinstance(payload, dict):
             payload = {}
+        result = raw.get("result")
+        checkpoint = raw.get("checkpoint")
+        old_archive = _parse_uuid(raw.get("archive_blob_id"))
+        was_archived = bool(
+            raw.get("archived_at")
+            or old_archive
+            or (
+                isinstance(payload, dict) and payload.get("_jq_archived") is True
+            )
+        )
+        restore_error: str | None = None
+        if was_archived and old_archive is not None and hasattr(
+            self, "_read_archive_snapshot"
+        ):
+            try:
+                snap = self._read_archive_snapshot(old_archive)
+                if snap.get("payload") is not None:
+                    payload = snap["payload"]
+                if "result" in snap:
+                    result = snap.get("result")
+                if "checkpoint" in snap:
+                    checkpoint = snap.get("checkpoint")
+            except Exception as exc:  # noqa: BLE001
+                restore_error = str(exc)
         old_payload_blob = (
             self._blob_id_of(payload) if hasattr(self, "_blob_id_of") else None
         )
-        restore_error: str | None = None
-        if hasattr(self, "_materialize_envelope"):
+        if hasattr(self, "_materialize_envelope") and restore_error is None:
             try:
                 payload = self._materialize_envelope(payload, conn=conn)
             except Exception as exc:  # noqa: BLE001
@@ -973,7 +996,6 @@ class TenantsRestoreMixin:
             job_id=new_id,
             blob_kind="payload",
         )
-        result = raw.get("result")
         sealed_result = None
         old_result_blob = None
         if result is not None and not restore_error:
@@ -1012,6 +1034,39 @@ class TenantsRestoreMixin:
             new_result_blob = self._blob_id_of(sealed_result)
             if old_result_blob and old_result_blob != new_result_blob:
                 self._orphan_blob(conn, old_result_blob)
+        insert_payload = sealed
+        insert_result = sealed_result
+        insert_checkpoint = checkpoint
+        archived_at = None
+        archive_blob_id = None
+        if was_archived and not restore_error and hasattr(self, "_write_archive_blob"):
+            from job_queue.queue.tenants_archive import ARCHIVE_STUB
+
+            archive_blob_id, _nbytes = self._write_archive_blob(
+                conn,
+                tenant_id=target,
+                job_id=new_id,
+                snapshot={
+                    "v": 1,
+                    "payload": sealed,
+                    "result": sealed_result,
+                    "checkpoint": checkpoint,
+                },
+                key_id=kid,
+            )
+            insert_payload = dict(ARCHIVE_STUB)
+            insert_result = None
+            insert_checkpoint = None
+            archived_at = _parse_dt(raw.get("archived_at")) or _utcnow()
+            if hasattr(self, "_orphan_blob"):
+                if old_archive:
+                    self._orphan_blob(conn, old_archive)
+                sealed_blob = self._blob_id_of(sealed)
+                if sealed_blob and sealed_blob != archive_blob_id:
+                    self._orphan_blob(conn, sealed_blob)
+                sealed_result_blob = self._blob_id_of(sealed_result)
+                if sealed_result_blob and sealed_result_blob != archive_blob_id:
+                    self._orphan_blob(conn, sealed_result_blob)
         status = str(raw.get("status") or "pending")
         attempts = int(raw.get("attempts") or 0)
         leased_by = raw.get("leased_by")
@@ -1073,7 +1128,8 @@ class TenantsRestoreMixin:
                 approval_message, approval_outcome, approval_resolved_at,
                 await_children_started_at, await_children_deadline_at,
                 await_children_outcome, await_children_resolved_at,
-                last_error, partition_id, payload_key_id
+                last_error, partition_id, payload_key_id,
+                archived_at, archive_blob_id
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
@@ -1088,7 +1144,8 @@ class TenantsRestoreMixin:
                 %s, %s, %s,
                 %s, %s,
                 %s, %s,
-                %s, %s, %s
+                %s, %s, %s,
+                %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -1096,7 +1153,7 @@ class TenantsRestoreMixin:
                 new_id,
                 target,
                 raw.get("queue_name") or "default",
-                Jsonb(sealed),
+                Jsonb(insert_payload),
                 status,
                 int(raw.get("priority") or 0),
                 attempts,
@@ -1122,10 +1179,10 @@ class TenantsRestoreMixin:
                 _parse_dt(raw.get("updated_at")) or _utcnow(),
                 _parse_dt(raw.get("completed_at"))
                 or (_utcnow() if restore_error else None),
-                Jsonb(sealed_result) if sealed_result is not None else None,
-                Jsonb(raw["checkpoint"])
-                if isinstance(raw.get("checkpoint"), (dict, list))
-                else raw.get("checkpoint"),
+                Jsonb(insert_result) if insert_result is not None else None,
+                Jsonb(insert_checkpoint)
+                if isinstance(insert_checkpoint, (dict, list))
+                else insert_checkpoint,
                 _parse_dt(raw.get("checkpointed_at")),
                 _parse_dt(raw.get("deadline_at")),
                 raw.get("estimated_duration_seconds"),
@@ -1148,6 +1205,8 @@ class TenantsRestoreMixin:
                 ),
                 part_id,
                 kid,
+                archived_at,
+                archive_blob_id,
             ),
         )
 
@@ -1652,6 +1711,8 @@ class TenantsRestoreMixin:
         lease_burst = None
         c_ret = None
         d_ret = None
+        arch_after = None
+        arch_bytes = None
         def_ttl = None
         def_exp = None
         hops = None
@@ -1676,6 +1737,8 @@ class TenantsRestoreMixin:
             lease_burst = exported_settings.get("lease_burst")
             c_ret = exported_settings.get("completed_retention_seconds")
             d_ret = exported_settings.get("dead_retention_seconds")
+            arch_after = exported_settings.get("archive_after_seconds")
+            arch_bytes = exported_settings.get("archive_max_live_bytes")
             def_ttl = exported_settings.get("default_job_ttl_seconds")
             def_exp = exported_settings.get("default_expiry_action")
             hops = exported_settings.get("default_max_worker_hops")
@@ -1702,6 +1765,7 @@ class TenantsRestoreMixin:
                 enqueue_rate_per_sec, enqueue_burst,
                 lease_rate_per_sec, lease_burst,
                 completed_retention_seconds, dead_retention_seconds,
+                archive_after_seconds, archive_max_live_bytes,
                 default_job_ttl_seconds, default_expiry_action,
                 default_max_worker_hops, default_quarantine_action,
                 spend_enqueue_limit, spend_runtime_ms_limit,
@@ -1716,6 +1780,7 @@ class TenantsRestoreMixin:
             ) VALUES (
                 %s, %s, %s,
                 %s, FALSE, FALSE,
+                %s, %s,
                 %s, %s,
                 %s, %s,
                 %s, %s,
@@ -1741,6 +1806,8 @@ class TenantsRestoreMixin:
                 lease_burst = EXCLUDED.lease_burst,
                 completed_retention_seconds = EXCLUDED.completed_retention_seconds,
                 dead_retention_seconds = EXCLUDED.dead_retention_seconds,
+                archive_after_seconds = EXCLUDED.archive_after_seconds,
+                archive_max_live_bytes = EXCLUDED.archive_max_live_bytes,
                 default_job_ttl_seconds = EXCLUDED.default_job_ttl_seconds,
                 default_expiry_action = EXCLUDED.default_expiry_action,
                 default_max_worker_hops = EXCLUDED.default_max_worker_hops,
@@ -1769,6 +1836,8 @@ class TenantsRestoreMixin:
                 lease_burst,
                 c_ret,
                 d_ret,
+                arch_after,
+                arch_bytes,
                 def_ttl,
                 def_exp,
                 hops,

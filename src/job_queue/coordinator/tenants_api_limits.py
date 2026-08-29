@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from job_queue.codec import (
+    job_archive_settings_to_dict,
     job_retention_to_dict,
     tenant_breaker_to_dict,
     tenant_spend_cap_to_dict,
@@ -382,6 +383,52 @@ class TenantsApiLimitsMixin:
         tenant_id = parts[2]
         settings = self.queue.get_tenant_job_retention(tenant_id)
         out = job_retention_to_dict(settings)
+        out["tenant_id"] = tenant_id
+        return 200, out
+
+    def _set_tenant_archive(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        if body.get("clear"):
+            try:
+                settings = self.queue.set_tenant_job_archive(tenant_id, clear=True)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            out = job_archive_settings_to_dict(settings)
+            out["tenant_id"] = tenant_id
+            return 200, out
+        kwargs: dict[str, Any] = {}
+        if "archive_after_seconds" in body or "after_seconds" in body:
+            raw = body.get("archive_after_seconds", body.get("after_seconds"))
+            kwargs["after_seconds"] = None if raw is None else int(raw)
+        if "archive_max_live_bytes" in body or "max_live_bytes" in body:
+            raw = body.get("archive_max_live_bytes", body.get("max_live_bytes"))
+            kwargs["max_live_bytes"] = None if raw is None else int(raw)
+        if not kwargs:
+            return 400, {
+                "error": "archive_after_seconds and/or "
+                "archive_max_live_bytes required (null = never archive "
+                "by that policy); or clear=true to turn archival off"
+            }
+        try:
+            settings = self.queue.set_tenant_job_archive(tenant_id, **kwargs)
+        except (TypeError, ValueError) as exc:
+            return 400, {"error": str(exc)}
+        out = job_archive_settings_to_dict(settings)
+        out["tenant_id"] = tenant_id
+        return 200, out
+
+    def _get_tenant_archive(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid tenant path"}
+        tenant_id = parts[2]
+        settings = self.queue.get_tenant_job_archive(tenant_id)
+        out = job_archive_settings_to_dict(settings)
         out["tenant_id"] = tenant_id
         return 200, out
 

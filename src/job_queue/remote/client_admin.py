@@ -984,6 +984,46 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def set_tenant_job_archive(
+        self,
+        tenant_id: str,
+        *,
+        after_seconds: int | None = None,
+        max_live_bytes: int | None = None,
+        clear: bool = False,
+        set_after: bool = True,
+        set_size: bool = True,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if clear:
+            body["clear"] = True
+        else:
+            if set_after:
+                body["archive_after_seconds"] = after_seconds
+            if set_size:
+                body["archive_max_live_bytes"] = max_live_bytes
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/archive", body)
+        assert payload is not None
+        return payload
+
+    def get_tenant_job_archive(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/archive")
+        assert payload is not None
+        return payload
+
+    def process_job_archives(
+        self,
+        *,
+        limit: int = 200,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"limit": limit}
+        if tenant_id is not None:
+            body["tenant_id"] = tenant_id
+        payload = self._request("POST", "/v1/admin/process-job-archives", body)
+        assert payload is not None
+        return payload
+
     def backlog(self) -> dict[str, Any]:
         payload = self._request("GET", "/v1/admin/backlog")
         assert payload is not None

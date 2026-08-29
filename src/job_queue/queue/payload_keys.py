@@ -461,7 +461,8 @@ class PayloadKeysMixin:
             to_key_id = rec.key_id
         rows = conn.execute(
             """
-            SELECT id, payload, result, payload_key_id
+            SELECT id, payload, result, checkpoint, payload_key_id,
+                   archived_at, archive_blob_id
             FROM jobs
             WHERE tenant_id = %s
               AND (payload_key_id IS DISTINCT FROM %s)
@@ -473,19 +474,36 @@ class PayloadKeysMixin:
         ).fetchall()
         n = 0
         for row in rows:
+            payload_src = row.get("payload")
+            result_src = row.get("result")
+            checkpoint_src = row.get("checkpoint")
+            old_archive = row.get("archive_blob_id")
+            if (row.get("archived_at") or old_archive) and hasattr(
+                self, "_read_archive_snapshot"
+            ):
+                if old_archive is None:
+                    continue
+                try:
+                    snap = self._read_archive_snapshot(old_archive)
+                except BlobStoreError:
+                    continue
+                payload_src = snap.get("payload")
+                result_src = snap.get("result")
+                if "checkpoint" in snap:
+                    checkpoint_src = snap.get("checkpoint")
             old_payload_blob = (
-                self._blob_id_of(row.get("payload"))
+                self._blob_id_of(payload_src)
                 if hasattr(self, "_blob_id_of")
                 else None
             )
             old_result_blob = (
-                self._blob_id_of(row.get("result"))
+                self._blob_id_of(result_src)
                 if hasattr(self, "_blob_id_of")
                 else None
             )
             try:
                 plain = self._open_job_payload(
-                    row["payload"],
+                    payload_src,
                     tenant_id=tenant_id,
                     job_id=row["id"],
                     conn=conn,
@@ -501,7 +519,7 @@ class PayloadKeysMixin:
                     continue
                 if hasattr(self, "_assert_envelope_readable"):
                     self._assert_envelope_readable(env)
-                result_env = row.get("result")
+                result_env = result_src
                 if result_env is not None:
                     opened_result = self._open_json_value(
                         result_env,
@@ -525,23 +543,61 @@ class PayloadKeysMixin:
             except (BlobStoreError, PayloadCryptoError):
                 # Leave the row on the old key; retiring waits until it rewraps.
                 continue
-            conn.execute(
-                """
-                UPDATE jobs
-                SET payload = %s,
-                    result = %s,
-                    payload_key_id = %s,
-                    updated_at = NOW()
-                WHERE id = %s AND tenant_id = %s
-                """,
-                (
-                    Jsonb(env),
-                    None if result_env is None else Jsonb(result_env),
-                    rec.key_id,
-                    row["id"],
-                    tenant_id,
-                ),
-            )
+            new_archive = None
+            if (row.get("archived_at") or old_archive) and hasattr(
+                self, "_write_archive_blob"
+            ):
+                from job_queue.queue.tenants_archive import ARCHIVE_STUB
+
+                new_archive, _nbytes = self._write_archive_blob(
+                    conn,
+                    tenant_id=tenant_id,
+                    job_id=row["id"],
+                    snapshot={
+                        "v": 1,
+                        "payload": env,
+                        "result": result_env,
+                        "checkpoint": checkpoint_src,
+                    },
+                    key_id=rec.key_id,
+                )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET payload = %s,
+                        result = NULL,
+                        checkpoint = NULL,
+                        archive_blob_id = %s,
+                        payload_key_id = %s,
+                        updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s
+                    """,
+                    (
+                        Jsonb(ARCHIVE_STUB),
+                        new_archive,
+                        rec.key_id,
+                        row["id"],
+                        tenant_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET payload = %s,
+                        result = %s,
+                        payload_key_id = %s,
+                        updated_at = NOW()
+                    WHERE id = %s AND tenant_id = %s
+                    """,
+                    (
+                        Jsonb(env),
+                        None if result_env is None else Jsonb(result_env),
+                        rec.key_id,
+                        row["id"],
+                        tenant_id,
+                    ),
+                )
             if hasattr(self, "_orphan_blob"):
                 new_payload_blob = self._blob_id_of(env)
                 new_result_blob = self._blob_id_of(result_env)
@@ -549,6 +605,13 @@ class PayloadKeysMixin:
                     self._orphan_blob(conn, old_payload_blob)
                 if old_result_blob and old_result_blob != new_result_blob:
                     self._orphan_blob(conn, old_result_blob)
+                if old_archive and old_archive != new_archive:
+                    self._orphan_blob(conn, old_archive)
+                if new_archive is not None:
+                    if new_payload_blob and new_payload_blob != new_archive:
+                        self._orphan_blob(conn, new_payload_blob)
+                    if new_result_blob and new_result_blob != new_archive:
+                        self._orphan_blob(conn, new_result_blob)
             n += 1
         return n
 

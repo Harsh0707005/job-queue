@@ -169,6 +169,8 @@ class TenantsConcurrencyMixin:
               AND lease_rate_per_sec IS NULL
               AND completed_retention_seconds IS NULL
               AND dead_retention_seconds IS NULL
+              AND archive_after_seconds IS NULL
+              AND archive_max_live_bytes IS NULL
               AND default_job_ttl_seconds IS NULL
               AND default_expiry_action IS NULL
               AND spend_enqueue_limit IS NULL

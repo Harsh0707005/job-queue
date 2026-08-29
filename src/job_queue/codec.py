@@ -129,6 +129,9 @@ def job_to_dict(
         "cloned_from_job_id": _uuid(getattr(job, "cloned_from_job_id", None)),
         "coalesce_key": getattr(job, "coalesce_key", None),
         "tick_iteration": getattr(job, "tick_iteration", None),
+        "archived_at": _dt(getattr(job, "archived_at", None)),
+        "archive_blob_id": _uuid(getattr(job, "archive_blob_id", None)),
+        "archived": bool(getattr(job, "is_archived", False)),
     }
 
 
@@ -230,6 +233,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
             if data.get("tick_iteration") is None
             else int(data["tick_iteration"])
         ),
+        archived_at=parse_dt("archived_at"),
+        archive_blob_id=parse_uuid("archive_blob_id"),
     )
 
 
@@ -603,6 +608,24 @@ def job_retention_to_dict(settings: Any) -> dict[str, Any]:
         "metrics_retention_seconds": getattr(
             settings, "metrics_retention_seconds", None
         ),
+    }
+
+
+def job_archive_settings_to_dict(settings: Any) -> dict[str, Any]:
+    return {
+        "archive_after_seconds": settings.archive_after_seconds,
+        "archive_max_live_bytes": settings.archive_max_live_bytes,
+        "after_inherits": bool(getattr(settings, "after_inherits", True)),
+        "size_inherits": bool(getattr(settings, "size_inherits", True)),
+    }
+
+
+def job_archive_result_to_dict(result: Any) -> dict[str, Any]:
+    return {
+        "archived": int(getattr(result, "archived", 0) or 0),
+        "bytes_archived": int(getattr(result, "bytes_archived", 0) or 0),
+        "skipped": int(getattr(result, "skipped", 0) or 0),
+        "total": int(getattr(result, "total", 0) or 0),
     }
 
 
