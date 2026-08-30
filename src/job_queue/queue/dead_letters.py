@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
 from job_queue.models import (
@@ -95,6 +96,11 @@ class DeadLettersMixin(DeadLettersGraphMixin):
         forward by the original window so the cleaner does not immediately
         dead-letter the job again.
 
+        An archived dead job is brought back live: the sealed payload
+        (and checkpoint) are restored onto the row and archive metadata
+        is cleared so a later ``get`` / ack result is not hidden by the
+        old snapshot.
+
         Raises ``ReplayError`` if the job is missing, wrong tenant, not dead,
         or its ``dedupe_key`` collides with another active job.
         """
@@ -133,7 +139,11 @@ class DeadLettersMixin(DeadLettersGraphMixin):
             if row is None:
                 raise ReplayError(f"job {job_id} not found for tenant {tenant_id!r}")
 
-            job = self._job(row)
+            job = (
+                self._job_readable(row, conn=conn)
+                if hasattr(self, "_job_readable")
+                else self._job(row)
+            )
             if hasattr(self, "_assert_queue_accepts_enqueue"):
                 try:
                     self._assert_queue_accepts_enqueue(
@@ -195,6 +205,11 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                 now=now,
                 run_at=run_at,
             )
+            unarch = (
+                self._unarchive_fields_for_replay(row, job=job)
+                if hasattr(self, "_unarchive_fields_for_replay")
+                else None
+            )
 
             # Savepoint: if the unique index still fires (defensive), convert
             # to ReplayError instead of leaking a raw DB error.
@@ -215,6 +230,13 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                             completed_at = NULL,
                             last_error = %s,
                             failed_workers = ARRAY[]::text[],
+                            payload = CASE WHEN %s THEN %s ELSE payload END,
+                            result = CASE WHEN %s THEN NULL ELSE result END,
+                            checkpoint = CASE WHEN %s THEN %s ELSE checkpoint END,
+                            archived_at = CASE WHEN %s THEN NULL ELSE archived_at END,
+                            archive_blob_id = CASE
+                                WHEN %s THEN NULL ELSE archive_blob_id
+                            END,
                             updated_at = %s
                         WHERE id = %s
                           AND tenant_id = %s
@@ -234,6 +256,18 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                             run_at,
                             new_expires,
                             new_error,
+                            unarch is not None,
+                            Jsonb(unarch["payload"]) if unarch else Jsonb({}),
+                            unarch is not None,
+                            unarch is not None,
+                            (
+                                Jsonb(unarch["checkpoint"])
+                                if unarch
+                                and isinstance(unarch.get("checkpoint"), (dict, list))
+                                else (unarch.get("checkpoint") if unarch else None)
+                            ),
+                            unarch is not None,
+                            unarch is not None,
                             now,
                             job_id,
                             tenant_id,
@@ -252,6 +286,8 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                     f"job {job_id} could not be replayed (status changed)",
                     job=job,
                 )
+            if unarch and unarch.get("old_archive") and hasattr(self, "_orphan_blob"):
+                self._orphan_blob(conn, unarch["old_archive"])
             out = self._job(updated)
             self._append_job_audit(
                 conn,

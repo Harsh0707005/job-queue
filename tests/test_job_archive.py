@@ -9,12 +9,12 @@ from uuid import uuid4
 
 import pytest
 
-from job_queue import JobQueue, JobStatus
+from job_queue import JobQueue, JobStatus, ReplayError
 from job_queue.blob_store import FilesystemBlobStore
 from job_queue.db import transaction
 from job_queue.queue.tenants_archive import ARCHIVE_STUB
 
-from tests.helpers_queue import _ack, _nack
+from tests.helpers_queue import _ack, _drive_to_dead, _nack
 
 
 @pytest.fixture
@@ -306,3 +306,140 @@ def test_clear_turns_archival_off(blob_queue: JobQueue):
     assert settings.archive_after_seconds is None
     _complete(blob_queue, "arch-clear", {"n": 1}, {"ok": True})
     assert blob_queue.process_job_archives(limit=5).archived == 0
+
+
+def test_replay_archived_dead_job_shows_new_result(blob_queue: JobQueue):
+    """Full replay path: dead → archive → replay → lease → ack → get."""
+    tenant = "arch-replay"
+    blob_queue.set_tenant_job_archive(tenant, after_seconds=0)
+    dead = _drive_to_dead(
+        blob_queue,
+        tenant_id=tenant,
+        payload={"task": "retry-me", "secret": "orig-payload"},
+        max_attempts=1,
+    )
+    assert dead.status == JobStatus.DEAD
+    assert blob_queue.process_job_archives(limit=5).archived == 1
+    archived = blob_queue.get(dead.id, tenant_id=tenant)
+    assert archived is not None
+    assert archived.is_archived
+    assert archived.payload == {"task": "retry-me", "secret": "orig-payload"}
+    old_archive = _row(blob_queue, dead.id)["archive_blob_id"]
+    assert old_archive is not None
+    assert _row(blob_queue, dead.id)["payload"] == ARCHIVE_STUB
+
+    listed = blob_queue.list_dead_letters(tenant_id=tenant)
+    assert len(listed) == 1
+    assert listed[0].payload["secret"] == "orig-payload"
+
+    replayed = blob_queue.replay_dead_letter(dead.id, tenant_id=tenant)
+    assert replayed.status == JobStatus.PENDING
+    assert not replayed.is_archived
+    assert replayed.payload == {"task": "retry-me", "secret": "orig-payload"}
+    assert replayed.result is None
+    live = _row(blob_queue, dead.id)
+    assert live["archived_at"] is None
+    assert live["archive_blob_id"] is None
+    assert live["payload"] != ARCHIVE_STUB
+    assert live["result"] is None
+
+    got = blob_queue.get(dead.id, tenant_id=tenant)
+    assert got is not None
+    assert not got.is_archived
+    assert got.payload["secret"] == "orig-payload"
+    assert got.result is None
+
+    leased = blob_queue.lease(tenant_id=tenant, worker_id="rescuer")
+    assert leased is not None and leased.id == dead.id
+    assert leased.payload == {"task": "retry-me", "secret": "orig-payload"}
+    done = _ack(
+        blob_queue,
+        leased,
+        "rescuer",
+        result={"out": "new-result", "ok": True},
+    )
+    assert done.status == JobStatus.COMPLETED
+    assert done.result == {"out": "new-result", "ok": True}
+
+    after = blob_queue.get(dead.id, tenant_id=tenant)
+    assert after is not None
+    assert after.status == JobStatus.COMPLETED
+    assert not after.is_archived
+    assert after.payload["secret"] == "orig-payload"
+    assert after.result == {"out": "new-result", "ok": True}
+    assert blob_queue.get_result(dead.id, tenant_id=tenant) == {
+        "out": "new-result",
+        "ok": True,
+    }
+    listed_done = blob_queue.list_jobs(tenant_id=tenant, status=JobStatus.COMPLETED)
+    assert listed_done[0].result == {"out": "new-result", "ok": True}
+
+    # Old snapshot must not come back after a later archive pass.
+    assert blob_queue.process_job_archives(limit=5).archived == 1
+    rearchived = blob_queue.get(dead.id, tenant_id=tenant)
+    assert rearchived is not None
+    assert rearchived.is_archived
+    assert rearchived.result == {"out": "new-result", "ok": True}
+    new_archive = _row(blob_queue, dead.id)["archive_blob_id"]
+    assert new_archive is not None
+    assert new_archive != old_archive
+
+
+def test_replay_graph_unarchives_dead_job(blob_queue: JobQueue):
+    tenant = "arch-replay-graph"
+    blob_queue.set_tenant_job_archive(tenant, after_seconds=0)
+    dead = _drive_to_dead(
+        blob_queue,
+        tenant_id=tenant,
+        payload={"graph": True, "n": 1},
+        max_attempts=1,
+    )
+    blob_queue.process_job_archives(limit=5)
+    out = blob_queue.replay_dead_letter_graph(tenant, job_ids=[dead.id])
+    assert out.jobs_replayed == 1
+    live = _row(blob_queue, dead.id)
+    assert live["archive_blob_id"] is None
+    assert live["status"] == JobStatus.PENDING.value
+    leased = blob_queue.lease(tenant_id=tenant, worker_id="g")
+    assert leased is not None
+    _ack(blob_queue, leased, "g", result={"graph": "done"})
+    got = blob_queue.get(dead.id, tenant_id=tenant)
+    assert got is not None
+    assert got.result == {"graph": "done"}
+    assert not got.is_archived
+
+
+def test_replay_archived_dead_job_missing_blob_fails_closed(blob_queue: JobQueue):
+    tenant = "arch-replay-miss"
+    blob_queue.set_tenant_job_archive(tenant, after_seconds=0)
+    dead = _drive_to_dead(
+        blob_queue, tenant_id=tenant, payload={"n": 1}, max_attempts=1
+    )
+    blob_queue.process_job_archives(limit=5)
+    bid = _row(blob_queue, dead.id)["archive_blob_id"]
+    blob_queue._blob_store.delete(bid)
+    with pytest.raises(ReplayError, match="archive snapshot is unreadable"):
+        blob_queue.replay_dead_letter(dead.id, tenant_id=tenant)
+    still = _row(blob_queue, dead.id)
+    assert still["status"] == JobStatus.DEAD.value
+    assert still["archive_blob_id"] == bid
+
+
+def test_replay_restores_checkpoint_from_archive(blob_queue: JobQueue):
+    tenant = "arch-replay-ckpt"
+    blob_queue.set_tenant_job_archive(tenant, after_seconds=0)
+    job = blob_queue.enqueue(tenant_id=tenant, payload={"n": 1}, max_attempts=1)
+    leased = blob_queue.lease(tenant_id=tenant, worker_id="w")
+    assert leased is not None
+    blob_queue.checkpoint(
+        leased.id,
+        tenant_id=tenant,
+        worker_id="w",
+        lease_token=leased.lease_token,
+        progress={"step": 7},
+    )
+    _nack(blob_queue, leased, "w", error="boom", requeue=True)
+    blob_queue.process_job_archives(limit=5)
+    replayed = blob_queue.replay_dead_letter(job.id, tenant_id=tenant)
+    assert replayed.checkpoint == {"step": 7}
+    assert _row(blob_queue, job.id)["checkpoint"] == {"step": 7}

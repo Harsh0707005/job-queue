@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
 
 from job_queue.db import transaction
 from job_queue.models import (
@@ -471,7 +472,11 @@ class DeadLettersGraphMixin:
         clear_error: bool,
         restore_join: bool,
     ) -> dict[str, Any]:
-        job = self._job(row, conn=conn)
+        job = (
+            self._job_readable(row, conn=conn)
+            if hasattr(self, "_job_readable")
+            else self._job(row, conn=conn)
+        )
         new_attempts = 0 if reset_attempts else int(row["attempts"] or 0)
         new_max = (
             max_attempts if max_attempts is not None else int(row["max_attempts"])
@@ -492,6 +497,11 @@ class DeadLettersGraphMixin:
             )
         else:
             new_status = JobStatus.PENDING.value
+        unarch = (
+            self._unarchive_fields_for_replay(row, job=job)
+            if hasattr(self, "_unarchive_fields_for_replay")
+            else None
+        )
         updated = conn.execute(
             f"""
             UPDATE jobs
@@ -516,6 +526,13 @@ class DeadLettersGraphMixin:
                     WHEN %s THEN NULL
                     ELSE await_children_resolved_at
                 END,
+                payload = CASE WHEN %s THEN %s ELSE payload END,
+                result = CASE WHEN %s THEN NULL ELSE result END,
+                checkpoint = CASE WHEN %s THEN %s ELSE checkpoint END,
+                archived_at = CASE WHEN %s THEN NULL ELSE archived_at END,
+                archive_blob_id = CASE
+                    WHEN %s THEN NULL ELSE archive_blob_id
+                END,
                 updated_at = %s
             WHERE id = %s
               AND tenant_id = %s
@@ -531,6 +548,18 @@ class DeadLettersGraphMixin:
                 new_error,
                 restore_join,
                 restore_join,
+                unarch is not None,
+                Jsonb(unarch["payload"]) if unarch else Jsonb({}),
+                unarch is not None,
+                unarch is not None,
+                (
+                    Jsonb(unarch["checkpoint"])
+                    if unarch
+                    and isinstance(unarch.get("checkpoint"), (dict, list))
+                    else (unarch.get("checkpoint") if unarch else None)
+                ),
+                unarch is not None,
+                unarch is not None,
                 now,
                 job.id,
                 tenant_id,
@@ -542,6 +571,8 @@ class DeadLettersGraphMixin:
                 f"job {job.id} could not be replayed (status changed)",
                 job=job,
             )
+        if unarch and unarch.get("old_archive") and hasattr(self, "_orphan_blob"):
+            self._orphan_blob(conn, unarch["old_archive"])
         if hasattr(self, "_append_job_audit"):
             self._append_job_audit(
                 conn,

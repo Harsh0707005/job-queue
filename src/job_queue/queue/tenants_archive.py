@@ -16,6 +16,7 @@ from job_queue.queue._common import (
     _JOB_COLUMNS,
     _TENANT_RETENTION_FOREVER,
     _UNSET,
+    ReplayError,
     _utcnow,
 )
 from job_queue.queue.payload_blobs import BLOB_KIND_ARCHIVE
@@ -511,9 +512,12 @@ class TenantsArchiveMixin:
         self, data: dict[str, Any], *, conn: Any | None = None
     ) -> dict[str, Any]:
         bid = data.get("archive_blob_id")
-        if bid is None and not data.get("archived_at"):
-            return data
         if bid is None:
+            return data
+        # Live rows that were replayed (or otherwise rewritten) keep a
+        # leftover pointer only until the next write. Do not hide a new
+        # result behind the old snapshot.
+        if not is_archive_stub(data.get("payload")):
             return data
         snap = self._read_archive_snapshot(bid)
         if "payload" in snap and snap.get("payload") is not None:
@@ -523,3 +527,47 @@ class TenantsArchiveMixin:
         if "checkpoint" in snap:
             data["checkpoint"] = snap["checkpoint"]
         return data
+
+    def _unarchive_fields_for_replay(
+        self, row: dict[str, Any], *, job: Any = None
+    ) -> dict[str, Any] | None:
+        """Sealed payload/checkpoint to put back when a stub is replayed.
+
+        Returns ``None`` when the row is not archived. A missing snapshot
+        fails closed — replaying a stub without a body would lease garbage.
+        """
+        if not row.get("archive_blob_id") and not row.get("archived_at"):
+            return None
+        bid = row.get("archive_blob_id")
+        if bid is None:
+            payload = row.get("payload")
+            if is_archive_stub(payload):
+                payload = {}
+            return {
+                "payload": payload if isinstance(payload, dict) else {},
+                "checkpoint": row.get("checkpoint"),
+                "old_archive": None,
+            }
+        try:
+            snap = self._read_archive_snapshot(bid)
+        except BlobStoreError as exc:
+            raise ReplayError(
+                f"job {row.get('id')} cannot be replayed: "
+                "archive snapshot is unreadable",
+                job=job,
+            ) from exc
+        payload = snap.get("payload")
+        if payload is None:
+            raise ReplayError(
+                f"job {row.get('id')} cannot be replayed: "
+                "archive snapshot has no payload",
+                job=job,
+            )
+        checkpoint = (
+            snap.get("checkpoint") if "checkpoint" in snap else row.get("checkpoint")
+        )
+        return {
+            "payload": payload,
+            "checkpoint": checkpoint,
+            "old_archive": bid,
+        }
