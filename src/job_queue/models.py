@@ -810,6 +810,7 @@ class JobAuditEvent:
     actor: str | None
     detail: dict[str, Any]
     created_at: datetime
+    tenant_seq: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

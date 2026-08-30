@@ -268,6 +268,17 @@ class PayloadBlobsMixin:
             """,
             (bid,),
         ).fetchone()
+        if row is not None:
+            return True
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM job_audit_events
+            WHERE detail->>'blob_id' = %s
+            LIMIT 1
+            """,
+            (bid,),
+        ).fetchone()
         return row is not None
 
     def _materialize_envelope(

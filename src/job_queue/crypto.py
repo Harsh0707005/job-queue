@@ -141,6 +141,10 @@ def result_aad(job_id: UUID | str) -> bytes:
     return f"job-queue:v1:job-result:{job_id}".encode()
 
 
+def audit_event_aad(event_id: UUID | str) -> bytes:
+    return f"job-queue:v1:job-audit:{event_id}".encode()
+
+
 def schedule_generation_aad(
     schedule_id: UUID | str,
     iteration: int,

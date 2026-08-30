@@ -429,6 +429,18 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def list_tenant_events(
+        self,
+        tenant_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        q = f"after_seq={int(after_seq)}&limit={int(limit)}"
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/audit?{q}")
+        assert payload is not None
+        return payload
+
     def export_tenant(self, tenant_id: str) -> dict[str, Any]:
         payload = self._request("POST", f"/v1/tenants/{tenant_id}/export", {})
         assert payload is not None

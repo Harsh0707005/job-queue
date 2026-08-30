@@ -315,16 +315,23 @@ def preempt_result_to_dict(result: PreemptResult) -> dict[str, Any]:
 
 
 def job_audit_event_to_dict(ev: JobAuditEvent) -> dict[str, Any]:
+    detail = dict(ev.detail or {})
+    job = detail.get("job")
+    if isinstance(job, dict):
+        job = dict(job)
+        job["lease_token"] = None
+        detail["job"] = job
     return {
         "event_id": str(ev.event_id),
         "tenant_id": ev.tenant_id,
         "job_id": str(ev.job_id),
         "seq": ev.seq,
+        "tenant_seq": getattr(ev, "tenant_seq", None),
         "event_type": ev.event_type,
         "from_status": ev.from_status,
         "to_status": ev.to_status,
         "actor": ev.actor,
-        "detail": ev.detail,
+        "detail": detail,
         "created_at": _dt(ev.created_at),
     }
 

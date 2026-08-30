@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from job_queue.blob_store import BlobStoreError
 from job_queue.crypto import (
     PayloadCryptoError,
+    audit_event_aad,
     delivery_aad,
     encrypt_json,
     job_aad,
@@ -267,6 +268,12 @@ class PayloadKeysMixin:
                         to_key_id=active["key_id"],
                         limit=batch_size,
                     )
+                    self._reencrypt_audit_events_batch(
+                        conn,
+                        tenant_id=tenant_id,
+                        to_key_id=active["key_id"],
+                        limit=batch_size,
+                    )
                     self._retire_unreferenced_keys(conn, tenant_id=tenant_id)
                     synthetic = {
                         "id": uuid4(),
@@ -313,6 +320,12 @@ class PayloadKeysMixin:
                 limit=batch_size,
             )
             self._reencrypt_workflow_signals_batch(
+                conn,
+                tenant_id=tenant_id,
+                to_key_id=to_key_id,
+                limit=batch_size,
+            )
+            self._reencrypt_audit_events_batch(
                 conn,
                 tenant_id=tenant_id,
                 to_key_id=to_key_id,
@@ -445,6 +458,22 @@ class PayloadKeysMixin:
             (tenant_id, active_key_id, kid),
         ).fetchone()
         total += int(sig["n"] if sig else 0)
+        audit = conn.execute(
+            """
+            SELECT COUNT(*)::int AS n
+            FROM job_audit_events
+            WHERE tenant_id = %s
+              AND (
+                    payload_key_id IS DISTINCT FROM %s
+                 OR (
+                        detail ? '_jq_enc'
+                    AND detail->>'kid' IS DISTINCT FROM %s
+                 )
+              )
+            """,
+            (tenant_id, active_key_id, kid),
+        ).fetchone()
+        total += int(audit["n"] if audit else 0)
         return total
 
     def _reencrypt_jobs_batch(
@@ -833,6 +862,63 @@ class PayloadKeysMixin:
             n += 1
         return n
 
+    def _reencrypt_audit_events_batch(
+        self,
+        conn: Any,
+        *,
+        tenant_id: str,
+        to_key_id: UUID,
+        limit: int,
+    ) -> int:
+        rec = self._ensure_active_key(conn, tenant_id)
+        if rec.key_id != to_key_id:
+            to_key_id = rec.key_id
+        rows = conn.execute(
+            """
+            SELECT event_id, job_id, detail, payload_key_id
+            FROM job_audit_events
+            WHERE tenant_id = %s
+              AND (payload_key_id IS DISTINCT FROM %s)
+            ORDER BY tenant_seq ASC NULLS LAST, created_at ASC, event_id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (tenant_id, to_key_id, limit),
+        ).fetchall()
+        n = 0
+        for row in rows:
+            try:
+                opened = self._open_dict(
+                    row.get("detail") or {},
+                    tenant_id=tenant_id,
+                    aad=audit_event_aad(row["event_id"]),
+                    conn=conn,
+                )
+                if not isinstance(opened, dict):
+                    opened = {}
+                env, kid = self._seal_dict(
+                    conn,
+                    tenant_id=tenant_id,
+                    plaintext=opened,
+                    aad=audit_event_aad(row["event_id"]),
+                    job_id=row["job_id"],
+                    blob_kind="other",
+                    force_new=True,
+                )
+            except (BlobStoreError, PayloadCryptoError):
+                continue
+            conn.execute(
+                """
+                UPDATE job_audit_events
+                SET detail = %s,
+                    payload_key_id = %s
+                WHERE event_id = %s AND tenant_id = %s
+                """,
+                (Jsonb(env), kid, row["event_id"], tenant_id),
+            )
+            n += 1
+        return n
+
     def _retire_unreferenced_keys(self, conn: Any, *, tenant_id: str) -> int:
         """Zeroize wrapped DEKs that no ciphertext still names.
 
@@ -910,6 +996,20 @@ class PayloadKeysMixin:
                 (tenant_id, kid),
             ).fetchone()
             if blob_ref is not None:
+                continue
+            audit_ref = conn.execute(
+                """
+                SELECT 1 FROM job_audit_events
+                WHERE tenant_id = %s
+                  AND (
+                        payload_key_id = %s
+                     OR detail->>'kid' = %s
+                  )
+                LIMIT 1
+                """,
+                (tenant_id, kid, str(kid)),
+            ).fetchone()
+            if audit_ref is not None:
                 continue
             deliv_ref = conn.execute(
                 """

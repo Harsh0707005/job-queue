@@ -1113,6 +1113,28 @@ CREATE INDEX IF NOT EXISTS idx_job_audit_job_seq
 -- Superuser maintenance can DROP; normal role should not UPDATE/DELETE.
 REVOKE UPDATE, DELETE ON job_audit_events FROM PUBLIC;
 
+-- Per-tenant ordered cursor (durable follow). Backfill by write time so
+-- upgrades keep a stable order; new rows always set tenant_seq in-app.
+ALTER TABLE job_audit_events ADD COLUMN IF NOT EXISTS tenant_seq BIGINT;
+ALTER TABLE job_audit_events ADD COLUMN IF NOT EXISTS payload_key_id UUID;
+WITH numbered AS (
+    SELECT event_id,
+           ROW_NUMBER() OVER (
+               PARTITION BY tenant_id
+               ORDER BY created_at ASC, event_id ASC
+           ) AS n
+    FROM job_audit_events
+    WHERE tenant_seq IS NULL
+)
+UPDATE job_audit_events e
+SET tenant_seq = numbered.n
+FROM numbered
+WHERE e.event_id = numbered.event_id
+  AND e.tenant_seq IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_audit_tenant_seq
+    ON job_audit_events (tenant_id, tenant_seq)
+    WHERE tenant_seq IS NOT NULL;
+
 -- Durable once-only side effects for a job (survive lease reclaim).
 -- Two-phase protocol:
 --   1. begin  → status=started with a stable idempotency_key BEFORE the

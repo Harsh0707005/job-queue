@@ -137,7 +137,7 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     ),
     "job_audit_events": (
         "event_id, tenant_id, job_id, seq, event_type, from_status, to_status, "
-        "actor, detail, created_at",
+        "actor, detail, created_at, tenant_seq, payload_key_id",
         "job_audit_events",
     ),
     "webhook_endpoints": (
@@ -525,6 +525,34 @@ class TenantsExportMixin:
                     "created_at": None,
                     "committed_at": None,
                 }
+        audit_ptrs = conn.execute(
+            """
+            SELECT event_id, detail
+            FROM job_audit_events
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchall()
+        for r in audit_ptrs:
+            bid = (
+                self._blob_id_of(r.get("detail"))
+                if hasattr(self, "_blob_id_of")
+                else None
+            )
+            if bid is None or bid in refs:
+                continue
+            refs[bid] = {
+                "id": bid,
+                "tenant_id": tenant_id,
+                "job_id": None,
+                "kind": "other",
+                "sha256": "",
+                "nbytes": 0,
+                "key_id": None,
+                "status": "committed",
+                "created_at": None,
+                "committed_at": None,
+            }
         archive_rows = conn.execute(
             """
             SELECT id, archive_blob_id

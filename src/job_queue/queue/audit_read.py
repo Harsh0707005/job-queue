@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from job_queue.crypto import audit_event_aad, is_envelope
 from job_queue.models import (
     AuditConsistencyReport,
     JobAuditEvent,
@@ -15,16 +16,57 @@ from job_queue.models import (
 
 
 class AuditReadMixin:
-    @staticmethod
-    def _row_to_audit(row: dict[str, Any]) -> JobAuditEvent:
-        detail = row.get("detail") or {}
+    def _open_audit_detail(
+        self,
+        detail: Any,
+        *,
+        event_id: Any,
+        event_tenant: str,
+        reader_tenant: str | None,
+        conn: Any | None,
+    ) -> dict[str, Any]:
         if isinstance(detail, str):
             try:
                 detail = json.loads(detail)
             except json.JSONDecodeError:
-                detail = {}
+                return {}
         if not isinstance(detail, dict):
-            detail = {"value": detail}
+            return {"value": detail}
+        if not is_envelope(detail) or not hasattr(self, "_open_dict"):
+            return detail
+        tried: set[str] = set()
+        for tid in (reader_tenant, event_tenant):
+            if not tid or tid in tried:
+                continue
+            tried.add(tid)
+            try:
+                opened = self._open_dict(
+                    detail,
+                    tenant_id=tid,
+                    aad=audit_event_aad(event_id),
+                    conn=conn,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(opened, dict):
+                return opened
+        return {}
+
+    def _row_to_audit(
+        self,
+        row: dict[str, Any],
+        *,
+        conn: Any | None = None,
+        reader_tenant: str | None = None,
+    ) -> JobAuditEvent:
+        detail = self._open_audit_detail(
+            row.get("detail") or {},
+            event_id=row["event_id"],
+            event_tenant=str(row["tenant_id"]),
+            reader_tenant=reader_tenant,
+            conn=conn,
+        )
+        tenant_seq = row.get("tenant_seq")
         return JobAuditEvent(
             event_id=row["event_id"],
             tenant_id=row["tenant_id"],
@@ -36,6 +78,7 @@ class AuditReadMixin:
             actor=row.get("actor"),
             detail=detail,
             created_at=row["created_at"],
+            tenant_seq=(None if tenant_seq is None else int(tenant_seq)),
         )
 
     def list_job_audit(
@@ -69,7 +112,8 @@ class AuditReadMixin:
                 """
                 SELECT
                     event_id, tenant_id, job_id, seq, event_type,
-                    from_status, to_status, actor, detail, created_at
+                    from_status, to_status, actor, detail, created_at,
+                    tenant_seq, payload_key_id
                 FROM job_audit_events
                 WHERE job_id = %s
                   AND seq > %s
@@ -78,28 +122,38 @@ class AuditReadMixin:
                 """,
                 (job_id, after_seq, limit),
             ).fetchall()
-            return [self._row_to_audit(r) for r in rows]
+            return [
+                self._row_to_audit(r, conn=conn, reader_tenant=tenant_id)
+                for r in rows
+            ]
 
     def list_tenant_audit(
         self,
         tenant_id: str,
         *,
+        after_seq: int | None = None,
         after_created_at: datetime | None = None,
         after_event_id: UUID | None = None,
         limit: int = 500,
     ) -> list[JobAuditEvent]:
-        """Tenant-wide audit stream ordered by time (for catch-up consumers).
+        """Tenant-wide audit stream.
 
-        Includes:
-        * events originally written under *tenant_id*, and
-        * events for jobs **currently** owned by *tenant_id* (so after a
-          merge, the target tenant can catch up pre-merge history of jobs
-          they now own without mutating immutable event rows).
+        *after_seq* is the durable per-tenant cursor (``tenant_seq``). It
+        returns only rows written under *tenant_id* so consumers cannot
+        see another tenant's log. Omit it for the older time-ordered
+        catch-up that also includes events of jobs this tenant now owns
+        (merge).
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        if after_seq is not None and after_seq < 0:
+            raise ValueError("after_seq must be >= 0")
+        if after_seq is not None:
+            return self.list_tenant_events(
+                tenant_id, after_seq=after_seq, limit=limit
+            )
         # Events visible to this tenant: written under them, or belonging to
         # a job they currently own (covers merge without rewriting history).
         ownership = """
@@ -117,7 +171,8 @@ class AuditReadMixin:
                     f"""
                     SELECT
                         e.event_id, e.tenant_id, e.job_id, e.seq, e.event_type,
-                        e.from_status, e.to_status, e.actor, e.detail, e.created_at
+                        e.from_status, e.to_status, e.actor, e.detail,
+                        e.created_at, e.tenant_seq, e.payload_key_id
                     FROM job_audit_events e
                     WHERE {ownership}
                     ORDER BY e.created_at ASC, e.event_id ASC
@@ -130,7 +185,8 @@ class AuditReadMixin:
                     f"""
                     SELECT
                         e.event_id, e.tenant_id, e.job_id, e.seq, e.event_type,
-                        e.from_status, e.to_status, e.actor, e.detail, e.created_at
+                        e.from_status, e.to_status, e.actor, e.detail,
+                        e.created_at, e.tenant_seq, e.payload_key_id
                     FROM job_audit_events e
                     WHERE {ownership}
                       AND (
@@ -152,7 +208,48 @@ class AuditReadMixin:
                         limit,
                     ),
                 ).fetchall()
-            return [self._row_to_audit(r) for r in rows]
+            return [
+                self._row_to_audit(r, conn=conn, reader_tenant=tenant_id)
+                for r in rows
+            ]
+
+    def list_tenant_events(
+        self,
+        tenant_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 500,
+    ) -> list[JobAuditEvent]:
+        """Follow this tenant's sealed event log from *after_seq*.
+
+        ``tenant_seq`` is gap-free for writes under *tenant_id*. Other
+        tenants' rows are never returned.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if after_seq < 0:
+            raise ValueError("after_seq must be >= 0")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    event_id, tenant_id, job_id, seq, event_type,
+                    from_status, to_status, actor, detail, created_at,
+                    tenant_seq, payload_key_id
+                FROM job_audit_events
+                WHERE tenant_id = %s
+                  AND tenant_seq > %s
+                ORDER BY tenant_seq ASC
+                LIMIT %s
+                """,
+                (tenant_id, int(after_seq), limit),
+            ).fetchall()
+            return [
+                self._row_to_audit(r, conn=conn, reader_tenant=tenant_id)
+                for r in rows
+            ]
 
     def verify_job_audit(
         self,

@@ -440,6 +440,10 @@ class TenantsOffboardMixin:
             (tenant_id,),
         )
         conn.execute(
+            "DELETE FROM job_audit_events WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        conn.execute(
             """
             DELETE FROM tenant_restores
             WHERE source_tenant_id = %s OR target_tenant_id = %s

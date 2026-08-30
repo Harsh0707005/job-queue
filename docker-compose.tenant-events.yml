@@ -1,0 +1,55 @@
+# Sealed per-tenant event log on a multi-coordinator fleet.
+# Do not use --abort-on-container-exit: the soak kills the leader.
+#
+#   COMPOSE_PROJECT_NAME=jq-events docker compose -p jq-events \
+#     -f docker-compose.yml -f docker-compose.coordinator-leader.yml \
+#     -f docker-compose.tenant-events.yml up --build -d
+#   docker logs -f jq-events-tenant-events-soak-1
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+  leader-soak:
+    profiles: ["disabled"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+  coordinator-1:
+    ports: !reset []
+  coordinator-2:
+    ports: !reset []
+  coordinator-3:
+    ports: !reset []
+
+  tenant-events-soak:
+    build: .
+    command: ["python", "scripts/tenant_events_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+      TENANTS: "4"
+      JOBS_PER_TENANT: "12"
+      MAX_WALL_SECONDS: "240"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-events}
+      LOG_LEVEL: INFO
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/app/scripts
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      coordinator-3:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      worker-2:
+        condition: service_started
+      worker-3:
+        condition: service_started
+      worker-4:
+        condition: service_started

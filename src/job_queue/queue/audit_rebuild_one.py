@@ -63,7 +63,8 @@ class AuditRebuildOneMixin:
                 """
                 SELECT
                     event_id, tenant_id, job_id, seq, event_type,
-                    from_status, to_status, actor, detail, created_at
+                    from_status, to_status, actor, detail, created_at,
+                    tenant_seq, payload_key_id
                 FROM job_audit_events
                 WHERE job_id = %s
                 ORDER BY seq ASC
@@ -71,7 +72,14 @@ class AuditRebuildOneMixin:
                 """,
                 (job_id,),
             ).fetchall()
-            events = [self._row_to_audit(r) for r in rows]
+            events = [
+                self._row_to_audit(
+                    r,
+                    conn=conn,
+                    reader_tenant=tenant_id or str(r["tenant_id"]),
+                )
+                for r in rows
+            ]
             snap = self._validate_audit_for_rebuild(job_id, events)
 
             if tenant_id is not None and snap["tenant_id"] != tenant_id:

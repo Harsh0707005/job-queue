@@ -31,13 +31,24 @@ class TenantsApiLifecycleMixin:
             return 400, {"error": "invalid tenant audit path"}
         tenant_id = parts[2]
         limit = int((query.get("limit") or ["500"])[0])
+        after_seq_raw = (query.get("after_seq") or [None])[0]
         try:
-            events = self.queue.list_tenant_audit(tenant_id, limit=limit)
+            after_seq = None if after_seq_raw is None else int(after_seq_raw)
+            events = self.queue.list_tenant_audit(
+                tenant_id, after_seq=after_seq, limit=limit
+            )
         except ValueError as exc:
             return 400, {"error": str(exc)}
+        next_seq = None
+        if events:
+            last = events[-1].tenant_seq
+            if last is not None:
+                next_seq = int(last)
         return 200, {
             "events": [job_audit_event_to_dict(e) for e in events],
             "count": len(events),
+            "after_seq": after_seq,
+            "next_seq": next_seq,
         }
 
     def _tenant_audit_verify(

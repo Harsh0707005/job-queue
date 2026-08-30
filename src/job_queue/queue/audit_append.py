@@ -14,9 +14,11 @@ from job_queue.models import (
     JobAuditEvent,
     JobStatus,
 )
+from job_queue.crypto import audit_event_aad
 from job_queue.queue._common import (
     JOB_EVENTS_CHANNEL,
     _AUDIT_SEQ_LOCK_CLASS,
+    _AUDIT_TENANT_SEQ_LOCK_CLASS,
     _NOTIFY_MAX_BYTES,
     _as_utc,
     _utcnow,
@@ -164,22 +166,45 @@ class AuditAppendMixin:
             "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
             (_AUDIT_SEQ_LOCK_CLASS, str(job_id)),
         )
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (_AUDIT_TENANT_SEQ_LOCK_CLASS, str(tenant_id)),
+        )
         event_id = uuid4()
+        stored_detail: dict[str, Any] = detail_obj
+        payload_key_id = None
+        if hasattr(self, "_seal_dict"):
+            stored_detail, payload_key_id = self._seal_dict(
+                conn,
+                tenant_id=str(tenant_id),
+                plaintext=detail_obj,
+                aad=audit_event_aad(event_id),
+                job_id=job_id,
+                blob_kind="other",
+            )
         row = conn.execute(
             """
             INSERT INTO job_audit_events (
                 event_id, tenant_id, job_id, seq, event_type,
-                from_status, to_status, actor, detail, created_at
+                from_status, to_status, actor, detail, created_at,
+                tenant_seq, payload_key_id
             )
             SELECT
                 %s, %s, %s,
                 COALESCE((
                     SELECT MAX(e.seq) FROM job_audit_events e WHERE e.job_id = %s
                 ), 0) + 1,
-                %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s,
+                COALESCE((
+                    SELECT MAX(t.tenant_seq)
+                    FROM job_audit_events t
+                    WHERE t.tenant_id = %s
+                ), 0) + 1,
+                %s
             RETURNING
                 event_id, tenant_id, job_id, seq, event_type,
-                from_status, to_status, actor, detail, created_at
+                from_status, to_status, actor, detail, created_at,
+                tenant_seq, payload_key_id
             """,
             (
                 event_id,
@@ -190,8 +215,10 @@ class AuditAppendMixin:
                 from_status,
                 to_status,
                 actor,
-                Jsonb(detail_obj),
+                Jsonb(stored_detail),
                 ts,
+                tenant_id,
+                payload_key_id,
             ),
         ).fetchone()
         assert row is not None
@@ -205,7 +232,7 @@ class AuditAppendMixin:
                 actor=actor,
                 now=ts,
             )
-        return self._row_to_audit(row)
+        return self._row_to_audit(row, conn=conn, reader_tenant=str(tenant_id))
 
     def _notify_job_progress(
         self,
@@ -221,9 +248,8 @@ class AuditAppendMixin:
         labs = job_row.get("labels") or []
         if isinstance(labs, str):
             labs = []
-        cp = job_row.get("checkpoint")
-        result = job_row.get("result")
-        # Keep payload under NOTIFY size limit.
+        # Keep payload under NOTIFY size limit. Secrets stay in the sealed
+        # durable row, not on the notify bus.
         payload: dict[str, Any] = {
             "v": 1,
             "event": event_type,
@@ -233,11 +259,9 @@ class AuditAppendMixin:
             "from_status": from_status,
             "attempts": int(job_row.get("attempts") or 0),
             "labels": list(labs)[:32],
-            "checkpoint": cp,
-            "result": result
-            if job_row["status"] == JobStatus.COMPLETED.value
-            else None,
-            "last_error": ((job_row.get("last_error") or "")[:500] or None),
+            "checkpoint": None,
+            "result": None,
+            "last_error": None,
             "actor": actor,
             "ts": now.isoformat(),
             "snapshot": False,

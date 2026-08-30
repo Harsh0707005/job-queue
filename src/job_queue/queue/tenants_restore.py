@@ -1323,17 +1323,42 @@ class TenantsRestoreMixin:
     def _restore_job_audit_events(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:
+        from job_queue.crypto import audit_event_aad, is_envelope
+
+        old_id = _parse_uuid(raw.get("event_id"))
         new_id = self._map_id(id_map, "job_audit_events", raw.get("event_id"))
         job_id = self._map_id(id_map, "jobs", raw.get("job_id"))
         detail = raw.get("detail") or {}
         if isinstance(detail, str):
             detail = json.loads(detail)
+        kid = _parse_uuid(raw.get("payload_key_id"))
+        if isinstance(detail, dict) and is_envelope(detail) and old_id is not None:
+            try:
+                opened = self._open_dict(
+                    detail,
+                    tenant_id=target,
+                    aad=audit_event_aad(old_id),
+                    conn=conn,
+                )
+                if not isinstance(opened, dict):
+                    opened = {}
+                detail, kid = self._seal_dict(
+                    conn,
+                    tenant_id=target,
+                    plaintext=opened,
+                    aad=audit_event_aad(new_id),
+                    job_id=job_id,
+                    blob_kind="other",
+                )
+            except Exception:  # noqa: BLE001
+                detail = {}
+                kid = None
         conn.execute(
             """
             INSERT INTO job_audit_events (
                 event_id, tenant_id, job_id, seq, event_type, from_status,
-                to_status, actor, detail, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                to_status, actor, detail, created_at, tenant_seq, payload_key_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (event_id) DO NOTHING
             """,
             (
@@ -1347,6 +1372,12 @@ class TenantsRestoreMixin:
                 raw.get("actor"),
                 Jsonb(detail) if isinstance(detail, dict) else Jsonb({}),
                 _parse_dt(raw.get("created_at")) or _utcnow(),
+                (
+                    int(raw["tenant_seq"])
+                    if raw.get("tenant_seq") is not None
+                    else None
+                ),
+                kid,
             ),
         )
 
