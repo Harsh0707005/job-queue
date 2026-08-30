@@ -231,6 +231,13 @@ class JobsTenantMoveMixin:
                 """,
                 (dest, job_id),
             )
+            if hasattr(self, "_rehome_job_audit_events"):
+                self._rehome_job_audit_events(
+                    conn,
+                    from_tenant=tenant_id,
+                    to_tenant=dest,
+                    job_ids=[job_id],
+                )
             if hasattr(self, "_append_job_audit"):
                 self._append_job_audit(
                     conn,

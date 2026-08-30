@@ -236,6 +236,10 @@ class TenantsMergeMixin:
                 """,
                 (target, source),
             )
+            if hasattr(self, "_rehome_job_audit_events"):
+                self._rehome_job_audit_events(
+                    conn, from_tenant=source, to_tenant=target
+                )
             for jm in jobs_moved:
                 moved_row = conn.execute(
                     f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = %s",

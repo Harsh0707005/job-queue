@@ -132,15 +132,15 @@ def test_audit_history_survives_tenant_merge(queue: JobQueue):
     assert moved is not None
     assert moved.status == JobStatus.LEASED
 
-    # Target sees full history; pre-merge rows still stamped alpha.
+    # Target sees full history restamped onto beta so offboarding alpha
+    # cannot wipe dest-owned events.
     full = queue.list_job_audit(job.id, tenant_id="beta")
     types = [e.event_type for e in full]
     assert types[:3] == ["enqueued", "leased", "checkpointed"]
     assert "tenant_merged" in types
     assert [e.seq for e in full] == list(range(1, len(full) + 1))
-    assert full[0].tenant_id == "alpha"
+    assert all(e.tenant_id == "beta" for e in full)
     merge_ev = next(e for e in full if e.event_type == "tenant_merged")
-    assert merge_ev.tenant_id == "beta"
     assert merge_ev.detail.get("from_tenant") == "alpha"
     assert merge_ev.detail.get("to_tenant") == "beta"
 
@@ -156,11 +156,11 @@ def test_audit_history_survives_tenant_merge(queue: JobQueue):
     assert report.job_status == "leased"
     assert report.audit_final_status == "leased"
 
-    # Tenant-wide catch-up for beta includes pre-merge events for owned jobs.
+    # Tenant-wide catch-up for beta includes pre-merge events (now dest-owned).
     stream = queue.list_tenant_audit("beta", limit=100)
     job_events = [e for e in stream if e.job_id == job.id]
     assert len(job_events) >= 4
-    assert any(e.tenant_id == "alpha" for e in job_events)
+    assert all(e.tenant_id == "beta" for e in job_events)
 
     # Finish under beta; history remains contiguous.
     queue.ack(

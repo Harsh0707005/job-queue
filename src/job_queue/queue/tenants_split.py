@@ -194,6 +194,7 @@ class TenantsSplitMixin:
                 )
             pending_extra = 0
             queues: set[str] = set()
+            moved_rows: list[Any] = []
             for row in rows:
                 if (
                     row["status"] == JobStatus.LEASED.value
@@ -419,7 +420,16 @@ class TenantsSplitMixin:
                     """,
                     (dest, job.id),
                 )
-                if hasattr(self, "_append_job_audit"):
+                moved_rows.append(updated)
+            if ids and hasattr(self, "_rehome_job_audit_events"):
+                self._rehome_job_audit_events(
+                    conn,
+                    from_tenant=source,
+                    to_tenant=dest,
+                    job_ids=ids,
+                )
+            if hasattr(self, "_append_job_audit"):
+                for updated in moved_rows:
                     self._append_job_audit(
                         conn,
                         job_row=updated,

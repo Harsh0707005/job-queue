@@ -268,15 +268,8 @@ class AuditAppendMixin:
         }
         raw = json.dumps(payload, default=str, separators=(",", ":"))
         if len(raw.encode("utf-8")) > _NOTIFY_MAX_BYTES:
-            # Drop large fields first.
-            payload["checkpoint"] = {"_truncated": True} if cp is not None else None
-            payload["result"] = (
-                {"_truncated": True} if payload.get("result") is not None else None
-            )
+            payload["labels"] = []
             raw = json.dumps(payload, default=str, separators=(",", ":"))
-            if len(raw.encode("utf-8")) > _NOTIFY_MAX_BYTES:
-                payload["labels"] = []
-                raw = json.dumps(payload, default=str, separators=(",", ":"))
         try:
             conn.execute(
                 "SELECT pg_notify(%s, %s)",
@@ -285,3 +278,111 @@ class AuditAppendMixin:
         except Exception:  # noqa: BLE001 — never fail mutation for notify
             logger = __import__("logging").getLogger(__name__)
             logger.exception("pg_notify job progress failed")
+
+    def _rehome_job_audit_events(
+        self,
+        conn: Any,
+        *,
+        from_tenant: str,
+        to_tenant: str,
+        job_ids: list[UUID] | None = None,
+    ) -> int:
+        """Move sealed history for transferred jobs onto *to_tenant*.
+
+        Offboarding the source tenant deletes ``job_audit_events`` stamped
+        with that tenant_id. Events for jobs that now live elsewhere must
+        be restamped (and resealed under the dest DEK) first so dest
+        list/get survive the source wipe. ``tenant_seq`` is reassigned
+        after dest's current max so the dest cursor stays unique.
+        """
+        if not from_tenant or not to_tenant or from_tenant == to_tenant:
+            return 0
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (_AUDIT_TENANT_SEQ_LOCK_CLASS, str(to_tenant)),
+        )
+        if job_ids is not None and not job_ids:
+            return 0
+        if job_ids is None:
+            rows = conn.execute(
+                """
+                SELECT event_id, tenant_id, job_id, detail, created_at
+                FROM job_audit_events
+                WHERE tenant_id = %s
+                ORDER BY tenant_seq ASC NULLS LAST, created_at ASC, event_id ASC
+                FOR UPDATE
+                """,
+                (from_tenant,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT event_id, tenant_id, job_id, detail, created_at
+                FROM job_audit_events
+                WHERE tenant_id = %s
+                  AND job_id = ANY(%s)
+                ORDER BY tenant_seq ASC NULLS LAST, created_at ASC, event_id ASC
+                FOR UPDATE
+                """,
+                (from_tenant, list(job_ids)),
+            ).fetchall()
+        if not rows:
+            return 0
+        conn.execute(
+            """
+            UPDATE job_audit_events
+            SET tenant_seq = NULL
+            WHERE event_id = ANY(%s)
+            """,
+            ([r["event_id"] for r in rows],),
+        )
+        max_row = conn.execute(
+            """
+            SELECT COALESCE(MAX(tenant_seq), 0)::bigint AS n
+            FROM job_audit_events
+            WHERE tenant_id = %s
+            """,
+            (to_tenant,),
+        ).fetchone()
+        nxt = int(max_row["n"] if max_row else 0)
+        moved = 0
+        for row in rows:
+            nxt += 1
+            opened = self._open_audit_detail(
+                row.get("detail") or {},
+                event_id=row["event_id"],
+                event_tenant=str(row["tenant_id"]),
+                reader_tenant=to_tenant,
+                conn=conn,
+            )
+            stored = opened
+            kid = None
+            if hasattr(self, "_seal_dict"):
+                stored, kid = self._seal_dict(
+                    conn,
+                    tenant_id=to_tenant,
+                    plaintext=opened if isinstance(opened, dict) else {},
+                    aad=audit_event_aad(row["event_id"]),
+                    job_id=row["job_id"],
+                    blob_kind="other",
+                    force_new=True,
+                )
+            conn.execute(
+                """
+                UPDATE job_audit_events
+                SET tenant_id = %s,
+                    tenant_seq = %s,
+                    detail = %s,
+                    payload_key_id = %s
+                WHERE event_id = %s
+                """,
+                (
+                    to_tenant,
+                    nxt,
+                    Jsonb(stored) if isinstance(stored, dict) else Jsonb({}),
+                    kid,
+                    row["event_id"],
+                ),
+            )
+            moved += 1
+        return moved

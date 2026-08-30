@@ -52,7 +52,7 @@ def test_move_pending_flips_owner_keeps_id_and_history(queue: JobQueue):
     assert src_audit == []
     events = queue.list_job_audit(src.id, tenant_id="beta")
     assert [e.event_type for e in events] == ["enqueued", "tenant_moved"]
-    assert events[0].tenant_id == "alpha"
+    assert all(e.tenant_id == "beta" for e in events)
     moved_ev = events[-1]
     assert moved_ev.tenant_id == "beta"
     assert moved_ev.detail["from_tenant"] == "alpha"

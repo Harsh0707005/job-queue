@@ -440,8 +440,17 @@ class TenantsOffboardMixin:
             (tenant_id,),
         )
         conn.execute(
-            "DELETE FROM job_audit_events WHERE tenant_id = %s",
-            (tenant_id,),
+            """
+            DELETE FROM job_audit_events e
+            WHERE e.tenant_id = %s
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM jobs j
+                    WHERE j.id = e.job_id
+                      AND j.tenant_id IS DISTINCT FROM %s
+              )
+            """,
+            (tenant_id, tenant_id),
         )
         conn.execute(
             """

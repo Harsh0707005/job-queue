@@ -91,11 +91,9 @@ class AuditReadMixin:
     ) -> list[JobAuditEvent]:
         """Replay-ordered audit events for one job (tenant-authorized).
 
-        Authorization: the job's **current** owner must be *tenant_id*. Events
-        themselves keep the tenant id at write time (immutable), so after
-        ``merge_tenant`` pre-merge rows still store the source tenant. This
-        method returns the **full** per-job ``seq`` stream (all tenants on
-        the event rows) so history is continuous across ownership transfer.
+        Authorization: the job's **current** owner must be *tenant_id*.
+        Ownership moves restamp (and reseal) prior events onto the dest
+        tenant; this still returns the full per-job ``seq`` stream.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")

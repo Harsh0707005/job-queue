@@ -80,7 +80,7 @@ def test_rebuild_after_merge_uses_target_tenant(queue: JobQueue):
     assert rebuilt.checkpoint == {"step": 1}
     assert rebuilt.status == JobStatus.LEASED
     events = queue.list_job_audit(jid, tenant_id="beta")
-    assert events[0].tenant_id == "alpha"
+    assert events[0].tenant_id == "beta"
     assert any(e.event_type == "tenant_merged" for e in events)
     assert events[-1].event_type == "rebuilt"
     assert queue.verify_job_audit(jid, tenant_id="beta").ok

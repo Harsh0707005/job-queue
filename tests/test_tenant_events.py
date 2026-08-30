@@ -128,3 +128,66 @@ def test_export_restore_keeps_sealed_events(queue: JobQueue):
     assert [e.event_type for e in dest] == ["enqueued", "leased", "completed"]
     assert dest[0].tenant_seq == 1
     assert dest[-1].detail.get("job", {}).get("status") == "completed"
+
+
+def test_split_then_offboard_source_keeps_dest_history(queue: JobQueue):
+    parent = queue.enqueue(
+        tenant_id="ev-spl-src",
+        queue_name="email",
+        payload={"secret": "keep-hist", "n": 1},
+    )
+    leased = queue.lease(tenant_id="ev-spl-src", worker_id="w", queue_name="email")
+    assert leased is not None
+    _ack(queue, leased, "w", result={"out": 1})
+    child = queue.enqueue(
+        tenant_id="ev-spl-src",
+        queue_name="email",
+        payload={"n": 2},
+        depends_on=parent.id,
+    )
+    stay = queue.enqueue(
+        tenant_id="ev-spl-src",
+        queue_name="default",
+        payload={"stay": True},
+    )
+    queue.split_tenant("ev-spl-src", "ev-spl-dst", queue_name="email")
+    dest_hist = queue.list_job_audit(parent.id, tenant_id="ev-spl-dst")
+    types = [e.event_type for e in dest_hist]
+    assert types[:3] == ["enqueued", "leased", "completed"]
+    assert "tenant_split" in types
+    assert all(e.tenant_id == "ev-spl-dst" for e in dest_hist)
+    dest_cursor = queue.list_tenant_events("ev-spl-dst")
+    assert any(e.job_id == parent.id and e.event_type == "enqueued" for e in dest_cursor)
+    stay_ev = queue.list_tenant_events("ev-spl-src")
+    assert {e.job_id for e in stay_ev} == {stay.id}
+    _ = child
+
+    queue.offboard_tenant("ev-spl-src")
+    queue.process_offboard_finalizes(limit=5)
+    still = queue.list_job_audit(parent.id, tenant_id="ev-spl-dst")
+    assert [e.event_type for e in still][:3] == ["enqueued", "leased", "completed"]
+    assert all(e.tenant_id == "ev-spl-dst" for e in still)
+    assert queue.list_tenant_events("ev-spl-src") == []
+    cursor = queue.list_tenant_events("ev-spl-dst")
+    seqs = [e.tenant_seq for e in cursor]
+    assert seqs == list(range(1, len(seqs) + 1))
+    assert any(e.job_id == parent.id for e in cursor)
+
+
+def test_merge_then_offboard_source_keeps_dest_history(queue: JobQueue):
+    job = queue.enqueue(tenant_id="ev-mrg-src", payload={"secret": "merged"})
+    leased = queue.lease(tenant_id="ev-mrg-src", worker_id="w")
+    assert leased is not None
+    keep = queue.enqueue(tenant_id="ev-mrg-dst", payload={"already": True})
+    queue.merge_tenant("ev-mrg-src", "ev-mrg-dst")
+    hist = queue.list_job_audit(job.id, tenant_id="ev-mrg-dst")
+    assert [e.event_type for e in hist][:2] == ["enqueued", "leased"]
+    assert all(e.tenant_id == "ev-mrg-dst" for e in hist)
+    queue.offboard_tenant("ev-mrg-src")
+    queue.process_offboard_finalizes(limit=5)
+    still = queue.list_job_audit(job.id, tenant_id="ev-mrg-dst")
+    assert [e.event_type for e in still][:2] == ["enqueued", "leased"]
+    assert "tenant_merged" in [e.event_type for e in still]
+    keep_ev = [e for e in queue.list_tenant_events("ev-mrg-dst") if e.job_id == keep.id]
+    assert keep_ev
+    assert queue.list_tenant_events("ev-mrg-src") == []
