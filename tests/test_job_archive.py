@@ -443,3 +443,100 @@ def test_replay_restores_checkpoint_from_archive(blob_queue: JobQueue):
     replayed = blob_queue.replay_dead_letter(job.id, tenant_id=tenant)
     assert replayed.checkpoint == {"step": 7}
     assert _row(blob_queue, job.id)["checkpoint"] == {"step": 7}
+
+
+def _blob_tenant(queue: JobQueue, blob_id) -> str | None:
+    with queue._pool.connection() as conn:
+        row = conn.execute(
+            "SELECT tenant_id FROM job_payload_blobs WHERE id = %s",
+            (blob_id,),
+        ).fetchone()
+    return None if row is None else str(row["tenant_id"])
+
+
+def test_split_archived_job_survives_source_offboard(blob_queue: JobQueue):
+    """Archive on src, split to dst, offboard src — dest still rehydrates."""
+    src, dest = "arch-split-src", "arch-split-dst"
+    blob_queue.set_tenant_job_archive(src, after_seconds=0)
+    done = blob_queue.enqueue(
+        tenant_id=src,
+        queue_name="email",
+        payload={"kind": "render", "secret": "split-payload"},
+        labels=["xfer"],
+    )
+    stay = blob_queue.enqueue(
+        tenant_id=src,
+        queue_name="default",
+        payload={"stay": True, "secret": "keep-src"},
+    )
+    leased = blob_queue.lease(tenant_id=src, worker_id="w", queue_name="email")
+    assert leased is not None and leased.id == done.id
+    _ack(blob_queue, leased, "w", result={"out": "split-result", "n": 3})
+    child = blob_queue.enqueue(
+        tenant_id=src,
+        queue_name="email",
+        payload={"kind": "follow", "secret": "child-payload"},
+        depends_on=done.id,
+    )
+    assert blob_queue.process_job_archives(limit=10).archived == 1
+    before = blob_queue.get(done.id, tenant_id=src)
+    assert before is not None and before.is_archived
+    assert before.result == {"out": "split-result", "n": 3}
+    old_archive = _row(blob_queue, done.id)["archive_blob_id"]
+    assert old_archive is not None
+    assert _blob_tenant(blob_queue, old_archive) == src
+    assert blob_queue._blob_store.exists(old_archive)
+
+    moved = blob_queue.split_tenant(src, dest, queue_name="email")
+    assert moved.jobs_moved == 2
+    assert set(moved.job_ids) == {done.id, child.id}
+    assert blob_queue.get(done.id, tenant_id=src) is None
+    assert blob_queue.get(child.id, tenant_id=src) is None
+    assert blob_queue.get(stay.id, tenant_id=src) is not None
+
+    dest_job = blob_queue.get(done.id, tenant_id=dest)
+    assert dest_job is not None
+    assert dest_job.tenant_id == dest
+    assert dest_job.is_archived
+    assert dest_job.payload == {"kind": "render", "secret": "split-payload"}
+    assert dest_job.result == {"out": "split-result", "n": 3}
+    assert dest_job.status == JobStatus.COMPLETED
+    listed = {j.id: j for j in blob_queue.list_jobs(tenant_id=dest, queue_name="email")}
+    assert listed[done.id].result == {"out": "split-result", "n": 3}
+    assert listed[done.id].is_archived
+    assert listed[child.id].payload == {"kind": "follow", "secret": "child-payload"}
+    assert not listed[child.id].is_archived
+
+    new_archive = _row(blob_queue, done.id)["archive_blob_id"]
+    assert new_archive is not None
+    assert new_archive != old_archive
+    assert _blob_tenant(blob_queue, new_archive) == dest
+    assert _row(blob_queue, done.id)["payload"] == ARCHIVE_STUB
+    assert blob_queue._blob_store.exists(new_archive)
+
+    off = blob_queue.offboard_tenant(src)
+    blob_queue.process_offboard_finalizes(limit=10)
+    blob_queue.process_payload_blobs(limit=50)
+    assert blob_queue.tenant_is_empty(src)
+    assert not blob_queue._blob_store.exists(old_archive)
+
+    still = blob_queue.get(done.id, tenant_id=dest)
+    assert still is not None
+    assert still.is_archived
+    assert still.payload == {"kind": "render", "secret": "split-payload"}
+    assert still.result == {"out": "split-result", "n": 3}
+    assert blob_queue.get_result(done.id, tenant_id=dest) == {
+        "out": "split-result",
+        "n": 3,
+    }
+    assert blob_queue._blob_store.exists(new_archive)
+    assert _blob_tenant(blob_queue, new_archive) == dest
+
+    dest_child = blob_queue.lease(tenant_id=dest, worker_id="dw", queue_name="email")
+    assert dest_child is not None and dest_child.id == child.id
+    _ack(blob_queue, dest_child, "dw", result={"follow": "ok"})
+    assert blob_queue.get_result(child.id, tenant_id=dest) == {"follow": "ok"}
+    parent_again = blob_queue.get(done.id, tenant_id=dest)
+    assert parent_again is not None
+    assert parent_again.result == {"out": "split-result", "n": 3}
+    _ = off

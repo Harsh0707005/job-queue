@@ -26,6 +26,7 @@ from job_queue.queue._common import (
     _normalize_skills,
     _utcnow,
 )
+from job_queue.queue.tenants_archive import ARCHIVE_STUB
 from job_queue.queue.tenants_drain import _normalize_queue_name
 
 _MOVABLE = {
@@ -103,6 +104,10 @@ class TenantsSplitMixin:
         as a closed unit (live workflow tick, steps, signals, generations)
         even when a tick job is leased. A leftover standalone job that
         becomes leased mid-flight still aborts the split.
+
+        Archived terminals are resealed under the destination DEK and get
+        a new dest-owned archive blob so offboarding the source cannot
+        delete a file the destination still names.
         """
         source = (source_tenant_id or "").strip()
         dest = (target_tenant_id or "").strip()
@@ -276,6 +281,39 @@ class TenantsSplitMixin:
                     new_result_blob = self._blob_id_of(sealed_result)
                     if old_result_blob and old_result_blob != new_result_blob:
                         self._orphan_blob(conn, old_result_blob)
+                insert_payload = sealed
+                insert_result = sealed_result
+                archive_blob_id = row.get("archive_blob_id")
+                stub_archived = False
+                old_archive = archive_blob_id
+                if (row.get("archived_at") or old_archive) and hasattr(
+                    self, "_write_archive_blob"
+                ):
+                    new_archive, _nbytes = self._write_archive_blob(
+                        conn,
+                        tenant_id=dest,
+                        job_id=job.id,
+                        snapshot={
+                            "v": 1,
+                            "payload": sealed,
+                            "result": sealed_result,
+                            "checkpoint": job.checkpoint,
+                        },
+                        key_id=payload_key_id,
+                    )
+                    insert_payload = dict(ARCHIVE_STUB)
+                    insert_result = None
+                    archive_blob_id = new_archive
+                    stub_archived = True
+                    if hasattr(self, "_orphan_blob"):
+                        if old_archive and old_archive != new_archive:
+                            self._orphan_blob(conn, old_archive)
+                        dest_payload_blob = self._blob_id_of(sealed)
+                        if dest_payload_blob and dest_payload_blob != new_archive:
+                            self._orphan_blob(conn, dest_payload_blob)
+                        dest_result_blob = self._blob_id_of(sealed_result)
+                        if dest_result_blob and dest_result_blob != new_archive:
+                            self._orphan_blob(conn, dest_result_blob)
                 part_id = self._compute_partition_id(
                     conn, tenant_id=dest, job_id=job.id
                 )
@@ -299,6 +337,10 @@ class TenantsSplitMixin:
                                     payload_key_id = %s,
                                     partition_id = %s,
                                     lease_tenant_id = %s,
+                                    checkpoint = CASE
+                                        WHEN %s THEN NULL ELSE checkpoint
+                                    END,
+                                    archive_blob_id = %s,
                                     updated_at = %s
                                 WHERE id = %s
                                   AND tenant_id = %s
@@ -306,13 +348,15 @@ class TenantsSplitMixin:
                                 """,
                                 (
                                     dest,
-                                    Jsonb(sealed),
+                                    Jsonb(insert_payload),
                                     None
-                                    if sealed_result is None
-                                    else Jsonb(sealed_result),
+                                    if insert_result is None
+                                    else Jsonb(insert_result),
                                     payload_key_id,
                                     part_id,
                                     lease_tid,
+                                    stub_archived,
+                                    archive_blob_id,
                                     now,
                                     job.id,
                                     source,
@@ -329,6 +373,10 @@ class TenantsSplitMixin:
                                     partition_id = %s,
                                     schedule_id = NULL,
                                     lease_tenant_id = NULL,
+                                    checkpoint = CASE
+                                        WHEN %s THEN NULL ELSE checkpoint
+                                    END,
+                                    archive_blob_id = %s,
                                     updated_at = %s
                                 WHERE id = %s
                                   AND tenant_id = %s
@@ -337,12 +385,14 @@ class TenantsSplitMixin:
                                 """,
                                 (
                                     dest,
-                                    Jsonb(sealed),
+                                    Jsonb(insert_payload),
                                     None
-                                    if sealed_result is None
-                                    else Jsonb(sealed_result),
+                                    if insert_result is None
+                                    else Jsonb(insert_result),
                                     payload_key_id,
                                     part_id,
+                                    stub_archived,
+                                    archive_blob_id,
                                     now,
                                     job.id,
                                     source,
