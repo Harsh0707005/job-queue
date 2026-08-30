@@ -540,3 +540,62 @@ def test_split_archived_job_survives_source_offboard(blob_queue: JobQueue):
     assert parent_again is not None
     assert parent_again.result == {"out": "split-result", "n": 3}
     _ = off
+
+
+def test_purge_tenant_blobs_keeps_files_if_txn_rolls_back(blob_queue: JobQueue):
+    """Coordinator kill / rollback after catalog delete must not drop files."""
+    tenant = "arch-purge-rb"
+    blob_queue.set_tenant_job_archive(tenant, after_seconds=0)
+    done = _complete(
+        blob_queue,
+        tenant,
+        {"secret": "purge-rb", "n": 1},
+        {"out": "keep-me"},
+    )
+    assert blob_queue.process_job_archives(limit=5).archived == 1
+    bid = _row(blob_queue, done.id)["archive_blob_id"]
+    assert bid is not None
+    assert blob_queue._blob_store.exists(bid)
+
+    with pytest.raises(RuntimeError, match="boom mid-purge"):
+        with transaction(blob_queue._pool) as conn:
+            n = blob_queue._purge_tenant_blobs(conn, tenant)
+            assert n >= 1
+            # Still on disk while the wipe is uncommitted.
+            assert blob_queue._blob_store.exists(bid)
+            raise RuntimeError("boom mid-purge")
+
+    assert blob_queue._blob_store.exists(bid)
+    with blob_queue._pool.connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM job_payload_blobs WHERE id = %s",
+            (bid,),
+        ).fetchone()
+    assert row is not None
+    got = blob_queue.get(done.id, tenant_id=tenant)
+    assert got is not None
+    assert got.result == {"out": "keep-me"}
+    assert got.payload == {"secret": "purge-rb", "n": 1}
+
+
+def test_purge_tenant_blobs_unlinks_files_only_after_commit(blob_queue: JobQueue):
+    tenant = "arch-purge-ok"
+    blob_queue.set_tenant_job_archive(tenant, after_seconds=0)
+    done = _complete(
+        blob_queue, tenant, {"secret": "purge-ok"}, {"out": 1}
+    )
+    blob_queue.process_job_archives(limit=5)
+    bid = _row(blob_queue, done.id)["archive_blob_id"]
+    assert blob_queue._blob_store.exists(bid)
+    with transaction(blob_queue._pool) as conn:
+        n = blob_queue._purge_tenant_blobs(conn, tenant)
+        assert n >= 1
+        assert blob_queue._blob_store.exists(bid)
+    assert not blob_queue._blob_store.exists(bid)
+    with blob_queue._pool.connection() as conn:
+        left = conn.execute(
+            "SELECT 1 FROM job_payload_blobs WHERE id = %s",
+            (bid,),
+        ).fetchone()
+    assert left is None
+    _ = done

@@ -11,7 +11,7 @@ from dataclasses import replace
 
 from job_queue.blob_store import BlobStoreError, FilesystemBlobStore
 from job_queue.crypto import REDACTED_PAYLOAD, is_blob_pointer
-from job_queue.db import transaction
+from job_queue.db import after_commit, transaction
 from job_queue.models import JobStatus, WebhookEvent
 from job_queue.queue._common import _JOB_COLUMNS, UnreadablePayloadError, _utcnow
 
@@ -60,9 +60,8 @@ class PayloadBlobsMixin:
                 bid = row["id"]
                 if self._blob_is_referenced(conn, bid):
                     continue
-                if store is not None:
-                    store.delete(bid)
                 conn.execute("DELETE FROM job_payload_blobs WHERE id = %s", (bid,))
+                self._unlink_blob_after_commit(conn, bid, store=store)
                 deleted += 1
         unreferenced = self._gc_unreferenced_files(
             limit=max(0, int(limit) - deleted)
@@ -115,8 +114,26 @@ class PayloadBlobsMixin:
             (tenant_id,),
         )
 
+    def _unlink_blob_after_commit(
+        self, conn: Any, blob_id: UUID, *, store: Any | None = None
+    ) -> None:
+        """Unlink the file only after *conn* commits the catalog delete."""
+        store = store if store is not None else getattr(self, "_blob_store", None)
+        if store is None:
+            return
+
+        def _drop(bid: UUID = blob_id, blob_store: Any = store) -> None:
+            blob_store.delete(bid)
+
+        after_commit(conn, _drop)
+
     def _purge_tenant_blobs(self, conn: Any, tenant_id: str) -> int:
-        """Delete catalog rows + files for a tenant (offboard wipe)."""
+        """Delete catalog rows for a tenant; unlink files after commit.
+
+        Files stay on disk until the wipe transaction is durable so a
+        coordinator kill or rollback cannot restore catalog rows that
+        point at missing archive/payload files.
+        """
         if not tenant_id:
             return 0
         rows = conn.execute(
@@ -127,9 +144,8 @@ class PayloadBlobsMixin:
         n = 0
         for row in rows:
             bid = row["id"]
-            if store is not None:
-                store.delete(bid)
             conn.execute("DELETE FROM job_payload_blobs WHERE id = %s", (bid,))
+            self._unlink_blob_after_commit(conn, bid, store=store)
             n += 1
         return n
 
@@ -147,9 +163,8 @@ class PayloadBlobsMixin:
             bid = row["id"]
             if self._blob_is_referenced(conn, bid):
                 continue
-            if store is not None:
-                store.delete(bid)
             conn.execute("DELETE FROM job_payload_blobs WHERE id = %s", (bid,))
+            self._unlink_blob_after_commit(conn, bid, store=store)
             n += 1
         return n
 
