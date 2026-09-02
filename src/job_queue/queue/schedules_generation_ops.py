@@ -107,6 +107,9 @@ class SchedulesGenerationOpsMixin:
                 raise ScheduleError(
                     f"tenant {tenant_id!r} is offboarding; replay is refused"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="replay", error=ScheduleError
+            )
             if self._tenant_claims_blocked(conn, tenant_id, now=now):
                 raise ScheduleError(
                     f"tenant {tenant_id!r} is paused or the breaker is open"

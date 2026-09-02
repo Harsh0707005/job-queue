@@ -73,6 +73,7 @@ class JobsCloneMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is restoring; enqueue is rejected"
                 )
+            self._assert_tenant_mutable(conn, tenant_id, action="clone")
             source_row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

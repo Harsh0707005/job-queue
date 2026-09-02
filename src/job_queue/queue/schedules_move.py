@@ -68,6 +68,9 @@ class SchedulesMoveMixin:
                     raise ScheduleError(
                         f"{label} tenant {tid!r} is restoring; move is refused"
                     )
+                self._assert_tenant_mutable(
+                    conn, tid, action="move", error=ScheduleError
+                )
             row = conn.execute(
                 f"""
                 SELECT {_SCHEDULE_COLUMNS}

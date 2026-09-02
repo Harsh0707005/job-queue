@@ -266,6 +266,8 @@ class TenantsArchiveMixin:
                      OR (archive_max_live_bytes IS NOT NULL
                          AND archive_max_live_bytes >= 0)
                 )
+                AND COALESCE(relocating, FALSE) = FALSE
+                AND COALESCE(relocated, FALSE) = FALSE
                 {clause}
                 ORDER BY tenant_id
                 """,

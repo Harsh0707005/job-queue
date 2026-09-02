@@ -33,6 +33,9 @@ class ApprovalDecideMixin:
             raise ValueError("tenant_id is required")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=ApprovalError
+            )
             self._expire_approval_timeouts_locked(conn, now=now, tenant_id=tenant_id)
             row = conn.execute(
                 f"""
@@ -141,6 +144,9 @@ class ApprovalDecideMixin:
         now = _utcnow()
         err = (reason or "approval rejected").strip()[:2000] or "approval rejected"
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=ApprovalError
+            )
             self._expire_approval_timeouts_locked(conn, now=now, tenant_id=tenant_id)
             row = conn.execute(
                 f"""
@@ -229,6 +235,9 @@ class ApprovalDecideMixin:
             raise ValueError("offset must be >= 0")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=ApprovalError
+            )
             self._expire_approval_timeouts_locked(conn, now=now, tenant_id=tenant_id)
             rows = conn.execute(
                 f"""

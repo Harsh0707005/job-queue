@@ -126,6 +126,9 @@ class DeadLettersMixin(DeadLettersGraphMixin):
                 raise ReplayError(
                     f"tenant {tenant_id!r} is offboarding; replay is rejected"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="replay", error=ReplayError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

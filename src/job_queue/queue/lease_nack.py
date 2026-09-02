@@ -45,6 +45,9 @@ class LeaseNackMixin:
 
         with transaction(self._pool) as conn:
             row = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
+            self._assert_tenant_inflight_ok(
+                conn, str(row["tenant_id"]), action="nack", error=LeaseError
+            )
             self._assert_lease_tenant(row, tenant_id)
             self._assert_active_lease(row, worker_id, lease_token, now)
 

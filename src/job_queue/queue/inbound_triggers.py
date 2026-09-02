@@ -176,6 +176,7 @@ class InboundTriggersMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is offboarding; rotate rejected"
                 )
+            self._assert_tenant_mutable(conn, tenant_id, action="update")
             row = conn.execute(
                 f"""
                 UPDATE inbound_triggers

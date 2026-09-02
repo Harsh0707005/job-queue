@@ -157,3 +157,57 @@ class TenantsPauseMixin:
         if self._is_tenant_relocating(conn, tenant_id):
             return f"tenant {tenant_id!r} is relocating"
         return None
+
+    def _relocate_stage(self, conn: Any, tenant_id: str) -> str | None:
+        row = conn.execute(
+            """
+            SELECT stage FROM tenant_relocations
+            WHERE tenant_id = %s AND status = 'running'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return None if row is None else str(row["stage"])
+
+    def _assert_tenant_mutable(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        action: str,
+        error: type[Exception] = ValueError,
+    ) -> None:
+        """Refuse operator/system writes that would diverge from the snapshot."""
+        block = self._tenant_relocate_block(conn, tenant_id)
+        if block is not None:
+            raise error(f"{block}; {action} is rejected")
+
+    def _assert_tenant_inflight_ok(
+        self,
+        conn: Any,
+        tenant_id: str,
+        *,
+        action: str,
+        error: type[Exception] = ValueError,
+    ) -> None:
+        """Allow drain-time ack/nack/heartbeat; freeze once export has started."""
+        block = self._tenant_relocate_block(conn, tenant_id)
+        if block is None:
+            return
+        if self._is_tenant_relocated(conn, tenant_id):
+            raise error(f"{block}; {action} is rejected")
+        stage = self._relocate_stage(conn, tenant_id)
+        if stage in (None, "pausing", "draining"):
+            return
+        raise error(f"{block}; {action} is rejected")
+
+    @staticmethod
+    def _sql_skip_relocating(alias: str = "jobs") -> str:
+        return (
+            f" AND NOT EXISTS ("
+            f" SELECT 1 FROM tenant_settings ts"
+            f" WHERE ts.tenant_id = {alias}.tenant_id"
+            f" AND (COALESCE(ts.relocating, FALSE)"
+            f" OR COALESCE(ts.relocated, FALSE)))"
+        )

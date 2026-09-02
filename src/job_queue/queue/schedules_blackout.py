@@ -207,6 +207,9 @@ class SchedulesBlackoutMixin:
                 raise BlackoutError(
                     f"tenant {tenant_id!r} is offboarding; blackouts are refused"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=BlackoutError
+            )
             if schedule_id is not None:
                 found = conn.execute(
                     """

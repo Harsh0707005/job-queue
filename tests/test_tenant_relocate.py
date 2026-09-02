@@ -11,7 +11,15 @@ import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-from job_queue import JobQueue, JobStatus, RelocateError
+from job_queue import (
+    CancelError,
+    FreezeError,
+    JobQueue,
+    JobStatus,
+    PostponeError,
+    PriorityError,
+    RelocateError,
+)
 from job_queue.blob_store import FilesystemBlobStore
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
@@ -260,6 +268,103 @@ def test_relocate_keeps_dest_paused_until_cutover(
         tenant_id="half-move", worker_id="after", queue_name="default"
     )
     assert claimed is not None
+
+
+def _advance_past_export(src: JobQueue, dest: JobQueue, tenant_id: str):
+    rel = _relocate(src, dest, tenant_id, batch_size=2)
+    for _ in range(80):
+        if rel.status == "complete" or rel.stage in (
+            "applying",
+            "verifying",
+            "cutover",
+            "purging",
+            "complete",
+        ):
+            return rel
+        rel = src.advance_tenant_relocate(tenant_id, batch_size=2)
+    raise AssertionError(f"export never finished: {rel}")
+
+
+def test_relocate_rejects_source_mutations_after_export(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    pending = queue.enqueue(
+        tenant_id="mut-move",
+        payload={"keep": True},
+        queue_name="default",
+    )
+    other = queue.enqueue(
+        tenant_id="mut-keep",
+        payload={"other": True},
+        queue_name="default",
+    )
+    rel = _advance_past_export(queue, dest_queue, "mut-move")
+    assert rel.stage in ("applying", "verifying", "cutover", "purging", "complete")
+
+    with pytest.raises(CancelError, match="relocating"):
+        queue.cancel(pending.id, tenant_id="mut-move")
+    with pytest.raises(PriorityError, match="relocating"):
+        queue.set_job_priority(pending.id, tenant_id="mut-move", priority=9)
+    with pytest.raises(FreezeError, match="relocating"):
+        queue.freeze(pending.id, tenant_id="mut-move")
+    with pytest.raises(PostponeError, match="relocating"):
+        queue.postpone_job(pending.id, tenant_id="mut-move", delay_seconds=30)
+    with pytest.raises(ValueError, match="relocating"):
+        queue.cancel_matching(tenant_id="mut-move")
+
+    src = queue.get(pending.id, tenant_id="mut-move")
+    assert src is not None
+    assert src.status == JobStatus.PENDING
+    assert src.priority == pending.priority
+
+    # Other tenants can still cancel.
+    cancelled = queue.cancel(other.id, tenant_id="mut-keep")
+    assert cancelled.status == JobStatus.CANCELLED
+
+    done = _relocate(
+        queue, dest_queue, "mut-move", batch_size=50, run_until_complete=True
+    )
+    assert done.status == "complete"
+    dest = dest_queue.get(pending.id, tenant_id="mut-move")
+    assert dest is not None
+    assert dest.status == JobStatus.PENDING
+    claimed = dest_queue.lease(
+        tenant_id="mut-move", worker_id="dest-w", queue_name="default"
+    )
+    assert claimed is not None and claimed.id == pending.id
+
+
+def test_relocate_skips_ttl_expire_after_export(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    from datetime import timedelta
+
+    from job_queue.queue._common import _utcnow
+
+    job = queue.enqueue(
+        tenant_id="ttl-move",
+        payload={"ttl": True},
+        queue_name="default",
+        expires_at=_utcnow() + timedelta(seconds=1),
+        expiry_action="cancel",
+    )
+    rel = _advance_past_export(queue, dest_queue, "ttl-move")
+    assert rel.status == "running" or rel.stage != "complete"
+    import time
+
+    time.sleep(1.1)
+    expired = queue.process_expired_jobs(tenant_id="ttl-move")
+    assert expired["cancelled"] == 0
+    still = queue.get(job.id, tenant_id="ttl-move")
+    assert still is not None and still.status == JobStatus.PENDING
+
+    done = _relocate(
+        queue, dest_queue, "ttl-move", batch_size=50, run_until_complete=True
+    )
+    assert done.status == "complete"
+    dest = dest_queue.get(job.id, tenant_id="ttl-move")
+    assert dest is not None
+    assert dest.status == JobStatus.PENDING
 
 
 def test_http_relocate_roundtrip(queue: JobQueue, dest_queue: JobQueue):

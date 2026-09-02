@@ -100,6 +100,8 @@ class JobsFreezeBulkMixin:
 
         if not tenant_id:
             raise ValueError("tenant_id is required")
+        with self._pool.connection() as conn:
+            self._assert_tenant_mutable(conn, tenant_id, action=action)
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         if lock_wait_seconds < 0:

@@ -328,6 +328,18 @@ def main() -> int:
             last_stage = stage
         if status == "complete":
             break
+        if leftover and stage in ("applying", "verifying", "cutover", "purging"):
+            code, body = http_json(
+                "POST",
+                f"/v1/jobs/{leftover[0]}/cancel",
+                {"tenant_id": MOVE},
+            )
+            if code in (200, 201):
+                raise RuntimeError(
+                    f"source accepted cancel after export: {code} {body}"
+                )
+            if code not in (400, 409):
+                logger.info("cancel after export -> %s %s", code, body)
         if not killed and stage in ("applying", "verifying", "cutover", "purging"):
             lead = unique_leader()
             node = (lead or {}).get("node") or "coordinator-3"

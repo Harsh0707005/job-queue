@@ -73,6 +73,12 @@ class TenantsMergeMixin:
                 raise MergeError(
                     f"cannot merge into tenant {target!r}: target is offboarding"
                 )
+            self._assert_tenant_mutable(
+                conn, source, action="merge", error=MergeError
+            )
+            self._assert_tenant_mutable(
+                conn, target, action="merge", error=MergeError
+            )
 
             # Block concurrent source enqueue / schedule / webhook registration.
             conn.execute(

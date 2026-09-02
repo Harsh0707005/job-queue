@@ -32,6 +32,9 @@ class JobsPriorityMixin:
             raise ValueError("tenant_id is required")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=PriorityError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}
@@ -109,6 +112,9 @@ class JobsPriorityMixin:
             delta = int(delta)
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=PriorityError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

@@ -115,6 +115,9 @@ class DeadLettersGraphMixin:
                 raise ReplayError(
                     f"tenant {tenant_id!r} is offboarding; replay is rejected"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="replay"
+            )
             if self._is_tenant_restoring(conn, tenant_id):
                 raise ReplayError(
                     f"tenant {tenant_id!r} is restoring; replay is rejected"

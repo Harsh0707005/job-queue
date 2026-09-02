@@ -57,6 +57,9 @@ class JobsTenantMoveMixin:
                     raise TenantMoveError(
                         f"{label} tenant {tid!r} is restoring; move is rejected"
                     )
+                self._assert_tenant_mutable(
+                    conn, tid, action="move", error=TenantMoveError
+                )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

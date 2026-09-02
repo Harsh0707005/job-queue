@@ -120,6 +120,9 @@ class SpawnChildrenMixin:
                         f"tenant {tenant_id!r} is offboarding; spawn rejected",
                         job=self._job(row),
                     )
+                self._assert_tenant_mutable(
+                    conn, tenant_id, action="spawn", error=SpawnError
+                )
 
                 for i, spec in enumerate(specs):
                     qcheck = str(spec.get("queue_name") or parent_queue)

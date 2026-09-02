@@ -84,6 +84,9 @@ class JobsCoalesceMixin:
                 raise CoalesceError(
                     f"tenant {tenant_id!r} is restoring; coalesce is rejected"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="coalesce", error=CoalesceError
+            )
             rows = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

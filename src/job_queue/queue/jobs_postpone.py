@@ -52,6 +52,9 @@ class JobsPostponeMixin:
         else:
             run_at = now + timedelta(seconds=float(delay_seconds))
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=PostponeError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

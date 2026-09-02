@@ -136,6 +136,9 @@ class TenantsSplitMixin:
                     raise TenantSplitError(
                         f"{label} tenant {tid!r} is restoring; split is rejected"
                     )
+                self._assert_tenant_mutable(
+                    conn, tid, action="split", error=TenantSplitError
+                )
             plan = self._plan_tenant_split_on_conn(
                 conn,
                 source=source,

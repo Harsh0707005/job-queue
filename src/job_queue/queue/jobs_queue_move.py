@@ -56,6 +56,9 @@ class JobsQueueMoveMixin:
                 raise QueueMoveError(
                     f"tenant {tenant_id!r} is restoring; move is rejected"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="move", error=QueueMoveError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

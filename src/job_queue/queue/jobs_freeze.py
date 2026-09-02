@@ -45,6 +45,9 @@ class JobsFreezeMixin:
         now = _utcnow()
         err = (reason or "frozen by operator").strip() or "frozen by operator"
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="freeze", error=FreezeError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}
@@ -89,6 +92,9 @@ class JobsFreezeMixin:
             raise ValueError("tenant_id is required")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="unfreeze", error=FreezeError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}

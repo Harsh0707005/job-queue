@@ -117,6 +117,9 @@ class JobsCancelBulkMixin:
             now = _utcnow()
             batch_n = 0
             with transaction(self._pool) as conn:
+                self._assert_tenant_mutable(
+                    conn, tenant_id, action="cancel", error=ValueError
+                )
                 clauses = [
                     "tenant_id = %s",
                     "status = ANY(%s)",

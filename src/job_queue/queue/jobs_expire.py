@@ -176,6 +176,7 @@ class JobsExpireMixin:
                   AND status = ANY(%s)
                   AND expires_at IS NOT NULL
                   AND expires_at < %s
+                  {self._sql_skip_relocating("jobs")}
                 ORDER BY expires_at ASC
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
@@ -190,6 +191,7 @@ class JobsExpireMixin:
                 WHERE status = ANY(%s)
                   AND expires_at IS NOT NULL
                   AND expires_at < %s
+                  {self._sql_skip_relocating("jobs")}
                 ORDER BY expires_at ASC
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED

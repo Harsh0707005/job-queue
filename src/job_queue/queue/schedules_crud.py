@@ -504,6 +504,9 @@ class SchedulesCrudMixin:
                 raise ScheduleError(
                     f"tenant {tenant_id!r} is offboarding; resume is refused"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=ScheduleError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_SCHEDULE_COLUMNS}
@@ -585,6 +588,9 @@ class SchedulesCrudMixin:
 
         while True:
             with transaction(self._pool) as conn:
+                self._assert_tenant_mutable(
+                    conn, tenant_id, action="update", error=ScheduleError
+                )
                 row = conn.execute(
                     f"""
                     SELECT {_SCHEDULE_COLUMNS}
@@ -663,6 +669,9 @@ class SchedulesCrudMixin:
             raise ValueError("tenant_id is required")
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=ScheduleError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_SCHEDULE_COLUMNS}
@@ -811,6 +820,9 @@ class SchedulesCrudMixin:
                 raise ScheduleError(
                     f"tenant {tenant_id!r} is offboarding; update is refused"
                 )
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="update", error=ScheduleError
+            )
 
             cron_expr = row.get("cron_expr")
             interval = row.get("interval_seconds")

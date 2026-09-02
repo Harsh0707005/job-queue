@@ -39,6 +39,9 @@ class JobsCancelOneMixin:
 
         now = _utcnow()
         with transaction(self._pool) as conn:
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="cancel", error=CancelError
+            )
             row = conn.execute(
                 f"""
                 SELECT {_JOB_COLUMNS}
@@ -180,6 +183,9 @@ class JobsCancelOneMixin:
         status = row["status"]
         if status not in {s.value for s in _CANCELABLE_STATUSES}:
             return None
+        self._assert_tenant_mutable(
+            conn, tenant_id, action="cancel", error=CancelError
+        )
         job_id = row["id"]
         was_running = status == JobStatus.LEASED.value
         was_awaiting_children = status == JobStatus.AWAITING_CHILDREN.value
