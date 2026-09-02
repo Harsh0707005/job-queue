@@ -16,10 +16,11 @@ from job_queue.codec import (
     tenant_split_result_to_dict,
     tenant_offboard_result_to_dict,
     tenant_payload_key_to_dict,
+    tenant_relocate_to_dict,
     tenant_restore_to_dict,
     tenant_snapshot_to_dict,
 )
-from job_queue.queue import RestoreError
+from job_queue.queue import RelocateError, RestoreError
 
 
 class TenantsApiLifecycleMixin:
@@ -403,6 +404,72 @@ class TenantsApiLifecycleMixin:
         return 200, {
             "count": len(rots),
             "restores": [tenant_restore_to_dict(r) for r in rots],
+        }
+
+    def _relocate_tenant(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid relocate path"}
+        tenant_id = parts[2]
+        dest_dsn = body.get("dest_dsn") or body.get("destination_dsn")
+        dest_blob_dir = body.get("dest_blob_dir")
+        try:
+            rel = self.queue.relocate_tenant(
+                tenant_id,
+                dest_dsn=None if dest_dsn is None else str(dest_dsn),
+                dest_blob_dir=(
+                    None if dest_blob_dir is None else str(dest_blob_dir)
+                ),
+                batch_size=int(body.get("batch_size") or 100),
+                run_until_complete=bool(body.get("run_until_complete") or False),
+            )
+        except RelocateError as exc:
+            return 409, {"error": str(exc), "code": "relocate_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"relocate": tenant_relocate_to_dict(rel)}
+
+    def _advance_tenant_relocate(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid relocate advance path"}
+        tenant_id = parts[2]
+        try:
+            rel = self.queue.advance_tenant_relocate(
+                tenant_id, batch_size=int(body.get("batch_size") or 100)
+            )
+        except RelocateError as exc:
+            return 409, {"error": str(exc), "code": "relocate_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"relocate": tenant_relocate_to_dict(rel)}
+
+    def _get_tenant_relocate(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid relocate path"}
+        rel = self.queue.get_tenant_relocate(parts[2])
+        if rel is None:
+            return 404, {"error": "relocate not found"}
+        return 200, {"relocate": tenant_relocate_to_dict(rel)}
+
+    def _advance_all_relocations(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            rels = self.queue.process_tenant_relocations(
+                limit=int(body.get("limit") or 10),
+                batch_size=int(body.get("batch_size") or 100),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(rels),
+            "relocations": [tenant_relocate_to_dict(r) for r in rels],
         }
 
     def _list_tenant_payload_keys(

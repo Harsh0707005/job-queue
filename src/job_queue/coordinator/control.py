@@ -243,6 +243,15 @@ class CoordinatorControlLoop:
                 )
         except Exception:  # noqa: BLE001
             logger.exception("control restore tick failed node=%s", self.node_id)
+        if self._stop.is_set() or not self.is_leader():
+            return
+        try:
+            if hasattr(self.queue, "process_tenant_relocations"):
+                self.queue.process_tenant_relocations(
+                    limit=10, batch_size=min(self.retention_limit, 200)
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("control relocate tick failed node=%s", self.node_id)
 
 
 def _env_flag(name: str, default: str = "1") -> bool:

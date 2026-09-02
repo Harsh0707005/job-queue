@@ -493,6 +493,54 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def relocate_tenant(
+        self,
+        tenant_id: str,
+        *,
+        dest_dsn: str | None = None,
+        dest_blob_dir: str | None = None,
+        batch_size: int = 100,
+        run_until_complete: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "batch_size": batch_size,
+            "run_until_complete": run_until_complete,
+        }
+        if dest_dsn is not None:
+            body["dest_dsn"] = dest_dsn
+        if dest_blob_dir is not None:
+            body["dest_blob_dir"] = dest_blob_dir
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/relocate", body)
+        assert payload is not None
+        return payload
+
+    def advance_tenant_relocate(
+        self, tenant_id: str, *, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/relocate/advance",
+            {"batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_relocate(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/relocate")
+        assert payload is not None
+        return payload
+
+    def process_tenant_relocations(
+        self, *, limit: int = 10, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            "/v1/admin/relocations/advance",
+            {"limit": limit, "batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
     def process_payload_key_rotations(
         self,
         *,

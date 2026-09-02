@@ -805,6 +805,35 @@ class RoutingMixin:
             and path.endswith("/restore")
         ):
             return self._get_tenant_restore(path)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/relocate/advance")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._advance_tenant_relocate(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/relocate")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._relocate_tenant(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/relocate")
+        ):
+            return self._get_tenant_relocate(path)
+        if method == "POST" and path == "/v1/admin/relocations/advance":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._advance_all_relocations(body)
         if method == "GET" and path.startswith("/v1/snapshots/"):
             return self._get_snapshot(path)
         if method == "POST" and path == "/v1/admin/restores/advance":

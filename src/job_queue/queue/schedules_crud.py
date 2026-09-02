@@ -350,6 +350,9 @@ class SchedulesCrudMixin:
                     f"tenant {tenant_id!r} is offboarding; "
                     "schedule registration is rejected"
                 )
+            block = self._tenant_relocate_block(conn, tenant_id)
+            if block is not None:
+                raise ValueError(f"{block}; schedule registration is rejected")
             self._assert_waits_on_ok(
                 conn, tenant_id=tenant_id, schedule_id=sid, waits_on=wait_ids
             )

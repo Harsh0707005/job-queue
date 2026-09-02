@@ -85,6 +85,9 @@ class InboundTriggersMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is offboarding; trigger create rejected"
                 )
+            block = self._tenant_relocate_block(conn, tenant_id)
+            if block is not None:
+                raise ValueError(f"{block}; trigger create rejected")
             try:
                 row = conn.execute(
                     f"""
@@ -282,6 +285,9 @@ class InboundTriggersMixin:
                 raise ValueError(
                     f"tenant {trig.tenant_id!r} is offboarding; inbound rejected"
                 )
+            block = self._tenant_relocate_block(conn, trig.tenant_id)
+            if block is not None:
+                raise ValueError(f"{block}; inbound rejected")
             if action not in trig.kinds:
                 raise PermissionError(f"trigger does not allow action {action!r}")
             body_tenant = body.get("tenant_id")

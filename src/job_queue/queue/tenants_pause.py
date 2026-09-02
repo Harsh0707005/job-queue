@@ -60,6 +60,9 @@ class TenantsPauseMixin:
                 raise ValueError(
                     f"tenant {tenant_id!r} is restoring and cannot be resumed"
                 )
+            block = self._tenant_relocate_block(conn, tenant_id)
+            if block is not None:
+                raise ValueError(block)
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
@@ -125,3 +128,32 @@ class TenantsPauseMixin:
         if row is None:
             return False
         return bool(row["offboarding"])
+
+    @staticmethod
+    def _is_tenant_relocating(conn: Any, tenant_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT relocating FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return bool(row and row.get("relocating"))
+
+    @staticmethod
+    def _is_tenant_relocated(conn: Any, tenant_id: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT relocated FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return bool(row and row.get("relocated"))
+
+    def _tenant_relocate_block(self, conn: Any, tenant_id: str) -> str | None:
+        if self._is_tenant_relocated(conn, tenant_id):
+            return f"tenant {tenant_id!r} has been relocated"
+        if self._is_tenant_relocating(conn, tenant_id):
+            return f"tenant {tenant_id!r} is relocating"
+        return None

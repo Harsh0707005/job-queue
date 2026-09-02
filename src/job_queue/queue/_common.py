@@ -939,6 +939,10 @@ class RestoreError(Exception):
     """Raised when tenant export/restore cannot proceed."""
 
 
+class RelocateError(Exception):
+    """Raised when a live tenant relocate across Postgres cannot proceed."""
+
+
 class MergeError(Exception):
     """Raised when a tenant ownership transfer cannot complete."""
 

@@ -43,10 +43,13 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "schedule_generations",
     "job_dag_batches",
     "workflow_step_runs",
+    "workflow_activities",
     "job_side_effects",
     "job_audit_events",
     "webhook_endpoints",
     "webhook_deliveries",
+    "inbound_triggers",
+    "inbound_job_callbacks",
     "alert_rules",
     "alert_events",
     "queue_metric_buckets",
@@ -149,8 +152,24 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "id, endpoint_id, tenant_id, job_id, event, payload, status, attempts, "
         "max_attempts, backoff_base_seconds, backoff_max_seconds, "
         "next_attempt_at, delivering_until, last_error, last_status_code, "
-        "created_at, updated_at, completed_at, signing_secret, payload_key_id",
+        "created_at, updated_at, completed_at, signing_secret, payload_key_id, "
+        "callback_url",
         "webhook_deliveries",
+    ),
+    "inbound_triggers": (
+        "id, tenant_id, name, secret, kinds, enabled, created_at, updated_at",
+        "inbound_triggers",
+    ),
+    "inbound_job_callbacks": (
+        "job_id, trigger_id, tenant_id, callback_url, signing_secret, created_at",
+        "inbound_job_callbacks",
+    ),
+    "workflow_activities": (
+        "id, step_run_id, job_id, run_id, tenant_id, name, url, status, "
+        "timeout_seconds, heartbeat_timeout_seconds, started_at, "
+        "last_heartbeat_at, heartbeat_due_at, timeout_at, completed_at, "
+        "result, error, created_at, updated_at",
+        "workflow_activities",
     ),
     "alert_rules": (
         "id, name, enabled, scope, tenant_id, worker_id, metric, comparator, "
@@ -375,6 +394,9 @@ class TenantsExportMixin:
             "job_dag_batches": "created_at ASC, id ASC",
             "job_audit_events": "event_id ASC",
             "schedule_generations": "schedule_id ASC, iteration ASC",
+            "inbound_job_callbacks": "job_id ASC",
+            "inbound_triggers": "id ASC",
+            "workflow_activities": "id ASC",
         }.get(kind, "id ASC")
         total = 0
         seq = 0

@@ -1491,13 +1491,13 @@ class TenantsRestoreMixin:
                 attempts, max_attempts, backoff_base_seconds, backoff_max_seconds,
                 next_attempt_at, delivering_until, last_error, last_status_code,
                 created_at, updated_at, completed_at, signing_secret,
-                payload_key_id
+                payload_key_id, callback_url
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s, %s,
-                %s
+                %s, %s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -1522,6 +1522,7 @@ class TenantsRestoreMixin:
                 completed_at,
                 raw.get("signing_secret"),
                 kid,
+                raw.get("callback_url"),
             ),
         )
 
@@ -1722,6 +1723,106 @@ class TenantsRestoreMixin:
                 int(raw.get("webhook_dead") or 0),
                 int(raw.get("schedules_enabled") or 0),
                 int(raw.get("schedules_due") or 0),
+            ),
+        )
+
+    def _restore_workflow_activities(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        new_id = self._map_id(id_map, "workflow_activities", raw.get("id"))
+        step_id = self._mapped(id_map, "workflow_step_runs", raw.get("step_run_id"))
+        run_id = self._mapped(id_map, "workflow_runs", raw.get("run_id"))
+        if step_id is None or run_id is None:
+            return
+        job_id = (
+            self._mapped(id_map, "jobs", raw.get("job_id"))
+            if raw.get("job_id")
+            else None
+        )
+        result = raw.get("result")
+        conn.execute(
+            """
+            INSERT INTO workflow_activities (
+                id, step_run_id, job_id, run_id, tenant_id, name, url, status,
+                timeout_seconds, heartbeat_timeout_seconds, started_at,
+                last_heartbeat_at, heartbeat_due_at, timeout_at, completed_at,
+                result, error, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                new_id,
+                step_id,
+                job_id,
+                run_id,
+                target,
+                raw.get("name") or "activity",
+                raw.get("url"),
+                raw.get("status") or "running",
+                float(raw.get("timeout_seconds") or 30),
+                float(raw.get("heartbeat_timeout_seconds") or 10),
+                _parse_dt(raw.get("started_at")) or _utcnow(),
+                _parse_dt(raw.get("last_heartbeat_at")) or _utcnow(),
+                _parse_dt(raw.get("heartbeat_due_at")) or _utcnow(),
+                _parse_dt(raw.get("timeout_at")) or _utcnow(),
+                _parse_dt(raw.get("completed_at")),
+                Jsonb(result) if isinstance(result, (dict, list)) else result,
+                raw.get("error"),
+                _parse_dt(raw.get("created_at")) or _utcnow(),
+                _parse_dt(raw.get("updated_at")) or _utcnow(),
+            ),
+        )
+
+    def _restore_inbound_triggers(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        new_id = self._map_id(id_map, "inbound_triggers", raw.get("id"))
+        conn.execute(
+            """
+            INSERT INTO inbound_triggers (
+                id, tenant_id, name, secret, kinds, enabled, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                new_id,
+                target,
+                raw.get("name") or str(new_id),
+                raw.get("secret") or ("restored-trigger-" + str(new_id)[:16]),
+                list(raw.get("kinds") or ["job"]),
+                bool(raw.get("enabled", True)),
+                _parse_dt(raw.get("created_at")) or _utcnow(),
+                _parse_dt(raw.get("updated_at")) or _utcnow(),
+            ),
+        )
+
+    def _restore_inbound_job_callbacks(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        job_id = self._mapped(id_map, "jobs", raw.get("job_id"))
+        trigger_id = self._mapped(id_map, "inbound_triggers", raw.get("trigger_id"))
+        if job_id is None or trigger_id is None:
+            return
+        conn.execute(
+            """
+            INSERT INTO inbound_job_callbacks (
+                job_id, trigger_id, tenant_id, callback_url, signing_secret,
+                created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (job_id) DO NOTHING
+            """,
+            (
+                job_id,
+                trigger_id,
+                target,
+                raw.get("callback_url") or "",
+                raw.get("signing_secret") or "",
+                _parse_dt(raw.get("created_at")) or _utcnow(),
             ),
         )
 

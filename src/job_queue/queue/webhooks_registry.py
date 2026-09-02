@@ -74,6 +74,9 @@ class WebhooksRegistryMixin:
                     f"tenant {tenant_id!r} is offboarding; "
                     "webhook registration is rejected"
                 )
+            block = self._tenant_relocate_block(conn, tenant_id)
+            if block is not None:
+                raise ValueError(f"{block}; webhook registration is rejected")
             row = conn.execute(
                 f"""
                 INSERT INTO webhook_endpoints (

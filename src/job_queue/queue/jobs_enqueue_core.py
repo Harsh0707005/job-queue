@@ -253,6 +253,9 @@ class JobsEnqueueCoreMixin:
             raise ValueError(
                 f"tenant {tenant_id!r} is restoring; enqueue is rejected"
             )
+        block = self._tenant_relocate_block(conn, tenant_id)
+        if block is not None:
+            raise ValueError(f"{block}; enqueue is rejected")
         if dep_ids:
             self._validate_dependencies(
                 conn, tenant_id=tenant_id, depends_on=dep_ids

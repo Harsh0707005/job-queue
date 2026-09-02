@@ -1843,4 +1843,56 @@ CREATE INDEX IF NOT EXISTS idx_workflow_activities_job
     ON workflow_activities (job_id)
     WHERE job_id IS NOT NULL;
 
+-- Live tenant relocate across Postgres (crash-safe, other tenants keep running).
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS relocating BOOLEAN;
+UPDATE tenant_settings SET relocating = FALSE WHERE relocating IS NULL;
+ALTER TABLE tenant_settings ALTER COLUMN relocating SET DEFAULT FALSE;
+ALTER TABLE tenant_settings ALTER COLUMN relocating SET NOT NULL;
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS relocated BOOLEAN;
+UPDATE tenant_settings SET relocated = FALSE WHERE relocated IS NULL;
+ALTER TABLE tenant_settings ALTER COLUMN relocated SET DEFAULT FALSE;
+ALTER TABLE tenant_settings ALTER COLUMN relocated SET NOT NULL;
+
+CREATE TABLE IF NOT EXISTS tenant_relocations (
+    id                  UUID PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    dest_dsn            TEXT NOT NULL,
+    dest_blob_dir       TEXT,
+    snapshot_id         UUID,
+    status              TEXT NOT NULL,
+    stage               TEXT NOT NULL,
+    kind_index          INTEGER NOT NULL DEFAULT 0,
+    blob_seq            INTEGER NOT NULL DEFAULT 0,
+    blob_offset         INTEGER NOT NULL DEFAULT 0,
+    counts              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    CONSTRAINT tenant_relocations_status_check CHECK (
+        status IN ('running', 'complete', 'failed')
+    ),
+    CONSTRAINT tenant_relocations_stage_check CHECK (
+        stage IN (
+            'pausing', 'draining', 'exporting', 'applying',
+            'verifying', 'cutover', 'purging', 'complete'
+        )
+    ),
+    CONSTRAINT tenant_relocations_kind_index_check CHECK (kind_index >= 0),
+    CONSTRAINT tenant_relocations_blob_seq_check CHECK (blob_seq >= 0),
+    CONSTRAINT tenant_relocations_blob_offset_check CHECK (blob_offset >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_relocations_one_active
+    ON tenant_relocations (tenant_id)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_tenant_relocations_tenant
+    ON tenant_relocations (tenant_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_relocations_running
+    ON tenant_relocations (updated_at)
+    WHERE status = 'running';
+
 """

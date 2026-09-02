@@ -785,6 +785,25 @@ class TenantRestore:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantRelocate:
+    """Resumable live move of one tenant onto another Postgres."""
+
+    id: UUID
+    tenant_id: str
+    dest_dsn: str
+    dest_blob_dir: str | None
+    snapshot_id: UUID | None
+    status: str
+    stage: str
+    kind_index: int
+    counts: dict[str, int]
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PreemptResult:
     """One preemption: urgent pending gained a slot by parking a leased job."""
 

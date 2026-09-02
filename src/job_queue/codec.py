@@ -34,6 +34,7 @@ from job_queue.models import (
     ReplayGraphResult,
     TenantOffboardResult,
     TenantPayloadKey,
+    TenantRelocate,
     TenantRestore,
     TenantSnapshot,
     TenantBreaker,
@@ -795,6 +796,22 @@ def tenant_restore_to_dict(rst: TenantRestore) -> dict[str, Any]:
         "updated_at": _dt(rst.updated_at),
         "completed_at": _dt(rst.completed_at),
         "error": rst.error,
+    }
+
+
+def tenant_relocate_to_dict(rel: TenantRelocate) -> dict[str, Any]:
+    return {
+        "id": str(rel.id),
+        "tenant_id": rel.tenant_id,
+        "snapshot_id": None if rel.snapshot_id is None else str(rel.snapshot_id),
+        "status": rel.status,
+        "stage": rel.stage,
+        "kind_index": rel.kind_index,
+        "counts": dict(rel.counts),
+        "created_at": _dt(rel.created_at),
+        "updated_at": _dt(rel.updated_at),
+        "completed_at": _dt(rel.completed_at),
+        "error": rel.error,
     }
 
 

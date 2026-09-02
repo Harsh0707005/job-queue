@@ -116,6 +116,9 @@ class JobsEnqueueDagMixin:
             raise ValueError(
                 f"tenant {tenant_id!r} is restoring; enqueue is rejected"
             )
+        block = self._tenant_relocate_block(conn, tenant_id)
+        if block is not None:
+            raise ValueError(f"{block}; enqueue is rejected")
         existing = conn.execute(
             """
             SELECT id, job_ids, refs

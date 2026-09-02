@@ -83,6 +83,17 @@ class BaseMixin:
         return q
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        dests = getattr(self, "_relocate_dests", None)
+        if dests:
+            for q in list(dests.values()):
+                try:
+                    q.close()
+                except Exception:
+                    pass
+            dests.clear()
         self._pool.close()
 
     @property
