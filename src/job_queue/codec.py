@@ -812,6 +812,7 @@ def tenant_relocate_to_dict(rel: TenantRelocate) -> dict[str, Any]:
         "updated_at": _dt(rel.updated_at),
         "completed_at": _dt(rel.completed_at),
         "error": rel.error,
+        "source_paused": bool(rel.source_paused),
     }
 
 

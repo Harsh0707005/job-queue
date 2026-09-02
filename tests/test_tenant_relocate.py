@@ -270,6 +270,27 @@ def test_relocate_keeps_dest_paused_until_cutover(
     assert claimed is not None
 
 
+def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue):
+    job = queue.enqueue(tenant_id="paused-move", payload={"stay": "paused"})
+    queue.pause_tenant("paused-move")
+    assert queue.is_tenant_paused("paused-move")
+
+    rel = _relocate(
+        queue, dest_queue, "paused-move", batch_size=50, run_until_complete=True
+    )
+    assert rel.status == "complete"
+    assert rel.source_paused is True
+    assert dest_queue.is_tenant_paused("paused-move")
+    assert dest_queue.lease(
+        tenant_id="paused-move", worker_id="too-soon", queue_name="default"
+    ) is None
+    dest_queue.resume_tenant("paused-move")
+    claimed = dest_queue.lease(
+        tenant_id="paused-move", worker_id="after", queue_name="default"
+    )
+    assert claimed is not None and claimed.id == job.id
+
+
 def _advance_past_export(src: JobQueue, dest: JobQueue, tenant_id: str):
     rel = _relocate(src, dest, tenant_id, batch_size=2)
     for _ in range(80):

@@ -1866,6 +1866,7 @@ CREATE TABLE IF NOT EXISTS tenant_relocations (
     blob_seq            INTEGER NOT NULL DEFAULT 0,
     blob_offset         INTEGER NOT NULL DEFAULT 0,
     counts              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_paused       BOOLEAN NOT NULL DEFAULT FALSE,
     error               TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1894,5 +1895,10 @@ CREATE INDEX IF NOT EXISTS idx_tenant_relocations_tenant
 CREATE INDEX IF NOT EXISTS idx_tenant_relocations_running
     ON tenant_relocations (updated_at)
     WHERE status = 'running';
+
+ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS source_paused BOOLEAN;
+UPDATE tenant_relocations SET source_paused = FALSE WHERE source_paused IS NULL;
+ALTER TABLE tenant_relocations ALTER COLUMN source_paused SET DEFAULT FALSE;
+ALTER TABLE tenant_relocations ALTER COLUMN source_paused SET NOT NULL;
 
 """

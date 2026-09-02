@@ -74,6 +74,7 @@ def relocate_from_row(row: dict[str, Any]) -> TenantRelocate:
         updated_at=row["updated_at"],
         completed_at=row.get("completed_at"),
         error=row.get("error"),
+        source_paused=bool(row.get("source_paused")),
     )
 
 
@@ -342,6 +343,7 @@ class TenantsRelocateMixin:
     def _relocate_pause(self, row: dict[str, Any], *, now: datetime) -> TenantRelocate:
         tenant_id = str(row["tenant_id"])
         with transaction(self._pool) as conn:
+            was_paused = self._is_tenant_paused(conn, tenant_id)
             conn.execute(
                 """
                 INSERT INTO tenant_settings (
@@ -356,6 +358,14 @@ class TenantsRelocateMixin:
                     updated_at = EXCLUDED.updated_at
                 """,
                 (tenant_id, now),
+            )
+            conn.execute(
+                """
+                UPDATE tenant_relocations
+                SET source_paused = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (was_paused, now, row["id"]),
             )
             return self._set_relocate_stage(conn, row["id"], "draining", now=now)
 
@@ -537,7 +547,10 @@ class TenantsRelocateMixin:
                     if raw:
                         exported = raw[0]
         dest._finalize_restore_locked_on_pool(
-            tenant_id=tenant_id, exported_settings=exported, now=now
+            tenant_id=tenant_id,
+            exported_settings=exported,
+            now=now,
+            paused=bool(row.get("source_paused")),
         )
         with transaction(self._pool) as conn:
             conn.execute(
@@ -805,12 +818,13 @@ class TenantsRelocateMixin:
         tenant_id: str,
         exported_settings: Any,
         now: datetime,
+        paused: bool = False,
     ) -> None:
         with transaction(self._pool) as conn:
             live_settings = dict(exported_settings or {})
-            # Relocate pauses the source for a consistent snapshot; dest
-            # must come up serving unless the tenant was already paused.
-            live_settings["paused"] = False
+            # Relocate itself pauses source for a consistent snapshot.
+            # Dest must keep the pre-relocate pause flag, not that freeze.
+            live_settings["paused"] = bool(paused)
             live_settings["relocating"] = False
             live_settings["relocated"] = False
             live_settings["restoring"] = False
@@ -823,14 +837,14 @@ class TenantsRelocateMixin:
             conn.execute(
                 """
                 UPDATE tenant_settings
-                SET paused = FALSE,
+                SET paused = %s,
                     relocating = FALSE,
                     relocated = FALSE,
                     restoring = FALSE,
                     updated_at = %s
                 WHERE tenant_id = %s
                 """,
-                (now, tenant_id),
+                (bool(paused), now, tenant_id),
             )
 
     def _set_relocate_stage(

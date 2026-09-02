@@ -801,6 +801,7 @@ class TenantRelocate:
     updated_at: datetime
     completed_at: datetime | None = None
     error: str | None = None
+    source_paused: bool = False
 
 
 @dataclass(frozen=True, slots=True)
