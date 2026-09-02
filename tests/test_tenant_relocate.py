@@ -270,6 +270,40 @@ def test_relocate_keeps_dest_paused_until_cutover(
     assert claimed is not None
 
 
+def test_relocate_moves_inbound_nonces(queue: JobQueue, dest_queue: JobQueue):
+    trig = queue.create_inbound_trigger(
+        tenant_id="nonce-move",
+        name="hook",
+        secret="relocate-nonce-secret",
+        kinds=["job"],
+    )
+    queue.fire_inbound_trigger(
+        trig.id, {"action": "job", "payload": {"n": 1}}, nonce="once-only"
+    )
+    with pytest.raises(FileExistsError, match="replayed nonce"):
+        queue.fire_inbound_trigger(
+            trig.id, {"action": "job", "payload": {"n": 2}}, nonce="once-only"
+        )
+
+    rel = _relocate(
+        queue, dest_queue, "nonce-move", batch_size=50, run_until_complete=True
+    )
+    assert rel.status == "complete"
+    assert int(rel.counts.get("inbound_trigger_nonces") or 0) >= 1
+
+    with pytest.raises(FileExistsError, match="replayed nonce"):
+        dest_queue.fire_inbound_trigger(
+            trig.id, {"action": "job", "payload": {"n": 3}}, nonce="once-only"
+        )
+    dest_queue.fire_inbound_trigger(
+        trig.id, {"action": "job", "payload": {"n": 4}}, nonce="fresh-after-move"
+    )
+    dest_jobs = dest_queue.list_jobs(tenant_id="nonce-move")
+    assert len(dest_jobs) == 2
+    payloads = sorted(j.payload.get("n") for j in dest_jobs)
+    assert payloads == [1, 4]
+
+
 def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue):
     job = queue.enqueue(tenant_id="paused-move", payload={"stay": "paused"})
     queue.pause_tenant("paused-move")

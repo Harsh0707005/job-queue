@@ -49,6 +49,7 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "webhook_endpoints",
     "webhook_deliveries",
     "inbound_triggers",
+    "inbound_trigger_nonces",
     "inbound_job_callbacks",
     "alert_rules",
     "alert_events",
@@ -160,6 +161,10 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "id, tenant_id, name, secret, kinds, enabled, created_at, updated_at",
         "inbound_triggers",
     ),
+    "inbound_trigger_nonces": (
+        "trigger_id, nonce, seen_at",
+        "inbound_trigger_nonces",
+    ),
     "inbound_job_callbacks": (
         "job_id, trigger_id, tenant_id, callback_url, signing_secret, created_at",
         "inbound_job_callbacks",
@@ -213,7 +218,7 @@ RESTORE_RESIDUE_TABLES: tuple[str, ...] = tuple(
     dict.fromkeys(
         table
         for kind, (_cols, table) in _KIND_SQL.items()
-        if kind != "tenant_settings"
+        if kind not in ("tenant_settings", "inbound_trigger_nonces")
     )
 )
 
@@ -228,6 +233,18 @@ def tenant_residue_tables(conn: Any, tenant_id: str) -> list[str]:
         ).fetchone()
         if row is not None:
             leftover.append(table)
+    nonce = conn.execute(
+        """
+        SELECT 1
+        FROM inbound_trigger_nonces n
+        JOIN inbound_triggers t ON t.id = n.trigger_id
+        WHERE t.tenant_id = %s
+        LIMIT 1
+        """,
+        (tenant_id,),
+    ).fetchone()
+    if nonce is not None:
+        leftover.append("inbound_trigger_nonces")
     return leftover
 
 
@@ -366,6 +383,10 @@ class TenantsExportMixin:
             return self._capture_payload_blobs(
                 conn, snapshot_id=snapshot_id, tenant_id=tenant_id
             )
+        if kind == "inbound_trigger_nonces":
+            return self._capture_inbound_trigger_nonces(
+                conn, snapshot_id=snapshot_id, tenant_id=tenant_id
+            )
         if kind in ("jobs", "webhook_deliveries"):
             return self._capture_kind_with_blob_bytes(
                 conn,
@@ -396,6 +417,7 @@ class TenantsExportMixin:
             "schedule_generations": "schedule_id ASC, iteration ASC",
             "inbound_job_callbacks": "job_id ASC",
             "inbound_triggers": "id ASC",
+            "inbound_trigger_nonces": "trigger_id ASC, nonce ASC",
             "workflow_activities": "id ASC",
         }.get(kind, "id ASC")
         total = 0
@@ -422,6 +444,42 @@ class TenantsExportMixin:
                 ) VALUES (%s, %s, %s, %s, %s)
                 """,
                 (snapshot_id, kind, seq, len(blob), Jsonb(blob)),
+            )
+            total += len(rows)
+            seq += 1
+            offset += len(rows)
+            if len(rows) < CHUNK:
+                break
+        return total
+
+    def _capture_inbound_trigger_nonces(
+        self, conn: Any, *, snapshot_id: UUID, tenant_id: str
+    ) -> int:
+        total = 0
+        seq = 0
+        offset = 0
+        while True:
+            rows = conn.execute(
+                """
+                SELECT n.trigger_id, n.nonce, n.seen_at
+                FROM inbound_trigger_nonces n
+                JOIN inbound_triggers t ON t.id = n.trigger_id
+                WHERE t.tenant_id = %s
+                ORDER BY n.trigger_id ASC, n.nonce ASC
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, CHUNK, offset),
+            ).fetchall()
+            if not rows:
+                break
+            blob = [_jsonable(dict(r)) for r in rows]
+            conn.execute(
+                """
+                INSERT INTO tenant_snapshot_blobs (
+                    snapshot_id, kind, seq, row_count, rows
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (snapshot_id, "inbound_trigger_nonces", seq, len(blob), Jsonb(blob)),
             )
             total += len(rows)
             seq += 1

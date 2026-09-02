@@ -512,10 +512,21 @@ class TenantsRelocateMixin:
                 _cols, table = _KIND_SQL[kind]
                 if kind == "tenant_settings":
                     continue
-                got = dconn.execute(
-                    f"SELECT COUNT(*) AS n FROM {table} WHERE tenant_id = %s",
-                    (tenant_id,),
-                ).fetchone()["n"]
+                if kind == "inbound_trigger_nonces":
+                    got = dconn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM inbound_trigger_nonces n
+                        JOIN inbound_triggers t ON t.id = n.trigger_id
+                        WHERE t.tenant_id = %s
+                        """,
+                        (tenant_id,),
+                    ).fetchone()["n"]
+                else:
+                    got = dconn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE tenant_id = %s",
+                        (tenant_id,),
+                    ).fetchone()["n"]
                 if int(got) < int(want or 0):
                     raise RelocateError(
                         f"dest {kind} count {got} < exported {want}"

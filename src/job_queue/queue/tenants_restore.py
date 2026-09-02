@@ -1801,6 +1801,26 @@ class TenantsRestoreMixin:
             ),
         )
 
+    def _restore_inbound_trigger_nonces(
+        self, conn: Any, raw: dict, target: str, id_map: dict
+    ) -> None:
+        trigger_id = self._mapped(id_map, "inbound_triggers", raw.get("trigger_id"))
+        nonce = str(raw.get("nonce") or "").strip()
+        if trigger_id is None or not nonce:
+            return
+        conn.execute(
+            """
+            INSERT INTO inbound_trigger_nonces (trigger_id, nonce, seen_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (trigger_id, nonce) DO NOTHING
+            """,
+            (
+                trigger_id,
+                nonce,
+                _parse_dt(raw.get("seen_at")) or _utcnow(),
+            ),
+        )
+
     def _restore_inbound_job_callbacks(
         self, conn: Any, raw: dict, target: str, id_map: dict
     ) -> None:
