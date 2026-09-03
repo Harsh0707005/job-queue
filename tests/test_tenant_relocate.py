@@ -19,11 +19,12 @@ from job_queue import (
     PostponeError,
     PriorityError,
     RelocateError,
+    SpendCapError,
 )
 from job_queue.blob_store import FilesystemBlobStore
 from job_queue.coordinator import Coordinator, _make_handler
 from job_queue.remote import CoordinatorClient
-from tests.helpers_queue import _ack
+from tests.helpers_queue import _ack, _nack
 
 
 def _dest_dsn(postgres_url: str) -> str:
@@ -302,6 +303,73 @@ def test_relocate_moves_inbound_nonces(queue: JobQueue, dest_queue: JobQueue):
     assert len(dest_jobs) == 2
     payloads = sorted(j.payload.get("n") for j in dest_jobs)
     assert payloads == [1, 4]
+
+
+def test_relocate_preserves_spend_and_breaker_counters(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    tid = "cap-move"
+    queue.set_tenant_spend_cap(
+        tid, window_seconds=3600, max_enqueues=3, max_runtime_ms=10_000
+    )
+    queue.enqueue(tenant_id=tid, payload={"i": 1})
+    queue.enqueue(tenant_id=tid, payload={"i": 2})
+    queue.enqueue(tenant_id=tid, payload={"i": 3})
+    src_cap = queue.get_tenant_spend_cap(tid)
+    assert src_cap.enqueues == 3
+    assert src_cap.enqueue_remaining == 0
+    assert src_cap.window_start is not None
+
+    rel = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert rel.status == "complete"
+
+    dest_cap = dest_queue.get_tenant_spend_cap(tid)
+    assert dest_cap.max_enqueues == 3
+    assert dest_cap.max_runtime_ms == 10_000
+    assert dest_cap.window_seconds == 3600
+    assert dest_cap.enqueues == 3
+    assert dest_cap.runtime_ms == src_cap.runtime_ms
+    assert dest_cap.enqueue_remaining == 0
+    assert dest_cap.exhausted is True
+    assert dest_cap.window_start is not None
+    with pytest.raises(SpendCapError, match="enqueue cap"):
+        dest_queue.enqueue(tenant_id=tid, payload={"late": True})
+
+
+def test_relocate_preserves_open_breaker(queue: JobQueue, dest_queue: JobQueue):
+    tid = "brk-move"
+    queue.set_tenant_breaker(
+        tid, failure_threshold=2, window_seconds=60, cooldown_seconds=600
+    )
+    for i in range(2):
+        job = queue.enqueue(
+            tenant_id=tid,
+            payload={"i": i},
+            max_attempts=1,
+            retry_backoff_base_seconds=0,
+        )
+        leased = queue.lease(tenant_id=tid, worker_id=f"w-{i}")
+        assert leased is not None
+        assert _nack(queue, leased, f"w-{i}", error="boom", requeue=True).status == (
+            JobStatus.DEAD
+        )
+    src_br = queue.get_tenant_breaker(tid)
+    assert src_br.open is True
+    assert src_br.opened_at is not None
+
+    waiting = queue.enqueue(tenant_id=tid, payload={"wait": True})
+    assert queue.lease(tenant_id=tid, worker_id="blocked") is None
+
+    rel = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert rel.status == "complete"
+    dest_br = dest_queue.get_tenant_breaker(tid)
+    assert dest_br.open is True
+    assert dest_br.failures == src_br.failures
+    assert dest_br.opened_at is not None
+    assert dest_queue.lease(tenant_id=tid, worker_id="dest-blocked") is None
+    dest_queue.reset_tenant_breaker(tid)
+    claimed = dest_queue.lease(tenant_id=tid, worker_id="after-reset")
+    assert claimed is not None and claimed.id == waiting.id
 
 
 def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue):

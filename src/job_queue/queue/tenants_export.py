@@ -83,8 +83,10 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "default_job_ttl_seconds, default_expiry_action, "
         "default_max_worker_hops, default_quarantine_action, "
         "spend_enqueue_limit, spend_runtime_ms_limit, spend_window_seconds, "
+        "spend_window_start, spend_enqueues, spend_runtime_ms, "
         "breaker_failure_threshold, breaker_window_seconds, "
-        "breaker_cooldown_seconds, "
+        "breaker_cooldown_seconds, breaker_failures, breaker_window_start, "
+        "breaker_opened_at, "
         "lease_weight, draining_queues, "
         "prefer_last_worker_queues, prefer_last_worker_hold_seconds, "
         "updated_at, restoring",

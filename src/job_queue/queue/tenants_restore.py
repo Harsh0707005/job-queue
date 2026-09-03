@@ -1872,9 +1872,15 @@ class TenantsRestoreMixin:
         spend_e = None
         spend_r = None
         spend_w = None
+        spend_start = None
+        spend_enq = 0
+        spend_rt = 0
         br_t = None
         br_w = None
         br_c = None
+        br_fail = 0
+        br_start = None
+        br_opened = None
         lease_weight = None
         draining_queues = None
         prefer_queues = None
@@ -1898,9 +1904,30 @@ class TenantsRestoreMixin:
             spend_e = exported_settings.get("spend_enqueue_limit")
             spend_r = exported_settings.get("spend_runtime_ms_limit")
             spend_w = exported_settings.get("spend_window_seconds")
+            spend_start = _parse_dt(exported_settings.get("spend_window_start"))
+            try:
+                spend_enq = int(exported_settings.get("spend_enqueues") or 0)
+            except (TypeError, ValueError):
+                spend_enq = 0
+            try:
+                spend_rt = int(exported_settings.get("spend_runtime_ms") or 0)
+            except (TypeError, ValueError):
+                spend_rt = 0
+            if spend_enq < 0:
+                spend_enq = 0
+            if spend_rt < 0:
+                spend_rt = 0
             br_t = exported_settings.get("breaker_failure_threshold")
             br_w = exported_settings.get("breaker_window_seconds")
             br_c = exported_settings.get("breaker_cooldown_seconds")
+            try:
+                br_fail = int(exported_settings.get("breaker_failures") or 0)
+            except (TypeError, ValueError):
+                br_fail = 0
+            if br_fail < 0:
+                br_fail = 0
+            br_start = _parse_dt(exported_settings.get("breaker_window_start"))
+            br_opened = _parse_dt(exported_settings.get("breaker_opened_at"))
             lease_weight = exported_settings.get("lease_weight")
             raw_dq = exported_settings.get("draining_queues")
             if isinstance(raw_dq, (list, tuple)):
@@ -1939,9 +1966,9 @@ class TenantsRestoreMixin:
                 %s, %s,
                 %s, %s,
                 %s, %s,
-                %s, NULL,
-                0, 0,
-                %s, %s, %s, 0, NULL, NULL,
+                %s, %s,
+                %s, %s,
+                %s, %s, %s, %s, %s, %s,
                 %s, %s,
                 %s, %s,
                 %s
@@ -1967,9 +1994,15 @@ class TenantsRestoreMixin:
                 spend_enqueue_limit = EXCLUDED.spend_enqueue_limit,
                 spend_runtime_ms_limit = EXCLUDED.spend_runtime_ms_limit,
                 spend_window_seconds = EXCLUDED.spend_window_seconds,
+                spend_window_start = EXCLUDED.spend_window_start,
+                spend_enqueues = EXCLUDED.spend_enqueues,
+                spend_runtime_ms = EXCLUDED.spend_runtime_ms,
                 breaker_failure_threshold = EXCLUDED.breaker_failure_threshold,
                 breaker_window_seconds = EXCLUDED.breaker_window_seconds,
                 breaker_cooldown_seconds = EXCLUDED.breaker_cooldown_seconds,
+                breaker_failures = EXCLUDED.breaker_failures,
+                breaker_window_start = EXCLUDED.breaker_window_start,
+                breaker_opened_at = EXCLUDED.breaker_opened_at,
                 lease_weight = EXCLUDED.lease_weight,
                 draining_queues = EXCLUDED.draining_queues,
                 prefer_last_worker_queues = EXCLUDED.prefer_last_worker_queues,
@@ -1997,9 +2030,15 @@ class TenantsRestoreMixin:
                 spend_e,
                 spend_r,
                 spend_w,
+                spend_start,
+                spend_enq,
+                spend_rt,
                 br_t,
                 br_w,
                 br_c,
+                br_fail,
+                br_start,
+                br_opened,
                 lease_weight,
                 draining_queues,
                 prefer_queues,
