@@ -59,6 +59,16 @@ SNAPSHOT_KINDS: tuple[str, ...] = (
     "tenant_usage_buckets",
 )
 
+# Relocate also carries prior export/restore catalog so dest keeps backup
+# history. These are not part of a normal export_tenant snapshot (that would
+# nest the snapshot inside itself).
+RELOCATE_EXTRA_KINDS: tuple[str, ...] = (
+    "tenant_snapshots",
+    "tenant_snapshot_blobs",
+    "tenant_restores",
+)
+RELOCATE_SNAPSHOT_KINDS: tuple[str, ...] = SNAPSHOT_KINDS + RELOCATE_EXTRA_KINDS
+
 _KIND_SQL: dict[str, tuple[str, str]] = {
     "payload_blobs": (
         "id, tenant_id, job_id, kind, sha256, nbytes, key_id, status, "
@@ -212,6 +222,21 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
         "wait_ms",
         "tenant_usage_buckets",
     ),
+    "tenant_snapshots": (
+        "id, source_tenant_id, format_version, status, counts, error, "
+        "created_at, completed_at",
+        "tenant_snapshots",
+    ),
+    "tenant_snapshot_blobs": (
+        "snapshot_id, kind, seq, row_count, rows",
+        "tenant_snapshot_blobs",
+    ),
+    "tenant_restores": (
+        "id, snapshot_id, target_tenant_id, source_tenant_id, status, "
+        "kind_index, blob_seq, blob_offset, applied, id_map, "
+        "exported_settings, error, created_at, updated_at, completed_at",
+        "tenant_restores",
+    ),
 }
 
 # Keyset columns (unique per tenant) so pages do not OFFSET-scan prior rows.
@@ -244,6 +269,9 @@ _KIND_KEYS: dict[str, tuple[str, ...]] = {
     "queue_metric_buckets": ("bucket_start", "metric"),
     "queue_metric_snapshots": ("sampled_at",),
     "tenant_usage_buckets": ("bucket_start",),
+    "tenant_snapshots": ("id",),
+    "tenant_snapshot_blobs": ("snapshot_id", "kind", "seq"),
+    "tenant_restores": ("id",),
 }
 
 
@@ -278,7 +306,13 @@ RESTORE_RESIDUE_TABLES: tuple[str, ...] = tuple(
     dict.fromkeys(
         table
         for kind, (_cols, table) in _KIND_SQL.items()
-        if kind not in ("tenant_settings", "inbound_trigger_nonces")
+        if kind not in (
+            "tenant_settings",
+            "inbound_trigger_nonces",
+            "tenant_snapshots",
+            "tenant_snapshot_blobs",
+            "tenant_restores",
+        )
     )
 )
 
@@ -317,6 +351,26 @@ def relocate_residue_tables(conn: Any, tenant_id: str) -> list[str]:
     treated as a foreign settings row.
     """
     leftover = tenant_residue_tables(conn, tenant_id)
+    snap = conn.execute(
+        """
+        SELECT 1 FROM tenant_snapshots
+        WHERE source_tenant_id = %s
+        LIMIT 1
+        """,
+        (tenant_id,),
+    ).fetchone()
+    if snap is not None:
+        leftover.append("tenant_snapshots")
+    rst = conn.execute(
+        """
+        SELECT 1 FROM tenant_restores
+        WHERE source_tenant_id = %s OR target_tenant_id = %s
+        LIMIT 1
+        """,
+        (tenant_id, tenant_id),
+    ).fetchone()
+    if rst is not None:
+        leftover.append("tenant_restores")
     row = conn.execute(
         """
         SELECT restoring FROM tenant_settings
@@ -533,6 +587,16 @@ class TenantsExportMixin:
                 limit=limit,
                 seq=seq,
             )
+        if kind in ("tenant_snapshots", "tenant_snapshot_blobs", "tenant_restores"):
+            return self._export_backup_history_page(
+                conn,
+                snapshot_id=snapshot_id,
+                kind=kind,
+                tenant_id=tenant_id,
+                after=after,
+                limit=limit,
+                seq=seq,
+            )
         cols, table = _KIND_SQL[kind]
         key_cols = _kind_key_cols(kind)
         keyset_sql, keyset_params = _keyset_sql(kind, after)
@@ -610,6 +674,62 @@ class TenantsExportMixin:
             (snapshot_id, "inbound_trigger_nonces", seq, len(blob), Jsonb(blob)),
         )
         return len(rows), _keyset_from_row("inbound_trigger_nonces", dict(rows[-1]))
+
+    def _export_backup_history_page(
+        self,
+        conn: Any,
+        *,
+        snapshot_id: UUID,
+        kind: str,
+        tenant_id: str,
+        after: Any,
+        limit: int,
+        seq: int,
+    ) -> tuple[int, Any]:
+        """Copy prior tenant snapshots / restore rows, excluding this snapshot."""
+        cols, table = _KIND_SQL[kind]
+        key_cols = _kind_key_cols(kind)
+        keyset_sql, keyset_params = _keyset_sql(kind, after)
+        order = ", ".join(f"{c} ASC" for c in key_cols)
+        if kind == "tenant_snapshots":
+            where = "source_tenant_id = %s AND id <> %s"
+            params: tuple[Any, ...] = (tenant_id, snapshot_id)
+        elif kind == "tenant_snapshot_blobs":
+            where = (
+                "snapshot_id IN ("
+                "SELECT id FROM tenant_snapshots "
+                "WHERE source_tenant_id = %s AND id <> %s)"
+            )
+            params = (tenant_id, snapshot_id)
+        else:
+            where = (
+                "(source_tenant_id = %s OR target_tenant_id = %s) "
+                "AND snapshot_id <> %s"
+            )
+            params = (tenant_id, tenant_id, snapshot_id)
+        rows = conn.execute(
+            f"""
+            SELECT {cols}
+            FROM {table}
+            WHERE {where} {keyset_sql}
+            ORDER BY {order}
+            LIMIT %s
+            """,
+            params + keyset_params + (int(limit),),
+        ).fetchall()
+        if not rows:
+            return 0, after
+        blob = [_jsonable(dict(r)) for r in rows]
+        conn.execute(
+            """
+            INSERT INTO tenant_snapshot_blobs (
+                snapshot_id, kind, seq, row_count, rows
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (snapshot_id, kind, seq) DO NOTHING
+            """,
+            (snapshot_id, kind, seq, len(blob), Jsonb(blob)),
+        )
+        return len(rows), _keyset_from_row(kind, dict(rows[-1]))
 
     def _snapshot_sealed_value(self, value: Any) -> Any:
         """Copy ciphertext into the snapshot so restore does not need files.

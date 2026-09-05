@@ -25,8 +25,8 @@ from job_queue.db import transaction
 from job_queue.models import TenantRelocate
 from job_queue.queue._common import RelocateError, _as_utc, _utcnow
 from job_queue.queue.tenants_export import (
+    RELOCATE_SNAPSHOT_KINDS,
     SNAPSHOT_FORMAT_VERSION,
-    SNAPSHOT_KINDS,
     _KIND_SQL,
     relocate_residue_tables,
 )
@@ -53,6 +53,11 @@ _JSONB_COLUMNS = frozenset(
         "dag_jobs",
         "workflow",
         "resource_cost",
+        "counts",
+        "applied",
+        "id_map",
+        "exported_settings",
+        "rows",
     }
 )
 
@@ -721,8 +726,8 @@ class TenantsRelocateMixin:
                     return relocate_from_row(out)
             wrote = False
             seq = 0
-            while kind_index < len(SNAPSHOT_KINDS):
-                kind = SNAPSHOT_KINDS[kind_index]
+            while kind_index < len(RELOCATE_SNAPSHOT_KINDS):
+                kind = RELOCATE_SNAPSHOT_KINDS[kind_index]
                 seq, after = self._export_kind_resume(
                     conn, snapshot_id=sid, kind=kind
                 )
@@ -743,7 +748,7 @@ class TenantsRelocateMixin:
                 wrote = True
                 break
             counts = self._snapshot_kind_counts(conn, sid)
-            if kind_index >= len(SNAPSHOT_KINDS):
+            if kind_index >= len(RELOCATE_SNAPSHOT_KINDS):
                 conn.execute(
                     """
                     UPDATE tenant_snapshots
@@ -821,8 +826,8 @@ class TenantsRelocateMixin:
         remaining = batch_size
         with self._pool.connection() as src:
             with transaction(dest._pool) as dconn:
-                while remaining > 0 and kind_index < len(SNAPSHOT_KINDS):
-                    kind = SNAPSHOT_KINDS[kind_index]
+                while remaining > 0 and kind_index < len(RELOCATE_SNAPSHOT_KINDS):
+                    kind = RELOCATE_SNAPSHOT_KINDS[kind_index]
                     blob = src.execute(
                         """
                         SELECT seq, row_count, rows
@@ -859,7 +864,7 @@ class TenantsRelocateMixin:
                             kind_index += 1
                             blob_seq = 0
                             blob_offset = 0
-        done = kind_index >= len(SNAPSHOT_KINDS)
+        done = kind_index >= len(RELOCATE_SNAPSHOT_KINDS)
         next_stage = "verifying" if done else "applying"
         with transaction(self._pool) as conn:
             updated = conn.execute(
@@ -920,6 +925,32 @@ class TenantsRelocateMixin:
                         WHERE t.tenant_id = %s
                         """,
                         (tenant_id,),
+                    ).fetchone()["n"]
+                elif kind == "tenant_snapshots":
+                    got = dconn.execute(
+                        """
+                        SELECT COUNT(*) AS n FROM tenant_snapshots
+                        WHERE source_tenant_id = %s
+                        """,
+                        (tenant_id,),
+                    ).fetchone()["n"]
+                elif kind == "tenant_snapshot_blobs":
+                    got = dconn.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM tenant_snapshot_blobs b
+                        JOIN tenant_snapshots s ON s.id = b.snapshot_id
+                        WHERE s.source_tenant_id = %s
+                        """,
+                        (tenant_id,),
+                    ).fetchone()["n"]
+                elif kind == "tenant_restores":
+                    got = dconn.execute(
+                        """
+                        SELECT COUNT(*) AS n FROM tenant_restores
+                        WHERE source_tenant_id = %s OR target_tenant_id = %s
+                        """,
+                        (tenant_id, tenant_id),
                     ).fetchone()["n"]
                 else:
                     got = dconn.execute(

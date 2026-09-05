@@ -191,6 +191,68 @@ def test_relocate_moves_jobs_schedule_webhook_history(
         assert tomb is not None and tomb["relocated"] and tomb["paused"]
 
 
+def test_relocate_moves_snapshots_and_restore_history(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    tid = "snap-move"
+    job = queue.enqueue(
+        tenant_id=tid,
+        payload={"secret": "keep-backup", "n": 1},
+        queue_name="default",
+    )
+    snap = queue.export_tenant(tid)
+    assert snap.status == "ready"
+    assert snap.counts.get("jobs", 0) >= 1
+    rst = queue.restore_tenant(
+        "snap-hist", snapshot_id=snap.id, batch_size=50, run_until_complete=True
+    )
+    assert rst.status == "complete"
+
+    rel = _relocate(queue, dest_queue, tid, batch_size=20, run_until_complete=True)
+    assert rel.status == "complete"
+    assert int(rel.counts.get("tenant_snapshots") or 0) >= 1
+    assert int(rel.counts.get("tenant_snapshot_blobs") or 0) >= 1
+    assert int(rel.counts.get("tenant_restores") or 0) >= 1
+
+    dest_snap = dest_queue.get_tenant_snapshot(snap.id)
+    assert dest_snap is not None
+    assert dest_snap.status == "ready"
+    assert dest_snap.source_tenant_id == tid
+    assert dest_snap.counts.get("jobs", 0) >= 1
+    with dest_queue._pool.connection() as conn:
+        blob_n = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM tenant_snapshot_blobs
+            WHERE snapshot_id = %s
+            """,
+            (snap.id,),
+        ).fetchone()["n"]
+        hist = conn.execute(
+            """
+            SELECT source_tenant_id, target_tenant_id, status
+            FROM tenant_restores
+            WHERE id = %s
+            """,
+            (rst.id,),
+        ).fetchone()
+    assert int(blob_n) >= 1
+    assert hist is not None
+    assert hist["source_tenant_id"] == tid
+    assert hist["target_tenant_id"] == "snap-hist"
+    assert hist["status"] == "complete"
+    assert queue.get_tenant_snapshot(snap.id) is None
+
+    clone = dest_queue.restore_tenant(
+        "snap-clone", snapshot_id=snap.id, batch_size=50, run_until_complete=True
+    )
+    assert clone.status == "complete"
+    cloned = dest_queue.list_jobs(tenant_id="snap-clone")
+    assert any(j.payload.get("secret") == "keep-backup" for j in cloned)
+    moved = dest_queue.get(job.id, tenant_id=tid)
+    assert moved is not None
+    assert moved.payload == {"secret": "keep-backup", "n": 1}
+
+
 def _activity_steps(*, timeout: float = 30.0, heartbeat: float = 10.0):
     return [
         {
