@@ -541,7 +541,12 @@ class TenantsRelocateMixin:
         with transaction(self._pool) as conn:
             leased = self._count_leased(conn, tenant_id)
             delivering = self._count_webhook_delivering(conn, tenant_id)
-            if leased > 0 or delivering > 0:
+            running_acts = 0
+            if hasattr(self, "_count_running_activities"):
+                running_acts = int(
+                    self._count_running_activities(conn, tenant_id) or 0
+                )
+            if leased > 0 or delivering > 0 or running_acts > 0:
                 updated = conn.execute(
                     """
                     UPDATE tenant_relocations
@@ -752,6 +757,12 @@ class TenantsRelocateMixin:
                 raise RelocateError(
                     "refusing to purge source while webhooks are delivering"
                 )
+            if hasattr(self, "_count_running_activities"):
+                if int(self._count_running_activities(conn, tenant_id) or 0) > 0:
+                    raise RelocateError(
+                        "refusing to purge source while workflow activities "
+                        "are running"
+                    )
             self._purge_relocated_source(conn, tenant_id=tenant_id, now=now)
             updated = conn.execute(
                 """

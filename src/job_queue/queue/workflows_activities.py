@@ -147,6 +147,9 @@ class WorkflowsActivitiesMixin:
                     ).fetchone()
                     return self._row_to_workflow_activity(row or existing)
                 return self._row_to_workflow_activity(existing)
+            self._assert_tenant_mutable(
+                conn, tenant_id, action="activity start", error=LeaseError
+            )
             spec = self._activity_spec_from_job(job, conn=conn)
             timeout = float(spec["timeout_seconds"])
             hb = float(spec["heartbeat_timeout_seconds"])
@@ -229,6 +232,9 @@ class WorkflowsActivitiesMixin:
             job = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_lease_tenant(job, tenant_id)
             self._assert_active_lease(job, worker_id, lease_token, now)
+            self._assert_tenant_inflight_ok(
+                conn, tenant_id, action="activity heartbeat", error=LeaseError
+            )
             row = self._lock_activity_for_job(conn, job_id, tenant_id)
             if row["status"] != "running":
                 return self._row_to_workflow_activity(row)
@@ -278,6 +284,9 @@ class WorkflowsActivitiesMixin:
             job = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_lease_tenant(job, tenant_id)
             self._assert_active_lease(job, worker_id, lease_token, now)
+            self._assert_tenant_inflight_ok(
+                conn, tenant_id, action="activity complete", error=LeaseError
+            )
             row = self._lock_activity_for_job(conn, job_id, tenant_id)
             if row["status"] == "completed":
                 return self._row_to_workflow_activity(row)
@@ -338,6 +347,9 @@ class WorkflowsActivitiesMixin:
             job = self._lock_job_for_lease(conn, job_id, tenant_id=tenant_id)
             self._assert_lease_tenant(job, tenant_id)
             self._assert_active_lease(job, worker_id, lease_token, now)
+            self._assert_tenant_inflight_ok(
+                conn, tenant_id, action="activity fail", error=LeaseError
+            )
             row = self._lock_activity_for_job(conn, job_id, tenant_id)
             if row["status"] != "running":
                 return self._row_to_workflow_activity(row)
@@ -354,6 +366,18 @@ class WorkflowsActivitiesMixin:
                 (row["id"],),
             ).fetchone()
             return self._row_to_workflow_activity(done or row)
+
+    @staticmethod
+    def _count_running_activities(conn: Any, tenant_id: str) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM workflow_activities
+            WHERE tenant_id = %s AND status = 'running'
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return int(row["n"] if row is not None else 0)
 
     def get_workflow_activity(
         self, job_id: UUID, *, tenant_id: str
@@ -432,6 +456,15 @@ class WorkflowsActivitiesMixin:
             if peek is None or peek["status"] != "running":
                 return False
             if not self._activity_is_due(peek, now):
+                return False
+            try:
+                self._assert_tenant_inflight_ok(
+                    conn,
+                    str(peek["tenant_id"]),
+                    action="activity timeout",
+                    error=ValueError,
+                )
+            except ValueError:
                 return False
             # Lock the step job first so ack (job then activity) cannot deadlock.
             job = None

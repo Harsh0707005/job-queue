@@ -17,6 +17,7 @@ from job_queue import (
     FreezeError,
     JobQueue,
     JobStatus,
+    LeaseError,
     PostponeError,
     PriorityError,
     RelocateError,
@@ -185,6 +186,117 @@ def test_relocate_moves_jobs_schedule_webhook_history(
             ("move",),
         ).fetchone()
         assert tomb is not None and tomb["relocated"] and tomb["paused"]
+
+
+def _activity_steps(*, timeout: float = 30.0, heartbeat: float = 10.0):
+    return [
+        {
+            "name": "reserve",
+            "kind": "effect",
+            "payload": {"op": "reserve"},
+            "compensate": {"kind": "effect", "payload": {"op": "release"}},
+        },
+        {
+            "name": "charge",
+            "kind": "activity",
+            "activity": "charge",
+            "timeout_seconds": timeout,
+            "heartbeat_timeout_seconds": heartbeat,
+            "payload": {"op": "charge"},
+            "compensate": {"kind": "effect", "payload": {"op": "undo_charge"}},
+        },
+        {"name": "ship", "kind": "effect", "payload": {"op": "ship"}},
+    ]
+
+
+def _drive_effect(queue: JobQueue, tenant_id: str):
+    j = queue.lease(tenant_id=tenant_id, worker_id="w")
+    assert j is not None
+    _ack(queue, j, "w", result={"ok": True, "name": j.payload.get("step_name")})
+    return j
+
+
+def test_relocate_waits_for_running_activity(queue: JobQueue, dest_queue: JobQueue):
+    tid = "act-move"
+    queue.start_workflow(
+        tenant_id=tid, max_attempts=1, steps=_activity_steps()
+    )
+    _drive_effect(queue, tid)
+    job = queue.lease(tenant_id=tid, worker_id="w")
+    assert job is not None
+    started = queue.start_workflow_activity(
+        job.id, tenant_id=tid, worker_id="w", lease_token=job.lease_token
+    )
+    assert started.status == "running"
+
+    rel = _relocate(queue, dest_queue, tid, batch_size=50)
+    for _ in range(6):
+        assert rel.status == "running"
+        assert rel.stage == "draining"
+        hb = queue.heartbeat_workflow_activity(
+            job.id, tenant_id=tid, worker_id="w", lease_token=job.lease_token
+        )
+        assert hb.status == "running"
+        with dest_queue._pool.connection() as conn:
+            n = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM workflow_activities
+                WHERE tenant_id = %s
+                """,
+                (tid,),
+            ).fetchone()["n"]
+        assert int(n) == 0
+        rel = queue.advance_tenant_relocate(tid, batch_size=50)
+
+    done_act = queue.complete_workflow_activity(
+        job.id,
+        tenant_id=tid,
+        worker_id="w",
+        lease_token=job.lease_token,
+        result={"charged": True},
+    )
+    assert done_act.status == "completed"
+    _ack(queue, job, "w", result=done_act.result)
+
+    fin = _relocate(
+        queue, dest_queue, tid, batch_size=50, run_until_complete=True
+    )
+    assert fin.status == "complete"
+    dest_act = dest_queue.get_workflow_activity(job.id, tenant_id=tid)
+    assert dest_act is not None
+    assert dest_act.status == "completed"
+    assert dest_act.result == {"charged": True}
+    with dest_queue._pool.connection() as conn:
+        running = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM workflow_activities
+            WHERE tenant_id = %s AND status = 'running'
+            """,
+            (tid,),
+        ).fetchone()["n"]
+    assert int(running) == 0
+
+
+def test_relocate_rejects_new_activity_start(queue: JobQueue, dest_queue: JobQueue):
+    tid = "act-start-block"
+    queue.start_workflow(
+        tenant_id=tid, max_attempts=1, steps=_activity_steps()
+    )
+    _drive_effect(queue, tid)
+    job = queue.lease(tenant_id=tid, worker_id="w")
+    assert job is not None
+    rel = _relocate(queue, dest_queue, tid, batch_size=50)
+    assert rel.status == "running"
+    with pytest.raises(LeaseError, match="relocating"):
+        queue.start_workflow_activity(
+            job.id, tenant_id=tid, worker_id="w", lease_token=job.lease_token
+        )
+    aborted = queue.abort_tenant_relocate(tid)
+    assert aborted.status == "aborted"
+    started = queue.start_workflow_activity(
+        job.id, tenant_id=tid, worker_id="w", lease_token=job.lease_token
+    )
+    assert started.status == "running"
 
 
 def test_relocate_refuses_occupied_dest(queue: JobQueue, dest_queue: JobQueue):
