@@ -691,6 +691,106 @@ def test_abort_relocate_keeps_prior_pause(queue: JobQueue, dest_queue: JobQueue)
     assert queue.lease(tenant_id="abort-paused", worker_id="w") is None
 
 
+def test_redact_dest_dsn_strips_uri_and_keyword_passwords():
+    from job_queue.queue.tenants_relocate import _redact_dest_dsn
+
+    uri = _redact_dest_dsn("postgresql://alice:s3cret-pw@db.example:5432/jobs")
+    assert "s3cret-pw" not in uri
+    assert conninfo_to_dict(uri).get("password") == "***"
+    kw = _redact_dest_dsn(
+        "host=db.example dbname=jobs user=alice password=s3cret-pw"
+    )
+    assert "s3cret-pw" not in kw
+    assert conninfo_to_dict(kw).get("password") == "***"
+
+
+def _stored_relocate_secrets(q: JobQueue, tenant_id: str):
+    with q._pool.connection() as conn:
+        return conn.execute(
+            """
+            SELECT dest_dsn, dest_kek, dest_keks, status
+            FROM tenant_relocations
+            WHERE tenant_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
+        ).fetchone()
+
+
+def test_relocate_scrubs_dest_secrets_after_complete(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    tid = "scrub-done"
+    dest_kek = base64.b64encode(b"K" * 32).decode()
+    queue.enqueue(tenant_id=tid, payload={"n": 1})
+    secret = conninfo_to_dict(dest_queue.dsn).get("password") or ""
+    mid = _relocate(
+        queue,
+        dest_queue,
+        tid,
+        dest_kek=dest_kek,
+        dest_kek_id="dest",
+        batch_size=1,
+    )
+    assert mid.status == "running"
+    live = _stored_relocate_secrets(queue, tid)
+    assert live is not None
+    assert live["dest_kek"] == dest_kek
+    if secret:
+        assert conninfo_to_dict(str(live["dest_dsn"])).get("password") == secret
+
+    done = _relocate(
+        queue,
+        dest_queue,
+        tid,
+        dest_kek=dest_kek,
+        dest_kek_id="dest",
+        batch_size=50,
+        run_until_complete=True,
+    )
+    assert done.status == "complete"
+    done_pw = conninfo_to_dict(done.dest_dsn).get("password")
+    assert done_pw in (None, "", "***")
+    stored = _stored_relocate_secrets(queue, tid)
+    assert stored is not None
+    assert stored["status"] == "complete"
+    assert stored["dest_kek"] is None
+    assert stored["dest_keks"] is None
+    stored_info = conninfo_to_dict(str(stored["dest_dsn"]))
+    assert stored_info.get("password") in (None, "", "***")
+    dest_info = conninfo_to_dict(dest_queue.dsn)
+    assert stored_info.get("dbname") == dest_info.get("dbname")
+    assert stored_info.get("host") == dest_info.get("host")
+
+
+def test_abort_relocate_scrubs_dest_secrets(queue: JobQueue, dest_queue: JobQueue):
+    tid = "scrub-abort"
+    dest_kek = base64.b64encode(b"A" * 32).decode()
+    queue.enqueue(tenant_id=tid, payload={"n": 1})
+    secret = conninfo_to_dict(dest_queue.dsn).get("password") or ""
+    rel = _relocate(
+        queue,
+        dest_queue,
+        tid,
+        dest_kek=dest_kek,
+        dest_kek_id="dest",
+        batch_size=1,
+    )
+    assert rel.status == "running"
+    aborted = queue.abort_tenant_relocate(tid)
+    assert aborted.status == "aborted"
+    assert conninfo_to_dict(aborted.dest_dsn).get("password") in (None, "", "***")
+    stored = _stored_relocate_secrets(queue, tid)
+    assert stored is not None
+    assert stored["dest_kek"] is None
+    assert stored["dest_keks"] is None
+    stored_pw = conninfo_to_dict(str(stored["dest_dsn"])).get("password")
+    assert stored_pw in (None, "", "***")
+    extra = queue.enqueue(tenant_id=tid, payload={"after": True})
+    assert extra is not None
+
+
 def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue):
     job = queue.enqueue(tenant_id="paused-move", payload={"stay": "paused"})
     queue.pause_tenant("paused-move")

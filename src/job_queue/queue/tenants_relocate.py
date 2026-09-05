@@ -10,11 +10,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
 from uuid import UUID, uuid4
 
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 
 from job_queue.blob_store import FilesystemBlobStore
@@ -57,6 +59,29 @@ _JSONB_COLUMNS = frozenset(
 _TIME_COLUMNS = frozenset({"daily_start", "daily_end"})
 
 
+def _redact_dest_dsn(dsn: str) -> str:
+    """Keep dest identity, drop the password so a tombstone is not a secret."""
+    raw = (dsn or "").strip()
+    if not raw:
+        return raw
+    try:
+        info = conninfo_to_dict(raw)
+    except Exception:
+        return _redact_dest_dsn_loose(raw)
+    if not info.get("password"):
+        return raw
+    info["password"] = "***"
+    try:
+        return make_conninfo(**info)
+    except Exception:
+        return _redact_dest_dsn_loose(raw)
+
+
+def _redact_dest_dsn_loose(dsn: str) -> str:
+    out = re.sub(r"(://[^:/?#]+):([^@/]+)@", r"\1:***@", dsn)
+    return re.sub(r"(?i)\bpassword\s*=\s*\S+", "password=***", out)
+
+
 def relocate_from_row(row: dict[str, Any]) -> TenantRelocate:
     counts = row.get("counts") or {}
     if isinstance(counts, str):
@@ -64,7 +89,11 @@ def relocate_from_row(row: dict[str, Any]) -> TenantRelocate:
     return TenantRelocate(
         id=row["id"],
         tenant_id=str(row["tenant_id"]),
-        dest_dsn=str(row["dest_dsn"]),
+        dest_dsn=(
+            _redact_dest_dsn(str(row["dest_dsn"]))
+            if str(row["status"]) in ("complete", "aborted", "failed")
+            else str(row["dest_dsn"])
+        ),
         dest_blob_dir=(
             None if row.get("dest_blob_dir") is None else str(row["dest_blob_dir"])
         ),
@@ -402,6 +431,9 @@ class TenantsRelocateMixin:
                 """
                 UPDATE tenant_relocations
                 SET status = 'aborted',
+                    dest_dsn = %s,
+                    dest_kek = NULL,
+                    dest_keks = NULL,
                     error = %s,
                     updated_at = %s,
                     completed_at = %s
@@ -409,6 +441,7 @@ class TenantsRelocateMixin:
                 RETURNING *
                 """,
                 (
+                    _redact_dest_dsn(str(row["dest_dsn"])),
                     (error or row.get("error") or "aborted")[:2000],
                     now,
                     now,
@@ -967,13 +1000,21 @@ class TenantsRelocateMixin:
                 UPDATE tenant_relocations
                 SET status = 'complete',
                     stage = 'complete',
+                    dest_dsn = %s,
+                    dest_kek = NULL,
+                    dest_keks = NULL,
                     updated_at = %s,
                     completed_at = %s,
                     error = NULL
                 WHERE id = %s
                 RETURNING *
                 """,
-                (now, now, row["id"]),
+                (
+                    _redact_dest_dsn(str(row["dest_dsn"])),
+                    now,
+                    now,
+                    row["id"],
+                ),
             ).fetchone()
             assert updated is not None
             return relocate_from_row(updated)
