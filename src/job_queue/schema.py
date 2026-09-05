@@ -1872,7 +1872,7 @@ CREATE TABLE IF NOT EXISTS tenant_relocations (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at        TIMESTAMPTZ,
     CONSTRAINT tenant_relocations_status_check CHECK (
-        status IN ('running', 'complete', 'failed')
+        status IN ('running', 'complete', 'failed', 'aborted')
     ),
     CONSTRAINT tenant_relocations_stage_check CHECK (
         stage IN (
@@ -1904,5 +1904,10 @@ ALTER TABLE tenant_relocations ALTER COLUMN source_paused SET NOT NULL;
 ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS dest_kek_id TEXT;
 ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS dest_kek TEXT;
 ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS dest_keks JSONB;
+
+ALTER TABLE tenant_relocations DROP CONSTRAINT IF EXISTS tenant_relocations_status_check;
+ALTER TABLE tenant_relocations ADD CONSTRAINT tenant_relocations_status_check CHECK (
+    status IN ('running', 'complete', 'failed', 'aborted')
+);
 
 """

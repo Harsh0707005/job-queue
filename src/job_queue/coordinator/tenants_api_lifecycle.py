@@ -447,6 +447,26 @@ class TenantsApiLifecycleMixin:
             return 400, {"error": str(exc)}
         return 200, {"relocate": tenant_relocate_to_dict(rel)}
 
+    def _abort_tenant_relocate(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid relocate abort path"}
+        tenant_id = parts[2]
+        try:
+            rel = self.queue.abort_tenant_relocate(
+                tenant_id,
+                error=(
+                    None if not body.get("error") else str(body.get("error"))
+                ),
+            )
+        except RelocateError as exc:
+            return 409, {"error": str(exc), "code": "relocate_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"relocate": tenant_relocate_to_dict(rel)}
+
     def _advance_tenant_relocate(
         self, path: str, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:

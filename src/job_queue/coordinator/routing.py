@@ -808,6 +808,15 @@ class RoutingMixin:
         if (
             method == "POST"
             and path.startswith("/v1/tenants/")
+            and path.endswith("/relocate/abort")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._abort_tenant_relocate(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
             and path.endswith("/relocate/advance")
         ):
             gated = self._control_gate()

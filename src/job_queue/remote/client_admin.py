@@ -523,6 +523,18 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def abort_tenant_relocate(
+        self, tenant_id: str, *, error: str | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if error is not None:
+            body["error"] = error
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/relocate/abort", body
+        )
+        assert payload is not None
+        return payload
+
     def advance_tenant_relocate(
         self, tenant_id: str, *, batch_size: int = 100
     ) -> dict[str, Any]:

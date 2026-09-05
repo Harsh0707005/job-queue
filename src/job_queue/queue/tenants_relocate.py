@@ -151,7 +151,7 @@ class TenantsRelocateMixin:
                 rst = self.advance_tenant_relocate(
                     tenant_id, batch_size=batch_size
                 )
-                if rst.status in ("complete", "failed"):
+                if rst.status in ("complete", "failed", "aborted"):
                     return rst
             raise RelocateError("relocate did not complete within batch budget")
         return self.advance_tenant_relocate(tenant_id, batch_size=batch_size)
@@ -211,7 +211,9 @@ class TenantsRelocateMixin:
         try:
             updated = self._advance_relocate_stage(row, batch_size=batch_size, now=now)
             return updated
-        except RelocateError:
+        except RelocateError as exc:
+            if exc.fatal:
+                self.abort_tenant_relocate(tenant_id, error=str(exc))
             raise
         except Exception as exc:  # noqa: BLE001
             self._mark_relocate_error(row["id"], str(exc)[:2000])
@@ -246,6 +248,107 @@ class TenantsRelocateMixin:
                 )
             except RelocateError:
                 continue
+        return out
+
+    def abort_tenant_relocate(
+        self, tenant_id: str, *, error: str | None = None
+    ) -> TenantRelocate:
+        """Undo a relocate that has not cut dest over.
+
+        Source is unfrozen (paused only if it was paused before the move).
+        Partial dest rows written while dest was ``restoring`` are wiped.
+        Dest tenants that already had data are left alone.
+        """
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        now = _utcnow()
+        dest_row: dict[str, Any] | None = None
+        wipe_dest = False
+        with transaction(self._pool) as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"relocate:{tenant_id}",),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM tenant_relocations
+                WHERE tenant_id = %s AND status = 'running'
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if row is None:
+                latest = conn.execute(
+                    """
+                    SELECT * FROM tenant_relocations
+                    WHERE tenant_id = %s
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+                if latest is None:
+                    raise RelocateError(
+                        f"no relocate in progress for tenant {tenant_id!r}"
+                    )
+                return relocate_from_row(latest)
+            stage = str(row["stage"])
+            if stage in ("cutover", "purging", "complete"):
+                raise RelocateError(
+                    f"tenant {tenant_id!r} already cut over; abort is refused"
+                )
+            relocating = self._is_tenant_relocating(conn, tenant_id)
+            if relocating:
+                paused = bool(row.get("source_paused"))
+                conn.execute(
+                    """
+                    UPDATE tenant_settings
+                    SET paused = %s,
+                        relocating = FALSE,
+                        relocated = FALSE,
+                        restoring = FALSE,
+                        updated_at = %s
+                    WHERE tenant_id = %s
+                    """,
+                    (paused, now, tenant_id),
+                )
+            sid = row.get("snapshot_id")
+            if sid is not None:
+                conn.execute(
+                    "DELETE FROM tenant_snapshots WHERE id = %s",
+                    (sid,),
+                )
+            updated = conn.execute(
+                """
+                UPDATE tenant_relocations
+                SET status = 'aborted',
+                    error = %s,
+                    updated_at = %s,
+                    completed_at = %s
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    (error or row.get("error") or "aborted")[:2000],
+                    now,
+                    now,
+                    row["id"],
+                ),
+            ).fetchone()
+            assert updated is not None
+            dest_row = dict(row)
+            wipe_dest = stage in ("applying", "verifying")
+            out = relocate_from_row(updated)
+        if wipe_dest and dest_row is not None:
+            try:
+                dest = self._relocate_dest_queue(dest_row)
+                with dest._pool.connection() as dconn:
+                    dest_ours = dest._is_tenant_restoring(dconn, tenant_id)
+                if dest_ours:
+                    self._wipe_relocate_dest_copy(dest, tenant_id)
+            except Exception:
+                pass
         return out
 
     def _ensure_relocate(
@@ -290,6 +393,15 @@ class TenantsRelocateMixin:
             raise RelocateError(
                 f"destination KEK is not usable: {exc}"
             ) from exc
+        dest = self._relocate_dest_queue(
+            {
+                "dest_dsn": dest_dsn,
+                "dest_blob_dir": dest_blob_dir,
+                "dest_kek": dest_kek,
+                "dest_kek_id": dest_kek_id,
+                "dest_keks": dest_keks,
+            }
+        )
         with transaction(self._pool) as conn:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -336,6 +448,13 @@ class TenantsRelocateMixin:
             if existing is not None and existing["status"] == "complete":
                 if str(existing["dest_dsn"]) == dest_dsn:
                     return relocate_from_row(existing)
+            with dest._pool.connection() as dconn:
+                leftover = tenant_residue_tables(dconn, tenant_id)
+            if leftover:
+                raise RelocateError(
+                    f"dest tenant {tenant_id!r} is not empty; leftover: "
+                    + ", ".join(leftover)
+                )
             row = conn.execute(
                 """
                 INSERT INTO tenant_relocations (
@@ -745,6 +864,22 @@ class TenantsRelocateMixin:
         if crypto is not None:
             crypto.drop_tenant(tenant_id)
 
+    def _wipe_relocate_dest_copy(self, dest: Any, tenant_id: str) -> None:
+        """Remove a half-applied dest copy. Other dest tenants stay."""
+        with transaction(dest._pool) as conn:
+            dest._purge_relocated_source(conn, tenant_id=tenant_id, now=_utcnow())
+            conn.execute(
+                "DELETE FROM tenant_settings WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            conn.execute(
+                "DELETE FROM tenant_relocations WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            crypto = getattr(dest, "_crypto", None)
+            if crypto is not None:
+                crypto.drop_tenant(tenant_id)
+
     def _prepare_dest_tenant(
         self, dest: Any, tenant_id: str, *, resuming: bool
     ) -> None:
@@ -756,7 +891,8 @@ class TenantsRelocateMixin:
             if leftover and not restoring and not resuming:
                 raise RelocateError(
                     f"dest tenant {tenant_id!r} is not empty; leftover: "
-                    + ", ".join(leftover)
+                    + ", ".join(leftover),
+                    fatal=True,
                 )
             if relocated and leftover:
                 raise RelocateError(
@@ -840,7 +976,8 @@ class TenantsRelocateMixin:
                 raise RelocateError(
                     f"cannot unwrap payload key {key_id} for tenant "
                     f"{tenant_id!r} (kek_id={kek_id!r}); dest would be "
-                    f"unreadable: {exc}"
+                    f"unreadable: {exc}",
+                    fatal=True,
                 ) from exc
             new_wrapped, new_nonce = wrap_dek(
                 dest_crypto.active_kek,
@@ -898,7 +1035,8 @@ class TenantsRelocateMixin:
             except Exception as exc:  # noqa: BLE001
                 raise RelocateError(
                     f"destination cannot open payload key {raw['key_id']} "
-                    f"for tenant {tenant_id!r} (kek_id={raw['kek_id']!r}): {exc}"
+                    f"for tenant {tenant_id!r} (kek_id={raw['kek_id']!r}): {exc}",
+                    fatal=True,
                 ) from exc
 
     def _relocate_apply_blobs(

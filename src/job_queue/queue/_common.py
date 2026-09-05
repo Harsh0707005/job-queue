@@ -942,6 +942,10 @@ class RestoreError(Exception):
 class RelocateError(Exception):
     """Raised when a live tenant relocate across Postgres cannot proceed."""
 
+    def __init__(self, message: str, *, fatal: bool = False) -> None:
+        super().__init__(message)
+        self.fatal = fatal
+
 
 class MergeError(Exception):
     """Raised when a tenant ownership transfer cannot complete."""

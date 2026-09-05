@@ -194,6 +194,10 @@ def test_relocate_refuses_occupied_dest(queue: JobQueue, dest_queue: JobQueue):
         _relocate(
             queue, dest_queue, "move-busy", batch_size=50, run_until_complete=True
         )
+    assert queue.is_tenant_paused("move-busy") is False
+    assert queue.get_tenant_relocate("move-busy") is None
+    extra = queue.enqueue(tenant_id="move-busy", payload={"still": "live"})
+    assert extra is not None
 
 
 def test_relocate_resumes_after_source_reconnect(
@@ -437,6 +441,21 @@ def test_relocate_fails_if_source_dek_cannot_unwrap(
         _relocate(
             queue, dest_queue, "kek-bad", batch_size=50, run_until_complete=True
         )
+    rel = queue.get_tenant_relocate("kek-bad")
+    assert rel is not None
+    assert rel.status == "aborted"
+    assert queue.is_tenant_paused("kek-bad") is False
+    with queue._pool.connection() as conn:
+        flags = conn.execute(
+            """
+            SELECT relocating, relocated FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            ("kek-bad",),
+        ).fetchone()
+    assert flags is None or (
+        not flags["relocating"] and not flags["relocated"]
+    )
     assert dest_queue.get(job.id, tenant_id="kek-bad") is None
     with queue._pool.connection() as conn:
         still = conn.execute(
@@ -444,6 +463,32 @@ def test_relocate_fails_if_source_dek_cannot_unwrap(
             (job.id, "kek-bad"),
         ).fetchone()
     assert still is not None
+
+
+def test_abort_relocate_unpauses_source(queue: JobQueue, dest_queue: JobQueue):
+    job = queue.enqueue(tenant_id="abort-move", payload={"keep": True})
+    rel = _relocate(queue, dest_queue, "abort-move", batch_size=1)
+    assert rel.status == "running"
+    assert queue.is_tenant_paused("abort-move") is True
+    aborted = queue.abort_tenant_relocate("abort-move")
+    assert aborted.status == "aborted"
+    assert queue.is_tenant_paused("abort-move") is False
+    extra = queue.enqueue(tenant_id="abort-move", payload={"after": True})
+    assert extra is not None
+    src = queue.get(job.id, tenant_id="abort-move")
+    assert src is not None
+    assert dest_queue.get(job.id, tenant_id="abort-move") is None
+
+
+def test_abort_relocate_keeps_prior_pause(queue: JobQueue, dest_queue: JobQueue):
+    queue.enqueue(tenant_id="abort-paused", payload={"p": 1})
+    queue.pause_tenant("abort-paused")
+    rel = _relocate(queue, dest_queue, "abort-paused", batch_size=1)
+    assert rel.status == "running"
+    aborted = queue.abort_tenant_relocate("abort-paused")
+    assert aborted.status == "aborted"
+    assert queue.is_tenant_paused("abort-paused") is True
+    assert queue.lease(tenant_id="abort-paused", worker_id="w") is None
 
 
 def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue):
