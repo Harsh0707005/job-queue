@@ -250,6 +250,30 @@ def tenant_residue_tables(conn: Any, tenant_id: str) -> list[str]:
     return leftover
 
 
+def relocate_residue_tables(conn: Any, tenant_id: str) -> list[str]:
+    """Residue that blocks a new relocate onto *tenant_id*.
+
+    Unlike restore, an existing ``tenant_settings`` row is occupancy:
+    dest already has configured limits/pause/spend/breaker. A dest that
+    is mid-restore (``restoring``) is the in-progress copy and is not
+    treated as a foreign settings row.
+    """
+    leftover = tenant_residue_tables(conn, tenant_id)
+    row = conn.execute(
+        """
+        SELECT restoring FROM tenant_settings
+        WHERE tenant_id = %s
+        """,
+        (tenant_id,),
+    ).fetchone()
+    if row is None:
+        return leftover
+    if row.get("restoring"):
+        return leftover
+    leftover.append("tenant_settings")
+    return leftover
+
+
 def _jsonable(value: Any) -> Any:
     if value is None:
         return None

@@ -200,6 +200,32 @@ def test_relocate_refuses_occupied_dest(queue: JobQueue, dest_queue: JobQueue):
     assert extra is not None
 
 
+def test_relocate_refuses_dest_that_only_has_settings(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    queue.enqueue(tenant_id="set-busy", payload={"src": True})
+    dest_queue.set_tenant_spend_cap(
+        "set-busy", window_seconds=3600, max_enqueues=5
+    )
+    dest_queue.pause_tenant("set-busy")
+    before = dest_queue.get_tenant_spend_cap("set-busy")
+    assert before.max_enqueues == 5
+    assert dest_queue.is_tenant_paused("set-busy") is True
+
+    with pytest.raises(RelocateError, match="tenant_settings"):
+        _relocate(
+            queue, dest_queue, "set-busy", batch_size=50, run_until_complete=True
+        )
+
+    assert queue.is_tenant_paused("set-busy") is False
+    assert dest_queue.is_tenant_paused("set-busy") is True
+    after = dest_queue.get_tenant_spend_cap("set-busy")
+    assert after.max_enqueues == 5
+    assert after.enqueues == 0
+    extra = queue.enqueue(tenant_id="set-busy", payload={"still": "src"})
+    assert extra is not None
+
+
 def test_relocate_resumes_after_source_reconnect(
     queue: JobQueue, dest_queue: JobQueue, postgres_url: str
 ):

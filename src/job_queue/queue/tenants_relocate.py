@@ -24,7 +24,7 @@ from job_queue.queue._common import RelocateError, _as_utc, _utcnow
 from job_queue.queue.tenants_export import (
     SNAPSHOT_KINDS,
     _KIND_SQL,
-    tenant_residue_tables,
+    relocate_residue_tables,
 )
 
 
@@ -449,7 +449,7 @@ class TenantsRelocateMixin:
                 if str(existing["dest_dsn"]) == dest_dsn:
                     return relocate_from_row(existing)
             with dest._pool.connection() as dconn:
-                leftover = tenant_residue_tables(dconn, tenant_id)
+                leftover = relocate_residue_tables(dconn, tenant_id)
             if leftover:
                 raise RelocateError(
                     f"dest tenant {tenant_id!r} is not empty; leftover: "
@@ -885,7 +885,7 @@ class TenantsRelocateMixin:
     ) -> None:
         now = _utcnow()
         with transaction(dest._pool) as conn:
-            leftover = tenant_residue_tables(conn, tenant_id)
+            leftover = relocate_residue_tables(conn, tenant_id)
             restoring = dest._is_tenant_restoring(conn, tenant_id)
             relocated = dest._is_tenant_relocated(conn, tenant_id)
             if leftover and not restoring and not resuming:
