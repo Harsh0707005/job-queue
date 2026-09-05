@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import threading
 from http.server import ThreadingHTTPServer
@@ -23,6 +24,7 @@ from job_queue import (
 )
 from job_queue.blob_store import FilesystemBlobStore
 from job_queue.coordinator import Coordinator, _make_handler
+from job_queue.crypto import PayloadCrypto
 from job_queue.remote import CoordinatorClient
 from tests.helpers_queue import _ack, _nack
 
@@ -370,6 +372,78 @@ def test_relocate_preserves_open_breaker(queue: JobQueue, dest_queue: JobQueue):
     dest_queue.reset_tenant_breaker(tid)
     claimed = dest_queue.lease(tenant_id=tid, worker_id="after-reset")
     assert claimed is not None and claimed.id == waiting.id
+
+
+def test_relocate_rewraps_keys_for_dest_kek(queue: JobQueue, dest_queue: JobQueue):
+    dest_raw = b"D" * 32
+    dest_kek = base64.b64encode(dest_raw).decode()
+    job = queue.enqueue(
+        tenant_id="kek-move",
+        payload={"secret": "keep-me"},
+        queue_name="default",
+    )
+    rel = _relocate(
+        queue,
+        dest_queue,
+        "kek-move",
+        dest_kek=dest_kek,
+        dest_kek_id="dest",
+        batch_size=50,
+        run_until_complete=True,
+    )
+    assert rel.status == "complete"
+    dest_queue._crypto = PayloadCrypto({"dest": dest_raw}, "dest")
+    dest_queue._crypto.drop_tenant("kek-move")
+    got = dest_queue.get(job.id, tenant_id="kek-move")
+    assert got is not None
+    assert got.payload == {"secret": "keep-me"}
+    leased = dest_queue.lease(
+        tenant_id="kek-move", worker_id="dest-w", queue_name="default"
+    )
+    assert leased is not None
+    assert leased.payload == {"secret": "keep-me"}
+    with dest_queue._pool.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT kek_id FROM tenant_payload_keys
+            WHERE tenant_id = %s
+            """,
+            ("kek-move",),
+        ).fetchone()
+    assert row is not None
+    assert row["kek_id"] == "dest"
+
+
+def test_relocate_fails_if_source_dek_cannot_unwrap(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    job = queue.enqueue(
+        tenant_id="kek-bad",
+        payload={"secret": "stuck"},
+        queue_name="default",
+    )
+    with queue._pool.connection() as conn:
+        conn.execute(
+            """
+            UPDATE tenant_payload_keys
+            SET kek_id = 'gone'
+            WHERE tenant_id = %s
+            """,
+            ("kek-bad",),
+        )
+        conn.commit()
+    queue._crypto.drop_tenant("kek-bad")
+    with pytest.raises(RelocateError, match="unwrap"):
+        _relocate(
+            queue, dest_queue, "kek-bad", batch_size=50, run_until_complete=True
+        )
+    assert dest_queue.get(job.id, tenant_id="kek-bad") is None
+    with queue._pool.connection() as conn:
+        still = conn.execute(
+            "SELECT 1 FROM jobs WHERE id = %s AND tenant_id = %s",
+            (job.id, "kek-bad"),
+        ).fetchone()
+    assert still is not None
 
 
 def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue):

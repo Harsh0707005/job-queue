@@ -1901,4 +1901,8 @@ UPDATE tenant_relocations SET source_paused = FALSE WHERE source_paused IS NULL;
 ALTER TABLE tenant_relocations ALTER COLUMN source_paused SET DEFAULT FALSE;
 ALTER TABLE tenant_relocations ALTER COLUMN source_paused SET NOT NULL;
 
+ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS dest_kek_id TEXT;
+ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS dest_kek TEXT;
+ALTER TABLE tenant_relocations ADD COLUMN IF NOT EXISTS dest_keks JSONB;
+
 """

@@ -499,6 +499,9 @@ class ClientAdminMixin:
         *,
         dest_dsn: str | None = None,
         dest_blob_dir: str | None = None,
+        dest_kek: str | None = None,
+        dest_kek_id: str | None = None,
+        dest_keks: dict[str, str] | None = None,
         batch_size: int = 100,
         run_until_complete: bool = False,
     ) -> dict[str, Any]:
@@ -510,6 +513,12 @@ class ClientAdminMixin:
             body["dest_dsn"] = dest_dsn
         if dest_blob_dir is not None:
             body["dest_blob_dir"] = dest_blob_dir
+        if dest_kek is not None:
+            body["dest_kek"] = dest_kek
+        if dest_kek_id is not None:
+            body["dest_kek_id"] = dest_kek_id
+        if dest_keks is not None:
+            body["dest_keks"] = dest_keks
         payload = self._request("POST", f"/v1/tenants/{tenant_id}/relocate", body)
         assert payload is not None
         return payload

@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from job_queue.blob_store import FilesystemBlobStore
+from job_queue.crypto import PayloadCrypto, PayloadCryptoError, wrap_dek
 from job_queue.db import transaction
 from job_queue.models import TenantRelocate
 from job_queue.queue._common import RelocateError, _as_utc, _utcnow
@@ -118,6 +119,9 @@ class TenantsRelocateMixin:
         *,
         dest_dsn: str | None = None,
         dest_blob_dir: str | None = None,
+        dest_kek: str | None = None,
+        dest_kek_id: str | None = None,
+        dest_keks: dict[str, str] | None = None,
         batch_size: int = 100,
         run_until_complete: bool = False,
     ) -> TenantRelocate:
@@ -133,7 +137,12 @@ class TenantsRelocateMixin:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         rst = self._ensure_relocate(
-            tenant_id, dest_dsn=dest_dsn, dest_blob_dir=dest_blob_dir
+            tenant_id,
+            dest_dsn=dest_dsn,
+            dest_blob_dir=dest_blob_dir,
+            dest_kek=dest_kek,
+            dest_kek_id=dest_kek_id,
+            dest_keks=dest_keks,
         )
         if rst.status == "complete":
             return rst
@@ -245,16 +254,42 @@ class TenantsRelocateMixin:
         *,
         dest_dsn: str | None,
         dest_blob_dir: str | None,
+        dest_kek: str | None = None,
+        dest_kek_id: str | None = None,
+        dest_keks: dict[str, str] | None = None,
     ) -> TenantRelocate:
         now = _utcnow()
         dest_dsn = (dest_dsn or os.environ.get("JOB_QUEUE_RELOCATE_DEST_DSN") or "").strip()
         if dest_blob_dir is None:
             raw_dir = os.environ.get("JOB_QUEUE_RELOCATE_DEST_BLOB_DIR")
             dest_blob_dir = raw_dir.strip() if raw_dir else None
+        if dest_kek is None:
+            dest_kek = os.environ.get("JOB_QUEUE_RELOCATE_DEST_KEK") or None
+        if dest_kek_id is None:
+            dest_kek_id = os.environ.get("JOB_QUEUE_RELOCATE_DEST_KEK_ID") or None
+        if dest_keks is None:
+            raw_keks = os.environ.get("JOB_QUEUE_RELOCATE_DEST_KEKS")
+            if raw_keks:
+                parsed = json.loads(raw_keks)
+                if not isinstance(parsed, dict):
+                    raise ValueError("dest_keks must be a JSON object of id → key")
+                dest_keks = {str(k): str(v) for k, v in parsed.items()}
+        if dest_kek is not None:
+            dest_kek = dest_kek.strip() or None
+        if dest_kek_id is not None:
+            dest_kek_id = dest_kek_id.strip() or None
         if not dest_dsn:
             raise ValueError("dest_dsn is required")
         if dest_dsn == getattr(self, "_dsn", None):
             raise RelocateError("dest_dsn must be a different Postgres")
+        try:
+            self._relocate_dest_crypto(
+                dest_kek=dest_kek, dest_kek_id=dest_kek_id, dest_keks=dest_keks
+            )
+        except (PayloadCryptoError, ValueError) as exc:
+            raise RelocateError(
+                f"destination KEK is not usable: {exc}"
+            ) from exc
         with transaction(self._pool) as conn:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -306,14 +341,27 @@ class TenantsRelocateMixin:
                 INSERT INTO tenant_relocations (
                     id, tenant_id, dest_dsn, dest_blob_dir, status, stage,
                     kind_index, blob_seq, blob_offset, counts,
+                    dest_kek_id, dest_kek, dest_keks,
                     created_at, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, 'running', 'pausing',
-                    0, 0, 0, '{}'::jsonb, %s, %s
+                    0, 0, 0, '{}'::jsonb,
+                    %s, %s, %s,
+                    %s, %s
                 )
                 RETURNING *
                 """,
-                (uuid4(), tenant_id, dest_dsn, dest_blob_dir, now, now),
+                (
+                    uuid4(),
+                    tenant_id,
+                    dest_dsn,
+                    dest_blob_dir,
+                    dest_kek_id,
+                    dest_kek,
+                    Jsonb(dest_keks) if dest_keks else None,
+                    now,
+                    now,
+                ),
             ).fetchone()
             assert row is not None
             return relocate_from_row(row)
@@ -429,9 +477,7 @@ class TenantsRelocateMixin:
         snapshot_id = row.get("snapshot_id")
         if snapshot_id is None:
             raise RelocateError("relocate snapshot missing")
-        dest = self._relocate_dest_queue(
-            str(row["dest_dsn"]), row.get("dest_blob_dir")
-        )
+        dest = self._relocate_dest_queue(row)
         self._prepare_dest_tenant(dest, tenant_id, resuming=int(row["kind_index"] or 0) > 0)
         kind_index = int(row["kind_index"] or 0)
         blob_seq = int(row["blob_seq"] or 0)
@@ -499,9 +545,7 @@ class TenantsRelocateMixin:
 
     def _relocate_verify(self, row: dict[str, Any], *, now: datetime) -> TenantRelocate:
         tenant_id = str(row["tenant_id"])
-        dest = self._relocate_dest_queue(
-            str(row["dest_dsn"]), row.get("dest_blob_dir")
-        )
+        dest = self._relocate_dest_queue(row)
         expected = dict(row.get("counts") or {})
         if isinstance(expected, str):
             expected = json.loads(expected)
@@ -531,14 +575,16 @@ class TenantsRelocateMixin:
                     raise RelocateError(
                         f"dest {kind} count {got} < exported {want}"
                     )
+                if kind == "payload_keys" and int(want or 0) > 0:
+                    self._relocate_verify_payload_keys(
+                        dest, dconn, tenant_id=tenant_id
+                    )
         with transaction(self._pool) as conn:
             return self._set_relocate_stage(conn, row["id"], "cutover", now=now)
 
     def _relocate_cutover(self, row: dict[str, Any], *, now: datetime) -> TenantRelocate:
         tenant_id = str(row["tenant_id"])
-        dest = self._relocate_dest_queue(
-            str(row["dest_dsn"]), row.get("dest_blob_dir")
-        )
+        dest = self._relocate_dest_queue(row)
         exported = None
         sid = row.get("snapshot_id")
         if sid is not None:
@@ -747,6 +793,9 @@ class TenantsRelocateMixin:
         if kind == "payload_blobs":
             self._relocate_apply_blobs(dest, dconn, rows, tenant_id)
             return
+        if kind == "payload_keys":
+            self._relocate_apply_payload_keys(dest, dconn, rows, tenant_id)
+            return
         if kind not in _KIND_SQL:
             return
         cols, table = _KIND_SQL[kind]
@@ -761,6 +810,96 @@ class TenantsRelocateMixin:
                 continue
             values = [_sql_value(c, raw.get(c)) for c in col_names]
             dconn.execute(sql, values)
+
+    def _relocate_apply_payload_keys(
+        self, dest: Any, dconn: Any, rows: list[Any], tenant_id: str
+    ) -> None:
+        """Unwrap source DEKs and rewrap under dest's active KEK.
+
+        Ciphertext stays as-is (same key_id / AAD). If source cannot unwrap
+        a DEK, dest would be unreadable — fail before cutover.
+        """
+        src_crypto = self._require_crypto()
+        dest_crypto = dest._require_crypto()
+        for raw in rows:
+            if not isinstance(raw, dict) or not raw.get("key_id"):
+                continue
+            key_id = UUID(str(raw["key_id"]))
+            wrapped = _sql_value("wrapped_dek", raw.get("wrapped_dek"))
+            nonce = _sql_value("wrap_nonce", raw.get("wrap_nonce"))
+            kek_id = str(raw.get("kek_id") or "")
+            try:
+                dek = src_crypto.unwrap_stored_dek(
+                    tenant_id=tenant_id,
+                    key_id=key_id,
+                    wrapped=bytes(wrapped or b""),
+                    nonce=bytes(nonce or b""),
+                    kek_id=kek_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RelocateError(
+                    f"cannot unwrap payload key {key_id} for tenant "
+                    f"{tenant_id!r} (kek_id={kek_id!r}); dest would be "
+                    f"unreadable: {exc}"
+                ) from exc
+            new_wrapped, new_nonce = wrap_dek(
+                dest_crypto.active_kek,
+                dek,
+                tenant_id=tenant_id,
+                key_id=key_id,
+            )
+            dest_crypto.cache_dek(tenant_id, key_id, dek)
+            dconn.execute(
+                """
+                INSERT INTO tenant_payload_keys (
+                    tenant_id, key_id, wrapped_dek, wrap_nonce, kek_id,
+                    status, created_at, retired_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()), %s)
+                ON CONFLICT (tenant_id, key_id) DO UPDATE
+                SET wrapped_dek = EXCLUDED.wrapped_dek,
+                    wrap_nonce = EXCLUDED.wrap_nonce,
+                    kek_id = EXCLUDED.kek_id,
+                    status = EXCLUDED.status,
+                    retired_at = EXCLUDED.retired_at
+                """,
+                (
+                    tenant_id,
+                    key_id,
+                    new_wrapped,
+                    new_nonce,
+                    dest_crypto.active_kek_id,
+                    raw.get("status") or "decrypt_only",
+                    _parse_dt(raw.get("created_at")),
+                    _parse_dt(raw.get("retired_at")),
+                ),
+            )
+
+    def _relocate_verify_payload_keys(
+        self, dest: Any, dconn: Any, *, tenant_id: str
+    ) -> None:
+        dest_crypto = dest._require_crypto()
+        rows = dconn.execute(
+            """
+            SELECT key_id, wrapped_dek, wrap_nonce, kek_id
+            FROM tenant_payload_keys
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchall()
+        for raw in rows:
+            try:
+                dest_crypto.unwrap_stored_dek(
+                    tenant_id=tenant_id,
+                    key_id=raw["key_id"],
+                    wrapped=bytes(raw["wrapped_dek"] or b""),
+                    nonce=bytes(raw["wrap_nonce"] or b""),
+                    kek_id=str(raw["kek_id"] or ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RelocateError(
+                    f"destination cannot open payload key {raw['key_id']} "
+                    f"for tenant {tenant_id!r} (kek_id={raw['kek_id']!r}): {exc}"
+                ) from exc
 
     def _relocate_apply_blobs(
         self, dest: Any, dconn: Any, rows: list[Any], tenant_id: str
@@ -801,10 +940,40 @@ class TenantsRelocateMixin:
                 ),
             )
 
-    def _relocate_dest_queue(self, dest_dsn: str, dest_blob_dir: str | None) -> Any:
+    def _relocate_dest_crypto(
+        self,
+        *,
+        dest_kek: str | None,
+        dest_kek_id: str | None,
+        dest_keks: dict[str, str] | None,
+    ) -> PayloadCrypto:
+        if dest_kek or dest_keks:
+            env: dict[str, str] = {}
+            if dest_kek:
+                env["JOB_QUEUE_PAYLOAD_KEK"] = dest_kek
+            if dest_kek_id:
+                env["JOB_QUEUE_PAYLOAD_KEK_ID"] = dest_kek_id
+            if dest_keks:
+                env["JOB_QUEUE_PAYLOAD_KEKS"] = json.dumps(dest_keks)
+            return PayloadCrypto.from_env(env)
+        return self._require_crypto()
+
+    def _relocate_dest_queue(self, row: dict[str, Any]) -> Any:
         from job_queue.queue.core import JobQueue
 
-        key = (dest_dsn, dest_blob_dir or "")
+        dest_dsn = str(row["dest_dsn"])
+        dest_blob_dir = row.get("dest_blob_dir")
+        dest_keks = row.get("dest_keks")
+        if isinstance(dest_keks, str):
+            dest_keks = json.loads(dest_keks)
+        if dest_keks is not None:
+            dest_keks = {str(k): str(v) for k, v in dict(dest_keks).items()}
+        dest_crypto = self._relocate_dest_crypto(
+            dest_kek=row.get("dest_kek"),
+            dest_kek_id=row.get("dest_kek_id"),
+            dest_keks=dest_keks,
+        )
+        key = (dest_dsn, dest_blob_dir or "", dest_crypto.active_kek_id)
         cache = getattr(self, "_relocate_dests", None)
         if cache is None:
             self._relocate_dests = {}
@@ -818,6 +987,7 @@ class TenantsRelocateMixin:
             max_size=4,
             require_worker_registration=False,
         )
+        q._crypto = dest_crypto
         if dest_blob_dir:
             q._blob_store = FilesystemBlobStore(dest_blob_dir)
         cache[key] = q

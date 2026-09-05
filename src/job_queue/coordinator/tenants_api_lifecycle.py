@@ -416,11 +416,27 @@ class TenantsApiLifecycleMixin:
         dest_dsn = body.get("dest_dsn") or body.get("destination_dsn")
         dest_blob_dir = body.get("dest_blob_dir")
         try:
+            dest_keks = body.get("dest_keks")
+            if dest_keks is not None and not isinstance(dest_keks, dict):
+                return 400, {"error": "dest_keks must be an object of id → key"}
             rel = self.queue.relocate_tenant(
                 tenant_id,
                 dest_dsn=None if dest_dsn is None else str(dest_dsn),
                 dest_blob_dir=(
                     None if dest_blob_dir is None else str(dest_blob_dir)
+                ),
+                dest_kek=(
+                    None if body.get("dest_kek") is None else str(body.get("dest_kek"))
+                ),
+                dest_kek_id=(
+                    None
+                    if body.get("dest_kek_id") is None
+                    else str(body.get("dest_kek_id"))
+                ),
+                dest_keks=(
+                    None
+                    if dest_keks is None
+                    else {str(k): str(v) for k, v in dest_keks.items()}
                 ),
                 batch_size=int(body.get("batch_size") or 100),
                 run_until_complete=bool(body.get("run_until_complete") or False),
