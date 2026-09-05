@@ -20,6 +20,7 @@ from job_queue import (
     LeaseError,
     PostponeError,
     PriorityError,
+    RateLimitError,
     RelocateError,
     SpendCapError,
 )
@@ -514,6 +515,65 @@ def test_relocate_preserves_open_breaker(queue: JobQueue, dest_queue: JobQueue):
     dest_queue.reset_tenant_breaker(tid)
     claimed = dest_queue.lease(tenant_id=tid, worker_id="after-reset")
     assert claimed is not None and claimed.id == waiting.id
+
+
+def _rate_token_state(q: JobQueue, tenant_id: str):
+    with q._pool.connection() as conn:
+        return conn.execute(
+            """
+            SELECT enqueue_rate_per_sec, enqueue_burst,
+                   enqueue_tokens, enqueue_tokens_at,
+                   lease_rate_per_sec, lease_burst,
+                   lease_tokens, lease_tokens_at
+            FROM tenant_settings
+            WHERE tenant_id = %s
+            """,
+            (tenant_id,),
+        ).fetchone()
+
+
+def test_relocate_preserves_rate_limit_tokens(queue: JobQueue, dest_queue: JobQueue):
+    tid = "rate-move"
+    # Refill is slow enough that relocate elapsed time cannot refill a token.
+    queue.set_enqueue_rate_limit(tid, 0.0001, burst=2)
+    queue.set_lease_rate_limit(tid, 0.0001, burst=1)
+    first = queue.enqueue(tenant_id=tid, payload={"i": 1})
+    second = queue.enqueue(tenant_id=tid, payload={"i": 2})
+    with pytest.raises(RateLimitError, match="enqueue rate limit"):
+        queue.enqueue(tenant_id=tid, payload={"i": 3})
+    leased = queue.lease(tenant_id=tid, worker_id="w")
+    assert leased is not None
+    leftover_id = second.id if leased.id == first.id else first.id
+    assert queue.lease(tenant_id=tid, worker_id="blocked") is None
+    # Drain the inflight lease so relocate can cut over; tokens stay spent.
+    _ack(queue, leased, "w", result={"ok": True})
+    src = _rate_token_state(queue, tid)
+    assert src is not None
+    assert src["enqueue_tokens"] is not None and float(src["enqueue_tokens"]) < 1
+    assert src["lease_tokens"] is not None and float(src["lease_tokens"]) < 1
+    assert src["enqueue_tokens_at"] is not None
+    assert src["lease_tokens_at"] is not None
+
+    rel = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert rel.status == "complete"
+
+    dest_rate, dest_burst = dest_queue.get_enqueue_rate_limit(tid)
+    assert dest_rate == 0.0001 and dest_burst == 2
+    dest_lease_rate, dest_lease_burst = dest_queue.get_lease_rate_limit(tid)
+    assert dest_lease_rate == 0.0001 and dest_lease_burst == 1
+    dest = _rate_token_state(dest_queue, tid)
+    assert dest is not None
+    assert dest["enqueue_tokens"] is not None
+    assert float(dest["enqueue_tokens"]) < 1
+    assert dest["lease_tokens"] is not None
+    assert float(dest["lease_tokens"]) < 1
+    assert dest["enqueue_tokens_at"] is not None
+    assert dest["lease_tokens_at"] is not None
+    with pytest.raises(RateLimitError, match="enqueue rate limit"):
+        dest_queue.enqueue(tenant_id=tid, payload={"late": True})
+    assert dest_queue.lease(tenant_id=tid, worker_id="dest-blocked") is None
+    waiting = dest_queue.get(leftover_id, tenant_id=tid)
+    assert waiting is not None and waiting.status == JobStatus.PENDING
 
 
 def test_relocate_rewraps_keys_for_dest_kek(queue: JobQueue, dest_queue: JobQueue):

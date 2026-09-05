@@ -56,6 +56,19 @@ def _parse_dt(raw: Any) -> datetime | None:
     return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
 
 
+def _parse_rate_tokens(raw: Any) -> float | None:
+    """Live token-bucket remainder; ``None`` means dest starts at burst."""
+    if raw is None:
+        return None
+    try:
+        tokens = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if tokens < 0:
+        return 0.0
+    return tokens
+
+
 def _parse_uuid(raw: Any) -> UUID | None:
     if raw is None:
         return None
@@ -1859,8 +1872,12 @@ class TenantsRestoreMixin:
         max_p = None
         enq_rate = None
         enq_burst = None
+        enq_tokens = None
+        enq_tokens_at = None
         lease_rate = None
         lease_burst = None
+        lease_tokens = None
+        lease_tokens_at = None
         c_ret = None
         d_ret = None
         arch_after = None
@@ -1891,8 +1908,12 @@ class TenantsRestoreMixin:
             max_p = exported_settings.get("max_pending_jobs")
             enq_rate = exported_settings.get("enqueue_rate_per_sec")
             enq_burst = exported_settings.get("enqueue_burst")
+            enq_tokens = _parse_rate_tokens(exported_settings.get("enqueue_tokens"))
+            enq_tokens_at = _parse_dt(exported_settings.get("enqueue_tokens_at"))
             lease_rate = exported_settings.get("lease_rate_per_sec")
             lease_burst = exported_settings.get("lease_burst")
+            lease_tokens = _parse_rate_tokens(exported_settings.get("lease_tokens"))
+            lease_tokens_at = _parse_dt(exported_settings.get("lease_tokens_at"))
             c_ret = exported_settings.get("completed_retention_seconds")
             d_ret = exported_settings.get("dead_retention_seconds")
             arch_after = exported_settings.get("archive_after_seconds")
@@ -1942,7 +1963,9 @@ class TenantsRestoreMixin:
                 tenant_id, max_concurrent_leases, max_pending_jobs,
                 paused, offboarding, restoring,
                 enqueue_rate_per_sec, enqueue_burst,
+                enqueue_tokens, enqueue_tokens_at,
                 lease_rate_per_sec, lease_burst,
+                lease_tokens, lease_tokens_at,
                 completed_retention_seconds, dead_retention_seconds,
                 archive_after_seconds, archive_max_live_bytes,
                 default_job_ttl_seconds, default_expiry_action,
@@ -1968,6 +1991,8 @@ class TenantsRestoreMixin:
                 %s, %s,
                 %s, %s,
                 %s, %s,
+                %s, %s,
+                %s, %s,
                 %s, %s, %s, %s, %s, %s,
                 %s, %s,
                 %s, %s,
@@ -1981,8 +2006,12 @@ class TenantsRestoreMixin:
                 restoring = FALSE,
                 enqueue_rate_per_sec = EXCLUDED.enqueue_rate_per_sec,
                 enqueue_burst = EXCLUDED.enqueue_burst,
+                enqueue_tokens = EXCLUDED.enqueue_tokens,
+                enqueue_tokens_at = EXCLUDED.enqueue_tokens_at,
                 lease_rate_per_sec = EXCLUDED.lease_rate_per_sec,
                 lease_burst = EXCLUDED.lease_burst,
+                lease_tokens = EXCLUDED.lease_tokens,
+                lease_tokens_at = EXCLUDED.lease_tokens_at,
                 completed_retention_seconds = EXCLUDED.completed_retention_seconds,
                 dead_retention_seconds = EXCLUDED.dead_retention_seconds,
                 archive_after_seconds = EXCLUDED.archive_after_seconds,
@@ -2017,8 +2046,12 @@ class TenantsRestoreMixin:
                 paused,
                 enq_rate,
                 enq_burst,
+                enq_tokens,
+                enq_tokens_at,
                 lease_rate,
                 lease_burst,
+                lease_tokens,
+                lease_tokens_at,
                 c_ret,
                 d_ret,
                 arch_after,
