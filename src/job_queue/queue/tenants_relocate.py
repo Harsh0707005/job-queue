@@ -10,8 +10,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
@@ -128,9 +129,11 @@ class TenantsRelocateMixin:
         """Start or resume moving *tenant_id* onto *dest_dsn*.
 
         Source is paused first so no new work is created after the snapshot.
-        Dest stays paused+restoring until cutover. Each ``advance`` is one
-        transaction (or one dest batch); a coordinator crash leaves a cursor
-        another node can resume. Other tenants are not touched.
+        Dest stays paused+restoring until cutover. Each ``advance`` holds a
+        session lock across the stage work (export/apply/...) so an API tick
+        and the cleaner cannot both export or both bump the apply cursor. A
+        coordinator crash drops the lock; another node resumes from the
+        committed cursor. Other tenants are not touched.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
@@ -172,54 +175,67 @@ class TenantsRelocateMixin:
             return relocate_from_row(row) if row else None
 
     def advance_tenant_relocate(
-        self, tenant_id: str, *, batch_size: int = 100
+        self, tenant_id: str, *, batch_size: int = 100, wait: bool = True
     ) -> TenantRelocate:
         if not tenant_id:
             raise ValueError("tenant_id is required")
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         now = _utcnow()
-        with transaction(self._pool) as conn:
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"relocate:{tenant_id}",),
-            )
-            row = conn.execute(
-                """
-                SELECT * FROM tenant_relocations
-                WHERE tenant_id = %s AND status = 'running'
-                ORDER BY created_at DESC
-                LIMIT 1
-                FOR UPDATE
-                """,
-                (tenant_id,),
-            ).fetchone()
-            if row is None:
-                latest = conn.execute(
-                    """
-                    SELECT * FROM tenant_relocations
-                    WHERE tenant_id = %s
-                    ORDER BY created_at DESC LIMIT 1
-                    """,
-                    (tenant_id,),
-                ).fetchone()
-                if latest is None:
+        fatal: RelocateError | None = None
+        with self._hold_relocate_stage_lock(tenant_id, wait=wait) as held:
+            if not held:
+                current = self.get_tenant_relocate(tenant_id)
+                if current is None:
                     raise RelocateError(
                         f"no relocate in progress for tenant {tenant_id!r}"
                     )
-                return relocate_from_row(latest)
-        try:
-            updated = self._advance_relocate_stage(row, batch_size=batch_size, now=now)
-            return updated
-        except RelocateError as exc:
-            if exc.fatal:
-                self.abort_tenant_relocate(tenant_id, error=str(exc))
-            raise
-        except Exception as exc:  # noqa: BLE001
-            self._mark_relocate_error(row["id"], str(exc)[:2000])
-            raise RelocateError(
-                f"relocate failed for tenant {tenant_id!r}: {exc}"
-            ) from exc
+                return current
+            with transaction(self._pool) as conn:
+                row = conn.execute(
+                    """
+                    SELECT * FROM tenant_relocations
+                    WHERE tenant_id = %s AND status = 'running'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+                if row is None:
+                    latest = conn.execute(
+                        """
+                        SELECT * FROM tenant_relocations
+                        WHERE tenant_id = %s
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (tenant_id,),
+                    ).fetchone()
+                    if latest is None:
+                        raise RelocateError(
+                            f"no relocate in progress for tenant {tenant_id!r}"
+                        )
+                    return relocate_from_row(latest)
+            try:
+                return self._advance_relocate_stage(
+                    row, batch_size=batch_size, now=now
+                )
+            except RelocateError as exc:
+                if exc.fatal:
+                    # Abort takes the same advisory key on another
+                    # connection; release this session lock first.
+                    fatal = exc
+                else:
+                    raise
+            except Exception as exc:  # noqa: BLE001
+                self._mark_relocate_error(row["id"], str(exc)[:2000])
+                raise RelocateError(
+                    f"relocate failed for tenant {tenant_id!r}: {exc}"
+                ) from exc
+        if fatal is not None:
+            self.abort_tenant_relocate(tenant_id, error=str(fatal))
+            raise fatal
+        raise RelocateError(f"relocate failed for tenant {tenant_id!r}")
 
     def process_tenant_relocations(
         self, *, limit: int = 10, batch_size: int = 100
@@ -241,14 +257,52 @@ class TenantsRelocateMixin:
         out: list[TenantRelocate] = []
         for r in rows:
             try:
+                # Skip a tenant another advance already holds rather than
+                # blocking the cleaner tick behind a long export.
                 out.append(
                     self.advance_tenant_relocate(
-                        str(r["tenant_id"]), batch_size=batch_size
+                        str(r["tenant_id"]),
+                        batch_size=batch_size,
+                        wait=False,
                     )
                 )
             except RelocateError:
                 continue
         return out
+
+    @contextmanager
+    def _hold_relocate_stage_lock(
+        self, tenant_id: str, *, wait: bool = True
+    ) -> Iterator[bool]:
+        """Session lock covering one relocate stage, not just the claim txn.
+
+        ``pg_advisory_xact_lock`` is released when that transaction commits,
+        before export/apply run. Concurrent API + cleaner would both see the
+        same cursor and export twice. Session lock lives until unlock or the
+        backend disconnects (crash-safe).
+        """
+        key = f"relocate:{tenant_id}"
+        with self._pool.connection() as conn:
+            if wait:
+                conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (key,))
+                held = True
+            else:
+                row = conn.execute(
+                    "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+                    (key,),
+                ).fetchone()
+                held = bool(row and row["ok"])
+            # Lock is session-scoped; do not hold an open transaction across
+            # export/apply (those use other connections from the same pool).
+            conn.commit()
+            try:
+                yield held
+            finally:
+                if held:
+                    conn.execute(
+                        "SELECT pg_advisory_unlock(hashtext(%s))", (key,)
+                    )
+                    conn.commit()
 
     def abort_tenant_relocate(
         self, tenant_id: str, *, error: str | None = None
@@ -572,7 +626,7 @@ class TenantsRelocateMixin:
                     )
         snap = self.export_tenant(tenant_id)
         with transaction(self._pool) as conn:
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE tenant_relocations
                 SET snapshot_id = %s,
@@ -584,15 +638,24 @@ class TenantsRelocateMixin:
                     updated_at = %s,
                     error = NULL
                 WHERE id = %s
+                  AND stage = 'exporting'
+                  AND snapshot_id IS NULL
+                RETURNING *
                 """,
                 (snap.id, Jsonb(dict(snap.counts)), now, row["id"]),
-            )
-            out = conn.execute(
-                "SELECT * FROM tenant_relocations WHERE id = %s",
-                (row["id"],),
             ).fetchone()
-            assert out is not None
-            return relocate_from_row(out)
+            if updated is None:
+                conn.execute(
+                    "DELETE FROM tenant_snapshots WHERE id = %s",
+                    (snap.id,),
+                )
+                out = conn.execute(
+                    "SELECT * FROM tenant_relocations WHERE id = %s",
+                    (row["id"],),
+                ).fetchone()
+                assert out is not None
+                return relocate_from_row(out)
+            return relocate_from_row(updated)
 
     def _relocate_apply(
         self, row: dict[str, Any], *, batch_size: int, now: datetime
@@ -602,10 +665,13 @@ class TenantsRelocateMixin:
         if snapshot_id is None:
             raise RelocateError("relocate snapshot missing")
         dest = self._relocate_dest_queue(row)
-        self._prepare_dest_tenant(dest, tenant_id, resuming=int(row["kind_index"] or 0) > 0)
-        kind_index = int(row["kind_index"] or 0)
-        blob_seq = int(row["blob_seq"] or 0)
-        blob_offset = int(row["blob_offset"] or 0)
+        orig_kind = int(row["kind_index"] or 0)
+        orig_seq = int(row["blob_seq"] or 0)
+        orig_off = int(row["blob_offset"] or 0)
+        self._prepare_dest_tenant(dest, tenant_id, resuming=orig_kind > 0)
+        kind_index = orig_kind
+        blob_seq = orig_seq
+        blob_offset = orig_off
         remaining = batch_size
         with self._pool.connection() as src:
             with transaction(dest._pool) as dconn:
@@ -660,11 +726,30 @@ class TenantsRelocateMixin:
                     updated_at = %s,
                     error = NULL
                 WHERE id = %s
+                  AND kind_index = %s
+                  AND blob_seq = %s
+                  AND blob_offset = %s
                 RETURNING *
                 """,
-                (next_stage, kind_index, blob_seq, blob_offset, now, row["id"]),
+                (
+                    next_stage,
+                    kind_index,
+                    blob_seq,
+                    blob_offset,
+                    now,
+                    row["id"],
+                    orig_kind,
+                    orig_seq,
+                    orig_off,
+                ),
             ).fetchone()
-            assert updated is not None
+            if updated is None:
+                out = conn.execute(
+                    "SELECT * FROM tenant_relocations WHERE id = %s",
+                    (row["id"],),
+                ).fetchone()
+                assert out is not None
+                return relocate_from_row(out)
             return relocate_from_row(updated)
 
     def _relocate_verify(self, row: dict[str, Any], *, now: datetime) -> TenantRelocate:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import os
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -723,6 +724,206 @@ def _advance_past_export(src: JobQueue, dest: JobQueue, tenant_id: str):
             return rel
         rel = src.advance_tenant_relocate(tenant_id, batch_size=2)
     raise AssertionError(f"export never finished: {rel}")
+
+
+def _drive_to_exporting(src: JobQueue, dest: JobQueue, tenant_id: str):
+    rel = _relocate(src, dest, tenant_id, batch_size=50)
+    for _ in range(8):
+        if rel.stage == "exporting":
+            return rel
+        if rel.status != "running":
+            raise AssertionError(f"stopped before export: {rel}")
+        rel = src.advance_tenant_relocate(tenant_id, batch_size=50)
+    raise AssertionError(f"never reached exporting: {rel}")
+
+
+def _snapshot_count(q: JobQueue, tenant_id: str) -> int:
+    with q._pool.connection() as conn:
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM tenant_snapshots
+                WHERE source_tenant_id = %s
+                """,
+                (tenant_id,),
+            ).fetchone()["n"]
+        )
+
+
+def test_concurrent_advance_exports_once(queue: JobQueue, dest_queue: JobQueue):
+    """API advance + cleaner must not both snapshot the same cursor."""
+    tid = "race-export"
+    queue.enqueue(tenant_id=tid, payload={"i": 1})
+    rel = _drive_to_exporting(queue, dest_queue, tid)
+    assert rel.snapshot_id is None
+
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    orig = queue.export_tenant
+
+    def slow_export(tenant_id: str):
+        calls.append(tenant_id)
+        started.set()
+        assert release.wait(10)
+        return orig(tenant_id)
+
+    errors: list[BaseException] = []
+    results: list = []
+
+    def api_advance() -> None:
+        try:
+            results.append(queue.advance_tenant_relocate(tid, batch_size=50))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def cleaner_advance() -> None:
+        try:
+            results.extend(
+                queue.process_tenant_relocations(limit=10, batch_size=50)
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    queue.export_tenant = slow_export  # type: ignore[method-assign]
+    try:
+        t_api = threading.Thread(target=api_advance)
+        t_api.start()
+        assert started.wait(10)
+        t_clean = threading.Thread(target=cleaner_advance)
+        t_clean.start()
+        # Old bug: cleaner passed the released xact lock and exported again.
+        time.sleep(0.3)
+        release.set()
+        t_api.join(15)
+        t_clean.join(15)
+        assert not t_api.is_alive() and not t_clean.is_alive()
+    finally:
+        queue.export_tenant = orig  # type: ignore[method-assign]
+
+    assert errors == []
+    assert calls == [tid]
+    assert _snapshot_count(queue, tid) == 1
+    after = queue.get_tenant_relocate(tid)
+    assert after is not None and after.snapshot_id is not None
+    done = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert done.status == "complete"
+    got = dest_queue.list_jobs(tenant_id=tid)
+    assert len(got) == 1
+
+
+def test_concurrent_api_advances_serialize_export(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    tid = "race-api"
+    queue.enqueue(tenant_id=tid, payload={"i": 1})
+    rel = _drive_to_exporting(queue, dest_queue, tid)
+    assert rel.stage == "exporting"
+
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+    orig = queue.export_tenant
+
+    def slow_export(tenant_id: str):
+        calls.append(tenant_id)
+        started.set()
+        assert release.wait(10)
+        return orig(tenant_id)
+
+    errors: list[BaseException] = []
+    results: list = []
+
+    def run() -> None:
+        try:
+            results.append(queue.advance_tenant_relocate(tid, batch_size=50))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    queue.export_tenant = slow_export  # type: ignore[method-assign]
+    try:
+        t1 = threading.Thread(target=run)
+        t1.start()
+        assert started.wait(10)
+        t2 = threading.Thread(target=run)
+        t2.start()
+        time.sleep(0.3)
+        release.set()
+        t1.join(15)
+        t2.join(15)
+        assert not t1.is_alive() and not t2.is_alive()
+    finally:
+        queue.export_tenant = orig  # type: ignore[method-assign]
+
+    assert errors == []
+    assert calls == [tid]
+    assert _snapshot_count(queue, tid) == 1
+    assert len(results) == 2
+    ids = {r.snapshot_id for r in results}
+    assert None not in ids and len(ids) == 1
+    done = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert done.status == "complete"
+
+
+def test_concurrent_apply_holds_stage_lock(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    tid = "race-apply"
+    for i in range(4):
+        queue.enqueue(tenant_id=tid, payload={"i": i})
+    rel = _advance_past_export(queue, dest_queue, tid)
+    assert rel.stage in ("applying", "verifying", "cutover", "purging", "complete")
+    if rel.status == "complete":
+        return
+
+    in_apply = 0
+    max_in = 0
+    gate = threading.Lock()
+    started = threading.Event()
+    release = threading.Event()
+    orig = queue._relocate_apply
+
+    def slow_apply(row, *, batch_size, now):
+        nonlocal in_apply, max_in
+        with gate:
+            in_apply += 1
+            max_in = max(max_in, in_apply)
+        started.set()
+        release.wait(10)
+        try:
+            return orig(row, batch_size=batch_size, now=now)
+        finally:
+            with gate:
+                in_apply -= 1
+
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            queue.advance_tenant_relocate(tid, batch_size=2)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    queue._relocate_apply = slow_apply  # type: ignore[method-assign]
+    try:
+        t1 = threading.Thread(target=run)
+        t1.start()
+        assert started.wait(10)
+        t2 = threading.Thread(target=run)
+        t2.start()
+        time.sleep(0.3)
+        release.set()
+        t1.join(15)
+        t2.join(15)
+        assert not t1.is_alive() and not t2.is_alive()
+    finally:
+        queue._relocate_apply = orig  # type: ignore[method-assign]
+
+    assert errors == []
+    assert max_in == 1
+    done = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert done.status == "complete"
+    assert len(dest_queue.list_jobs(tenant_id=tid)) == 4
 
 
 def test_relocate_rejects_source_mutations_after_export(
