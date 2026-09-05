@@ -807,6 +807,8 @@ def tenant_relocate_to_dict(rel: TenantRelocate) -> dict[str, Any]:
         "status": rel.status,
         "stage": rel.stage,
         "kind_index": rel.kind_index,
+        "blob_seq": rel.blob_seq,
+        "blob_offset": rel.blob_offset,
         "counts": dict(rel.counts),
         "created_at": _dt(rel.created_at),
         "updated_at": _dt(rel.updated_at),

@@ -23,6 +23,7 @@ from job_queue.db import transaction
 from job_queue.models import TenantRelocate
 from job_queue.queue._common import RelocateError, _as_utc, _utcnow
 from job_queue.queue.tenants_export import (
+    SNAPSHOT_FORMAT_VERSION,
     SNAPSHOT_KINDS,
     _KIND_SQL,
     relocate_residue_tables,
@@ -71,6 +72,8 @@ def relocate_from_row(row: dict[str, Any]) -> TenantRelocate:
         status=str(row["status"]),
         stage=str(row["stage"]),
         kind_index=int(row.get("kind_index") or 0),
+        blob_seq=int(row.get("blob_seq") or 0),
+        blob_offset=int(row.get("blob_offset") or 0),
         counts={str(k): int(v) for k, v in dict(counts).items()},
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -150,13 +153,35 @@ class TenantsRelocateMixin:
         if rst.status == "complete":
             return rst
         if run_until_complete:
-            for _ in range(20000):
+            last_sig: tuple[Any, ...] | None = None
+            stalled = 0
+            while True:
                 rst = self.advance_tenant_relocate(
                     tenant_id, batch_size=batch_size
                 )
                 if rst.status in ("complete", "failed", "aborted"):
                     return rst
-            raise RelocateError("relocate did not complete within batch budget")
+                sig = (
+                    rst.stage,
+                    rst.kind_index,
+                    rst.blob_seq,
+                    rst.blob_offset,
+                    rst.snapshot_id,
+                )
+                # Drain can sit on the same cursor while inflight work ends.
+                if rst.stage == "draining":
+                    last_sig = sig
+                    stalled = 0
+                    continue
+                if sig == last_sig:
+                    stalled += 1
+                    if stalled >= 32:
+                        raise RelocateError(
+                            "relocate did not complete; cursor did not advance"
+                        )
+                else:
+                    stalled = 0
+                last_sig = sig
         return self.advance_tenant_relocate(tenant_id, batch_size=batch_size)
 
     def get_tenant_relocate(self, tenant_id: str) -> TenantRelocate | None:
@@ -548,7 +573,7 @@ class TenantsRelocateMixin:
         if stage == "draining":
             return self._relocate_drain(row, now=now)
         if stage == "exporting":
-            return self._relocate_export(row, now=now)
+            return self._relocate_export(row, batch_size=batch_size, now=now)
         if stage == "applying":
             return self._relocate_apply(row, batch_size=batch_size, now=now)
         if stage == "verifying":
@@ -614,7 +639,10 @@ class TenantsRelocateMixin:
                 return relocate_from_row(updated)
             return self._set_relocate_stage(conn, row["id"], "exporting", now=now)
 
-    def _relocate_export(self, row: dict[str, Any], *, now: datetime) -> TenantRelocate:
+    def _relocate_export(
+        self, row: dict[str, Any], *, batch_size: int, now: datetime
+    ) -> TenantRelocate:
+        """Page one export chunk and release. Huge tenants cannot hold RR."""
         tenant_id = str(row["tenant_id"])
         sid = row.get("snapshot_id")
         if sid is not None:
@@ -624,31 +652,116 @@ class TenantsRelocateMixin:
                     return self._set_relocate_stage(
                         conn, row["id"], "applying", now=now, snapshot_id=sid
                     )
-        snap = self.export_tenant(tenant_id)
+        kind_index = int(row["kind_index"] or 0)
         with transaction(self._pool) as conn:
-            updated = conn.execute(
-                """
-                UPDATE tenant_relocations
-                SET snapshot_id = %s,
-                    counts = %s,
-                    stage = 'applying',
-                    kind_index = 0,
-                    blob_seq = 0,
-                    blob_offset = 0,
-                    updated_at = %s,
-                    error = NULL
-                WHERE id = %s
-                  AND stage = 'exporting'
-                  AND snapshot_id IS NULL
-                RETURNING *
-                """,
-                (snap.id, Jsonb(dict(snap.counts)), now, row["id"]),
-            ).fetchone()
-            if updated is None:
+            if sid is None:
+                sid = uuid4()
                 conn.execute(
-                    "DELETE FROM tenant_snapshots WHERE id = %s",
-                    (snap.id,),
+                    """
+                    INSERT INTO tenant_snapshots (
+                        id, source_tenant_id, format_version, status, counts,
+                        created_at
+                    ) VALUES (
+                        %s, %s, %s, 'capturing', '{}'::jsonb, %s
+                    )
+                    """,
+                    (sid, tenant_id, SNAPSHOT_FORMAT_VERSION, now),
                 )
+                claimed = conn.execute(
+                    """
+                    UPDATE tenant_relocations
+                    SET snapshot_id = %s, updated_at = %s
+                    WHERE id = %s AND snapshot_id IS NULL
+                    RETURNING id
+                    """,
+                    (sid, now, row["id"]),
+                ).fetchone()
+                if claimed is None:
+                    conn.execute(
+                        "DELETE FROM tenant_snapshots WHERE id = %s", (sid,)
+                    )
+                    out = conn.execute(
+                        "SELECT * FROM tenant_relocations WHERE id = %s",
+                        (row["id"],),
+                    ).fetchone()
+                    assert out is not None
+                    return relocate_from_row(out)
+            wrote = False
+            seq = 0
+            while kind_index < len(SNAPSHOT_KINDS):
+                kind = SNAPSHOT_KINDS[kind_index]
+                seq, after = self._export_kind_resume(
+                    conn, snapshot_id=sid, kind=kind
+                )
+                n, _after = self._export_kind_page(
+                    conn,
+                    snapshot_id=sid,
+                    kind=kind,
+                    tenant_id=tenant_id,
+                    after=after,
+                    limit=max(1, int(batch_size)),
+                    seq=seq,
+                    include_blob_bytes=False,
+                    hydrate_sealed=False,
+                )
+                if n == 0:
+                    kind_index += 1
+                    continue
+                wrote = True
+                break
+            counts = self._snapshot_kind_counts(conn, sid)
+            if kind_index >= len(SNAPSHOT_KINDS):
+                conn.execute(
+                    """
+                    UPDATE tenant_snapshots
+                    SET status = 'ready',
+                        counts = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                    """,
+                    (Jsonb(counts), now, sid),
+                )
+                updated = conn.execute(
+                    """
+                    UPDATE tenant_relocations
+                    SET snapshot_id = %s,
+                        counts = %s,
+                        stage = 'applying',
+                        kind_index = 0,
+                        blob_seq = 0,
+                        blob_offset = 0,
+                        updated_at = %s,
+                        error = NULL
+                    WHERE id = %s AND stage = 'exporting'
+                    RETURNING *
+                    """,
+                    (sid, Jsonb(counts), now, row["id"]),
+                ).fetchone()
+            else:
+                updated = conn.execute(
+                    """
+                    UPDATE tenant_relocations
+                    SET snapshot_id = %s,
+                        counts = %s,
+                        stage = 'exporting',
+                        kind_index = %s,
+                        blob_seq = %s,
+                        blob_offset = 0,
+                        updated_at = %s,
+                        error = NULL
+                    WHERE id = %s AND stage = 'exporting'
+                    RETURNING *
+                    """,
+                    (
+                        sid,
+                        Jsonb(counts),
+                        kind_index,
+                        (seq + 1) if wrote else 0,
+                        now,
+                        row["id"],
+                    ),
+                ).fetchone()
+            if updated is None:
                 out = conn.execute(
                     "SELECT * FROM tenant_relocations WHERE id = %s",
                     (row["id"],),
@@ -1138,16 +1251,28 @@ class TenantsRelocateMixin:
     def _relocate_apply_blobs(
         self, dest: Any, dconn: Any, rows: list[Any], tenant_id: str
     ) -> None:
-        store = getattr(dest, "_blob_store", None)
+        dest_store = getattr(dest, "_blob_store", None)
+        src_store = getattr(self, "_blob_store", None)
         for raw in rows:
             if not isinstance(raw, dict) or not raw.get("id"):
                 continue
             bid = UUID(str(raw["id"]))
             data_b64 = raw.get("data_b64") or ""
             status = str(raw.get("status") or "committed")
-            if store is not None and data_b64:
-                store.write(bid, base64.b64decode(str(data_b64)))
-            elif not data_b64:
+            copied = False
+            if dest_store is not None:
+                payload: bytes | None = None
+                if data_b64:
+                    payload = base64.b64decode(str(data_b64))
+                elif src_store is not None:
+                    try:
+                        payload = src_store.read(bid)
+                    except Exception:
+                        payload = None
+                if payload is not None:
+                    dest_store.write(bid, payload)
+                    copied = True
+            if not copied:
                 status = "orphan"
             dconn.execute(
                 """

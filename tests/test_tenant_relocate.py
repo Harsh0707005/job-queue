@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import threading
 import time
@@ -713,7 +714,7 @@ def test_relocate_preserves_source_paused(queue: JobQueue, dest_queue: JobQueue)
 
 def _advance_past_export(src: JobQueue, dest: JobQueue, tenant_id: str):
     rel = _relocate(src, dest, tenant_id, batch_size=2)
-    for _ in range(80):
+    for _ in range(200):
         if rel.status == "complete" or rel.stage in (
             "applying",
             "verifying",
@@ -759,14 +760,13 @@ def test_concurrent_advance_exports_once(queue: JobQueue, dest_queue: JobQueue):
 
     started = threading.Event()
     release = threading.Event()
-    calls: list[str] = []
-    orig = queue.export_tenant
+    orig = queue._export_kind_page
 
-    def slow_export(tenant_id: str):
-        calls.append(tenant_id)
-        started.set()
-        assert release.wait(10)
-        return orig(tenant_id)
+    def slow_page(*args, **kwargs):
+        if not started.is_set():
+            started.set()
+            assert release.wait(10)
+        return orig(*args, **kwargs)
 
     errors: list[BaseException] = []
     results: list = []
@@ -785,7 +785,7 @@ def test_concurrent_advance_exports_once(queue: JobQueue, dest_queue: JobQueue):
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    queue.export_tenant = slow_export  # type: ignore[method-assign]
+    queue._export_kind_page = slow_page  # type: ignore[method-assign]
     try:
         t_api = threading.Thread(target=api_advance)
         t_api.start()
@@ -799,10 +799,9 @@ def test_concurrent_advance_exports_once(queue: JobQueue, dest_queue: JobQueue):
         t_clean.join(15)
         assert not t_api.is_alive() and not t_clean.is_alive()
     finally:
-        queue.export_tenant = orig  # type: ignore[method-assign]
+        queue._export_kind_page = orig  # type: ignore[method-assign]
 
     assert errors == []
-    assert calls == [tid]
     assert _snapshot_count(queue, tid) == 1
     after = queue.get_tenant_relocate(tid)
     assert after is not None and after.snapshot_id is not None
@@ -822,14 +821,13 @@ def test_concurrent_api_advances_serialize_export(
 
     started = threading.Event()
     release = threading.Event()
-    calls: list[str] = []
-    orig = queue.export_tenant
+    orig = queue._export_kind_page
 
-    def slow_export(tenant_id: str):
-        calls.append(tenant_id)
-        started.set()
-        assert release.wait(10)
-        return orig(tenant_id)
+    def slow_page(*args, **kwargs):
+        if not started.is_set():
+            started.set()
+            assert release.wait(10)
+        return orig(*args, **kwargs)
 
     errors: list[BaseException] = []
     results: list = []
@@ -840,7 +838,7 @@ def test_concurrent_api_advances_serialize_export(
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
-    queue.export_tenant = slow_export  # type: ignore[method-assign]
+    queue._export_kind_page = slow_page  # type: ignore[method-assign]
     try:
         t1 = threading.Thread(target=run)
         t1.start()
@@ -853,10 +851,9 @@ def test_concurrent_api_advances_serialize_export(
         t2.join(15)
         assert not t1.is_alive() and not t2.is_alive()
     finally:
-        queue.export_tenant = orig  # type: ignore[method-assign]
+        queue._export_kind_page = orig  # type: ignore[method-assign]
 
     assert errors == []
-    assert calls == [tid]
     assert _snapshot_count(queue, tid) == 1
     assert len(results) == 2
     ids = {r.snapshot_id for r in results}
@@ -924,6 +921,128 @@ def test_concurrent_apply_holds_stage_lock(
     done = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
     assert done.status == "complete"
     assert len(dest_queue.list_jobs(tenant_id=tid)) == 4
+
+
+def test_relocate_export_pages_without_long_snapshot(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    tid = "page-export"
+    jobs = [queue.enqueue(tenant_id=tid, payload={"i": i}) for i in range(8)]
+    rel = _drive_to_exporting(queue, dest_queue, tid)
+    first = queue.advance_tenant_relocate(tid, batch_size=2)
+    assert first.stage == "exporting"
+    assert first.snapshot_id is not None
+    snap = queue.get_tenant_snapshot(first.snapshot_id)
+    assert snap is not None and snap.status == "capturing"
+    second = queue.advance_tenant_relocate(tid, batch_size=2)
+    assert second.stage == "exporting"
+    assert second.snapshot_id == first.snapshot_id
+    assert (second.kind_index, second.blob_seq) >= (first.kind_index, first.blob_seq)
+    done = _relocate(queue, dest_queue, tid, batch_size=3, run_until_complete=True)
+    assert done.status == "complete"
+    for job in jobs:
+        got = dest_queue.get(job.id, tenant_id=tid)
+        assert got is not None
+        assert got.payload == {"i": job.payload["i"]}
+
+
+def test_relocate_does_not_store_blob_bytes_in_source_postgres(
+    queue: JobQueue, dest_queue: JobQueue, tmp_path: Path
+):
+    tid = "blob-move"
+    queue._blob_store = FilesystemBlobStore(tmp_path / "src-blobs")
+    queue.payload_blob_threshold_bytes = 256
+    dest_queue.payload_blob_threshold_bytes = 256
+    secret = "relocate-blob-secret"
+    job = queue.enqueue(
+        tenant_id=tid,
+        payload={"secret": secret, "blob": "S" * 800},
+        queue_name="default",
+    )
+    rel = _advance_past_export(queue, dest_queue, tid)
+    assert rel.snapshot_id is not None
+    with queue._pool.connection() as conn:
+        blobs = conn.execute(
+            """
+            SELECT rows FROM tenant_snapshot_blobs
+            WHERE snapshot_id = %s AND kind = 'payload_blobs'
+            """,
+            (rel.snapshot_id,),
+        ).fetchall()
+        jobs_pages = conn.execute(
+            """
+            SELECT rows FROM tenant_snapshot_blobs
+            WHERE snapshot_id = %s AND kind = 'jobs'
+            """,
+            (rel.snapshot_id,),
+        ).fetchall()
+    assert blobs
+    for page in blobs:
+        raw = page["rows"] or []
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        for item in raw:
+            assert not item.get("data_b64")
+    for page in jobs_pages:
+        raw = page["rows"] or []
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        text = str(raw)
+        assert secret not in text
+        assert "data_b64" not in text
+    done = _relocate(queue, dest_queue, tid, batch_size=50, run_until_complete=True)
+    assert done.status == "complete"
+    got = dest_queue.get(job.id, tenant_id=tid)
+    assert got is not None
+    assert got.payload["secret"] == secret
+    leased = dest_queue.lease(tenant_id=tid, worker_id="dw", queue_name="default")
+    assert leased is not None
+    assert leased.payload["secret"] == secret
+
+
+def test_relocate_export_does_not_stall_other_tenant(
+    queue: JobQueue, dest_queue: JobQueue
+):
+    keep = queue.enqueue(tenant_id="keep-live", payload={"stay": True})
+    queue.enqueue(tenant_id="slow-move", payload={"i": 1})
+    _drive_to_exporting(queue, dest_queue, "slow-move")
+
+    started = threading.Event()
+    release = threading.Event()
+    orig = queue._export_kind_page
+
+    def slow_page(*args, **kwargs):
+        if not started.is_set():
+            started.set()
+            assert release.wait(10)
+        return orig(*args, **kwargs)
+
+    queue._export_kind_page = slow_page  # type: ignore[method-assign]
+    try:
+        t = threading.Thread(
+            target=lambda: queue.advance_tenant_relocate("slow-move", batch_size=50)
+        )
+        t.start()
+        assert started.wait(10)
+        claimed = queue.lease(
+            tenant_id="keep-live", worker_id="k", queue_name="default"
+        )
+        assert claimed is not None and claimed.id == keep.id
+        _ack(queue, claimed, "k")
+        other = queue.enqueue(tenant_id="other-move", payload={"x": 1})
+        other_rel = _relocate(queue, dest_queue, "other-move", batch_size=50)
+        assert other_rel.status == "running"
+        release.set()
+        t.join(15)
+        assert not t.is_alive()
+    finally:
+        queue._export_kind_page = orig  # type: ignore[method-assign]
+
+    done = _relocate(
+        queue, dest_queue, "other-move", batch_size=50, run_until_complete=True
+    )
+    assert done.status == "complete"
+    assert dest_queue.get(other.id, tenant_id="other-move") is not None
 
 
 def test_relocate_rejects_source_mutations_after_export(

@@ -802,6 +802,8 @@ class TenantRelocate:
     completed_at: datetime | None = None
     error: str | None = None
     source_paused: bool = False
+    blob_seq: int = 0
+    blob_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)

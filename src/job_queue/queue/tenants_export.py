@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from datetime import datetime, time
 from typing import Any
@@ -213,6 +214,63 @@ _KIND_SQL: dict[str, tuple[str, str]] = {
     ),
 }
 
+# Keyset columns (unique per tenant) so pages do not OFFSET-scan prior rows.
+_KIND_KEYS: dict[str, tuple[str, ...]] = {
+    "payload_keys": ("key_id",),
+    "payload_blobs": ("id",),
+    "payload_key_rotations": ("id",),
+    "tenant_settings": ("tenant_id",),
+    "tenant_fairness": ("tenant_id",),
+    "duration_estimates": ("queue_name", "kind"),
+    "job_worker_affinity": ("queue_name", "kind"),
+    "schedules": ("id",),
+    "schedule_generations": ("schedule_id", "iteration"),
+    "schedule_blackouts": ("id",),
+    "workflow_runs": ("id",),
+    "workflow_signals": ("id",),
+    "jobs": ("id",),
+    "job_dag_batches": ("id",),
+    "workflow_step_runs": ("id",),
+    "workflow_activities": ("id",),
+    "job_side_effects": ("job_id", "effect_key"),
+    "job_audit_events": ("event_id",),
+    "webhook_endpoints": ("id",),
+    "webhook_deliveries": ("id",),
+    "inbound_triggers": ("id",),
+    "inbound_trigger_nonces": ("trigger_id", "nonce"),
+    "inbound_job_callbacks": ("job_id",),
+    "alert_rules": ("id",),
+    "alert_events": ("id",),
+    "queue_metric_buckets": ("bucket_start", "metric"),
+    "queue_metric_snapshots": ("sampled_at",),
+    "tenant_usage_buckets": ("bucket_start",),
+}
+
+
+def _kind_key_cols(kind: str) -> tuple[str, ...]:
+    return _KIND_KEYS.get(kind, ("id",))
+
+
+def _keyset_from_row(kind: str, row: dict[str, Any] | None) -> tuple[Any, ...] | None:
+    if not row:
+        return None
+    cols = _kind_key_cols(kind)
+    return tuple(row.get(c) for c in cols)
+
+
+def _keyset_sql(kind: str, after: Any) -> tuple[str, tuple[Any, ...]]:
+    if after is None:
+        return "", ()
+    cols = _kind_key_cols(kind)
+    values = tuple(after) if isinstance(after, (tuple, list)) else (after,)
+    if len(values) != len(cols):
+        return "", ()
+    if len(cols) == 1:
+        return f"AND {cols[0]} > %s", values
+    col_list = ", ".join(cols)
+    placeholders = ", ".join(["%s"] * len(cols))
+    return f"AND ({col_list}) > ({placeholders})", values
+
 # Restore must find these empty on the dest. tenant_settings is exempt:
 # empty dests commonly already have limits/pause rows, and restore itself
 # writes paused+restoring before applying snapshot blobs.
@@ -315,19 +373,25 @@ def snapshot_from_row(row: dict[str, Any]) -> TenantSnapshot:
 
 
 class TenantsExportMixin:
-    def export_tenant(self, tenant_id: str) -> TenantSnapshot:
-        """Capture a consistent snapshot of *tenant_id* without pausing it.
+    def export_tenant(
+        self,
+        tenant_id: str,
+        *,
+        include_blob_bytes: bool = True,
+    ) -> TenantSnapshot:
+        """Capture a snapshot of *tenant_id* without pausing it.
 
-        Uses ``REPEATABLE READ`` so in-flight workers keep running. Ciphertext
-        is copied as-is (no decrypt). The snapshot lives in Postgres so a
-        later restore can resume after a coordinator crash.
+        Pages with keyset reads in short transactions so a huge tenant cannot
+        hold a long ``REPEATABLE READ`` or OFFSET-scan prior rows. Ciphertext
+        is copied as-is (no decrypt). *include_blob_bytes* embeds spilled
+        files as ``data_b64`` so restore can rebuild a fresh fleet; relocate
+        leaves files on the shared/dest store instead.
         """
         if not tenant_id:
             raise ValueError("tenant_id is required")
         now = _utcnow()
         sid = uuid4()
         with transaction(self._pool) as conn:
-            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             conn.execute(
                 """
                 INSERT INTO tenant_snapshots (
@@ -339,20 +403,40 @@ class TenantsExportMixin:
                 """,
                 (sid, tenant_id, SNAPSHOT_FORMAT_VERSION, now),
             )
-            counts: dict[str, int] = {}
-            try:
-                for kind in SNAPSHOT_KINDS:
-                    cols, table = _KIND_SQL[kind]
-                    n = self._capture_kind(
-                        conn,
-                        snapshot_id=sid,
-                        kind=kind,
-                        table=table,
-                        cols=cols,
-                        tenant_id=tenant_id,
-                    )
-                    counts[kind] = n
-            except Exception as exc:  # noqa: BLE001
+        try:
+            for kind in SNAPSHOT_KINDS:
+                after: Any = None
+                seq = 0
+                while True:
+                    with transaction(self._pool) as conn:
+                        n, after = self._export_kind_page(
+                            conn,
+                            snapshot_id=sid,
+                            kind=kind,
+                            tenant_id=tenant_id,
+                            after=after,
+                            limit=CHUNK,
+                            seq=seq,
+                            include_blob_bytes=include_blob_bytes,
+                            hydrate_sealed=include_blob_bytes,
+                        )
+                    if n == 0:
+                        break
+                    seq += 1
+            with transaction(self._pool) as conn:
+                counts = self._snapshot_kind_counts(conn, sid)
+                conn.execute(
+                    """
+                    UPDATE tenant_snapshots
+                    SET status = 'ready',
+                        counts = %s,
+                        completed_at = %s
+                    WHERE id = %s
+                    """,
+                    (Jsonb(counts), _utcnow(), sid),
+                )
+        except Exception as exc:  # noqa: BLE001
+            with transaction(self._pool) as conn:
                 conn.execute(
                     """
                     UPDATE tenant_snapshots
@@ -361,27 +445,12 @@ class TenantsExportMixin:
                     """,
                     (str(exc)[:2000], _utcnow(), sid),
                 )
-                raise RestoreError(f"export failed for tenant {tenant_id!r}: {exc}") from exc
-            conn.execute(
-                """
-                UPDATE tenant_snapshots
-                SET status = 'ready',
-                    counts = %s,
-                    completed_at = %s
-                WHERE id = %s
-                """,
-                (Jsonb(counts), _utcnow(), sid),
-            )
-            row = conn.execute(
-                """
-                SELECT id, source_tenant_id, format_version, status, counts,
-                       error, created_at, completed_at
-                FROM tenant_snapshots WHERE id = %s
-                """,
-                (sid,),
-            ).fetchone()
-            assert row is not None
-            return snapshot_from_row(row)
+            raise RestoreError(
+                f"export failed for tenant {tenant_id!r}: {exc}"
+            ) from exc
+        snap = self.get_tenant_snapshot(sid)
+        assert snap is not None
+        return snap
 
     def get_tenant_snapshot(self, snapshot_id: UUID) -> TenantSnapshot | None:
         with self._pool.connection() as conn:
@@ -395,124 +464,152 @@ class TenantsExportMixin:
             ).fetchone()
             return snapshot_from_row(row) if row else None
 
-    def _capture_kind(
+    def _snapshot_kind_counts(self, conn: Any, snapshot_id: UUID) -> dict[str, int]:
+        rows = conn.execute(
+            """
+            SELECT kind, COALESCE(SUM(row_count), 0) AS n
+            FROM tenant_snapshot_blobs
+            WHERE snapshot_id = %s
+            GROUP BY kind
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        return {str(r["kind"]): int(r["n"] or 0) for r in rows}
+
+    def _export_kind_resume(
+        self, conn: Any, *, snapshot_id: UUID, kind: str
+    ) -> tuple[int, Any]:
+        """Return ``(next_seq, after_key)`` from already-written pages."""
+        row = conn.execute(
+            """
+            SELECT seq, rows
+            FROM tenant_snapshot_blobs
+            WHERE snapshot_id = %s AND kind = %s
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            (snapshot_id, kind),
+        ).fetchone()
+        if row is None:
+            return 0, None
+        raw = row["rows"] or []
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        last = raw[-1] if raw else None
+        return int(row["seq"]) + 1, _keyset_from_row(kind, last)
+
+    def _export_kind_page(
         self,
         conn: Any,
         *,
         snapshot_id: UUID,
         kind: str,
-        table: str,
-        cols: str,
         tenant_id: str,
-    ) -> int:
+        after: Any,
+        limit: int,
+        seq: int,
+        include_blob_bytes: bool = True,
+        hydrate_sealed: bool = True,
+    ) -> tuple[int, Any]:
+        """Capture one keyset page. Returns ``(row_count, next_after)``."""
+        if limit < 1:
+            return 0, after
         if kind == "payload_blobs":
-            return self._capture_payload_blobs(
-                conn, snapshot_id=snapshot_id, tenant_id=tenant_id
-            )
-        if kind == "inbound_trigger_nonces":
-            return self._capture_inbound_trigger_nonces(
-                conn, snapshot_id=snapshot_id, tenant_id=tenant_id
-            )
-        if kind in ("jobs", "webhook_deliveries"):
-            return self._capture_kind_with_blob_bytes(
+            return self._export_payload_blobs_page(
                 conn,
                 snapshot_id=snapshot_id,
-                kind=kind,
-                table=table,
-                cols=cols,
                 tenant_id=tenant_id,
+                after=after,
+                limit=limit,
+                seq=seq,
+                include_blob_bytes=include_blob_bytes,
             )
+        if kind == "inbound_trigger_nonces":
+            return self._export_nonces_page(
+                conn,
+                snapshot_id=snapshot_id,
+                tenant_id=tenant_id,
+                after=after,
+                limit=limit,
+                seq=seq,
+            )
+        cols, table = _KIND_SQL[kind]
+        key_cols = _kind_key_cols(kind)
+        keyset_sql, keyset_params = _keyset_sql(kind, after)
         if kind == "alert_rules":
-            where = "tenant_id = %s OR (scope = 'tenant' AND tenant_id = %s)"
+            where = "(tenant_id = %s OR (scope = 'tenant' AND tenant_id = %s))"
             params: tuple[Any, ...] = (tenant_id, tenant_id)
         else:
             where = "tenant_id = %s"
             params = (tenant_id,)
-        order = {
-            "payload_keys": "key_id ASC",
-            "duration_estimates": "queue_name ASC, kind ASC",
-            "job_worker_affinity": "queue_name ASC, kind ASC",
-            "tenant_settings": "tenant_id ASC",
-            "tenant_fairness": "tenant_id ASC",
-            "job_side_effects": "job_id ASC, effect_key ASC",
-            "queue_metric_buckets": "bucket_start ASC, metric ASC",
-            "queue_metric_snapshots": "sampled_at ASC",
-            "tenant_usage_buckets": "bucket_start ASC",
-            "job_dag_batches": "created_at ASC, id ASC",
-            "job_audit_events": "event_id ASC",
-            "schedule_generations": "schedule_id ASC, iteration ASC",
-            "inbound_job_callbacks": "job_id ASC",
-            "inbound_triggers": "id ASC",
-            "inbound_trigger_nonces": "trigger_id ASC, nonce ASC",
-            "workflow_activities": "id ASC",
-        }.get(kind, "id ASC")
-        total = 0
-        seq = 0
-        offset = 0
-        while True:
-            rows = conn.execute(
-                f"""
-                SELECT {cols}
-                FROM {table}
-                WHERE {where}
-                ORDER BY {order}
-                LIMIT %s OFFSET %s
-                """,
-                params + (CHUNK, offset),
-            ).fetchall()
-            if not rows:
-                break
-            blob = [_jsonable(dict(r)) for r in rows]
-            conn.execute(
-                """
-                INSERT INTO tenant_snapshot_blobs (
-                    snapshot_id, kind, seq, row_count, rows
-                ) VALUES (%s, %s, %s, %s, %s)
-                """,
-                (snapshot_id, kind, seq, len(blob), Jsonb(blob)),
-            )
-            total += len(rows)
-            seq += 1
-            offset += len(rows)
-            if len(rows) < CHUNK:
-                break
-        return total
+        order = ", ".join(f"{c} ASC" for c in key_cols)
+        rows = conn.execute(
+            f"""
+            SELECT {cols}
+            FROM {table}
+            WHERE {where} {keyset_sql}
+            ORDER BY {order}
+            LIMIT %s
+            """,
+            params + keyset_params + (int(limit),),
+        ).fetchall()
+        if not rows:
+            return 0, after
+        blob: list[dict[str, Any]] = []
+        for r in rows:
+            item = _jsonable(dict(r))
+            if hydrate_sealed and kind in ("jobs", "webhook_deliveries"):
+                if "payload" in item:
+                    item["payload"] = self._snapshot_sealed_value(item.get("payload"))
+                if item.get("result") is not None:
+                    item["result"] = self._snapshot_sealed_value(item.get("result"))
+            blob.append(item)
+        conn.execute(
+            """
+            INSERT INTO tenant_snapshot_blobs (
+                snapshot_id, kind, seq, row_count, rows
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (snapshot_id, kind, seq) DO NOTHING
+            """,
+            (snapshot_id, kind, seq, len(blob), Jsonb(blob)),
+        )
+        return len(rows), _keyset_from_row(kind, dict(rows[-1]))
 
-    def _capture_inbound_trigger_nonces(
-        self, conn: Any, *, snapshot_id: UUID, tenant_id: str
-    ) -> int:
-        total = 0
-        seq = 0
-        offset = 0
-        while True:
-            rows = conn.execute(
-                """
-                SELECT n.trigger_id, n.nonce, n.seen_at
-                FROM inbound_trigger_nonces n
-                JOIN inbound_triggers t ON t.id = n.trigger_id
-                WHERE t.tenant_id = %s
-                ORDER BY n.trigger_id ASC, n.nonce ASC
-                LIMIT %s OFFSET %s
-                """,
-                (tenant_id, CHUNK, offset),
-            ).fetchall()
-            if not rows:
-                break
-            blob = [_jsonable(dict(r)) for r in rows]
-            conn.execute(
-                """
-                INSERT INTO tenant_snapshot_blobs (
-                    snapshot_id, kind, seq, row_count, rows
-                ) VALUES (%s, %s, %s, %s, %s)
-                """,
-                (snapshot_id, "inbound_trigger_nonces", seq, len(blob), Jsonb(blob)),
-            )
-            total += len(rows)
-            seq += 1
-            offset += len(rows)
-            if len(rows) < CHUNK:
-                break
-        return total
+    def _export_nonces_page(
+        self,
+        conn: Any,
+        *,
+        snapshot_id: UUID,
+        tenant_id: str,
+        after: Any,
+        limit: int,
+        seq: int,
+    ) -> tuple[int, Any]:
+        keyset_sql, keyset_params = _keyset_sql("inbound_trigger_nonces", after)
+        rows = conn.execute(
+            f"""
+            SELECT n.trigger_id, n.nonce, n.seen_at
+            FROM inbound_trigger_nonces n
+            JOIN inbound_triggers t ON t.id = n.trigger_id
+            WHERE t.tenant_id = %s {keyset_sql}
+            ORDER BY n.trigger_id ASC, n.nonce ASC
+            LIMIT %s
+            """,
+            (tenant_id,) + keyset_params + (int(limit),),
+        ).fetchall()
+        if not rows:
+            return 0, after
+        blob = [_jsonable(dict(r)) for r in rows]
+        conn.execute(
+            """
+            INSERT INTO tenant_snapshot_blobs (
+                snapshot_id, kind, seq, row_count, rows
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (snapshot_id, kind, seq) DO NOTHING
+            """,
+            (snapshot_id, "inbound_trigger_nonces", seq, len(blob), Jsonb(blob)),
+        )
+        return len(rows), _keyset_from_row("inbound_trigger_nonces", dict(rows[-1]))
 
     def _snapshot_sealed_value(self, value: Any) -> Any:
         """Copy ciphertext into the snapshot so restore does not need files.
@@ -535,195 +632,53 @@ class TenantsExportMixin:
                 return value
         return value
 
-    def _capture_kind_with_blob_bytes(
+    def _export_payload_blobs_page(
         self,
         conn: Any,
         *,
         snapshot_id: UUID,
-        kind: str,
-        table: str,
-        cols: str,
         tenant_id: str,
-    ) -> int:
-        total = 0
-        seq = 0
-        offset = 0
-        order = "id ASC"
-        while True:
-            rows = conn.execute(
-                f"""
-                SELECT {cols}
-                FROM {table}
-                WHERE tenant_id = %s
-                ORDER BY {order}
-                LIMIT %s OFFSET %s
-                """,
-                (tenant_id, CHUNK, offset),
-            ).fetchall()
-            if not rows:
-                break
-            blob: list[dict[str, Any]] = []
-            for r in rows:
-                item = _jsonable(dict(r))
-                if "payload" in item:
-                    item["payload"] = self._snapshot_sealed_value(item.get("payload"))
-                if "result" in item and item.get("result") is not None:
-                    item["result"] = self._snapshot_sealed_value(item.get("result"))
-                blob.append(item)
-            conn.execute(
-                """
-                INSERT INTO tenant_snapshot_blobs (
-                    snapshot_id, kind, seq, row_count, rows
-                ) VALUES (%s, %s, %s, %s, %s)
-                """,
-                (snapshot_id, kind, seq, len(blob), Jsonb(blob)),
-            )
-            total += len(rows)
-            seq += 1
-            offset += len(rows)
-            if len(rows) < CHUNK:
-                break
-        return total
-
-    def _iter_tenant_blob_refs(
-        self, conn: Any, tenant_id: str
-    ) -> dict[UUID, dict[str, Any]]:
-        refs: dict[UUID, dict[str, Any]] = {}
+        after: Any,
+        limit: int,
+        seq: int,
+        include_blob_bytes: bool,
+    ) -> tuple[int, Any]:
+        keyset_sql, keyset_params = _keyset_sql("payload_blobs", after)
         rows = conn.execute(
-            """
+            f"""
             SELECT id, tenant_id, job_id, kind, sha256, nbytes, key_id,
                    status, created_at, committed_at
             FROM job_payload_blobs
-            WHERE tenant_id = %s
-            ORDER BY created_at ASC, id ASC
+            WHERE tenant_id = %s {keyset_sql}
+            ORDER BY id ASC
+            LIMIT %s
             """,
-            (tenant_id,),
+            (tenant_id,) + keyset_params + (int(limit),),
         ).fetchall()
-        for r in rows:
-            refs[r["id"]] = dict(r)
-        pointer_rows = conn.execute(
-            """
-            SELECT id AS job_id, payload, result FROM jobs WHERE tenant_id = %s
-            UNION ALL
-            SELECT job_id, payload, NULL FROM webhook_deliveries
-            WHERE tenant_id = %s
-            """,
-            (tenant_id, tenant_id),
-        ).fetchall()
-        for r in pointer_rows:
-            for col in ("payload", "result"):
-                bid = (
-                    self._blob_id_of(r.get(col))
-                    if hasattr(self, "_blob_id_of")
-                    else None
-                )
-                if bid is None or bid in refs:
-                    continue
-                refs[bid] = {
-                    "id": bid,
-                    "tenant_id": tenant_id,
-                    "job_id": r.get("job_id"),
-                    "kind": "other",
-                    "sha256": "",
-                    "nbytes": 0,
-                    "key_id": None,
-                    "status": "committed",
-                    "created_at": None,
-                    "committed_at": None,
-                }
-        audit_ptrs = conn.execute(
-            """
-            SELECT event_id, detail
-            FROM job_audit_events
-            WHERE tenant_id = %s
-            """,
-            (tenant_id,),
-        ).fetchall()
-        for r in audit_ptrs:
-            bid = (
-                self._blob_id_of(r.get("detail"))
-                if hasattr(self, "_blob_id_of")
-                else None
-            )
-            if bid is None or bid in refs:
-                continue
-            refs[bid] = {
-                "id": bid,
-                "tenant_id": tenant_id,
-                "job_id": None,
-                "kind": "other",
-                "sha256": "",
-                "nbytes": 0,
-                "key_id": None,
-                "status": "committed",
-                "created_at": None,
-                "committed_at": None,
-            }
-        archive_rows = conn.execute(
-            """
-            SELECT id, archive_blob_id
-            FROM jobs
-            WHERE tenant_id = %s AND archive_blob_id IS NOT NULL
-            """,
-            (tenant_id,),
-        ).fetchall()
-        for r in archive_rows:
-            bid = r["archive_blob_id"]
-            if bid is None or bid in refs:
-                continue
-            refs[bid] = {
-                "id": bid,
-                "tenant_id": tenant_id,
-                "job_id": r["id"],
-                "kind": "archive",
-                "sha256": "",
-                "nbytes": 0,
-                "key_id": None,
-                "status": "committed",
-                "created_at": None,
-                "committed_at": None,
-            }
-        return refs
-
-    def _capture_payload_blobs(
-        self, conn: Any, *, snapshot_id: UUID, tenant_id: str
-    ) -> int:
+        if not rows:
+            return 0, after
         store = getattr(self, "_blob_store", None)
-        refs = self._iter_tenant_blob_refs(conn, tenant_id)
-        if not refs:
-            return 0
-        items = sorted(refs.values(), key=lambda r: str(r.get("id")))
-        seq = 0
-        total = 0
-        for start in range(0, len(items), CHUNK):
-            chunk = items[start : start + CHUNK]
-            out: list[dict[str, Any]] = []
-            for r in chunk:
-                item = _jsonable(dict(r))
-                bid = r["id"]
-                data_b64 = ""
-                if store is not None:
-                    try:
-                        raw = store.read(bid)
-                        data_b64 = base64.b64encode(raw).decode("ascii")
-                        if not item.get("nbytes"):
-                            item["nbytes"] = len(raw)
-                        if not item.get("sha256"):
-                            import hashlib
-
-                            item["sha256"] = hashlib.sha256(raw).hexdigest()
-                    except Exception:
-                        data_b64 = ""
-                item["data_b64"] = data_b64
-                out.append(item)
-            conn.execute(
-                """
-                INSERT INTO tenant_snapshot_blobs (
-                    snapshot_id, kind, seq, row_count, rows
-                ) VALUES (%s, %s, %s, %s, %s)
-                """,
-                (snapshot_id, "payload_blobs", seq, len(out), Jsonb(out)),
-            )
-            total += len(out)
-            seq += 1
-        return total
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item = _jsonable(dict(r))
+            if include_blob_bytes and store is not None:
+                try:
+                    raw = store.read(r["id"])
+                    item["data_b64"] = base64.b64encode(raw).decode("ascii")
+                    if not item.get("nbytes"):
+                        item["nbytes"] = len(raw)
+                    if not item.get("sha256"):
+                        item["sha256"] = hashlib.sha256(raw).hexdigest()
+                except Exception:
+                    item["data_b64"] = ""
+            out.append(item)
+        conn.execute(
+            """
+            INSERT INTO tenant_snapshot_blobs (
+                snapshot_id, kind, seq, row_count, rows
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (snapshot_id, kind, seq) DO NOTHING
+            """,
+            (snapshot_id, "payload_blobs", seq, len(out), Jsonb(out)),
+        )
+        return len(rows), _keyset_from_row("payload_blobs", dict(rows[-1]))
