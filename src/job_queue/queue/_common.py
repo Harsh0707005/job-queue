@@ -947,6 +947,14 @@ class RelocateError(Exception):
         self.fatal = fatal
 
 
+class ReplicaError(Exception):
+    """Raised when a live tenant shadow replica cannot proceed."""
+
+    def __init__(self, message: str, *, fatal: bool = False) -> None:
+        super().__init__(message)
+        self.fatal = fatal
+
+
 class MergeError(Exception):
     """Raised when a tenant ownership transfer cannot complete."""
 

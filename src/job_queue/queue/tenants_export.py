@@ -274,6 +274,41 @@ _KIND_KEYS: dict[str, tuple[str, ...]] = {
     "tenant_restores": ("id",),
 }
 
+# Primary key (or unique identity) used for replica upsert / delete reconcile.
+KIND_PK: dict[str, tuple[str, ...]] = {
+    "payload_blobs": ("id",),
+    "payload_keys": ("tenant_id", "key_id"),
+    "payload_key_rotations": ("id",),
+    "tenant_settings": ("tenant_id",),
+    "tenant_fairness": ("tenant_id",),
+    "duration_estimates": ("tenant_id", "queue_name", "kind"),
+    "job_worker_affinity": ("tenant_id", "queue_name", "kind"),
+    "schedules": ("id",),
+    "schedule_generations": ("schedule_id", "iteration"),
+    "schedule_blackouts": ("id",),
+    "workflow_runs": ("id",),
+    "workflow_signals": ("id",),
+    "jobs": ("id",),
+    "job_dag_batches": ("id",),
+    "workflow_step_runs": ("id",),
+    "workflow_activities": ("id",),
+    "job_side_effects": ("job_id", "effect_key"),
+    "job_audit_events": ("event_id",),
+    "webhook_endpoints": ("id",),
+    "webhook_deliveries": ("id",),
+    "inbound_triggers": ("id",),
+    "inbound_trigger_nonces": ("trigger_id", "nonce"),
+    "inbound_job_callbacks": ("job_id",),
+    "alert_rules": ("id",),
+    "alert_events": ("id",),
+    "queue_metric_buckets": ("bucket_start", "tenant_id", "metric"),
+    "queue_metric_snapshots": ("sampled_at", "tenant_id"),
+    "tenant_usage_buckets": ("bucket_start", "tenant_id"),
+    "tenant_snapshots": ("id",),
+    "tenant_snapshot_blobs": ("snapshot_id", "kind", "seq"),
+    "tenant_restores": ("id",),
+}
+
 
 def _kind_key_cols(kind: str) -> tuple[str, ...]:
     return _KIND_KEYS.get(kind, ("id",))

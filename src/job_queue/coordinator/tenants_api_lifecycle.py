@@ -17,10 +17,11 @@ from job_queue.codec import (
     tenant_offboard_result_to_dict,
     tenant_payload_key_to_dict,
     tenant_relocate_to_dict,
+    tenant_replica_to_dict,
     tenant_restore_to_dict,
     tenant_snapshot_to_dict,
 )
-from job_queue.queue import RelocateError, RestoreError
+from job_queue.queue import RelocateError, ReplicaError, RestoreError
 
 
 class TenantsApiLifecycleMixin:
@@ -506,6 +507,121 @@ class TenantsApiLifecycleMixin:
         return 200, {
             "count": len(rels),
             "relocations": [tenant_relocate_to_dict(r) for r in rels],
+        }
+
+    def _replicate_tenant(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid replica path"}
+        tenant_id = parts[2]
+        dest_dsn = body.get("dest_dsn") or body.get("destination_dsn")
+        dest_blob_dir = body.get("dest_blob_dir")
+        try:
+            dest_keks = body.get("dest_keks")
+            if dest_keks is not None and not isinstance(dest_keks, dict):
+                return 400, {"error": "dest_keks must be an object of id → key"}
+            rel = self.queue.replicate_tenant(
+                tenant_id,
+                dest_dsn=None if dest_dsn is None else str(dest_dsn),
+                dest_blob_dir=(
+                    None if dest_blob_dir is None else str(dest_blob_dir)
+                ),
+                dest_kek=(
+                    None if body.get("dest_kek") is None else str(body.get("dest_kek"))
+                ),
+                dest_kek_id=(
+                    None
+                    if body.get("dest_kek_id") is None
+                    else str(body.get("dest_kek_id"))
+                ),
+                dest_keks=(
+                    None
+                    if dest_keks is None
+                    else {str(k): str(v) for k, v in dest_keks.items()}
+                ),
+                batch_size=int(body.get("batch_size") or 100),
+                min_catchup_rounds=int(body.get("min_catchup_rounds") or 1),
+                run_until_complete=bool(body.get("run_until_complete") or False),
+            )
+        except ReplicaError as exc:
+            return 409, {"error": str(exc), "code": "replica_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"replica": tenant_replica_to_dict(rel)}
+
+    def _abort_tenant_replica(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid replica abort path"}
+        try:
+            rel = self.queue.abort_tenant_replica(
+                parts[2],
+                error=(None if not body.get("error") else str(body.get("error"))),
+            )
+        except ReplicaError as exc:
+            return 409, {"error": str(exc), "code": "replica_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"replica": tenant_replica_to_dict(rel)}
+
+    def _advance_tenant_replica(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid replica advance path"}
+        try:
+            rel = self.queue.advance_tenant_replica(
+                parts[2], batch_size=int(body.get("batch_size") or 100)
+            )
+        except ReplicaError as exc:
+            return 409, {"error": str(exc), "code": "replica_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"replica": tenant_replica_to_dict(rel)}
+
+    def _cutover_tenant_replica(
+        self, path: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
+            return 400, {"error": "invalid replica cutover path"}
+        try:
+            rel = self.queue.cutover_tenant_replica(
+                parts[2], batch_size=int(body.get("batch_size") or 100)
+            )
+        except ReplicaError as exc:
+            return 409, {"error": str(exc), "code": "replica_error"}
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {"replica": tenant_replica_to_dict(rel)}
+
+    def _get_tenant_replica(self, path: str) -> tuple[int, dict[str, Any]]:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4:
+            return 400, {"error": "invalid replica path"}
+        rel = self.queue.get_tenant_replica(parts[2])
+        if rel is None:
+            return 404, {"error": "replica not found"}
+        return 200, {"replica": tenant_replica_to_dict(rel)}
+
+    def _advance_all_replicas(
+        self, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            rels = self.queue.process_tenant_replicas(
+                limit=int(body.get("limit") or 10),
+                batch_size=int(body.get("batch_size") or 100),
+            )
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return 200, {
+            "count": len(rels),
+            "replicas": [tenant_replica_to_dict(r) for r in rels],
         }
 
     def _list_tenant_payload_keys(

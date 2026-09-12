@@ -25,6 +25,7 @@ from job_queue.db import transaction
 from job_queue.models import TenantRelocate
 from job_queue.queue._common import RelocateError, _as_utc, _utcnow
 from job_queue.queue.tenants_export import (
+    KIND_PK,
     RELOCATE_SNAPSHOT_KINDS,
     SNAPSHOT_FORMAT_VERSION,
     _KIND_SQL,
@@ -545,6 +546,18 @@ class TenantsRelocateMixin:
                     return relocate_from_row(existing)
                 raise RelocateError(
                     f"tenant {tenant_id!r} has already been relocated"
+                )
+            replica_running = conn.execute(
+                """
+                SELECT 1 FROM tenant_replicas
+                WHERE tenant_id = %s AND status = 'running'
+                LIMIT 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+            if replica_running is not None:
+                raise RelocateError(
+                    f"tenant {tenant_id!r} is already replicating"
                 )
             existing = conn.execute(
                 """
@@ -1204,6 +1217,7 @@ class TenantsRelocateMixin:
         kind: str,
         rows: list[Any],
         tenant_id: str,
+        upsert: bool = False,
     ) -> None:
         if kind == "tenant_settings":
             return
@@ -1218,9 +1232,21 @@ class TenantsRelocateMixin:
         cols, table = _KIND_SQL[kind]
         col_names = [c.strip() for c in cols.split(",") if c.strip()]
         placeholders = ", ".join(["%s"] * len(col_names))
+        pk = KIND_PK.get(kind) or ()
+        if upsert and pk and all(c in col_names for c in pk):
+            sets = ", ".join(
+                f"{c} = EXCLUDED.{c}" for c in col_names if c not in pk
+            )
+            conflict = (
+                f"ON CONFLICT ({', '.join(pk)}) DO UPDATE SET {sets}"
+                if sets
+                else f"ON CONFLICT ({', '.join(pk)}) DO NOTHING"
+            )
+        else:
+            conflict = "ON CONFLICT DO NOTHING"
         sql = (
             f"INSERT INTO {table} ({', '.join(col_names)}) "
-            f"VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+            f"VALUES ({placeholders}) {conflict}"
         )
         for raw in rows:
             if not isinstance(raw, dict):

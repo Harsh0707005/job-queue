@@ -35,6 +35,7 @@ from job_queue.models import (
     TenantOffboardResult,
     TenantPayloadKey,
     TenantRelocate,
+    TenantReplica,
     TenantRestore,
     TenantSnapshot,
     TenantBreaker,
@@ -809,6 +810,27 @@ def tenant_relocate_to_dict(rel: TenantRelocate) -> dict[str, Any]:
         "kind_index": rel.kind_index,
         "blob_seq": rel.blob_seq,
         "blob_offset": rel.blob_offset,
+        "counts": dict(rel.counts),
+        "created_at": _dt(rel.created_at),
+        "updated_at": _dt(rel.updated_at),
+        "completed_at": _dt(rel.completed_at),
+        "error": rel.error,
+        "source_paused": bool(rel.source_paused),
+    }
+
+
+def tenant_replica_to_dict(rel: TenantReplica) -> dict[str, Any]:
+    return {
+        "id": str(rel.id),
+        "tenant_id": rel.tenant_id,
+        "snapshot_id": None if rel.snapshot_id is None else str(rel.snapshot_id),
+        "status": rel.status,
+        "stage": rel.stage,
+        "kind_index": rel.kind_index,
+        "blob_seq": rel.blob_seq,
+        "blob_offset": rel.blob_offset,
+        "catchup_rounds": rel.catchup_rounds,
+        "cutover_requested": bool(rel.cutover_requested),
         "counts": dict(rel.counts),
         "created_at": _dt(rel.created_at),
         "updated_at": _dt(rel.updated_at),

@@ -1910,4 +1910,54 @@ ALTER TABLE tenant_relocations ADD CONSTRAINT tenant_relocations_status_check CH
     status IN ('running', 'complete', 'failed', 'aborted')
 );
 
+-- Live shadow replica: dest catches up while source keeps serving, then
+-- a fenced cutover leaves exactly one live side.
+CREATE TABLE IF NOT EXISTS tenant_replicas (
+    id                  UUID PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    dest_dsn            TEXT NOT NULL,
+    dest_blob_dir       TEXT,
+    snapshot_id         UUID,
+    status              TEXT NOT NULL,
+    stage               TEXT NOT NULL,
+    kind_index          INTEGER NOT NULL DEFAULT 0,
+    blob_seq            INTEGER NOT NULL DEFAULT 0,
+    blob_offset         INTEGER NOT NULL DEFAULT 0,
+    catchup_rounds      INTEGER NOT NULL DEFAULT 0,
+    cutover_requested   BOOLEAN NOT NULL DEFAULT FALSE,
+    counts              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_paused       BOOLEAN NOT NULL DEFAULT FALSE,
+    dest_kek_id         TEXT,
+    dest_kek            TEXT,
+    dest_keks           JSONB,
+    error               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    CONSTRAINT tenant_replicas_status_check CHECK (
+        status IN ('running', 'complete', 'failed', 'aborted')
+    ),
+    CONSTRAINT tenant_replicas_stage_check CHECK (
+        stage IN (
+            'bootstrapping', 'catching_up', 'freezing',
+            'verifying', 'cutover', 'purging', 'complete'
+        )
+    ),
+    CONSTRAINT tenant_replicas_kind_index_check CHECK (kind_index >= 0),
+    CONSTRAINT tenant_replicas_blob_seq_check CHECK (blob_seq >= 0),
+    CONSTRAINT tenant_replicas_blob_offset_check CHECK (blob_offset >= 0),
+    CONSTRAINT tenant_replicas_catchup_rounds_check CHECK (catchup_rounds >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_replicas_one_active
+    ON tenant_replicas (tenant_id)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_tenant_replicas_tenant
+    ON tenant_replicas (tenant_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_replicas_running
+    ON tenant_replicas (updated_at)
+    WHERE status = 'running';
+
 """

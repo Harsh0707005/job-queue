@@ -1,0 +1,173 @@
+# Shadow-replicate one tenant onto a second Postgres while others keep running.
+# Do not use --abort-on-container-exit: the soak kills the source leader.
+#
+#   COMPOSE_PROJECT_NAME=jq-repl docker compose -p jq-repl \
+#     -f docker-compose.yml -f docker-compose.coordinator-leader.yml \
+#     -f docker-compose.tenant-replica.yml up --build -d
+#   docker logs -f jq-repl-tenant-replica-soak-1
+
+x-dest-coord: &dest_coord
+  build: .
+  command: ["job-queue-coordinator", "--host", "0.0.0.0", "--port", "8080"]
+  environment: &dest_coord_env
+    JOB_QUEUE_DSN: postgresql://queue:queue@postgres-dest:5432/queue
+    LOG_LEVEL: INFO
+    JOB_QUEUE_ALLOW_PRIVATE_WEBHOOKS: "1"
+    JOB_QUEUE_PAYLOAD_KEK: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+    JOB_QUEUE_PAYLOAD_KEK_ID: fleet
+    JOB_QUEUE_BLOB_DIR: /var/lib/job-queue/dest-blobs
+    JOB_QUEUE_PAYLOAD_BLOB_THRESHOLD: "32768"
+    COORDINATOR_CONTROL: "1"
+    COORDINATOR_LEADER_TTL: "2"
+    COORDINATOR_CONTROL_INTERVAL: "0.35"
+  volumes:
+    - dest-blobs:/var/lib/job-queue/dest-blobs
+  depends_on:
+    postgres-dest:
+      condition: service_healthy
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "python",
+        "-c",
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)",
+      ]
+    interval: 3s
+    timeout: 5s
+    retries: 40
+    start_period: 5s
+
+x-dest-worker: &dest_worker
+  build: .
+  command: ["job-queue-worker-agent"]
+  environment: &dest_worker_env
+    COORDINATOR_URLS: http://coordinator-dest-1:8080,http://coordinator-dest-2:8080
+    POLL_INTERVAL: "0.3"
+    VISIBILITY_TIMEOUT: "30"
+    LOG_LEVEL: INFO
+  depends_on:
+    coordinator-dest-1:
+      condition: service_healthy
+    coordinator-dest-2:
+      condition: service_healthy
+
+services:
+  chaos:
+    profiles: ["off"]
+  soak:
+    profiles: ["off"]
+  leader-soak:
+    profiles: ["disabled"]
+
+  postgres:
+    ports: !reset []
+  webhook-sink:
+    ports: !reset []
+  coordinator-1:
+    ports: !reset []
+    environment:
+      JOB_QUEUE_REPLICA_DEST_DSN: postgresql://queue:queue@postgres-dest:5432/queue
+      JOB_QUEUE_REPLICA_DEST_BLOB_DIR: /var/lib/job-queue/dest-blobs
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+      - dest-blobs:/var/lib/job-queue/dest-blobs
+    depends_on:
+      postgres-dest:
+        condition: service_healthy
+  coordinator-2:
+    ports: !reset []
+    environment:
+      JOB_QUEUE_REPLICA_DEST_DSN: postgresql://queue:queue@postgres-dest:5432/queue
+      JOB_QUEUE_REPLICA_DEST_BLOB_DIR: /var/lib/job-queue/dest-blobs
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+      - dest-blobs:/var/lib/job-queue/dest-blobs
+    depends_on:
+      postgres-dest:
+        condition: service_healthy
+  coordinator-3:
+    ports: !reset []
+    environment:
+      JOB_QUEUE_REPLICA_DEST_DSN: postgresql://queue:queue@postgres-dest:5432/queue
+      JOB_QUEUE_REPLICA_DEST_BLOB_DIR: /var/lib/job-queue/dest-blobs
+    volumes:
+      - payload-blobs:/var/lib/job-queue/blobs
+      - dest-blobs:/var/lib/job-queue/dest-blobs
+    depends_on:
+      postgres-dest:
+        condition: service_healthy
+
+  postgres-dest:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queue
+      POSTGRES_PASSWORD: queue
+      POSTGRES_DB: queue
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue -d queue"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports: !reset []
+
+  coordinator-dest-1:
+    <<: *dest_coord
+    environment:
+      <<: *dest_coord_env
+      COORDINATOR_NODE: coordinator-dest-1
+
+  coordinator-dest-2:
+    <<: *dest_coord
+    environment:
+      <<: *dest_coord_env
+      COORDINATOR_NODE: coordinator-dest-2
+
+  dest-worker-1:
+    <<: *dest_worker
+    environment:
+      <<: *dest_worker_env
+      WORKER_ID: dest-worker-1
+
+  dest-worker-2:
+    <<: *dest_worker
+    environment:
+      <<: *dest_worker_env
+      WORKER_ID: dest-worker-2
+
+  tenant-replica-soak:
+    build: .
+    command: ["python", "scripts/tenant_replica_soak.py"]
+    environment:
+      COORDINATOR_URLS: http://coordinator-1:8080,http://coordinator-2:8080,http://coordinator-3:8080
+      DEST_COORDINATOR_URLS: http://coordinator-dest-1:8080,http://coordinator-dest-2:8080
+      JOB_QUEUE_REPLICA_DEST_DSN: postgresql://queue:queue@postgres-dest:5432/queue
+      JOB_QUEUE_REPLICA_DEST_BLOB_DIR: /var/lib/job-queue/dest-blobs
+      MOVE_JOBS: "16"
+      KEEP_JOBS: "10"
+      MAX_WALL_SECONDS: "360"
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-jq-repl}
+      LOG_LEVEL: INFO
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/app/scripts
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+      coordinator-3:
+        condition: service_healthy
+      coordinator-dest-1:
+        condition: service_healthy
+      coordinator-dest-2:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+      dest-worker-1:
+        condition: service_started
+      dest-worker-2:
+        condition: service_started
+
+volumes:
+  dest-blobs:

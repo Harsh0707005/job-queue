@@ -807,6 +807,30 @@ class TenantRelocate:
 
 
 @dataclass(frozen=True, slots=True)
+class TenantReplica:
+    """Shadow copy of a tenant onto another Postgres, then fenced cutover."""
+
+    id: UUID
+    tenant_id: str
+    dest_dsn: str
+    dest_blob_dir: str | None
+    snapshot_id: UUID | None
+    status: str
+    stage: str
+    kind_index: int
+    counts: dict[str, int]
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
+    source_paused: bool = False
+    blob_seq: int = 0
+    blob_offset: int = 0
+    catchup_rounds: int = 0
+    cutover_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class PreemptResult:
     """One preemption: urgent pending gained a slot by parking a leased job."""
 

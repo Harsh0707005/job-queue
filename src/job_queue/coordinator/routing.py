@@ -843,6 +843,53 @@ class RoutingMixin:
             if gated is not None:
                 return gated
             return self._advance_all_relocations(body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/replica/abort")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._abort_tenant_replica(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/replica/advance")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._advance_tenant_replica(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/replica/cutover")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._cutover_tenant_replica(path, body)
+        if (
+            method == "POST"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/replica")
+        ):
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._replicate_tenant(path, body)
+        if (
+            method == "GET"
+            and path.startswith("/v1/tenants/")
+            and path.endswith("/replica")
+        ):
+            return self._get_tenant_replica(path)
+        if method == "POST" and path == "/v1/admin/replicas/advance":
+            gated = self._control_gate()
+            if gated is not None:
+                return gated
+            return self._advance_all_replicas(body)
         if method == "GET" and path.startswith("/v1/snapshots/"):
             return self._get_snapshot(path)
         if method == "POST" and path == "/v1/admin/restores/advance":

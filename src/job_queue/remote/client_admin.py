@@ -562,6 +562,88 @@ class ClientAdminMixin:
         assert payload is not None
         return payload
 
+    def replicate_tenant(
+        self,
+        tenant_id: str,
+        *,
+        dest_dsn: str | None = None,
+        dest_blob_dir: str | None = None,
+        dest_kek: str | None = None,
+        dest_kek_id: str | None = None,
+        dest_keks: dict[str, str] | None = None,
+        batch_size: int = 100,
+        min_catchup_rounds: int = 1,
+        run_until_complete: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "batch_size": batch_size,
+            "min_catchup_rounds": min_catchup_rounds,
+            "run_until_complete": run_until_complete,
+        }
+        if dest_dsn is not None:
+            body["dest_dsn"] = dest_dsn
+        if dest_blob_dir is not None:
+            body["dest_blob_dir"] = dest_blob_dir
+        if dest_kek is not None:
+            body["dest_kek"] = dest_kek
+        if dest_kek_id is not None:
+            body["dest_kek_id"] = dest_kek_id
+        if dest_keks is not None:
+            body["dest_keks"] = dest_keks
+        payload = self._request("POST", f"/v1/tenants/{tenant_id}/replica", body)
+        assert payload is not None
+        return payload
+
+    def abort_tenant_replica(
+        self, tenant_id: str, *, error: str | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if error is not None:
+            body["error"] = error
+        payload = self._request(
+            "POST", f"/v1/tenants/{tenant_id}/replica/abort", body
+        )
+        assert payload is not None
+        return payload
+
+    def advance_tenant_replica(
+        self, tenant_id: str, *, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/replica/advance",
+            {"batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
+    def cutover_tenant_replica(
+        self, tenant_id: str, *, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/replica/cutover",
+            {"batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
+    def get_tenant_replica(self, tenant_id: str) -> dict[str, Any]:
+        payload = self._request("GET", f"/v1/tenants/{tenant_id}/replica")
+        assert payload is not None
+        return payload
+
+    def process_tenant_replicas(
+        self, *, limit: int = 10, batch_size: int = 100
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            "/v1/admin/replicas/advance",
+            {"limit": limit, "batch_size": batch_size},
+        )
+        assert payload is not None
+        return payload
+
     def process_payload_key_rotations(
         self,
         *,

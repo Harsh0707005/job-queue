@@ -9,6 +9,7 @@ from job_queue.queue.tenants_merge import TenantsMergeMixin
 from job_queue.queue.tenants_export import TenantsExportMixin
 from job_queue.queue.tenants_restore import TenantsRestoreMixin
 from job_queue.queue.tenants_relocate import TenantsRelocateMixin
+from job_queue.queue.tenants_replica import TenantsReplicaMixin
 from job_queue.queue.tenants_split import TenantsSplitMixin
 
 
@@ -20,6 +21,7 @@ class TenantsLifecycleMixin(
     TenantsExportMixin,
     TenantsRestoreMixin,
     TenantsRelocateMixin,
+    TenantsReplicaMixin,
     TenantsSplitMixin,
 ):
     """Aggregated TenantsLifecycleMixin (split for maintainability)."""

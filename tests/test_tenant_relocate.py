@@ -70,6 +70,7 @@ def _wipe(q: JobQueue) -> None:
         conn.execute("TRUNCATE workflow_step_runs CASCADE")
         conn.execute("TRUNCATE workflow_runs CASCADE")
         conn.execute("TRUNCATE tenant_relocations")
+        conn.execute("TRUNCATE tenant_replicas")
         conn.execute("TRUNCATE tenant_restores CASCADE")
         conn.execute("TRUNCATE tenant_snapshots CASCADE")
         conn.execute(
